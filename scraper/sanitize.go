@@ -121,7 +121,8 @@ var allowedAnnotationDomains = []string{
 }
 
 // deniedAnnotationKeys lists specific annotation keys within allowed domains that must always
-// be stripped because they can embed unsanitized manifests, CLI commands, or container specs.
+// be stripped because they can embed unsanitized manifests, CLI commands, container specs,
+// cloud project/volume identifiers, or internal node IP addresses.
 var deniedAnnotationKeys = []string{
 	strings.ToLower(corev1.LastAppliedConfigAnnotation), // kubectl.kubernetes.io/last-applied-configuration
 	"kubernetes.io/change-cause",
@@ -129,6 +130,26 @@ var deniedAnnotationKeys = []string{
 	"pod.beta.kubernetes.io/init-containers",
 	"pod.alpha.kubernetes.io/init-container-statuses",
 	"pod.beta.kubernetes.io/init-container-statuses",
+	"csi.volume.kubernetes.io/nodeid",
+	"alpha.kubernetes.io/provided-node-ip",
+}
+
+// deniedNodeLabelKeys lists cloud-provider and cluster-identifying Node label keys (all lowercase)
+// that can leak cluster names, cloud project/subscription IDs, VM instance IDs, or node service
+// accounts, while preserving scheduling, hardware, and topology labels needed by ResourceFlavor,
+// Topology, and Pod nodeSelector/nodeAffinity.
+var deniedNodeLabelKeys = []string{
+	"cloud.google.com/gke-cluster-name",
+	"cloud.google.com/gke-boot-disk",
+	"cloud.google.com/project",
+	"project.cloud.google.com/id",
+	"iam.gke.io/node-service-account",
+	"topology.gke.io/cluster",
+	"alpha.eksctl.io/cluster-name",
+	"alpha.eksctl.io/instance-id",
+	"eks.amazonaws.com/nodegroup-image",
+	"kubernetes.azure.com/cluster",
+	"kubernetes.azure.com/subscription-id",
 }
 
 // ShouldKeepAnnotation returns true iff key is a domain-prefixed annotation ("<domain>/<name>")
@@ -172,6 +193,24 @@ func FilterAnnotations(annotations map[string]string, hashNames bool) map[string
 		return nil
 	}
 	return filtered
+}
+
+// FilterLabels copies labels while omitting any key present in deniedKeys (entries in deniedKeys must be lowercase).
+func FilterLabels(labels map[string]string, deniedKeys []string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(labels))
+	for k, v := range labels {
+		if slices.Contains(deniedKeys, strings.ToLower(k)) {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // SanitizeLabels copies labels and hashes values that store workload/job/pod names when hashNames is true.
@@ -486,51 +525,87 @@ func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletion
 	}
 }
 
-// SanitizeNode prepares a Node for infra.json (whole node information including status).
+func sanitizeInfraObjectMeta(meta *metav1.ObjectMeta) {
+	meta.ManagedFields = nil
+	meta.Annotations = FilterAnnotations(meta.Annotations, false)
+}
+
+// SanitizeNode prepares a Node for infra.json, retaining only scheduling-relevant spec fields
+// (taints, unschedulable) and status fields (capacity, allocatable, conditions, phase), filtering
+// annotations, and stripping cloud/cluster-identifying node labels.
 func SanitizeNode(node *corev1.Node) *corev1.Node {
+	if node == nil {
+		return nil
+	}
 	cp := node.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Node"}
-	cp.ManagedFields = nil
+	sanitizeInfraObjectMeta(&cp.ObjectMeta)
+	cp.Labels = FilterLabels(cp.Labels, deniedNodeLabelKeys)
+	cp.Spec = corev1.NodeSpec{
+		Taints:        cp.Spec.Taints,
+		Unschedulable: cp.Spec.Unschedulable,
+	}
+	cp.Status = corev1.NodeStatus{
+		Capacity:    cp.Status.Capacity,
+		Allocatable: cp.Status.Allocatable,
+		Conditions:  cp.Status.Conditions,
+		Phase:       cp.Status.Phase,
+	}
 	return cp
 }
 
-// SanitizeNamespace prepares a Namespace for infra.json (whole object without status).
+// SanitizeNamespace prepares a Namespace for infra.json (filtering annotations and omitting status).
 func SanitizeNamespace(ns *corev1.Namespace) map[string]any {
+	if ns == nil {
+		return nil
+	}
 	cp := ns.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"}
-	cp.ManagedFields = nil
+	sanitizeInfraObjectMeta(&cp.ObjectMeta)
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeClusterQueue prepares a ClusterQueue for infra.json (whole object without status).
+// SanitizeClusterQueue prepares a ClusterQueue for infra.json (filtering annotations and omitting status).
 func SanitizeClusterQueue(cq *kueuev1beta2.ClusterQueue) map[string]any {
+	if cq == nil {
+		return nil
+	}
 	cp := cq.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "ClusterQueue"}
-	cp.ManagedFields = nil
+	sanitizeInfraObjectMeta(&cp.ObjectMeta)
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeLocalQueue prepares a LocalQueue for infra.json (whole object without status).
+// SanitizeLocalQueue prepares a LocalQueue for infra.json (filtering annotations and omitting status).
 func SanitizeLocalQueue(lq *kueuev1beta2.LocalQueue) map[string]any {
+	if lq == nil {
+		return nil
+	}
 	cp := lq.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "LocalQueue"}
-	cp.ManagedFields = nil
+	sanitizeInfraObjectMeta(&cp.ObjectMeta)
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeResourceFlavor prepares a ResourceFlavor for infra.json (whole object without status).
+// SanitizeResourceFlavor prepares a ResourceFlavor for infra.json (filtering annotations and omitting status).
 func SanitizeResourceFlavor(rf *kueuev1beta2.ResourceFlavor) map[string]any {
+	if rf == nil {
+		return nil
+	}
 	cp := rf.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "ResourceFlavor"}
-	cp.ManagedFields = nil
+	sanitizeInfraObjectMeta(&cp.ObjectMeta)
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeTopology prepares a Topology for infra.json (whole object without status).
+// SanitizeTopology prepares a Topology for infra.json (filtering annotations and omitting status).
 func SanitizeTopology(topo *kueuev1beta2.Topology) map[string]any {
+	if topo == nil {
+		return nil
+	}
 	cp := topo.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "Topology"}
-	cp.ManagedFields = nil
+	sanitizeInfraObjectMeta(&cp.ObjectMeta)
 	return toMapWithoutStatus(cp)
 }
 

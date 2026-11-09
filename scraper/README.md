@@ -11,10 +11,12 @@ For the complete output format, event envelope, `workloadState` state machine, a
 ## Features
 
 - **Hybrid Periodic + Watch Recording**:
-  - Periodically snapshots `Node`s (with status), `Namespace`s, and Kueue `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, and `Topology` objects, emitting events only when canonical object state changes.
+  - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, and Kueue `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, and `Topology` objects, emitting events only when canonical object state changes.
   - Watches `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, and Kueue `Workload`s in real time to capture exact creation, admission, scheduling, preemption, completion, and deletion timestamps.
   - Gracefully handles optional CRDs (`JobSet`, `LeaderWorkerSet`, `RayJob`, `RayCluster`, Kueue APIs) if they are not installed on the target cluster, retrying periodically without failing.
 - **Strict Data Sanitization**:
+  - `Node` records in `infra.json` retain only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`) fields, stripping cached `.status.images`, `.status.addresses`, `.status.nodeInfo`, attached volumes, `.spec.providerID`/CIDRs, cloud/cluster-identifying node labels, and disallowed annotations.
+  - `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, and `Topology` records in `infra.json` omit `.status`, `metadata.managedFields`, and any disallowed/sensitive annotations.
   - Scheduled/running `Pod` records in `infra.json` store **only** node placement, effective resource requests, scheduling time, first notice time, and deletion time.
   - Workflow specs in `workflows.json` have container images replaced with a pause image (`registry.k8s.io/pause:3.10` by default) and strip commands, args, `env`/`envFrom`, volumes, secrets, `.status`, sensitive Kubernetes annotations (such as `kubectl.kubernetes.io/last-applied-configuration` and `kubernetes.io/change-cause`), and any annotations outside the official `kubernetes.io`, `k8s.io`, `x-k8s.io`, and `kueue-optimizer.gke.io` domains and their subdomains (e.g. `*.kubernetes.io`, `*.k8s.io`, `*.x-k8s.io`, `*.kueue-optimizer.gke.io`).
 - **Optional SHA-256 Name Anonymization (`--hash-names`)**:
@@ -113,7 +115,7 @@ Each run produces three append-only **JSON Lines (NDJSON)** files (one compact J
 
 | File | Recorded Resources & Events |
 | :--- | :--- |
-| `infra.json` | `"New"`, `"Update"`, and `"Deleted"` events for `Node`s (full object + `.status`), `Namespace`s, `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without `.status`), and scheduled/running `Pod` placements and resource requests. |
+| `infra.json` | `"New"`, `"Update"`, and `"Deleted"` events for sanitized `Node`s (scheduling-relevant `.spec` + `.status`), `Namespace`s, `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without `.status`, with annotations filtered), and scheduled/running `Pod` placements and resource requests. |
 | `workflows.json` | Watch-driven `"New"`, `"Update"`, and `"Deleted"` events for `Job`, `JobSet`, `LeaderWorkerSet`, `Deployment`, `RayJob`, `RayCluster`, and standalone Kueue-managed `Pod` specs, annotated with top-level `workloadState` (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`). |
 | `execution-time.json` | Watch-driven `"Admitted"`, `"PartialExecution"` (preempted), and `"FullExecution"` (completed without preemption) timing records for Kueue `Workload` objects. |
 

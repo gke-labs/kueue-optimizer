@@ -10,7 +10,7 @@ This document specifies the exact JSON Lines (NDJSON) file format, event envelop
 
 | File | Default Flag | Purpose |
 | :--- | :--- | :--- |
-| `infra.json` | `--infra-file` | Periodic state & changes of `Node`s (with status), `Namespace`s, `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without status), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
+| `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
 | `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s, with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
 | `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), preempted runs (`PartialExecution`), and non-preempted completions (`FullExecution`), with top-level `workloadState` metadata. |
 
@@ -108,7 +108,7 @@ Every `payload` object in `infra.json` contains top-level `"apiVersion"` and `"k
 
 | `payload.kind` | `payload.apiVersion` | Includes `.status`? | Name Hashed with `--hash-names`? |
 | :--- | :--- | :--- | :--- |
-| `"Node"` | `"v1"` | **Yes** (full node spec + status) | **No** (plain name) |
+| `"Node"` | `"v1"` | **Yes** (scheduling-only: `capacity`, `allocatable`, `conditions`, `phase`) | **No** (plain name) |
 | `"Namespace"` | `"v1"` | **No** (status omitted) | **No** (plain name) |
 | `"ClusterQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"LocalQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
@@ -120,7 +120,10 @@ Every `payload` object in `infra.json` contains top-level `"apiVersion"` and `"k
 
 ### 3.3 `Node` Payload (`payload.kind == "Node"`)
 
-Stores the complete Kubernetes `v1/Node` object **including `.status`** (capacity, allocatable, conditions, addresses, nodeInfo, images, etc.), with only `metadata.managedFields` stripped.
+Stores a sanitized Kubernetes `v1/Node` object retaining only scheduling-relevant fields:
+- `metadata`: `metadata.managedFields` is stripped, `metadata.annotations` retains only keys under the `kubernetes.io`, `k8s.io`, `x-k8s.io`, and `kueue-optimizer.gke.io` domains and their subdomains (excluding sensitive keys such as `kubectl.kubernetes.io/last-applied-configuration`, `csi.volume.kubernetes.io/nodeid`, and `alpha.kubernetes.io/provided-node-ip`), and `metadata.labels` preserves scheduling/topology/hardware labels while stripping cloud/cluster-identifying keys (such as `cloud.google.com/gke-cluster-name`, `cloud.google.com/project`, `iam.gke.io/node-service-account`, `alpha.eksctl.io/cluster-name`, and `kubernetes.azure.com/cluster`).
+- `spec`: retains only `taints` and `unschedulable` (omitting `providerID`, `podCIDR`, `podCIDRs`, and `configSource`).
+- `status`: retains only `capacity`, `allocatable`, `conditions`, and `phase` (omitting `images`, `addresses`, `nodeInfo`, `volumesInUse`, `volumesAttached`, `daemonEndpoints`, `config`, `runtimeHandlers`, and `features`).
 
 On disk (single line in `infra.json`):
 ```json
@@ -131,7 +134,7 @@ On disk (single line in `infra.json`):
 
 ### 3.4 `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, and `Topology` Payloads
 
-Stores the full Kubernetes/Kueue object (`apiVersion`, `kind`, `metadata`, `spec`), **excluding `.status`** and `metadata.managedFields`.
+Stores the Kubernetes/Kueue object (`apiVersion`, `kind`, `metadata`, `spec`), **excluding `.status`**, `metadata.managedFields`, and any `metadata.annotations` outside the allowed `kubernetes.io`, `k8s.io`, `x-k8s.io`, and `kueue-optimizer.gke.io` domains (and their subdomains) or on the sensitive annotation denylist.
 
 On disk (single line in `infra.json` for `ClusterQueue`):
 ```json

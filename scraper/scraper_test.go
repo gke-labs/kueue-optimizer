@@ -45,6 +45,28 @@ import (
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
 
+// Predefined sensitive sentinel constants reused across sanitization test fixtures (annotations,
+// labels, raw resource names, cloud/system IDs, container images, commands/args, env vars, volumes,
+// and IPs/CIDRs). Always reuse these constants when adding test cases so testForbiddenSubstrings
+// stays small, consistent, and easy to follow.
+const (
+	testSecretValue      = "SENSITIVE_SECRET_VALUE"
+	testSecretImage      = "registry.internal/SENSITIVE_SECRET_IMAGE:v1"
+	testSecretEmail      = "owner@sensitive-client.internal"
+	testSecretIP         = "10.128.99.42"
+	testSecretCIDR       = "10.244.99.0/24"
+	testSecretNamePrefix = "secret-name-"
+)
+
+var testForbiddenSubstrings = []string{
+	testSecretValue,
+	testSecretImage,
+	testSecretEmail,
+	testSecretIP,
+	testSecretCIDR,
+	testSecretNamePrefix,
+}
+
 func readJSONLines[T any](t *testing.T, raw []byte) []T {
 	t.Helper()
 	var results []T
@@ -130,6 +152,8 @@ func TestShouldKeepAnnotation(t *testing.T) {
 		{key: "pod.beta.kubernetes.io/init-containers", want: false},
 		{key: "pod.alpha.kubernetes.io/init-container-statuses", want: false},
 		{key: "pod.beta.kubernetes.io/init-container-statuses", want: false},
+		{key: "csi.volume.kubernetes.io/nodeid", want: false},
+		{key: "alpha.kubernetes.io/provided-node-ip", want: false},
 
 		// Custom/third-party domains that contain "k8s", "kubernetes", "x-k8s", or "kueue-optimizer" as substrings.
 		{key: "k8s.client-domain.com/owner", want: false},
@@ -163,21 +187,114 @@ func TestShouldKeepAnnotation(t *testing.T) {
 	}
 }
 
+func TestNodeLabelSanitization(t *testing.T) {
+	savedLabels := map[string]string{
+		"instance":                            "gpu",
+		"role":                                "worker",
+		"type":                                "kwok",
+		"kubernetes.io/hostname":              "kwok-node-0",
+		"kubernetes.io/arch":                  "amd64",
+		"node.kubernetes.io/instance-type":    "a2-highgpu-8g",
+		"topology.kubernetes.io/zone":         "us-central1-a",
+		"cloud.google.com/gke-accelerator":    "nvidia-tesla-a100",
+		"cloud.google.com/gke-nodepool":       "gpu-pool",
+		"cloud.google.com/gke-topology-block": "block-1",
+	}
+	omittedNodeLabels := []string{
+		"cloud.google.com/gke-cluster-name",
+		"CLOUD.GOOGLE.COM/GKE-BOOT-DISK",
+		"cloud.google.com/project",
+		"project.cloud.google.com/id",
+		"iam.gke.io/node-service-account",
+		"topology.gke.io/cluster",
+		"alpha.eksctl.io/cluster-name",
+		"alpha.eksctl.io/instance-id",
+		"eks.amazonaws.com/nodegroup-image",
+		"kubernetes.azure.com/cluster",
+		"kubernetes.azure.com/subscription-id",
+	}
+
+	input := make(map[string]string, len(savedLabels)+len(omittedNodeLabels))
+	for k, v := range savedLabels {
+		input[k] = v
+	}
+	for _, k := range omittedNodeLabels {
+		input[k] = testSecretValue
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "kwok-node-0",
+			Labels: input,
+		},
+	}
+	sanitized := SanitizeNode(node)
+
+	for k, want := range savedLabels {
+		if got := sanitized.Labels[k]; got != want {
+			t.Errorf("expected node label %q=%q to be saved, got %q", k, want, got)
+		}
+	}
+	for _, k := range omittedNodeLabels {
+		if got, exists := sanitized.Labels[k]; exists {
+			t.Errorf("expected node label %q to be omitted, got %q", k, got)
+		}
+	}
+}
+
+func TestFilterLabels(t *testing.T) {
+	filtered := FilterLabels(map[string]string{
+		"keep-key":        "ok",
+		"Custom.Deny/Key": testSecretValue,
+		"exact.deny/key":  testSecretValue,
+	}, []string{"custom.deny/key", "exact.deny/key"})
+	if filtered["keep-key"] != "ok" {
+		t.Errorf("expected keep-key to be saved, got %v", filtered)
+	}
+	for _, omitted := range []string{"Custom.Deny/Key", "custom.deny/key", "exact.deny/key"} {
+		if _, exists := filtered[omitted]; exists {
+			t.Errorf("expected %q to be omitted", omitted)
+		}
+	}
+	if got := FilterLabels(map[string]string{"only-denied": "v"}, []string{"only-denied"}); got != nil {
+		t.Errorf("expected nil when all labels are omitted, got %v", got)
+	}
+}
+
+func TestSanitizationListsAreLowercase(t *testing.T) {
+	for _, k := range deniedNodeLabelKeys {
+		if k != strings.ToLower(k) {
+			t.Errorf("deniedNodeLabelKeys entry %q must be lowercase", k)
+		}
+	}
+	for _, k := range deniedAnnotationKeys {
+		if k != strings.ToLower(k) {
+			t.Errorf("deniedAnnotationKeys entry %q must be lowercase", k)
+		}
+	}
+	for _, d := range allowedAnnotationDomains {
+		if d != strings.ToLower(d) {
+			t.Errorf("allowedAnnotationDomains entry %q must be lowercase", d)
+		}
+	}
+}
+
 func TestAnnotationFilteringAndPodSanitization(t *testing.T) {
+	secretJobName := testSecretNamePrefix + "job"
 	ann := map[string]string{
-		"business.corp.com/cost-center":                     "secret-finance-code",
-		"team.internal/owner":                               "alice",
-		"k8s.client-domain.com/owner":                       "dev@client.com",
-		"kubernetes.client-domain.com/team":                 "ml-infra@client.com",
-		"client-domain.com/k8s-owner":                       "bob@client.com",
-		"k8s-unprefixed-owner":                              "carol@client.com",
-		corev1.LastAppliedConfigAnnotation:                  `{"apiVersion":"batch/v1","kind":"Job","spec":{"template":{"spec":{"containers":[{"image":"gcr.io/client/proprietary:v1","env":[{"name":"DB_PASS","value":"s3cr3t"}]}]}}}}`,
-		"kubernetes.io/change-cause":                        "kubectl set image job/my-secret-job main=gcr.io/client/proprietary:v2 --record",
+		"business.corp.com/cost-center":                     testSecretValue,
+		"team.internal/owner":                               testSecretEmail,
+		"k8s.client-domain.com/owner":                       testSecretEmail,
+		"kubernetes.client-domain.com/team":                 testSecretEmail,
+		"client-domain.com/k8s-owner":                       testSecretEmail,
+		"k8s-unprefixed-owner":                              testSecretEmail,
+		corev1.LastAppliedConfigAnnotation:                  `{"image":"` + testSecretImage + `","secret":"` + testSecretValue + `"}`,
+		"kubernetes.io/change-cause":                        "kubectl set image job/" + secretJobName + " main=" + testSecretImage + " --record",
 		"kueue.x-k8s.io/queue-name":                         "main-lq",
 		"kueue-optimizer.gke.io/pod-execution-time-seconds": "15",
 		"kubernetes.io/psp":                                 "restricted",
 		"k8s.io/custom":                                     "yes",
-		"kueue.x-k8s.io/job-owner-name":                     "my-secret-job",
+		"kueue.x-k8s.io/job-owner-name":                     secretJobName,
 	}
 
 	filtered := FilterAnnotations(ann, true)
@@ -207,7 +324,7 @@ func TestAnnotationFilteringAndPodSanitization(t *testing.T) {
 	if filtered["k8s.io/custom"] != "yes" {
 		t.Errorf("expected k8s annotation to be preserved")
 	}
-	if filtered["kueue.x-k8s.io/job-owner-name"] != HashName("my-secret-job", true) {
+	if filtered["kueue.x-k8s.io/job-owner-name"] != HashName(secretJobName, true) {
 		t.Errorf("expected job-owner-name annotation value to be SHA-256 hashed")
 	}
 }
@@ -224,41 +341,97 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 	}
 
 	schedTime := metav1.NewTime(time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC))
+	rawPodName := testSecretNamePrefix + "train-pod-0"
 
 	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "kwok-node-0"},
-		Spec:       corev1.NodeSpec{PodCIDR: "10.0.0.0/24"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "kwok-node-0",
+			Labels: map[string]string{
+				"instance":                          "gpu",
+				"kubernetes.io/hostname":            "kwok-node-0",
+				"cloud.google.com/gke-accelerator":  "nvidia-tesla-a100",
+				"cloud.google.com/gke-cluster-name": testSecretValue,
+			},
+			Annotations: map[string]string{
+				"kwok.x-k8s.io/node":                   "fake",
+				"container.googleapis.com/instance_id": testSecretValue,
+				"csi.volume.kubernetes.io/nodeid":      testSecretValue,
+				"alpha.kubernetes.io/provided-node-ip": testSecretIP,
+				corev1.LastAppliedConfigAnnotation:     testSecretValue,
+			},
+		},
+		Spec: corev1.NodeSpec{
+			PodCIDR:       testSecretCIDR,
+			PodCIDRs:      []string{testSecretCIDR},
+			ProviderID:    "gce://" + testSecretValue + "/us-central1-a/kwok-node-0",
+			Unschedulable: false,
+			Taints: []corev1.Taint{
+				{Key: "kwok.x-k8s.io/node", Value: "fake", Effect: corev1.TaintEffectNoSchedule},
+			},
+		},
 		Status: corev1.NodeStatus{
+			Phase: corev1.NodeRunning,
 			Capacity: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("8"),
 				corev1.ResourceMemory: resource.MustParse("32Gi"),
 			},
+			Allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("8"),
+				corev1.ResourceMemory: resource.MustParse("32Gi"),
+			},
+			Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "KubeletReady"},
+			},
+			Images: []corev1.ContainerImage{
+				{Names: []string{testSecretImage}, SizeBytes: 1024},
+			},
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: testSecretIP},
+				{Type: corev1.NodeInternalDNS, Address: testSecretValue},
+			},
+			NodeInfo: corev1.NodeSystemInfo{
+				MachineID:  testSecretValue,
+				SystemUUID: testSecretValue,
+				BootID:     testSecretValue,
+			},
+			VolumesInUse: []corev1.UniqueVolumeName{corev1.UniqueVolumeName(testSecretValue)},
+			VolumesAttached: []corev1.AttachedVolume{
+				{Name: corev1.UniqueVolumeName(testSecretValue), DevicePath: "/dev/sdb"},
+			},
 		},
 	}
 	ns := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{Name: "ai-lab"},
-		Status:     corev1.NamespaceStatus{Phase: corev1.NamespaceActive},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "ai-lab",
+			Labels: map[string]string{"team": "ai"},
+			Annotations: map[string]string{
+				"corp.internal/owner":              testSecretEmail,
+				"k8s.io/ns-note":                   "keep-ns-annot",
+				corev1.LastAppliedConfigAnnotation: testSecretValue,
+			},
+		},
+		Status: corev1.NamespaceStatus{Phase: corev1.NamespaceActive},
 	}
 	runningPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "train-pod-0",
+			Name:      rawPodName,
 			Namespace: "ai-lab",
-			Labels:    map[string]string{"secret-label": "do-not-save"},
+			Labels:    map[string]string{"secret-label": testSecretValue},
 			Annotations: map[string]string{
-				"secret-annotation": "do-not-save",
+				"secret-annotation": testSecretValue,
 			},
 		},
 		Spec: corev1.PodSpec{
 			NodeName:         "kwok-node-0",
-			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}},
-			Volumes:          []corev1.Volume{{Name: "secret-vol"}},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: testSecretValue}},
+			Volumes:          []corev1.Volume{{Name: testSecretValue}},
 			Containers: []corev1.Container{
 				{
 					Name:    "trainer",
-					Image:   "gcr.io/proprietary/model:v1",
-					Command: []string{"python", "train.py"},
-					Args:    []string{"--lr=0.001"},
-					Env:     []corev1.EnvVar{{Name: "API_KEY", Value: "top-secret"}},
+					Image:   testSecretImage,
+					Command: []string{"python", testSecretValue},
+					Args:    []string{testSecretValue},
+					Env:     []corev1.EnvVar{{Name: "API_KEY", Value: testSecretValue}},
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("4"),
@@ -281,7 +454,13 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 	}
 
 	cq := &kueuev1beta2.ClusterQueue{
-		ObjectMeta: metav1.ObjectMeta{Name: "ai-lab-cq"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ai-lab-cq",
+			Annotations: map[string]string{
+				"finance.corp.com/cost-center": testSecretValue,
+				"kueue.x-k8s.io/cq-note":       "keep-cq-annot",
+			},
+		},
 		Spec: kueuev1beta2.ClusterQueueSpec{
 			CohortName: "main-cohort",
 		},
@@ -290,7 +469,13 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		},
 	}
 	lq := &kueuev1beta2.LocalQueue{
-		ObjectMeta: metav1.ObjectMeta{Name: "ai-lab-lq", Namespace: "ai-lab"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ai-lab-lq",
+			Namespace: "ai-lab",
+			Annotations: map[string]string{
+				"corp.internal/owner": testSecretEmail,
+			},
+		},
 		Spec: kueuev1beta2.LocalQueueSpec{
 			ClusterQueue: "ai-lab-cq",
 		},
@@ -299,13 +484,23 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		},
 	}
 	rf := &kueuev1beta2.ResourceFlavor{
-		ObjectMeta: metav1.ObjectMeta{Name: "default-flavor"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "default-flavor",
+			Annotations: map[string]string{
+				"k8s.client-domain.com/owner": testSecretEmail,
+			},
+		},
 		Spec: kueuev1beta2.ResourceFlavorSpec{
 			NodeLabels: map[string]string{"instance": "gpu"},
 		},
 	}
 	topo := &kueuev1beta2.Topology{
-		ObjectMeta: metav1.ObjectMeta{Name: "default-topology"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "default-topology",
+			Annotations: map[string]string{
+				"corp.internal/doc": testSecretValue,
+			},
+		},
 		Spec: kueuev1beta2.TopologySpec{
 			Levels: []kueuev1beta2.TopologyLevel{{NodeLabel: "kubernetes.io/hostname"}},
 		},
@@ -383,7 +578,7 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 			}
 		case "Pod":
 			name := payload["name"].(string)
-			expectedHash := HashName("train-pod-0", true)
+			expectedHash := HashName(rawPodName, true)
 			if name != expectedHash {
 				t.Errorf("Pod name should be SHA-256 hashed to %q, got %q", expectedHash, name)
 			}
@@ -402,11 +597,25 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		}
 	}
 
-	// Ensure no secret strings leaked anywhere into infra.json.
+	// Ensure none of the predefined sensitive sentinel constants leaked anywhere into infra.json.
 	infraStr := string(rawInfra)
-	for _, secret := range []string{"do-not-save", "gcr.io/proprietary", "train.py", "--lr=0.001", "top-secret", "regcred", "secret-vol", "train-pod-0"} {
+	for _, secret := range testForbiddenSubstrings {
 		if strings.Contains(infraStr, secret) {
-			t.Errorf("infra.json leaked sensitive pod information %q:\n%s", secret, infraStr)
+			t.Errorf("infra.json leaked sensitive information %q:\n%s", secret, infraStr)
+		}
+	}
+
+	// Ensure scheduling-relevant Node/Namespace fields and allowed annotations WERE preserved in infra.json.
+	for _, expected := range []string{
+		"kwok.x-k8s.io/node",
+		"nvidia-tesla-a100",
+		"KubeletReady",
+		"keep-ns-annot",
+		"keep-cq-annot",
+		`"team":"ai"`,
+	} {
+		if !strings.Contains(infraStr, expected) {
+			t.Errorf("infra.json missing expected sanitized field/value %q:\n%s", expected, infraStr)
 		}
 	}
 }
@@ -451,24 +660,24 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{
 				"kueue-optimizer.gke.io/pod-execution-time-seconds": "20",
-				"corp.internal/secret-note":                         "proprietary-dataset-path",
+				"corp.internal/secret-note":                         testSecretValue,
 			},
 			Labels: map[string]string{
 				KueueQueueLabel: "team-a-lq",
 			},
 		},
 		Spec: corev1.PodSpec{
-			Volumes:          []corev1.Volume{{Name: "data-vol"}},
-			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "pull-secret"}},
+			Volumes:          []corev1.Volume{{Name: testSecretValue}},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: testSecretValue}},
 			Containers: []corev1.Container{
 				{
 					Name:         "worker",
-					Image:        "registry.internal/secret-llm:v9",
-					Command:      []string{"/bin/run_secret_training"},
-					Args:         []string{"--weights=/mnt/secret"},
-					Env:          []corev1.EnvVar{{Name: "SECRET_TOKEN", Value: "xyz123"}},
-					EnvFrom:      []corev1.EnvFromSource{{Prefix: "SEC_"}},
-					VolumeMounts: []corev1.VolumeMount{{Name: "data-vol", MountPath: "/mnt"}},
+					Image:        testSecretImage,
+					Command:      []string{testSecretValue},
+					Args:         []string{testSecretValue},
+					Env:          []corev1.EnvVar{{Name: "API_KEY", Value: testSecretValue}},
+					EnvFrom:      []corev1.EnvFromSource{{Prefix: testSecretValue}},
+					VolumeMounts: []corev1.VolumeMount{{Name: testSecretValue, MountPath: "/mnt"}},
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU: resource.MustParse("2"),
@@ -482,15 +691,15 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	// 1. Job
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "my-batch-job",
+			Name:              testSecretNamePrefix + "batch-job",
 			Namespace:         "ai-lab",
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
 			Annotations: map[string]string{
-				"business.org/project":             "confidential-project",
-				"k8s.client-domain.com/owner":      "dev@client.com",
-				"kubernetes.io/change-cause":       "kubectl apply -f /corp/secret-manifest.yaml --record",
-				corev1.LastAppliedConfigAnnotation: `{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"my-batch-job","annotations":{"k8s.client-domain.com/owner":"dev@client.com"}},"spec":{"template":{"spec":{"containers":[{"image":"registry.internal/last-applied-secret:v1","command":["/bin/last_applied_cmd"],"args":["--token=last-applied-secret"],"env":[{"name":"API_SECRET","value":"super-secret-env"}]}],"volumes":[{"name":"last-applied-vol"}]}}}}`,
+				"business.org/project":             testSecretValue,
+				"k8s.client-domain.com/owner":      testSecretEmail,
+				"kubernetes.io/change-cause":       "kubectl apply -f " + testSecretValue + " --record",
+				corev1.LastAppliedConfigAnnotation: `{"apiVersion":"batch/v1","kind":"Job","metadata":{"annotations":{"k8s.client-domain.com/owner":"` + testSecretEmail + `"}},"spec":{"template":{"spec":{"containers":[{"image":"` + testSecretImage + `","env":[{"name":"API_SECRET","value":"` + testSecretValue + `"}]}]}}}}`,
 				"k8s.io/keep-me":                   "true",
 			},
 		},
@@ -503,14 +712,14 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	// 2. JobSet
 	js := &jobsetv1alpha2.JobSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "my-jobset",
+			Name:              testSecretNamePrefix + "jobset",
 			Namespace:         "ai-lab",
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
 			Annotations: map[string]string{
-				"business.org/owner":                 "secret-owner",
+				"business.org/owner":                 testSecretEmail,
 				"kueue-optimizer.gke.io/pod-count":   "4",
-				"kueue.x-k8s.io/workload-slice-name": "my-jobset",
+				"kueue.x-k8s.io/workload-slice-name": testSecretNamePrefix + "jobset",
 			},
 		},
 		Spec: jobsetv1alpha2.JobSetSpec{
@@ -522,7 +731,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 					Template: batchv1.JobTemplateSpec{
 						ObjectMeta: metav1.ObjectMeta{
 							Annotations: map[string]string{
-								"business.corp/custom": "strip-me",
+								"business.corp/custom": testSecretValue,
 								"kubernetes.io/info":   "keep-me",
 							},
 						},
@@ -539,7 +748,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	// 3. LeaderWorkerSet
 	lws := &leaderworkersetv1.LeaderWorkerSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "my-lws",
+			Name:              testSecretNamePrefix + "lws",
 			Namespace:         "ai-lab",
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
@@ -549,7 +758,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 			LeaderWorkerTemplate: leaderworkersetv1.LeaderWorkerTemplate{
 				LeaderTemplate:       secretPodTemplate.DeepCopy(),
 				WorkerTemplate:       secretPodTemplate,
-				VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "pvc"}}},
+				VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: testSecretValue}}},
 			},
 		},
 	}
@@ -558,7 +767,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	// 4. Deployment
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "my-deployment",
+			Name:              testSecretNamePrefix + "deployment",
 			Namespace:         "ai-lab",
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
@@ -572,19 +781,22 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	// 5. RayJob
 	rj := &rayv1.RayJob{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "my-rayjob",
+			Name:              testSecretNamePrefix + "rayjob",
 			Namespace:         "ai-lab",
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
 		},
 		Spec: rayv1.RayJobSpec{
-			Entrypoint:           "python secret_entrypoint.py",
-			RuntimeEnvYAML:       "pip: [secret-pkg]",
+			Entrypoint:           testSecretValue,
+			RuntimeEnvYAML:       testSecretValue,
 			SubmitterPodTemplate: secretPodTemplate.DeepCopy(),
 			RayClusterSpec: &rayv1.RayClusterSpec{
 				HeadGroupSpec: rayv1.HeadGroupSpec{
-					RayStartParams: map[string]string{"secret-param": "1"},
-					Template:       secretPodTemplate,
+					RayStartParams: map[string]string{
+						testSecretValue:  "1",
+						"redis-password": testSecretValue,
+					},
+					Template: secretPodTemplate,
 				},
 			},
 		},
@@ -594,20 +806,20 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	// 6. RayCluster
 	rc := &rayv1.RayCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "my-raycluster",
+			Name:              testSecretNamePrefix + "raycluster",
 			Namespace:         "ai-lab",
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
 		},
 		Spec: rayv1.RayClusterSpec{
 			HeadGroupSpec: rayv1.HeadGroupSpec{
-				RayStartParams: map[string]string{"redis-password": "secret"},
+				RayStartParams: map[string]string{"redis-password": testSecretValue},
 				Template:       secretPodTemplate,
 			},
 			WorkerGroupSpecs: []rayv1.WorkerGroupSpec{
 				{
 					GroupName:      "gpu-group",
-					RayStartParams: map[string]string{"num-gpus": "8"},
+					RayStartParams: map[string]string{"token": testSecretValue},
 					Template:       secretPodTemplate,
 				},
 			},
@@ -618,7 +830,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	// 7. Standalone Kueue-managed Pod (should be recorded) vs Job-owned Pod (should NOT be recorded in workflows.json)
 	standalonePod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:              "standalone-kueue-pod",
+			Name:              testSecretNamePrefix + "standalone-kueue-pod",
 			Namespace:         "ai-lab",
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
@@ -629,9 +841,9 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	scraper.handlePodWatchEvent(watch.Added, standalonePod)
 
 	jobOwnedPod := standalonePod.DeepCopy()
-	jobOwnedPod.Name = "job-owned-pod"
+	jobOwnedPod.Name = testSecretNamePrefix + "job-owned-pod"
 	jobOwnedPod.OwnerReferences = []metav1.OwnerReference{
-		{APIVersion: "batch/v1", Kind: "Job", Name: "my-batch-job"},
+		{APIVersion: "batch/v1", Kind: "Job", Name: testSecretNamePrefix + "batch-job"},
 	}
 	scraper.handlePodWatchEvent(watch.Added, jobOwnedPod)
 
@@ -668,43 +880,10 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	}
 
 	wfStr := string(rawWorkflows)
-	// Verify all business-specific details and unhashed names are completely absent.
-	forbiddenStrings := []string{
-		"registry.internal/secret-llm:v9",
-		"/bin/run_secret_training",
-		"--weights=/mnt/secret",
-		"SECRET_TOKEN",
-		"xyz123",
-		"SEC_",
-		"data-vol",
-		"pull-secret",
-		"proprietary-dataset-path",
-		"confidential-project",
-		"dev@client.com",
-		"k8s.client-domain.com",
-		"last-applied-configuration",
-		"last-applied-secret",
-		"last_applied_cmd",
-		"super-secret-env",
-		"last-applied-vol",
-		"secret-manifest.yaml",
-		"secret-owner",
-		"strip-me",
-		"secret_entrypoint.py",
-		"secret-pkg",
-		"redis-password",
-		"my-batch-job",
-		"my-jobset",
-		"my-lws",
-		"my-deployment",
-		"my-rayjob",
-		"my-raycluster",
-		"standalone-kueue-pod",
-		"job-owned-pod",
-	}
-	for _, s := range forbiddenStrings {
-		if strings.Contains(wfStr, s) {
-			t.Errorf("workflows.json leaked forbidden string %q:\n%s", s, wfStr)
+	// Verify none of the predefined sensitive sentinel constants or raw names leaked into workflows.json.
+	for _, secret := range testForbiddenSubstrings {
+		if strings.Contains(wfStr, secret) {
+			t.Errorf("workflows.json leaked sensitive information %q:\n%s", secret, wfStr)
 		}
 	}
 
