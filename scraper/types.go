@@ -266,6 +266,8 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 	b.WriteString("  - Workflow Objects (Jobs, JobSets, LeaderWorkerSets, Deployments, RayJobs, RayClusters, standalone Kueue Pods in workflows.json):\n")
 	b.WriteString(fmt.Sprintf("      * Command line / container image : Replaced with pause container (%s) and command cleared\n", cfg.PauseImage))
 	b.WriteString("      * Command line arguments         : Omitted (args, Ray entrypoint/runtimeEnvYAML/rayStartParams cleared)\n")
+	b.WriteString("      * Probes & lifecycle hooks       : Omitted (livenessProbe, readinessProbe, startupProbe, lifecycle)\n")
+	b.WriteString("      * Pod identity & network names   : Omitted (serviceAccountName, serviceAccount, hostname, hostnameOverride, subdomain)\n")
 	b.WriteString("      * Volumes                        : Omitted (volumes, volumeMounts, volumeDevices, volumeClaimTemplates, volumeClaimPolicies)\n")
 	b.WriteString("      * Secrets                        : Omitted (imagePullSecrets, secret volumes/env)\n")
 	b.WriteString("      * Environment variables          : Omitted (env, envFrom)\n")

@@ -231,10 +231,13 @@ Every workflow object in `workflows.json` is sanitized before being hashed for c
 4. **Secrets Stripped**:
    - `spec.imagePullSecrets`, secret volumes, and secret environment references are set to `nil`.
 5. **Environment Variables Stripped**:
-   - Container `env` and `envFrom` slices are set to `nil`.
-6. **Annotation Filtering**:
-   - On both top-level `metadata.annotations` and all nested `JobTemplateSpec` / `PodTemplateSpec` / `Service` `metadata.annotations`, an annotation is **retained if and only if** its key has a domain prefix (`<domain>/<name>`) equal to `"kubernetes.io"`, `"k8s.io"`, `"x-k8s.io"`, or `"kueue-optimizer.gke.io"` **or any of their subdomains** (`*.kubernetes.io`, `*.k8s.io`, `*.x-k8s.io`, `*.kueue-optimizer.gke.io`, such as `kueue.x-k8s.io` or `jobset.sigs.k8s.io`, matched case-insensitively), **and** is not on the sensitive annotation denylist (`kubectl.kubernetes.io/last-applied-configuration`, `kubernetes.io/change-cause`, `pod.alpha.kubernetes.io/init-containers`, `pod.beta.kubernetes.io/init-containers`, `pod.alpha.kubernetes.io/init-container-statuses`, `pod.beta.kubernetes.io/init-container-statuses`). Custom domain annotations (including domains merely containing `k8s` or `kubernetes` as substrings, such as `k8s.client-domain.com/owner`) and unprefixed annotations are stripped.
-7. **Status & ManagedFields Stripped**:
+   - Container `env` and `envFrom` fields are omitted.
+6. **Probes, Lifecycle Hooks, and Pod Identity/Host Fields Stripped**:
+   - Container `livenessProbe`, `readinessProbe`, `startupProbe`, and `lifecycle` (`postStart` / `preStop`) fields are omitted across `containers`, `initContainers`, and `ephemeralContainers`.
+   - Pod `serviceAccountName` (and legacy `serviceAccount`), `hostname`, `hostnameOverride`, and `subdomain` fields are omitted.
+7. **Annotation Filtering**:
+   - On both top-level `metadata.annotations` and all nested `JobTemplateSpec` / `PodTemplateSpec` / `Service` `metadata.annotations`, an annotation is **retained if and only if** its key has a domain prefix (`<domain>/<name>`) equal to `"kubernetes.io"`, `"k8s.io"`, `"x-k8s.io"`, or `"kueue-optimizer.gke.io"` **or any of their subdomains** (`*.kubernetes.io`, `*.k8s.io`, `*.x-k8s.io`, `*.kueue-optimizer.gke.io`, such as `kueue.x-k8s.io` or `jobset.sigs.k8s.io`, matched case-insensitively), **and** is not on the sensitive annotation denylist (`kubectl.kubernetes.io/last-applied-configuration`, `kubernetes.io/change-cause`, `pod.alpha.kubernetes.io/init-containers`, `pod.beta.kubernetes.io/init-containers`, `pod.alpha.kubernetes.io/init-container-statuses`, `pod.beta.kubernetes.io/init-container-statuses`, `csi.volume.kubernetes.io/nodeid`, `alpha.kubernetes.io/provided-node-ip`). Custom domain annotations (including domains merely containing `k8s` or `kubernetes` as substrings, such as `k8s.client-domain.com/owner`) and unprefixed annotations are stripped.
+8. **Status & ManagedFields Stripped**:
    - `.status` and `metadata.managedFields` are removed so only the submitted specification is stored.
 
 ### 4.4 On-Disk Single-Line Examples (`New` and `Update` `JobSet` Events in `workflows.json`)

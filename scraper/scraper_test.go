@@ -22,6 +22,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -279,7 +280,7 @@ func TestSanitizationListsAreLowercase(t *testing.T) {
 	}
 }
 
-func TestAnnotationFilteringAndPodSanitization(t *testing.T) {
+func TestFilterAnnotations(t *testing.T) {
 	secretJobName := testSecretNamePrefix + "job"
 	ann := map[string]string{
 		"business.corp.com/cost-center":                     testSecretValue,
@@ -326,6 +327,124 @@ func TestAnnotationFilteringAndPodSanitization(t *testing.T) {
 	}
 	if filtered["kueue.x-k8s.io/job-owner-name"] != HashName(secretJobName, true) {
 		t.Errorf("expected job-owner-name annotation value to be SHA-256 hashed")
+	}
+}
+
+func TestPodSpecProbesLifecycleAndIdentitySanitization(t *testing.T) {
+	secretProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{Command: []string{"/bin/check", testSecretValue}},
+			HTTPGet: &corev1.HTTPGetAction{
+				Path:        "/" + testSecretValue,
+				HTTPHeaders: []corev1.HTTPHeader{{Name: "Authorization", Value: testSecretValue}},
+			},
+		},
+	}
+	secretLifecycle := &corev1.Lifecycle{
+		PostStart: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{Command: []string{"/bin/post-start", testSecretValue}},
+		},
+		PreStop: &corev1.LifecycleHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				HTTPHeaders: []corev1.HTTPHeader{{Name: "X-Auth-Token", Value: testSecretValue}},
+			},
+		},
+	}
+
+	spec := &corev1.PodSpec{
+		ServiceAccountName:       testSecretValue,
+		DeprecatedServiceAccount: testSecretValue,
+		Hostname:                 testSecretValue,
+		HostnameOverride:         ptr.To(testSecretValue),
+		Subdomain:                testSecretValue,
+		Containers: []corev1.Container{
+			{
+				Name:           "main",
+				Image:          testSecretImage,
+				LivenessProbe:  secretProbe.DeepCopy(),
+				ReadinessProbe: secretProbe.DeepCopy(),
+				StartupProbe:   secretProbe.DeepCopy(),
+				Lifecycle:      secretLifecycle.DeepCopy(),
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+				},
+			},
+		},
+		InitContainers: []corev1.Container{
+			{
+				Name:           "init",
+				Image:          testSecretImage,
+				LivenessProbe:  secretProbe.DeepCopy(),
+				ReadinessProbe: secretProbe.DeepCopy(),
+				StartupProbe:   secretProbe.DeepCopy(),
+				Lifecycle:      secretLifecycle.DeepCopy(),
+			},
+		},
+		EphemeralContainers: []corev1.EphemeralContainer{
+			{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+					Name:           "debug",
+					Image:          testSecretImage,
+					LivenessProbe:  secretProbe.DeepCopy(),
+					ReadinessProbe: secretProbe.DeepCopy(),
+					StartupProbe:   secretProbe.DeepCopy(),
+					Lifecycle:      secretLifecycle.DeepCopy(),
+				},
+			},
+		},
+	}
+
+	SanitizePodSpec(spec, DefaultPauseImage)
+
+	for _, f := range []struct {
+		name  string
+		value string
+	}{
+		{"ServiceAccountName", spec.ServiceAccountName},
+		{"DeprecatedServiceAccount", spec.DeprecatedServiceAccount},
+		{"Hostname", spec.Hostname},
+		{"Subdomain", spec.Subdomain},
+	} {
+		if f.value != "" {
+			t.Errorf("expected PodSpec.%s to be cleared, got %q", f.name, f.value)
+		}
+	}
+	if spec.HostnameOverride != nil {
+		t.Errorf("expected PodSpec.HostnameOverride to be nil, got %q", *spec.HostnameOverride)
+	}
+
+	for _, c := range append(slices.Clone(spec.Containers), spec.InitContainers...) {
+		for _, f := range []struct {
+			name  string
+			isNil bool
+		}{
+			{"LivenessProbe", c.LivenessProbe == nil},
+			{"ReadinessProbe", c.ReadinessProbe == nil},
+			{"StartupProbe", c.StartupProbe == nil},
+			{"Lifecycle", c.Lifecycle == nil},
+		} {
+			if !f.isNil {
+				t.Errorf("container %q expected %s to be nil", c.Name, f.name)
+			}
+		}
+	}
+	for _, ec := range spec.EphemeralContainers {
+		for _, f := range []struct {
+			name  string
+			isNil bool
+		}{
+			{"LivenessProbe", ec.LivenessProbe == nil},
+			{"ReadinessProbe", ec.ReadinessProbe == nil},
+			{"StartupProbe", ec.StartupProbe == nil},
+			{"Lifecycle", ec.Lifecycle == nil},
+		} {
+			if !f.isNil {
+				t.Errorf("ephemeralContainer %q expected %s to be nil", ec.Name, f.name)
+			}
+		}
+	}
+	if gotCPU := spec.Containers[0].Resources.Requests[corev1.ResourceCPU]; !gotCPU.Equal(resource.MustParse("1")) {
+		t.Errorf("expected container CPU request to be preserved, got %v", gotCPU)
 	}
 }
 
@@ -667,8 +786,13 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 			},
 		},
 		Spec: corev1.PodSpec{
-			Volumes:          []corev1.Volume{{Name: testSecretValue}},
-			ImagePullSecrets: []corev1.LocalObjectReference{{Name: testSecretValue}},
+			ServiceAccountName:       testSecretValue,
+			DeprecatedServiceAccount: testSecretValue,
+			Hostname:                 testSecretValue,
+			HostnameOverride:         ptr.To(testSecretValue),
+			Subdomain:                testSecretValue,
+			Volumes:                  []corev1.Volume{{Name: testSecretValue}},
+			ImagePullSecrets:         []corev1.LocalObjectReference{{Name: testSecretValue}},
 			Containers: []corev1.Container{
 				{
 					Name:         "worker",
@@ -678,6 +802,31 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 					Env:          []corev1.EnvVar{{Name: "API_KEY", Value: testSecretValue}},
 					EnvFrom:      []corev1.EnvFromSource{{Prefix: testSecretValue}},
 					VolumeMounts: []corev1.VolumeMount{{Name: testSecretValue, MountPath: "/mnt"}},
+					LivenessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							Exec: &corev1.ExecAction{Command: []string{testSecretValue}},
+						},
+					},
+					ReadinessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								HTTPHeaders: []corev1.HTTPHeader{{Name: "Authorization", Value: testSecretValue}},
+							},
+						},
+					},
+					StartupProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							Exec: &corev1.ExecAction{Command: []string{testSecretValue}},
+						},
+					},
+					Lifecycle: &corev1.Lifecycle{
+						PostStart: &corev1.LifecycleHandler{
+							Exec: &corev1.ExecAction{Command: []string{testSecretValue}},
+						},
+						PreStop: &corev1.LifecycleHandler{
+							Exec: &corev1.ExecAction{Command: []string{testSecretValue}},
+						},
+					},
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU: resource.MustParse("2"),

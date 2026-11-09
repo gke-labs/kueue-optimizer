@@ -261,6 +261,8 @@ func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hashNames bool) {
 
 // SanitizePodSpec strips business-specific fields from a PodSpec:
 //   - Replaces container images with pauseImage and clears Command and Args
+//   - Removes container probes (LivenessProbe, ReadinessProbe, StartupProbe) and Lifecycle hooks
+//   - Clears ServiceAccountName (and DeprecatedServiceAccount), Hostname, HostnameOverride, and Subdomain
 //   - Removes Volumes, VolumeMounts, and VolumeDevices
 //   - Removes Secrets (ImagePullSecrets, secret env/volumes)
 //   - Removes Environment variables (Env and EnvFrom)
@@ -273,6 +275,11 @@ func SanitizePodSpec(spec *corev1.PodSpec, pauseImage string) {
 	}
 	spec.Volumes = nil
 	spec.ImagePullSecrets = nil
+	spec.ServiceAccountName = ""
+	spec.DeprecatedServiceAccount = ""
+	spec.Hostname = ""
+	spec.HostnameOverride = nil
+	spec.Subdomain = ""
 
 	for i := range spec.Containers {
 		sanitizeContainer(&spec.Containers[i], pauseImage)
@@ -293,6 +300,10 @@ func sanitizeContainer(c *corev1.Container, pauseImage string) {
 	c.EnvFrom = nil
 	c.VolumeMounts = nil
 	c.VolumeDevices = nil
+	c.LivenessProbe = nil
+	c.ReadinessProbe = nil
+	c.StartupProbe = nil
+	c.Lifecycle = nil
 }
 
 func sanitizeEphemeralContainer(c *corev1.EphemeralContainer, pauseImage string) {
@@ -303,6 +314,10 @@ func sanitizeEphemeralContainer(c *corev1.EphemeralContainer, pauseImage string)
 	c.EnvFrom = nil
 	c.VolumeMounts = nil
 	c.VolumeDevices = nil
+	c.LivenessProbe = nil
+	c.ReadinessProbe = nil
+	c.StartupProbe = nil
+	c.Lifecycle = nil
 }
 
 // SanitizePodTemplateSpec sanitizes both the template ObjectMeta and PodSpec.
