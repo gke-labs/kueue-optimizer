@@ -237,7 +237,9 @@ Every workflow object in `workflows.json` is sanitized before being hashed for c
    - Pod `serviceAccountName` (and legacy `serviceAccount`), `hostname`, `hostnameOverride`, and `subdomain` fields are omitted.
 7. **Annotation Filtering**:
    - On both top-level `metadata.annotations` and all nested `JobTemplateSpec` / `PodTemplateSpec` / `Service` `metadata.annotations`, an annotation is **retained if and only if** its key has a domain prefix (`<domain>/<name>`) equal to `"kubernetes.io"`, `"k8s.io"`, `"x-k8s.io"`, or `"kueue-optimizer.gke.io"` **or any of their subdomains** (`*.kubernetes.io`, `*.k8s.io`, `*.x-k8s.io`, `*.kueue-optimizer.gke.io`, such as `kueue.x-k8s.io` or `jobset.sigs.k8s.io`, matched case-insensitively), **and** is not on the sensitive annotation denylist (`kubectl.kubernetes.io/last-applied-configuration`, `kubernetes.io/change-cause`, `pod.alpha.kubernetes.io/init-containers`, `pod.beta.kubernetes.io/init-containers`, `pod.alpha.kubernetes.io/init-container-statuses`, `pod.beta.kubernetes.io/init-container-statuses`, `csi.volume.kubernetes.io/nodeid`, `alpha.kubernetes.io/provided-node-ip`). Custom domain annotations (including domains merely containing `k8s` or `kubernetes` as substrings, such as `k8s.client-domain.com/owner`) and unprefixed annotations are stripped.
-8. **Status & ManagedFields Stripped**:
+8. **Label Denylist Filtering**:
+   - On top-level `metadata.labels`, nested `JobTemplateSpec` / `PodTemplateSpec` `metadata.labels`, and `spec.selector` (`matchLabels` / `matchExpressions`), common organizational/identity label keys (`owner`, `team`, `customer`, `client`, `user`, `username`, `author`, `creator`, `maintainer`, `contact`, `email`, `department`, `org`, `organization`, `cost-center`, `cost_center`, `costcenter`, `billing`, `project`, `account`) as well as any user-supplied `--deny-labels` keys are stripped (case-insensitively).
+9. **Status & ManagedFields Stripped**:
    - `.status` and `metadata.managedFields` are removed so only the submitted specification is stored.
 
 ### 4.4 On-Disk Single-Line Examples (`New` and `Update` `JobSet` Events in `workflows.json`)

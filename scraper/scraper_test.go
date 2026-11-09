@@ -229,7 +229,7 @@ func TestNodeLabelSanitization(t *testing.T) {
 			Labels: input,
 		},
 	}
-	sanitized := SanitizeNode(node)
+	sanitized := SanitizeNode(node, nil)
 
 	for k, want := range savedLabels {
 		if got := sanitized.Labels[k]; got != want {
@@ -263,25 +263,98 @@ func TestFilterLabels(t *testing.T) {
 }
 
 func TestSanitizationListsAreLowercase(t *testing.T) {
-	for _, k := range deniedNodeLabelKeys {
-		if k != strings.ToLower(k) {
-			t.Errorf("deniedNodeLabelKeys entry %q must be lowercase", k)
+	for _, list := range []struct {
+		name  string
+		items []string
+	}{
+		{"deniedNodeLabelKeys", deniedNodeLabelKeys},
+		{"deniedWorkflowLabelKeys", deniedWorkflowLabelKeys},
+		{"deniedAnnotationKeys", deniedAnnotationKeys},
+		{"allowedAnnotationDomains", allowedAnnotationDomains},
+	} {
+		for _, item := range list.items {
+			if item != strings.ToLower(item) {
+				t.Errorf("%s entry %q must be lowercase", list.name, item)
+			}
 		}
 	}
-	for _, k := range deniedAnnotationKeys {
+	for k := range labelKeysHoldingWorkloadNames {
 		if k != strings.ToLower(k) {
-			t.Errorf("deniedAnnotationKeys entry %q must be lowercase", k)
+			t.Errorf("labelKeysHoldingWorkloadNames key %q must be lowercase", k)
 		}
 	}
-	for _, d := range allowedAnnotationDomains {
-		if d != strings.ToLower(d) {
-			t.Errorf("allowedAnnotationDomains entry %q must be lowercase", d)
+	for k := range annotationKeysHoldingWorkloadNames {
+		if k != strings.ToLower(k) {
+			t.Errorf("annotationKeysHoldingWorkloadNames key %q must be lowercase", k)
+		}
+	}
+}
+
+func TestSanitizeLabels(t *testing.T) {
+	savedPlain := map[string]string{
+		KueueQueueLabel:   "main-lq",
+		KueueManagedLabel: "true",
+		"component":       "trainer",
+	}
+	hashedWorkloadLabels := []string{
+		"app",
+		"app.kubernetes.io/name",
+		"app.kubernetes.io/instance",
+		"job-name",
+		"batch.kubernetes.io/job-name",
+		"jobset.sigs.k8s.io/jobset-name",
+		"leaderworkerset.sigs.k8s.io/name",
+		"ray.io/cluster",
+		KueuePrebuiltWorkloadLabel,
+		KueuePodGroupNameLabel,
+	}
+	omittedLabels := []string{
+		"owner",
+		"TEAM",
+		"customer",
+		"cost-center",
+		"project",
+		"email",
+		"corp.io/custom-denied",
+	}
+
+	rawWorkloadRef := testSecretNamePrefix + "workload"
+	input := make(map[string]string)
+	for k, v := range savedPlain {
+		input[k] = v
+	}
+	for _, k := range hashedWorkloadLabels {
+		input[k] = rawWorkloadRef
+	}
+	for _, k := range omittedLabels {
+		input[k] = testSecretValue
+	}
+
+	sanitized := SanitizeLabels(input, true, []string{"Corp.IO/Custom-Denied"})
+
+	for k, want := range savedPlain {
+		if got := sanitized[k]; got != want {
+			t.Errorf("expected label %q=%q to be preserved in plain text, got %q", k, want, got)
+		}
+	}
+	wantHash := HashName(rawWorkloadRef, true)
+	for _, k := range hashedWorkloadLabels {
+		if got := sanitized[k]; got != wantHash {
+			t.Errorf("expected workload-name label %q to be SHA-256 hashed to %q, got %q", k, wantHash, got)
+		}
+	}
+	for _, k := range omittedLabels {
+		for _, candidate := range []string{k, strings.ToLower(k)} {
+			if got, exists := sanitized[candidate]; exists {
+				t.Errorf("expected denied label %q to be omitted, got %q", candidate, got)
+			}
 		}
 	}
 }
 
 func TestFilterAnnotations(t *testing.T) {
 	secretJobName := testSecretNamePrefix + "job"
+	secretReplacedSlice := testSecretNamePrefix + "old-slice"
 	ann := map[string]string{
 		"business.corp.com/cost-center":                     testSecretValue,
 		"team.internal/owner":                               testSecretEmail,
@@ -296,6 +369,7 @@ func TestFilterAnnotations(t *testing.T) {
 		"kubernetes.io/psp":                                 "restricted",
 		"k8s.io/custom":                                     "yes",
 		"kueue.x-k8s.io/job-owner-name":                     secretJobName,
+		KueueWorkloadSliceReplacementForAnnot:               secretReplacedSlice,
 	}
 
 	filtered := FilterAnnotations(ann, true)
@@ -327,6 +401,9 @@ func TestFilterAnnotations(t *testing.T) {
 	}
 	if filtered["kueue.x-k8s.io/job-owner-name"] != HashName(secretJobName, true) {
 		t.Errorf("expected job-owner-name annotation value to be SHA-256 hashed")
+	}
+	if filtered[KueueWorkloadSliceReplacementForAnnot] != HashName(secretReplacedSlice, true) {
+		t.Errorf("expected %s annotation value to be SHA-256 hashed", KueueWorkloadSliceReplacementForAnnot)
 	}
 }
 
@@ -745,6 +822,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		Interval:          60 * time.Second,
 		HashNames:         true,
 		PauseImage:        DefaultPauseImage,
+		DeniedLabels:      []string{"corp.io/custom-denied"},
 		InfraFile:         filepath.Join(tmpDir, "infra.json"),
 		WorkflowsFile:     filepath.Join(tmpDir, "workflows.json"),
 		ExecutionTimeFile: filepath.Join(tmpDir, "execution-time.json"),
@@ -782,7 +860,11 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 				"corp.internal/secret-note":                         testSecretValue,
 			},
 			Labels: map[string]string{
-				KueueQueueLabel: "team-a-lq",
+				KueueQueueLabel:         "team-a-lq",
+				"owner":                 testSecretEmail,
+				"team":                  testSecretValue,
+				"customer":              testSecretValue,
+				"corp.io/custom-denied": testSecretValue,
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -866,9 +948,10 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
 			Annotations: map[string]string{
-				"business.org/owner":                 testSecretEmail,
-				"kueue-optimizer.gke.io/pod-count":   "4",
-				"kueue.x-k8s.io/workload-slice-name": testSecretNamePrefix + "jobset",
+				"business.org/owner":                  testSecretEmail,
+				"kueue-optimizer.gke.io/pod-count":    "4",
+				"kueue.x-k8s.io/workload-slice-name":  testSecretNamePrefix + "jobset",
+				KueueWorkloadSliceReplacementForAnnot: testSecretNamePrefix + "old-jobset",
 			},
 		},
 		Spec: jobsetv1alpha2.JobSetSpec{
@@ -914,15 +997,34 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	scraper.handleLeaderWorkerSetWatchEvent(watch.Added, lws)
 
 	// 4. Deployment
+	deployTpl := secretPodTemplate
+	deployTpl.Labels = map[string]string{
+		KueueQueueLabel:          "team-a-lq",
+		"app":                    testSecretNamePrefix + "deployment",
+		"app.kubernetes.io/name": testSecretNamePrefix + "deployment",
+		"owner":                  testSecretEmail,
+		"corp.io/custom-denied":  testSecretValue,
+	}
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              testSecretNamePrefix + "deployment",
 			Namespace:         "ai-lab",
 			CreationTimestamp: createTime,
-			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
+			Labels: map[string]string{
+				KueueQueueLabel:          "team-a-lq",
+				"app":                    testSecretNamePrefix + "deployment",
+				"app.kubernetes.io/name": testSecretNamePrefix + "deployment",
+				"customer":               testSecretValue,
+			},
 		},
 		Spec: appsv1.DeploymentSpec{
-			Template: secretPodTemplate,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app":   testSecretNamePrefix + "deployment",
+					"owner": testSecretEmail,
+				},
+			},
+			Template: deployTpl,
 		},
 	}
 	scraper.handleDeploymentWatchEvent(watch.Added, deploy)
@@ -1276,11 +1378,16 @@ func TestParseFlags(t *testing.T) {
 		"-n", "15",
 		"--duration", "5m",
 		"--sha256-names",
+		"--deny-labels", "Corp.IO/Custom-Denied, billing-code",
+		"--deny-labels", "extra-tag",
 		"--qps", "150",
 		"--burst", "300",
 	}, &errBuf)
 	if err != nil {
 		t.Fatalf("parseFlags returned unexpected error: %v", err)
+	}
+	if !slices.Equal(cfg.DeniedLabels, []string{"corp.io/custom-denied", "billing-code", "extra-tag"}) {
+		t.Errorf("unexpected DeniedLabels: %v", cfg.DeniedLabels)
 	}
 	if cfg.Kubeconfig != "/tmp/test-kubeconfig" {
 		t.Errorf("expected Kubeconfig=/tmp/test-kubeconfig, got %q", cfg.Kubeconfig)
@@ -1334,8 +1441,8 @@ func TestCanonicalDigestIgnoresResourceVersion(t *testing.T) {
 	nodeV2 := nodeV1.DeepCopy()
 	nodeV2.ResourceVersion = "205"
 
-	payloadV1 := SanitizeNode(nodeV1)
-	payloadV2 := SanitizeNode(nodeV2)
+	payloadV1 := SanitizeNode(nodeV1, nil)
+	payloadV2 := SanitizeNode(nodeV2, nil)
 
 	digestV1 := canonicalDigest(payloadV1)
 	digestV2 := canonicalDigest(payloadV2)
@@ -1349,7 +1456,7 @@ func TestCanonicalDigestIgnoresResourceVersion(t *testing.T) {
 	// Verify that changing a non-resourceVersion field changes the digest.
 	nodeV3 := nodeV2.DeepCopy()
 	nodeV3.Labels["role"] = "gpu-worker"
-	digestV3 := canonicalDigest(SanitizeNode(nodeV3))
+	digestV3 := canonicalDigest(SanitizeNode(nodeV3, nil))
 	if digestV3 == digestV1 {
 		t.Errorf("expected digest to change when metadata.labels changes")
 	}

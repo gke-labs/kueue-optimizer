@@ -66,6 +66,7 @@ type Config struct {
 	Duration          time.Duration
 	HashNames         bool
 	PauseImage        string
+	DeniedLabels      []string
 	InfraFile         string
 	WorkflowsFile     string
 	ExecutionTimeFile string
@@ -237,6 +238,9 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 		b.WriteString("Run Duration Limit       : until interrupted (SIGINT/SIGTERM)\n")
 	}
 	b.WriteString(fmt.Sprintf("Pause Container Image    : %s\n", cfg.PauseImage))
+	if len(cfg.DeniedLabels) > 0 {
+		b.WriteString(fmt.Sprintf("Extra Denied Labels      : %s\n", strings.Join(cfg.DeniedLabels, ", ")))
+	}
 	b.WriteString("\n")
 	b.WriteString("Output JSON Event Logs:\n")
 	b.WriteString(fmt.Sprintf("  1. %-22s : Nodes, Namespaces, ClusterQueues, LocalQueues, ResourceFlavors, Topologies, and Scheduled/Running Pods\n", cfg.InfraFile))
@@ -272,6 +276,7 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 	b.WriteString("      * Secrets                        : Omitted (imagePullSecrets, secret volumes/env)\n")
 	b.WriteString("      * Environment variables          : Omitted (env, envFrom)\n")
 	b.WriteString("      * Annotations                    : Omitted unless domain is kubernetes.io, k8s.io, x-k8s.io, or kueue-optimizer.gke.io (or their subdomains, excluding sensitive keys like kubectl.kubernetes.io/last-applied-configuration)\n")
+	b.WriteString("      * Labels                         : Omitted if key matches sensitive user label denylist (owner, team, customer, ...) or --deny-labels\n")
 	b.WriteString("      * Status & managedFields         : Omitted (stored as submitted to the cluster)\n")
 	b.WriteString("\n")
 	b.WriteString("SHA-256 Name Replacement:\n")
