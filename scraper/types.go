@@ -266,7 +266,7 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 	b.WriteString("      * Volumes                        : Omitted (volumes, volumeMounts, volumeDevices, volumeClaimTemplates, volumeClaimPolicies)\n")
 	b.WriteString("      * Secrets                        : Omitted (imagePullSecrets, secret volumes/env)\n")
 	b.WriteString("      * Environment variables          : Omitted (env, envFrom)\n")
-	b.WriteString("      * Annotations                    : Omitted if annotation key does not contain 'k8s', 'kubernetes', 'k8s-x', or 'kueue-optimizer' (in both top-level metadata and pod/job templates)\n")
+	b.WriteString("      * Annotations                    : Omitted unless domain is kubernetes.io, k8s.io, x-k8s.io, or kueue-optimizer.gke.io (or their subdomains, excluding sensitive keys like kubectl.kubernetes.io/last-applied-configuration)\n")
 	b.WriteString("      * Status & managedFields         : Omitted (stored as submitted to the cluster)\n")
 	b.WriteString("\n")
 	b.WriteString("SHA-256 Name Replacement:\n")

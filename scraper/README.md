@@ -16,7 +16,7 @@ For the complete output format, event envelope, `workloadState` state machine, a
   - Gracefully handles optional CRDs (`JobSet`, `LeaderWorkerSet`, `RayJob`, `RayCluster`, Kueue APIs) if they are not installed on the target cluster, retrying periodically without failing.
 - **Strict Data Sanitization**:
   - Scheduled/running `Pod` records in `infra.json` store **only** node placement, effective resource requests, scheduling time, first notice time, and deletion time.
-  - Workflow specs in `workflows.json` have container images replaced with a pause image (`registry.k8s.io/pause:3.10` by default) and strip commands, args, `env`/`envFrom`, volumes, secrets, `.status`, and any annotations whose keys do not contain `k8s`, `kubernetes`, `k8s-x`, or `kueue-optimizer`.
+  - Workflow specs in `workflows.json` have container images replaced with a pause image (`registry.k8s.io/pause:3.10` by default) and strip commands, args, `env`/`envFrom`, volumes, secrets, `.status`, sensitive Kubernetes annotations (such as `kubectl.kubernetes.io/last-applied-configuration` and `kubernetes.io/change-cause`), and any annotations outside the official `kubernetes.io`, `k8s.io`, `x-k8s.io`, and `kueue-optimizer.gke.io` domains and their subdomains (e.g. `*.kubernetes.io`, `*.k8s.io`, `*.x-k8s.io`, `*.kueue-optimizer.gke.io`).
 - **Optional SHA-256 Name Anonymization (`--hash-names`)**:
   - Deterministically hashes workload, pod, job, jobset, deployment, LWS, and Ray resource names (along with cross-referencing labels, annotations, and `ownerReferences`) while keeping infrastructure names (`Node`, `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, `Topology`) in plain text.
 - **Streaming NDJSON Output**:

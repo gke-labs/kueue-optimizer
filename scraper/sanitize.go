@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"strings"
 	"time"
 
@@ -110,17 +111,48 @@ func HashNameForKind(kind, name string, enabled bool) string {
 	return HashName(name, true)
 }
 
-// ShouldKeepAnnotation returns true iff the annotation key contains "k8s", "kubernetes", "k8s-x",
-// or "kueue-optimizer" (case-insensitively).
-func ShouldKeepAnnotation(key string) bool {
-	lower := strings.ToLower(key)
-	return strings.Contains(lower, "k8s") ||
-		strings.Contains(lower, "kubernetes") ||
-		strings.Contains(lower, "k8s-x") ||
-		strings.Contains(lower, "kueue-optimizer")
+// allowedAnnotationDomains lists the official DNS domains (matched exactly or as a dot-separated
+// subdomain suffix) whose annotations are retained on sanitized workflow objects.
+var allowedAnnotationDomains = []string{
+	"kubernetes.io",
+	"k8s.io",
+	"x-k8s.io",
+	"kueue-optimizer.gke.io",
 }
 
-// FilterAnnotations retains only annotations whose keys include "k8s", "kubernetes", or "k8s-x",
+// deniedAnnotationKeys lists specific annotation keys within allowed domains that must always
+// be stripped because they can embed unsanitized manifests, CLI commands, or container specs.
+var deniedAnnotationKeys = []string{
+	strings.ToLower(corev1.LastAppliedConfigAnnotation), // kubectl.kubernetes.io/last-applied-configuration
+	"kubernetes.io/change-cause",
+	"pod.alpha.kubernetes.io/init-containers",
+	"pod.beta.kubernetes.io/init-containers",
+	"pod.alpha.kubernetes.io/init-container-statuses",
+	"pod.beta.kubernetes.io/init-container-statuses",
+}
+
+// ShouldKeepAnnotation returns true iff key is a domain-prefixed annotation ("<domain>/<name>")
+// whose domain is kubernetes.io, k8s.io, x-k8s.io, or kueue-optimizer.gke.io (or a subdomain thereof),
+// and key is not on the sensitive annotation denylist (e.g. kubectl.kubernetes.io/last-applied-configuration).
+func ShouldKeepAnnotation(key string) bool {
+	lower := strings.ToLower(key)
+	if slices.Contains(deniedAnnotationKeys, lower) {
+		return false
+	}
+	domain, name, hasSlash := strings.Cut(lower, "/")
+	if !hasSlash || domain == "" || name == "" || strings.Contains(name, "/") {
+		return false
+	}
+	for _, allowed := range allowedAnnotationDomains {
+		if domain == allowed || strings.HasSuffix(domain, "."+allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+// FilterAnnotations retains only allowed Kubernetes, SIG (x-k8s.io / k8s.io), and kueue-optimizer
+// domain annotations (excluding sensitive keys like kubectl.kubernetes.io/last-applied-configuration),
 // and hashes any annotation value that holds a workload/job/pod name when hashNames is true.
 func FilterAnnotations(annotations map[string]string, hashNames bool) map[string]string {
 	if len(annotations) == 0 {
@@ -131,7 +163,7 @@ func FilterAnnotations(annotations map[string]string, hashNames bool) map[string
 		if !ShouldKeepAnnotation(k) {
 			continue
 		}
-		if hashNames && annotationKeysHoldingWorkloadNames[k] && v != "" {
+		if hashNames && annotationKeysHoldingWorkloadNames[strings.ToLower(k)] && v != "" {
 			v = HashName(v, true)
 		}
 		filtered[k] = v

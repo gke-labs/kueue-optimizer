@@ -230,7 +230,7 @@ Every workflow object in `workflows.json` is sanitized before being hashed for c
 5. **Environment Variables Stripped**:
    - Container `env` and `envFrom` slices are set to `nil`.
 6. **Annotation Filtering**:
-   - On both top-level `metadata.annotations` and all nested `JobTemplateSpec` / `PodTemplateSpec` `metadata.annotations`, an annotation is **retained if and only if** its key (case-insensitively) contains `"k8s"`, `"kubernetes"`, `"k8s-x"`, or `"kueue-optimizer"`. All other business or user annotations are removed.
+   - On both top-level `metadata.annotations` and all nested `JobTemplateSpec` / `PodTemplateSpec` / `Service` `metadata.annotations`, an annotation is **retained if and only if** its key has a domain prefix (`<domain>/<name>`) equal to `"kubernetes.io"`, `"k8s.io"`, `"x-k8s.io"`, or `"kueue-optimizer.gke.io"` **or any of their subdomains** (`*.kubernetes.io`, `*.k8s.io`, `*.x-k8s.io`, `*.kueue-optimizer.gke.io`, such as `kueue.x-k8s.io` or `jobset.sigs.k8s.io`, matched case-insensitively), **and** is not on the sensitive annotation denylist (`kubectl.kubernetes.io/last-applied-configuration`, `kubernetes.io/change-cause`, `pod.alpha.kubernetes.io/init-containers`, `pod.beta.kubernetes.io/init-containers`, `pod.alpha.kubernetes.io/init-container-statuses`, `pod.beta.kubernetes.io/init-container-statuses`). Custom domain annotations (including domains merely containing `k8s` or `kubernetes` as substrings, such as `k8s.client-domain.com/owner`) and unprefixed annotations are stripped.
 7. **Status & ManagedFields Stripped**:
    - `.status` and `metadata.managedFields` are removed so only the submitted specification is stored.
 

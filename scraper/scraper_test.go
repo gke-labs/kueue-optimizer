@@ -103,10 +103,76 @@ func TestStartupBanner(t *testing.T) {
 	}
 }
 
+func TestShouldKeepAnnotation(t *testing.T) {
+	tests := []struct {
+		key  string
+		want bool
+	}{
+		// Allowed official domains and subdomains.
+		{key: "kubernetes.io/psp", want: true},
+		{key: "batch.kubernetes.io/job-tracking", want: true},
+		{key: "cluster-autoscaler.kubernetes.io/safe-to-evict", want: true},
+		{key: "k8s.io/custom", want: true},
+		{key: "jobset.sigs.k8s.io/jobset-name", want: true},
+		{key: "kueue.x-k8s.io/queue-name", want: true},
+		{key: "alpha.jobset.x-k8s.io/exclusive-topology", want: true},
+		{key: "leaderworkerset.x-k8s.io/exclusive-topology", want: true},
+		{key: "kwok.x-k8s.io/node", want: true},
+		{key: "kueue-optimizer.gke.io/pod-execution-time-seconds", want: true},
+		{key: "sub.kueue-optimizer.gke.io/metric", want: true},
+		{key: "KUEUE.X-K8S.IO/Queue-Name", want: true},
+
+		// Explicitly denied sensitive Kubernetes annotations.
+		{key: corev1.LastAppliedConfigAnnotation, want: false},
+		{key: "Kubectl.Kubernetes.io/Last-Applied-Configuration", want: false},
+		{key: "kubernetes.io/change-cause", want: false},
+		{key: "pod.alpha.kubernetes.io/init-containers", want: false},
+		{key: "pod.beta.kubernetes.io/init-containers", want: false},
+		{key: "pod.alpha.kubernetes.io/init-container-statuses", want: false},
+		{key: "pod.beta.kubernetes.io/init-container-statuses", want: false},
+
+		// Custom/third-party domains that contain "k8s", "kubernetes", "x-k8s", or "kueue-optimizer" as substrings.
+		{key: "k8s.client-domain.com/owner", want: false},
+		{key: "kubernetes.client-domain.com/owner", want: false},
+		{key: "x-k8s.client-domain.com/owner", want: false},
+		{key: "kueue-optimizer.client-domain.com/owner", want: false},
+		{key: "client-domain.com/k8s-owner", want: false},
+		{key: "client-domain.com/kubernetes-secret", want: false},
+		{key: "client-domain.com/kueue-optimizer", want: false},
+		{key: "fake-k8s.io/owner", want: false},
+		{key: "notkubernetes.io/owner", want: false},
+		{key: "myx-k8s.io/owner", want: false},
+		{key: "not-kueue-optimizer.gke.io/owner", want: false},
+		{key: "k8s.io.client-domain.com/owner", want: false},
+		{key: "kubernetes.io.client-domain.com/owner", want: false},
+
+		// Unprefixed and malformed annotation keys.
+		{key: "k8s-owner", want: false},
+		{key: "kubernetes-admin", want: false},
+		{key: "kueue-optimizer", want: false},
+		{key: "kubernetes.io/", want: false},
+		{key: "/kubernetes.io", want: false},
+		{key: "kubernetes.io/nested/slash", want: false},
+		{key: "", want: false},
+	}
+
+	for _, tc := range tests {
+		if got := ShouldKeepAnnotation(tc.key); got != tc.want {
+			t.Errorf("ShouldKeepAnnotation(%q) = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+}
+
 func TestAnnotationFilteringAndPodSanitization(t *testing.T) {
 	ann := map[string]string{
 		"business.corp.com/cost-center":                     "secret-finance-code",
 		"team.internal/owner":                               "alice",
+		"k8s.client-domain.com/owner":                       "dev@client.com",
+		"kubernetes.client-domain.com/team":                 "ml-infra@client.com",
+		"client-domain.com/k8s-owner":                       "bob@client.com",
+		"k8s-unprefixed-owner":                              "carol@client.com",
+		corev1.LastAppliedConfigAnnotation:                  `{"apiVersion":"batch/v1","kind":"Job","spec":{"template":{"spec":{"containers":[{"image":"gcr.io/client/proprietary:v1","env":[{"name":"DB_PASS","value":"s3cr3t"}]}]}}}}`,
+		"kubernetes.io/change-cause":                        "kubectl set image job/my-secret-job main=gcr.io/client/proprietary:v2 --record",
 		"kueue.x-k8s.io/queue-name":                         "main-lq",
 		"kueue-optimizer.gke.io/pod-execution-time-seconds": "15",
 		"kubernetes.io/psp":                                 "restricted",
@@ -115,11 +181,19 @@ func TestAnnotationFilteringAndPodSanitization(t *testing.T) {
 	}
 
 	filtered := FilterAnnotations(ann, true)
-	if _, exists := filtered["business.corp.com/cost-center"]; exists {
-		t.Errorf("expected business annotation to be stripped")
-	}
-	if _, exists := filtered["team.internal/owner"]; exists {
-		t.Errorf("expected internal annotation to be stripped")
+	for _, strippedKey := range []string{
+		"business.corp.com/cost-center",
+		"team.internal/owner",
+		"k8s.client-domain.com/owner",
+		"kubernetes.client-domain.com/team",
+		"client-domain.com/k8s-owner",
+		"k8s-unprefixed-owner",
+		corev1.LastAppliedConfigAnnotation,
+		"kubernetes.io/change-cause",
+	} {
+		if _, exists := filtered[strippedKey]; exists {
+			t.Errorf("expected annotation %q to be stripped, got value %q", strippedKey, filtered[strippedKey])
+		}
 	}
 	if filtered["kueue.x-k8s.io/queue-name"] != "main-lq" {
 		t.Errorf("expected queue-name annotation to be preserved unhashed, got %q", filtered["kueue.x-k8s.io/queue-name"])
@@ -413,8 +487,11 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 			CreationTimestamp: createTime,
 			Labels:            map[string]string{KueueQueueLabel: "team-a-lq"},
 			Annotations: map[string]string{
-				"business.org/project": "confidential-project",
-				"k8s.io/keep-me":       "true",
+				"business.org/project":             "confidential-project",
+				"k8s.client-domain.com/owner":      "dev@client.com",
+				"kubernetes.io/change-cause":       "kubectl apply -f /corp/secret-manifest.yaml --record",
+				corev1.LastAppliedConfigAnnotation: `{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"my-batch-job","annotations":{"k8s.client-domain.com/owner":"dev@client.com"}},"spec":{"template":{"spec":{"containers":[{"image":"registry.internal/last-applied-secret:v1","command":["/bin/last_applied_cmd"],"args":["--token=last-applied-secret"],"env":[{"name":"API_SECRET","value":"super-secret-env"}]}],"volumes":[{"name":"last-applied-vol"}]}}}}`,
+				"k8s.io/keep-me":                   "true",
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -603,6 +680,14 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		"pull-secret",
 		"proprietary-dataset-path",
 		"confidential-project",
+		"dev@client.com",
+		"k8s.client-domain.com",
+		"last-applied-configuration",
+		"last-applied-secret",
+		"last_applied_cmd",
+		"super-secret-env",
+		"last-applied-vol",
+		"secret-manifest.yaml",
 		"secret-owner",
 		"strip-me",
 		"secret_entrypoint.py",
