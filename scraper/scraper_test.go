@@ -154,6 +154,9 @@ func TestShouldKeepAnnotation(t *testing.T) {
 		{key: corev1.LastAppliedConfigAnnotation, want: false},
 		{key: "Kubectl.Kubernetes.io/Last-Applied-Configuration", want: false},
 		{key: "kubernetes.io/change-cause", want: false},
+		{key: "kubernetes.io/description", want: false},
+		{key: "kubernetes.io/service-account.name", want: false},
+		{key: "kubernetes.io/service-account.uid", want: false},
 		{key: "pod.alpha.kubernetes.io/init-containers", want: false},
 		{key: "pod.beta.kubernetes.io/init-containers", want: false},
 		{key: "pod.alpha.kubernetes.io/init-container-statuses", want: false},
@@ -314,7 +317,10 @@ func TestSanitizeLabels(t *testing.T) {
 		"job-name",
 		"batch.kubernetes.io/job-name",
 		"jobset.sigs.k8s.io/jobset-name",
+		"jobset.sigs.k8s.io/coordinator",
+		"alpha.jobset.sigs.k8s.io/namespaced-job",
 		"leaderworkerset.sigs.k8s.io/name",
+		"leaderworkerset.sigs.k8s.io/leader-name",
 		"ray.io/cluster",
 		KueuePrebuiltWorkloadLabel,
 		KueuePodGroupNameLabel,
@@ -669,6 +675,9 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 func TestFilterAnnotations(t *testing.T) {
 	secretJobName := testSecretNamePrefix + "job"
 	secretReplacedSlice := testSecretNamePrefix + "old-slice"
+	secretCoordinator := testSecretNamePrefix + "jobset-leader-0-0." + testSecretNamePrefix + "jobset"
+	secretLeaderPod := testSecretNamePrefix + "lws-0"
+	secretLeaderAddr := testSecretNamePrefix + "lws-0." + testSecretNamePrefix + "lws"
 	ann := map[string]string{
 		"business.corp.com/cost-center":                     testSecretValue,
 		"team.internal/owner":                               testSecretEmail,
@@ -678,12 +687,19 @@ func TestFilterAnnotations(t *testing.T) {
 		"k8s-unprefixed-owner":                              testSecretEmail,
 		corev1.LastAppliedConfigAnnotation:                  `{"image":"` + testSecretImage + `","secret":"` + testSecretValue + `"}`,
 		"kubernetes.io/change-cause":                        "kubectl set image job/" + secretJobName + " main=" + testSecretImage + " --record",
+		"kubernetes.io/description":                         testSecretValue,
+		"kubernetes.io/service-account.name":                testSecretValue,
+		"kubernetes.io/service-account.uid":                 testSecretValue,
 		"kueue.x-k8s.io/queue-name":                         "main-lq",
 		"kueue-optimizer.gke.io/pod-execution-time-seconds": "15",
 		"kubernetes.io/psp":                                 "restricted",
 		"k8s.io/custom":                                     "yes",
 		"kueue.x-k8s.io/job-owner-name":                     secretJobName,
 		KueueWorkloadSliceReplacementForAnnot:               secretReplacedSlice,
+		"jobset.sigs.k8s.io/coordinator":                    secretCoordinator,
+		"alpha.jobset.sigs.k8s.io/namespaced-job":           "ai-lab/" + secretJobName,
+		"leaderworkerset.sigs.k8s.io/leader-name":           secretLeaderPod,
+		"leaderworkerset.sigs.k8s.io/leader-address":        secretLeaderAddr,
 	}
 
 	filtered := FilterAnnotations(ann, true)
@@ -696,6 +712,9 @@ func TestFilterAnnotations(t *testing.T) {
 		"k8s-unprefixed-owner",
 		corev1.LastAppliedConfigAnnotation,
 		"kubernetes.io/change-cause",
+		"kubernetes.io/description",
+		"kubernetes.io/service-account.name",
+		"kubernetes.io/service-account.uid",
 	} {
 		if _, exists := filtered[strippedKey]; exists {
 			t.Errorf("expected annotation %q to be stripped, got value %q", strippedKey, filtered[strippedKey])
@@ -713,11 +732,17 @@ func TestFilterAnnotations(t *testing.T) {
 	if filtered["k8s.io/custom"] != "yes" {
 		t.Errorf("expected k8s annotation to be preserved")
 	}
-	if filtered["kueue.x-k8s.io/job-owner-name"] != HashName(secretJobName, true) {
-		t.Errorf("expected job-owner-name annotation value to be SHA-256 hashed")
-	}
-	if filtered[KueueWorkloadSliceReplacementForAnnot] != HashName(secretReplacedSlice, true) {
-		t.Errorf("expected %s annotation value to be SHA-256 hashed", KueueWorkloadSliceReplacementForAnnot)
+	for k, rawVal := range map[string]string{
+		"kueue.x-k8s.io/job-owner-name":              secretJobName,
+		KueueWorkloadSliceReplacementForAnnot:        secretReplacedSlice,
+		"jobset.sigs.k8s.io/coordinator":             secretCoordinator,
+		"alpha.jobset.sigs.k8s.io/namespaced-job":    "ai-lab/" + secretJobName,
+		"leaderworkerset.sigs.k8s.io/leader-name":    secretLeaderPod,
+		"leaderworkerset.sigs.k8s.io/leader-address": secretLeaderAddr,
+	} {
+		if filtered[k] != HashName(rawVal, true) {
+			t.Errorf("expected %q annotation value to be SHA-256 hashed, got %q", k, filtered[k])
+		}
 	}
 }
 

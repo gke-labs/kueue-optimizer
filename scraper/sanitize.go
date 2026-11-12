@@ -63,28 +63,35 @@ var nonHashedKinds = map[string]bool{
 // labelKeysHoldingWorkloadNames lists label keys (all lowercase) whose values represent
 // workload/job/pod/cluster/deployment names that should be hashed when SHA-256 name replacement is enabled.
 var labelKeysHoldingWorkloadNames = map[string]bool{
-	"app":                              true,
-	"app.kubernetes.io/name":           true,
-	"app.kubernetes.io/instance":       true,
-	"job-name":                         true,
-	"batch.kubernetes.io/job-name":     true,
-	"jobset.sigs.k8s.io/jobset-name":   true,
-	"leaderworkerset.sigs.k8s.io/name": true,
-	"ray.io/cluster":                   true,
-	KueuePrebuiltWorkloadLabel:         true,
-	KueuePodGroupNameLabel:             true,
+	"app":                                     true,
+	"app.kubernetes.io/name":                  true,
+	"app.kubernetes.io/instance":              true,
+	"job-name":                                true,
+	"batch.kubernetes.io/job-name":            true,
+	"jobset.sigs.k8s.io/jobset-name":          true,
+	"jobset.sigs.k8s.io/coordinator":          true,
+	"alpha.jobset.sigs.k8s.io/namespaced-job": true,
+	"leaderworkerset.sigs.k8s.io/name":        true,
+	"leaderworkerset.sigs.k8s.io/leader-name": true,
+	"ray.io/cluster":                          true,
+	KueuePrebuiltWorkloadLabel:                true,
+	KueuePodGroupNameLabel:                    true,
 }
 
 // annotationKeysHoldingWorkloadNames lists annotation keys (all lowercase) whose values represent
 // workload/job/pod names that should be hashed when SHA-256 name replacement is enabled.
 var annotationKeysHoldingWorkloadNames = map[string]bool{
-	KueueJobOwnerNameAnnotation:           true,
-	KueuePrebuiltWorkloadLabel:            true,
-	KueuePodGroupNameLabel:                true,
-	KueueWorkloadAnnot:                    true,
-	KueueWorkloadSliceNameAnnot:           true,
-	KueueWorkloadSliceReplacementForAnnot: true,
-	"jobset.sigs.k8s.io/jobset-name":      true,
+	KueueJobOwnerNameAnnotation:                  true,
+	KueuePrebuiltWorkloadLabel:                   true,
+	KueuePodGroupNameLabel:                       true,
+	KueueWorkloadAnnot:                           true,
+	KueueWorkloadSliceNameAnnot:                  true,
+	KueueWorkloadSliceReplacementForAnnot:        true,
+	"jobset.sigs.k8s.io/jobset-name":             true,
+	"jobset.sigs.k8s.io/coordinator":             true,
+	"alpha.jobset.sigs.k8s.io/namespaced-job":    true,
+	"leaderworkerset.sigs.k8s.io/leader-name":    true,
+	"leaderworkerset.sigs.k8s.io/leader-address": true,
 }
 
 // parentWorkflowKinds lists Kubernetes/CRD kinds for the workflow APIs tracked separately from standalone Pods.
@@ -132,6 +139,9 @@ var allowedAnnotationDomains = []string{
 var deniedAnnotationKeys = []string{
 	strings.ToLower(corev1.LastAppliedConfigAnnotation), // kubectl.kubernetes.io/last-applied-configuration
 	"kubernetes.io/change-cause",
+	"kubernetes.io/description",
+	"kubernetes.io/service-account.name",
+	"kubernetes.io/service-account.uid",
 	"pod.alpha.kubernetes.io/init-containers",
 	"pod.beta.kubernetes.io/init-containers",
 	"pod.alpha.kubernetes.io/init-container-statuses",
