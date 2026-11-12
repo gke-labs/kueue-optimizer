@@ -546,7 +546,7 @@ func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hashNames bool, hasher 
 // SanitizePodSpec strips business-specific fields and hashes sensitive label selectors in a PodSpec:
 //   - Replaces container images with pauseImage and clears Command and Args
 //   - Removes container probes (LivenessProbe, ReadinessProbe, StartupProbe) and Lifecycle hooks
-//   - Clears ServiceAccountName (and DeprecatedServiceAccount), Hostname, HostnameOverride, and Subdomain
+//   - Clears ServiceAccountName (and DeprecatedServiceAccount), Hostname, HostnameOverride, Subdomain, HostAliases, and DNSConfig
 //   - Removes Volumes, VolumeMounts, and VolumeDevices
 //   - Removes Secrets (ImagePullSecrets, secret env/volumes)
 //   - Removes Environment variables (Env and EnvFrom)
@@ -565,6 +565,8 @@ func SanitizePodSpec(spec *corev1.PodSpec, pauseImage string, hashNames bool, ha
 	spec.Hostname = ""
 	spec.HostnameOverride = nil
 	spec.Subdomain = ""
+	spec.HostAliases = nil
+	spec.DNSConfig = nil
 	spec.NodeSelector = SanitizeNodeLabels(spec.NodeSelector, hasher)
 	spec.Affinity = SanitizeAffinity(spec.Affinity, hashNames, hasher)
 	for i := range spec.TopologySpreadConstraints {
@@ -937,6 +939,9 @@ func SanitizeJobSet(js *jobsetv1alpha2.JobSet, pauseImage string, hashNames bool
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: jobsetv1alpha2.GroupVersion.String(), Kind: "JobSet"}
 	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
 	cp.Spec.VolumeClaimPolicies = nil
+	if cp.Spec.Network != nil {
+		cp.Spec.Network.Subdomain = ""
+	}
 	for i := range cp.Spec.ReplicatedJobs {
 		rj := &cp.Spec.ReplicatedJobs[i]
 		rj.Template.ObjectMeta.ManagedFields = nil

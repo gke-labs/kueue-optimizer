@@ -773,6 +773,8 @@ func TestPodSpecProbesLifecycleAndIdentitySanitization(t *testing.T) {
 		Hostname:                 testSecretValue,
 		HostnameOverride:         ptr.To(testSecretValue),
 		Subdomain:                testSecretValue,
+		HostAliases:              []corev1.HostAlias{{IP: testSecretIP, Hostnames: []string{testSecretValue}}},
+		DNSConfig:                &corev1.PodDNSConfig{Nameservers: []string{testSecretIP}, Searches: []string{testSecretValue}},
 		Containers: []corev1.Container{
 			{
 				Name:           "main",
@@ -827,6 +829,12 @@ func TestPodSpecProbesLifecycleAndIdentitySanitization(t *testing.T) {
 	}
 	if spec.HostnameOverride != nil {
 		t.Errorf("expected PodSpec.HostnameOverride to be nil, got %q", *spec.HostnameOverride)
+	}
+	if len(spec.HostAliases) > 0 {
+		t.Errorf("expected PodSpec.HostAliases to be nil, got %v", spec.HostAliases)
+	}
+	if spec.DNSConfig != nil {
+		t.Errorf("expected PodSpec.DNSConfig to be nil, got %v", spec.DNSConfig)
 	}
 
 	for _, c := range append(slices.Clone(spec.Containers), spec.InitContainers...) {
@@ -1296,6 +1304,10 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		},
 		Spec: jobsetv1alpha2.JobSetSpec{
 			VolumeClaimPolicies: []jobsetv1alpha2.VolumeClaimPolicy{{}},
+			Network: &jobsetv1alpha2.Network{
+				EnableDNSHostnames: ptr.To(true),
+				Subdomain:          testSecretNamePrefix + "custom-subdomain",
+			},
 			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
 				{
 					Name:     "workers",
