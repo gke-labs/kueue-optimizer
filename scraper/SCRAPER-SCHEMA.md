@@ -220,18 +220,18 @@ stateDiagram-v2
 Every workflow object in `workflows.json` is sanitized before being hashed for change detection or written to disk:
 
 1. **Container Image & Command Replacement**:
-   - All `containers`, `initContainers`, and `ephemeralContainers` have their `image` replaced with the pause container image (`registry.k8s.io/pause:3.10` by default, configurable via `--pause-image`) and `command` set to `nil`.
-2. **Command-Line Arguments Stripped**:
-   - Container `args` are set to `nil`.
-   - `RayJob.spec.entrypoint` and `RayJob.spec.runtimeEnvYAML` are cleared (`""`).
+   - All `containers`, `initContainers`, and `ephemeralContainers` (as well as `RayCluster` `autoscalerOptions.image` and `historyServerOptions.collectorOptions.image` when set) have their `image` replaced with the pause container image (`registry.k8s.io/pause:3.10` by default, configurable via `--pause-image`) and `command` set to `nil`.
+2. **Command-Line Arguments & Job Metadata Stripped**:
+   - Container and `RayCluster.spec.autoscalerOptions` `args` are set to `nil`.
+   - `RayJob.spec.entrypoint`, `RayJob.spec.runtimeEnvYAML`, and `RayJob.spec.jobId` are cleared (`""`), and `RayJob.spec.metadata` is set to `nil`.
    - `RayCluster` head and worker group `rayStartParams` are cleared (`nil`).
 3. **Volumes Stripped**:
-   - `spec.volumes`, container `volumeMounts`, and container `volumeDevices` are set to `nil`.
+   - `spec.volumes`, container/`autoscalerOptions` `volumeMounts`, and container `volumeDevices` are set to `nil`.
    - `LeaderWorkerSet.spec.leaderWorkerTemplate.volumeClaimTemplates` and `JobSet.spec.volumeClaimPolicies` are set to `nil`.
-4. **Secrets Stripped**:
-   - `spec.imagePullSecrets`, secret volumes, and secret environment references are set to `nil`.
+4. **Secrets, Credentials & Endpoints Stripped**:
+   - `spec.imagePullSecrets`, secret volumes, secret environment references, `RayCluster.spec.gcsFaultToleranceOptions`, `RayCluster.spec.authOptions.secretName`, `RayCluster.spec.networkPolicy`, `HeadGroupSpec.ingressOptions`/`enableIngress`, and `HeadService.spec` static IPs/CIDRs/`externalName` (preserving `clusterIP: "None"` for headless services) are cleared.
 5. **Environment Variables Stripped**:
-   - Container `env` and `envFrom` fields are omitted.
+   - Container, `autoscalerOptions`, and `collectorOptions` `env` / `envFrom` fields are omitted.
 6. **Probes, Lifecycle Hooks, and Pod Identity/Host Fields Stripped**:
    - Container `livenessProbe`, `readinessProbe`, `startupProbe`, and `lifecycle` (`postStart` / `preStop`) fields are omitted across `containers`, `initContainers`, and `ephemeralContainers`.
    - Pod `serviceAccountName` (and legacy `serviceAccount`), `hostname`, `hostnameOverride`, and `subdomain` fields are omitted.

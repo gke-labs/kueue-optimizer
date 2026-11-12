@@ -961,16 +961,65 @@ func SanitizeDeployment(deploy *appsv1.Deployment, pauseImage string, hashNames 
 	return toMapWithoutStatus(cp)
 }
 
+func sanitizeServiceSpec(spec *corev1.ServiceSpec, hashNames bool, hasher LabelHasher) {
+	if spec == nil {
+		return
+	}
+	spec.Selector = SanitizeLabels(spec.Selector, hashNames, hasher)
+	if spec.ClusterIP != corev1.ClusterIPNone {
+		spec.ClusterIP = ""
+	}
+	if len(spec.ClusterIPs) != 1 || spec.ClusterIPs[0] != corev1.ClusterIPNone {
+		spec.ClusterIPs = nil
+	}
+	spec.ExternalIPs = nil
+	spec.LoadBalancerIP = ""
+	spec.LoadBalancerSourceRanges = nil
+	spec.ExternalName = ""
+	if spec.Type == corev1.ServiceTypeExternalName {
+		spec.Type = corev1.ServiceTypeClusterIP
+	}
+}
+
 func sanitizeRayClusterSpec(spec *rayv1.RayClusterSpec, pauseImage string, hashNames bool, hasher LabelHasher) {
 	if spec == nil {
 		return
 	}
+	if pauseImage == "" {
+		pauseImage = DefaultPauseImage
+	}
 	spec.HeadServiceAnnotations = FilterAnnotations(spec.HeadServiceAnnotations, hashNames)
+	if spec.AutoscalerOptions != nil {
+		if spec.AutoscalerOptions.Image != nil && *spec.AutoscalerOptions.Image != "" {
+			img := pauseImage
+			spec.AutoscalerOptions.Image = &img
+		}
+		spec.AutoscalerOptions.Command = nil
+		spec.AutoscalerOptions.Args = nil
+		spec.AutoscalerOptions.Env = nil
+		spec.AutoscalerOptions.EnvFrom = nil
+		spec.AutoscalerOptions.VolumeMounts = nil
+	}
+	if spec.HistoryServerOptions != nil && spec.HistoryServerOptions.CollectorOptions != nil {
+		co := spec.HistoryServerOptions.CollectorOptions
+		if co.Image != nil && *co.Image != "" {
+			img := pauseImage
+			co.Image = &img
+		}
+		co.Env = nil
+	}
+	spec.GcsFaultToleranceOptions = nil
+	if spec.AuthOptions != nil {
+		spec.AuthOptions.SecretName = nil
+	}
+	spec.NetworkPolicy = nil
 	spec.HeadGroupSpec.RayStartParams = nil
+	spec.HeadGroupSpec.EnableIngress = nil
+	spec.HeadGroupSpec.IngressOptions = nil
 	spec.HeadGroupSpec.Labels = SanitizeLabels(spec.HeadGroupSpec.Labels, hashNames, hasher)
 	if spec.HeadGroupSpec.HeadService != nil {
 		SanitizeWorkflowObjectMeta(&spec.HeadGroupSpec.HeadService.ObjectMeta, hashNames, hasher)
-		spec.HeadGroupSpec.HeadService.Spec.Selector = SanitizeLabels(spec.HeadGroupSpec.HeadService.Spec.Selector, hashNames, hasher)
+		sanitizeServiceSpec(&spec.HeadGroupSpec.HeadService.Spec, hashNames, hasher)
 	}
 	SanitizePodTemplateSpec(&spec.HeadGroupSpec.Template, pauseImage, hashNames, hasher)
 	for i := range spec.WorkerGroupSpecs {
@@ -988,6 +1037,7 @@ func SanitizeRayJob(rj *rayv1.RayJob, pauseImage string, hashNames bool, hasher 
 	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
 	cp.Spec.Entrypoint = ""
 	cp.Spec.RuntimeEnvYAML = ""
+	cp.Spec.JobId = ""
 	cp.Spec.Metadata = nil
 	cp.Spec.ClusterSelector = SanitizeLabels(cp.Spec.ClusterSelector, hashNames, hasher)
 	if cp.Spec.SubmitterPodTemplate != nil {

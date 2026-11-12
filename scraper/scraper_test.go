@@ -33,6 +33,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1367,15 +1368,56 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		Spec: rayv1.RayJobSpec{
 			Entrypoint:           testSecretValue,
 			RuntimeEnvYAML:       testSecretValue,
+			JobId:                testSecretNamePrefix + "custom-job-id",
+			Metadata:             map[string]string{"owner": testSecretEmail},
 			ClusterSelector:      map[string]string{"ray.io/cluster": testSecretNamePrefix + "raycluster", "owner": testSecretEmail},
 			SubmitterPodTemplate: secretPodTemplate.DeepCopy(),
 			RayClusterSpec: &rayv1.RayClusterSpec{
+				AutoscalerOptions: &rayv1.AutoscalerOptions{
+					Image:        ptr.To(testSecretImage),
+					Command:      []string{testSecretValue},
+					Args:         []string{testSecretValue},
+					Env:          []corev1.EnvVar{{Name: "TOKEN", Value: testSecretValue}},
+					EnvFrom:      []corev1.EnvFromSource{{Prefix: testSecretValue}},
+					VolumeMounts: []corev1.VolumeMount{{Name: testSecretValue, MountPath: "/mnt"}},
+					Resources: &corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+					},
+				},
+				HistoryServerOptions: &rayv1.HistoryServerOptions{
+					CollectorOptions: &rayv1.CollectorOptions{
+						Image: ptr.To(testSecretImage),
+						Env:   []corev1.EnvVar{{Name: "COLLECTOR_KEY", Value: testSecretValue}},
+					},
+				},
+				GcsFaultToleranceOptions: &rayv1.GcsFaultToleranceOptions{
+					RedisAddress:             testSecretIP + ":6379",
+					ExternalStorageNamespace: testSecretValue,
+					RedisUsername:            &rayv1.RedisCredential{Value: testSecretValue},
+					RedisPassword:            &rayv1.RedisCredential{Value: testSecretValue},
+				},
+				AuthOptions: &rayv1.AuthOptions{
+					Mode:       rayv1.AuthModeToken,
+					SecretName: ptr.To(testSecretValue),
+				},
 				HeadGroupSpec: rayv1.HeadGroupSpec{
-					Labels: map[string]string{"owner": testSecretEmail, "corp.io/custom-hashed": testSecretValue},
+					Labels:        map[string]string{"owner": testSecretEmail, "corp.io/custom-hashed": testSecretValue},
+					EnableIngress: ptr.To(true),
+					IngressOptions: &rayv1.IngressOptions{
+						Host: ptr.To(testSecretValue),
+						Path: ptr.To("/" + testSecretValue),
+						TLS:  []networkingv1.IngressTLS{{Hosts: []string{testSecretValue}, SecretName: testSecretValue}},
+					},
 					HeadService: &corev1.Service{
 						ObjectMeta: metav1.ObjectMeta{Name: testSecretNamePrefix + "ray-head-svc"},
 						Spec: corev1.ServiceSpec{
-							Selector: map[string]string{"ray.io/cluster": testSecretNamePrefix + "raycluster", "owner": testSecretEmail},
+							Selector:                 map[string]string{"ray.io/cluster": testSecretNamePrefix + "raycluster", "owner": testSecretEmail},
+							ClusterIP:                testSecretIP,
+							ClusterIPs:               []string{testSecretIP},
+							ExternalIPs:              []string{testSecretIP},
+							LoadBalancerIP:           testSecretIP,
+							LoadBalancerSourceRanges: []string{testSecretCIDR},
+							ExternalName:             testSecretValue,
 						},
 					},
 					RayStartParams: map[string]string{
@@ -1389,7 +1431,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	}
 	scraper.handleRayJobWatchEvent(watch.Added, rj)
 
-	// 6. RayCluster
+	// 6. RayCluster (including headless HeadService with ClusterIP="None" preserved)
 	rc := &rayv1.RayCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              testSecretNamePrefix + "raycluster",
@@ -1401,7 +1443,14 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 			HeadGroupSpec: rayv1.HeadGroupSpec{
 				Labels:         map[string]string{"owner": testSecretEmail},
 				RayStartParams: map[string]string{"redis-password": testSecretValue},
-				Template:       secretPodTemplate,
+				HeadService: &corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: testSecretNamePrefix + "headless-svc"},
+					Spec: corev1.ServiceSpec{
+						ClusterIP:  corev1.ClusterIPNone,
+						ClusterIPs: []string{corev1.ClusterIPNone},
+					},
+				},
+				Template: secretPodTemplate,
 			},
 			WorkerGroupSpecs: []rayv1.WorkerGroupSpec{
 				{
@@ -1482,6 +1531,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		"k8s.io/keep-me",
 		"kubernetes.io/info",
 		"team-a-lq",
+		`"clusterIP":"None"`,
 	} {
 		if !strings.Contains(wfStr, expected) {
 			t.Errorf("workflows.json missing expected sanitized value %q:\n%s", expected, wfStr)
