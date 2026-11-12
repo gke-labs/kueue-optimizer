@@ -155,7 +155,7 @@ To guarantee strict data hygiene, **no other pod fields are ever written to `inf
 | :--- | :--- | :--- | :--- |
 | `apiVersion` | `string` | **Yes** | Always `"v1"`. |
 | `kind` | `string` | **Yes** | Always `"Pod"`. |
-| `name` | `string` | **Yes** | Pod name (or 64-character hex HMAC-SHA256 hash when `--hash-names` is enabled). |
+| `name` | `string` | **Yes** | Pod name (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). |
 | `namespace` | `string` | **Yes** | Plain (unhashed) namespace name. |
 | `placement` | `string` | **Yes** | Plain (unhashed) node name (`spec.nodeName`) where the pod is scheduled and running. |
 | `resourceRequest` | `map[string]Quantity` | **Yes** | Effective pod resource requests (e.g., `{"cpu": "1", "memory": "11Gi"}`). Computed using Kubernetes scheduling rules:<br>$\text{Request}(r) = \max\Big(\text{PodRequest}(r),\; \max_{i \in \text{Init}}(\text{Init}_i(r)),\; \sum_{c \in \text{Containers}} \text{Container}_c(r) + \sum_{s \in \text{Sidecars}} \text{Sidecar}_s(r)\Big) + \text{PodOverhead}(r)$ |
@@ -209,7 +209,7 @@ stateDiagram-v2
 | Field | JSON Type | Required | Description |
 | :--- | :--- | :--- | :--- |
 | `objectKind` | `string` | **Yes** | One of `"Job"`, `"JobSet"`, `"LeaderWorkerSet"`, `"Deployment"`, `"RayJob"`, `"RayCluster"`, `"Pod"`. |
-| `name` | `string` | **Yes** | Workflow object name (or 64-character hex HMAC-SHA256 hash when `--hash-names` is enabled). |
+| `name` | `string` | **Yes** | Workflow object name (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). |
 | `namespace` | `string` | **Yes** | Plain (unhashed) namespace name. |
 | `creationTime` | `string` (RFC3339 UTC) | **Yes** | `metadata.creationTimestamp` of the workflow object. |
 | `localQueueName` | `string` | **Yes** | Plain (unhashed) Kueue `LocalQueue` name extracted from `kueue.x-k8s.io/queue-name` (on the object's labels/annotations, pod template labels, or inherited from the parent `JobSet` for child `Job`s). Empty string `""` if the object is not associated with a Kueue queue. |
@@ -286,10 +286,10 @@ stateDiagram-v2
 | Field | JSON Type | Required | Description |
 | :--- | :--- | :--- | :--- |
 | `executionType` | `string` | On execution completion | `"Partial"` on `"PartialExecution"` events; `"Full"` on `"FullExecution"` events; omitted on `"Admitted"` events. |
-| `workloadName` | `string` | **Yes** | Kueue `Workload` object name (or 64-character hex HMAC-SHA256 hash when `--hash-names` is enabled). |
+| `workloadName` | `string` | **Yes** | Kueue `Workload` object name (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). |
 | `namespace` | `string` | **Yes** | Plain (unhashed) namespace name. |
 | `ownerKind` | `string` | Optional | Kind of the owning workflow object (e.g., `"JobSet"`, `"Job"`, `"LeaderWorkerSet"`, `"Deployment"`, `"RayJob"`, `"RayCluster"`, `"Pod"`). |
-| `ownerName` | `string` | Optional | Name of the owning workflow object (or 64-character hex HMAC-SHA256 hash when `--hash-names` is enabled). |
+| `ownerName` | `string` | Optional | Name of the owning workflow object (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). |
 | `ownerAPIVersion` | `string` | Optional | API group/version of the owning workflow object (e.g., `"jobset.x-k8s.io/v1alpha2"`). |
 | `localQueueName` | `string` | Optional | Plain (unhashed) `LocalQueue` name (`workload.spec.queueName`). |
 | `clusterQueueName` | `string` | Optional | Plain (unhashed) `ClusterQueue` name (`workload.status.admission.clusterQueue`). |
@@ -316,9 +316,9 @@ stateDiagram-v2
 ## 6. Salted HMAC-SHA256 Name & Label Anonymization (`--hash-names` / `--sha256-names`)
 
 - **Disabled (`--hash-names=false`, default)**: `Scraper` uses `NoopHasher`; names and label values remain in plain text (`--extra-hash-labels` requires `--hash-names`).
-- **Enabled (`--hash-names` / `--sha256-names`)**: `Scraper` uses a per-run 256-bit CSPRNG `HMAC-SHA256` key to deterministically hash:
-  - **Workload/workflow/pod names** (plus `ownerReferences` and name-holding annotations) as lowercase 64-character hex digests (`hmac-sha256(salt, name)`).
-  - **Sensitive, workload-referencing, and `--extra-hash-labels` label values** as `h-<32-hex>`.
+- **Enabled (`--hash-names` / `--sha256-names`)**: `Scraper` uses a per-run 256-bit CSPRNG `HMAC-SHA256` key (`HashName`) to deterministically hash both resource names and label values into the same `h-<32-hex>` format (34 characters `<= 63`-char Kubernetes DNS/label limit) so cross-references between object names and label values match 1-to-1:
+  - **Workload/workflow/pod names** (plus `ownerReferences` and name-holding annotations).
+  - **Sensitive, workload-referencing, and `--extra-hash-labels` label values** (label keys are never hashed).
 - **Infrastructure names**: Always kept in plain text so cluster topology and queue hierarchy remain directly inspectable.
 
 | Object Kind | Hashed When `--hash-names` Is Enabled? | Cross-References Also Hashed |

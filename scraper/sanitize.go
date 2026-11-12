@@ -211,10 +211,10 @@ func NewRandomHashSalt() []byte {
 // SensitiveDataHasher anonymizes workload/pod/job names and sensitive or workload-referencing
 // label values across scraped infrastructure, workflow, and execution-time records.
 type SensitiveDataHasher interface {
-	HashName(name string) string
+	HashName(val string) string
 	HashNameForKind(kind, name string) string
-	HashLabelValue(val string) string
-	ShouldHashLabel(key string, includeWorkloadNameLabels bool) bool
+	ShouldHashLabel(key string) bool
+	ShouldHashWorkloadLabel(key string) bool
 }
 
 // NoopHasher implements SensitiveDataHasher as a pass-through no-op when hashing (--hash-names) is disabled.
@@ -225,49 +225,55 @@ func NewNoopHasher() SensitiveDataHasher {
 	return NoopHasher{}
 }
 
-func (NoopHasher) HashName(name string) string {
-	return name
+func (NoopHasher) HashName(val string) string {
+	return val
 }
 
 func (NoopHasher) HashNameForKind(_, name string) string {
 	return name
 }
 
-func (NoopHasher) HashLabelValue(val string) string {
-	return val
-}
-
-func (NoopHasher) ShouldHashLabel(_ string, _ bool) bool {
+func (NoopHasher) ShouldHashLabel(_ string) bool {
 	return false
 }
 
-func ensureHasher(h SensitiveDataHasher) SensitiveDataHasher {
-	if h == nil {
-		return NoopHasher{}
-	}
-	return h
+func (NoopHasher) ShouldHashWorkloadLabel(_ string) bool {
+	return false
 }
 
 // hmacSensitiveDataHasher deterministically hashes resource names and sensitive label values using
 // per-run HMAC-SHA256 so low-entropy values (such as short team, project, customer, or job names)
-// cannot be dictionary-guessed while preserving 1-to-1 matching across all scraped objects and
-// selectors within a capture session.
+// cannot be dictionary-guessed while preserving 1-to-1 matching across all scraped objects, names,
+// and label selectors within a capture session.
 type hmacSensitiveDataHasher struct {
+	extraExactLabels   map[string]bool
 	extraLabelPatterns []string
 	salt               []byte
 }
 
 // NewSensitiveDataHasher constructs a per-run HMAC-SHA256 SensitiveDataHasher with normalized
-// --extra-hash-labels patterns and a 256-bit key (generated from OS CSPRNG when salt is empty).
-func NewSensitiveDataHasher(extraLabelPatterns []string, salt []byte) SensitiveDataHasher {
-	var patterns []string
-	if len(extraLabelPatterns) > 0 {
-		patterns = make([]string, 0, len(extraLabelPatterns))
-		for _, raw := range extraLabelPatterns {
-			if p := strings.ToLower(strings.TrimSpace(raw)); p != "" && !slices.Contains(patterns, p) {
-				patterns = append(patterns, p)
-			}
+// --extra-hash-labels exact keys and "<domain>/*" domain prefixes and a 256-bit key
+// (generated from OS CSPRNG when salt is empty).
+func NewSensitiveDataHasher(extraLabels []string, salt []byte) SensitiveDataHasher {
+	var (
+		exactLabels   map[string]bool
+		labelPatterns []string
+	)
+	for _, raw := range extraLabels {
+		entry := strings.ToLower(strings.TrimSpace(raw))
+		if entry == "" {
+			continue
 		}
+		if prefix, ok := strings.CutSuffix(entry, "/*"); ok {
+			if prefix != "" && !slices.Contains(labelPatterns, prefix) {
+				labelPatterns = append(labelPatterns, prefix)
+			}
+			continue
+		}
+		if exactLabels == nil {
+			exactLabels = make(map[string]bool)
+		}
+		exactLabels[entry] = true
 	}
 	var key []byte
 	if len(salt) > 0 {
@@ -276,7 +282,8 @@ func NewSensitiveDataHasher(extraLabelPatterns []string, salt []byte) SensitiveD
 		key = NewRandomHashSalt()
 	}
 	return hmacSensitiveDataHasher{
-		extraLabelPatterns: patterns,
+		extraExactLabels:   exactLabels,
+		extraLabelPatterns: labelPatterns,
 		salt:               key,
 	}
 }
@@ -296,13 +303,15 @@ func (h hmacSensitiveDataHasher) hmacSum(val string) [32]byte {
 	return sum
 }
 
-// HashName returns the 64-character hex-encoded HMAC-SHA256 digest of name when name is non-empty.
-func (h hmacSensitiveDataHasher) HashName(name string) string {
-	if name == "" {
+// HashName returns a deterministic, Kubernetes-valid HMAC-SHA256 digest ("h-" + 32 hex chars,
+// 34 chars total <= 63-char Kubernetes DNS/label limit) used consistently for both resource names
+// and label values.
+func (h hmacSensitiveDataHasher) HashName(val string) string {
+	if val == "" {
 		return ""
 	}
-	sum := h.hmacSum(name)
-	return hex.EncodeToString(sum[:])
+	sum := h.hmacSum(val)
+	return "h-" + hex.EncodeToString(sum[:16])
 }
 
 // HashNameForKind hashes name only if kind is a workload/pod/job/jobset/etc.
@@ -314,54 +323,42 @@ func (h hmacSensitiveDataHasher) HashNameForKind(kind, name string) string {
 	return h.HashName(name)
 }
 
-// HashLabelValue returns a deterministic, Kubernetes-valid HMAC-SHA256 label value digest
-// ("h-" + 32 hex chars, 34 chars total <= 63-char Kubernetes label limit) for non-empty values.
-func (h hmacSensitiveDataHasher) HashLabelValue(val string) string {
-	if val == "" {
-		return ""
+func (h hmacSensitiveDataHasher) shouldHashLabel(lowerKey string) bool {
+	if h.extraExactLabels[lowerKey] || slices.Contains(hashedLabelKeys, lowerKey) {
+		return true
 	}
-	sum := h.hmacSum(val)
-	return "h-" + hex.EncodeToString(sum[:16])
-}
-
-func (h hmacSensitiveDataHasher) matchesExtraLabelPattern(lowerKey string) bool {
-	if len(h.extraLabelPatterns) == 0 {
+	domain, name, hasSlash := strings.Cut(lowerKey, "/")
+	if !hasSlash {
 		return false
 	}
-	domain, _, hasSlash := strings.Cut(lowerKey, "/")
-	for _, pattern := range h.extraLabelPatterns {
-		if pattern == lowerKey {
+	if slices.Contains(hashedLabelKeys, name) {
+		return true
+	}
+	for _, prefix := range h.extraLabelPatterns {
+		if domain == prefix || strings.HasSuffix(domain, "."+prefix) {
 			return true
-		}
-		if prefix, ok := strings.CutSuffix(pattern, "/*"); ok && prefix != "" && hasSlash {
-			if domain == prefix || strings.HasSuffix(domain, "."+prefix) {
-				return true
-			}
 		}
 	}
 	return false
 }
 
-func (h hmacSensitiveDataHasher) shouldHashLabel(lowerKey string) bool {
-	if h.matchesExtraLabelPattern(lowerKey) {
-		return true
-	}
-	if slices.Contains(hashedLabelKeys, lowerKey) {
-		return true
-	}
-	_, name, hasSlash := strings.Cut(lowerKey, "/")
-	return hasSlash && slices.Contains(hashedLabelKeys, name)
-}
-
-func (h hmacSensitiveDataHasher) ShouldHashLabel(key string, includeWorkloadNameLabels bool) bool {
+func (h hmacSensitiveDataHasher) ShouldHashLabel(key string) bool {
 	lowerKey := strings.ToLower(key)
 	if protectedLabelKeys[lowerKey] {
 		return false
 	}
-	if includeWorkloadNameLabels && labelKeysHoldingWorkloadNames[lowerKey] {
+	return h.shouldHashLabel(lowerKey)
+}
+
+func (h hmacSensitiveDataHasher) ShouldHashWorkloadLabel(key string) bool {
+	lowerKey := strings.ToLower(key)
+	if protectedLabelKeys[lowerKey] {
+		return false
+	}
+	if labelKeysHoldingWorkloadNames[lowerKey] {
 		return true
 	}
-	return h.shouldHashLabel(lowerKey)
+	return h.ShouldHashLabel(lowerKey)
 }
 
 // ShouldKeepAnnotation returns true iff key is a domain-prefixed annotation ("<domain>/<name>")
@@ -386,7 +383,6 @@ func FilterAnnotations(annotations map[string]string, hasher SensitiveDataHasher
 	if len(annotations) == 0 {
 		return nil
 	}
-	hasher = ensureHasher(hasher)
 	filtered := make(map[string]string)
 	for k, v := range annotations {
 		if !ShouldKeepAnnotation(k) {
@@ -421,15 +417,14 @@ func FilterLabels(labels map[string]string, deniedKeys []string) map[string]stri
 	return out
 }
 
-func sanitizeLabelsWithScope(labels map[string]string, includeWorkloadNameLabels bool, hasher SensitiveDataHasher) map[string]string {
+func sanitizeLabelsFunc(labels map[string]string, shouldHash func(string) bool, hasher SensitiveDataHasher) map[string]string {
 	if len(labels) == 0 {
 		return nil
 	}
-	hasher = ensureHasher(hasher)
 	out := make(map[string]string, len(labels))
 	for k, v := range labels {
-		if hasher.ShouldHashLabel(k, includeWorkloadNameLabels) {
-			out[k] = hasher.HashLabelValue(v)
+		if shouldHash(k) {
+			out[k] = hasher.HashName(v)
 			continue
 		}
 		out[k] = v
@@ -441,21 +436,20 @@ func sanitizeLabelsWithScope(labels map[string]string, includeWorkloadNameLabels
 // workload/job/pod/deployment-referencing label values via hasher while keeping all label keys intact.
 // Queue names (kueue.x-k8s.io/queue-name) are never hashed.
 func SanitizeLabels(labels map[string]string, hasher SensitiveDataHasher) map[string]string {
-	return sanitizeLabelsWithScope(labels, true, hasher)
+	return sanitizeLabelsFunc(labels, hasher.ShouldHashWorkloadLabel, hasher)
 }
 
-func sanitizeLabelSelectorWithScope(sel *metav1.LabelSelector, includeWorkloadNameLabels bool, hasher SensitiveDataHasher) *metav1.LabelSelector {
+func sanitizeLabelSelectorFunc(sel *metav1.LabelSelector, shouldHash func(string) bool, hasher SensitiveDataHasher) *metav1.LabelSelector {
 	if sel == nil {
 		return nil
 	}
-	hasher = ensureHasher(hasher)
 	cp := sel.DeepCopy()
-	cp.MatchLabels = sanitizeLabelsWithScope(cp.MatchLabels, includeWorkloadNameLabels, hasher)
+	cp.MatchLabels = sanitizeLabelsFunc(cp.MatchLabels, shouldHash, hasher)
 	for i := range cp.MatchExpressions {
 		expr := &cp.MatchExpressions[i]
-		if hasher.ShouldHashLabel(expr.Key, includeWorkloadNameLabels) {
+		if shouldHash(expr.Key) {
 			for j, v := range expr.Values {
-				expr.Values[j] = hasher.HashLabelValue(v)
+				expr.Values[j] = hasher.HashName(v)
 			}
 		}
 	}
@@ -465,18 +459,18 @@ func sanitizeLabelSelectorWithScope(sel *metav1.LabelSelector, includeWorkloadNa
 // SanitizeLabelSelector hashes MatchLabels and MatchExpressions values on a LabelSelector via hasher so
 // sensitive and workload-referencing label selectors remain non-empty and consistent.
 func SanitizeLabelSelector(sel *metav1.LabelSelector, hasher SensitiveDataHasher) *metav1.LabelSelector {
-	return sanitizeLabelSelectorWithScope(sel, true, hasher)
+	return sanitizeLabelSelectorFunc(sel, hasher.ShouldHashWorkloadLabel, hasher)
 }
 
 // SanitizeInfraLabels hashes sensitive label values (hashedLabelKeys plus --extra-hash-labels) on infrastructure objects via hasher.
 func SanitizeInfraLabels(labels map[string]string, hasher SensitiveDataHasher) map[string]string {
-	return sanitizeLabelsWithScope(labels, false, hasher)
+	return sanitizeLabelsFunc(labels, hasher.ShouldHashLabel, hasher)
 }
 
 // SanitizeInfraLabelSelector hashes sensitive MatchLabels and MatchExpressions values on an infrastructure
 // LabelSelector (such as ClusterQueue.spec.namespaceSelector or PodAffinityTerm.namespaceSelector) via hasher.
 func SanitizeInfraLabelSelector(sel *metav1.LabelSelector, hasher SensitiveDataHasher) *metav1.LabelSelector {
-	return sanitizeLabelSelectorWithScope(sel, false, hasher)
+	return sanitizeLabelSelectorFunc(sel, hasher.ShouldHashLabel, hasher)
 }
 
 // SanitizeNodeLabels strips cloud/cluster-identifying node labels (deniedNodeLabelKeys) and hashes
@@ -486,7 +480,6 @@ func SanitizeNodeLabels(labels map[string]string, hasher SensitiveDataHasher) ma
 }
 
 func sanitizeNodeSelectorTerm(term *corev1.NodeSelectorTerm, hasher SensitiveDataHasher) bool {
-	hasher = ensureHasher(hasher)
 	if len(term.MatchExpressions) > 0 {
 		exprs := make([]corev1.NodeSelectorRequirement, 0, len(term.MatchExpressions))
 		for _, expr := range term.MatchExpressions {
@@ -494,10 +487,10 @@ func sanitizeNodeSelectorTerm(term *corev1.NodeSelectorTerm, hasher SensitiveDat
 			if slices.Contains(deniedNodeLabelKeys, lowerKey) {
 				continue
 			}
-			if hasher.ShouldHashLabel(expr.Key, false) && len(expr.Values) > 0 {
+			if hasher.ShouldHashLabel(expr.Key) && len(expr.Values) > 0 {
 				vals := make([]string, len(expr.Values))
 				for i, v := range expr.Values {
-					vals[i] = hasher.HashLabelValue(v)
+					vals[i] = hasher.HashName(v)
 				}
 				expr.Values = vals
 			}
@@ -523,7 +516,6 @@ func SanitizeAffinity(aff *corev1.Affinity, hasher SensitiveDataHasher) *corev1.
 	if aff == nil {
 		return nil
 	}
-	hasher = ensureHasher(hasher)
 	cp := aff.DeepCopy()
 	if cp.NodeAffinity != nil {
 		if req := cp.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; req != nil {
@@ -584,7 +576,6 @@ func SanitizeOwnerReferences(refs []metav1.OwnerReference, hasher SensitiveDataH
 	if len(refs) == 0 {
 		return nil
 	}
-	hasher = ensureHasher(hasher)
 	out := make([]metav1.OwnerReference, len(refs))
 	for i, r := range refs {
 		out[i] = r
@@ -595,7 +586,6 @@ func SanitizeOwnerReferences(refs []metav1.OwnerReference, hasher SensitiveDataH
 
 // SanitizeWorkflowObjectMeta sanitizes top-level ObjectMeta on workflow objects.
 func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hasher SensitiveDataHasher) {
-	hasher = ensureHasher(hasher)
 	meta.ManagedFields = nil
 	meta.Name = hasher.HashName(meta.Name)
 	if meta.GenerateName != "" {
@@ -618,7 +608,6 @@ func SanitizePodSpec(spec *corev1.PodSpec, pauseImage string, hasher SensitiveDa
 	if spec == nil {
 		return
 	}
-	hasher = ensureHasher(hasher)
 	if pauseImage == "" {
 		pauseImage = DefaultPauseImage
 	}
@@ -682,7 +671,6 @@ func SanitizePodTemplateSpec(tpl *corev1.PodTemplateSpec, pauseImage string, has
 	if tpl == nil {
 		return
 	}
-	hasher = ensureHasher(hasher)
 	tpl.ObjectMeta.ManagedFields = nil
 	if tpl.ObjectMeta.Name != "" {
 		tpl.ObjectMeta.Name = hasher.HashName(tpl.ObjectMeta.Name)
@@ -878,7 +866,6 @@ func ExtractPodSchedulingTime(pod *corev1.Pod) *metav1.Time {
 
 // BuildScrapedPodPayload constructs the strictly-scoped ScrapedPodPayload for infra.json.
 func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletionTime *time.Time, hasher SensitiveDataHasher) ScrapedPodPayload {
-	hasher = ensureHasher(hasher)
 	var delTime *metav1.Time
 	if deletionTime != nil && !deletionTime.IsZero() {
 		t := metav1.NewTime(deletionTime.UTC())

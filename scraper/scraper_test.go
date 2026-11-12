@@ -374,13 +374,13 @@ func TestSanitizeLabels(t *testing.T) {
 			t.Errorf("expected label %q=%q to be preserved in plain text, got %q", k, want, got)
 		}
 	}
-	wantWorkloadHash := hasher.HashLabelValue(rawWorkloadRef)
+	wantWorkloadHash := hasher.HashName(rawWorkloadRef)
 	for _, k := range hashedWorkloadLabels {
 		if got := sanitized[k]; got != wantWorkloadHash {
 			t.Errorf("expected workload-name label %q to be hashed to %q, got %q", k, wantWorkloadHash, got)
 		}
 	}
-	wantSecretHash := hasher.HashLabelValue(testSecretValue)
+	wantSecretHash := hasher.HashName(testSecretValue)
 	for _, k := range hashedValueLabels {
 		if got := sanitized[k]; got != wantSecretHash {
 			t.Errorf("expected sensitive label %q to keep its key and have hashed value %q, got %q", k, wantSecretHash, got)
@@ -404,45 +404,30 @@ func TestSaltedLabelHashingPreventsDictionaryAndCrossRunCorrelation(t *testing.T
 	run1 := NewSensitiveDataHasher(nil, nil)
 	run2 := NewSensitiveDataHasher(nil, nil)
 
-	h1 := run1.HashLabelValue(lowEntropyVal)
-	h2 := run2.HashLabelValue(lowEntropyVal)
+	h1 := run1.HashName(lowEntropyVal)
+	h2 := run2.HashName(lowEntropyVal)
 
+	if len(h1) != 34 || !strings.HasPrefix(h1, "h-") {
+		t.Errorf("expected 34-char h-<32-hex> HMAC-SHA256 digest, got %q", h1)
+	}
 	if h1 == unsaltedDigest || h2 == unsaltedDigest {
 		t.Errorf("expected salted HMAC-SHA256 digest to differ from unsalted SHA-256 %q", unsaltedDigest)
 	}
 	if h1 == h2 {
 		t.Errorf("expected independent per-run CSPRNG salts to produce distinct digests, both produced %q", h1)
 	}
-	// Within the same run, hashing the same label value is deterministic.
-	if run1.HashLabelValue(lowEntropyVal) != h1 {
+	// Within the same run, hashing the same value is deterministic.
+	if run1.HashName(lowEntropyVal) != h1 {
 		t.Errorf("expected deterministic digest within the same SensitiveDataHasher run")
 	}
 
-	// Verify --hash-names (HashName) also uses the per-run HMAC-SHA256 salt rather than unsalted SHA-256.
-	rawName := "jobset-train-01"
-	unsaltedNameSum := sha256.Sum256([]byte(rawName))
-	unsaltedNameDigest := hex.EncodeToString(unsaltedNameSum[:])
-	nh1 := run1.HashName(rawName)
-	nh2 := run2.HashName(rawName)
-	if len(nh1) != 64 || len(nh2) != 64 {
-		t.Errorf("expected 64-char hex HMAC-SHA256 name digest, got len=%d (%q) and len=%d (%q)", len(nh1), nh1, len(nh2), nh2)
-	}
-	if nh1 == unsaltedNameDigest || nh2 == unsaltedNameDigest {
-		t.Errorf("expected salted HMAC-SHA256 name digest to differ from unsalted SHA-256 %q", unsaltedNameDigest)
-	}
-	if nh1 == nh2 {
-		t.Errorf("expected independent per-run CSPRNG salts to produce distinct name digests, both produced %q", nh1)
-	}
-	if run1.HashName(rawName) != nh1 {
-		t.Errorf("expected deterministic name digest within the same SensitiveDataHasher run")
-	}
-
 	// Verify NoopHasher preserves both names and label values unchanged.
+	rawName := "jobset-train-01"
 	noop := NewNoopHasher()
 	if noop.HashName(rawName) != rawName || noop.HashNameForKind("JobSet", rawName) != rawName {
 		t.Errorf("expected NoopHasher to preserve plain name %q", rawName)
 	}
-	if noop.HashLabelValue(lowEntropyVal) != lowEntropyVal {
+	if noop.HashName(lowEntropyVal) != lowEntropyVal {
 		t.Errorf("expected NoopHasher to preserve plain label value %q", lowEntropyVal)
 	}
 
@@ -588,6 +573,9 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 	if err := json.Unmarshal(rawJSON, &roundTrip); err != nil {
 		t.Fatalf("unmarshal sanitized deployment: %v", err)
 	}
+	if roundTrip.Name != roundTrip.Spec.Template.Labels["app"] {
+		t.Errorf("expected sanitized Deployment.Name %q to match sanitized pod template label app=%q", roundTrip.Name, roundTrip.Spec.Template.Labels["app"])
+	}
 	if len(roundTrip.Spec.Selector.MatchLabels) == 0 {
 		t.Fatalf("expected Deployment.Spec.Selector.MatchLabels to remain non-empty")
 	}
@@ -640,7 +628,7 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 	var cleanCQ kueuev1beta2.ClusterQueue
 	_ = json.Unmarshal(nsBytes, &cleanNS)
 	_ = json.Unmarshal(cqBytes, &cleanCQ)
-	if cleanNS.Labels["team"] != hasher.HashLabelValue(testSecretValue) {
+	if cleanNS.Labels["team"] != hasher.HashName(testSecretValue) {
 		t.Errorf("expected default sensitive key 'team' to have hashed value on Namespace, got %v", cleanNS.Labels)
 	}
 	cqNsSel, err := metav1.LabelSelectorAsSelector(cleanCQ.Spec.NamespaceSelector)
@@ -660,7 +648,7 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 			Labels: map[string]string{"team": testSecretValue, "instance": "gpu"},
 		},
 	}, defaultHasher)
-	if cleanNodeDefault.Labels["team"] != defaultHasher.HashLabelValue(testSecretValue) {
+	if cleanNodeDefault.Labels["team"] != defaultHasher.HashName(testSecretValue) {
 		t.Errorf("expected default 'team' label on Node to be hashed even without --extra-hash-labels, got %v", cleanNodeDefault.Labels)
 	}
 
@@ -695,7 +683,7 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 	_ = json.Unmarshal(rfBytes, &cleanRF)
 	_ = json.Unmarshal(topoBytes, &cleanTopo)
 
-	if cleanNode.Labels["corp.io/team"] != hasher.HashLabelValue(testSecretValue) {
+	if cleanNode.Labels["corp.io/team"] != hasher.HashName(testSecretValue) {
 		t.Errorf("expected preserved key 'corp.io/team' with hashed value on Node, got %v", cleanNode.Labels)
 	}
 	if cleanRF.Spec.NodeLabels["corp.io/team"] != cleanNode.Labels["corp.io/team"] {
@@ -1165,8 +1153,8 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 			if _, hasStatus := payload["status"]; hasStatus {
 				t.Errorf("%s payload must NOT include status", kind)
 			}
-			if len(name) == 64 {
-				t.Errorf("%s name must not be SHA-256 hashed, got %q", kind, name)
+			if strings.HasPrefix(name, "h-") && len(name) == 34 {
+				t.Errorf("%s name must not be hashed, got %q", kind, name)
 			}
 		case "Pod":
 			name := payload["name"].(string)
@@ -1205,7 +1193,7 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		"keep-ns-annot",
 		"keep-cq-annot",
 		`"environment":"prod"`,
-		`"team":"` + scraper.hasher.HashLabelValue(testSecretValue) + `"`,
+		`"team":"` + scraper.hasher.HashName(testSecretValue) + `"`,
 	} {
 		if !strings.Contains(infraStr, expected) {
 			t.Errorf("infra.json missing expected sanitized field/value %q:\n%s", expected, infraStr)
@@ -1597,8 +1585,8 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		if ev.Payload.CreationTime.IsZero() {
 			t.Errorf("%s expected non-zero creationTime", ev.Payload.ObjectKind)
 		}
-		if len(ev.Payload.Name) != 64 {
-			t.Errorf("%s expected 64-char SHA-256 hashed name, got %q", ev.Payload.ObjectKind, ev.Payload.Name)
+		if len(ev.Payload.Name) != 34 || !strings.HasPrefix(ev.Payload.Name, "h-") {
+			t.Errorf("%s expected 34-char h-<32-hex> HMAC-SHA256 hashed name, got %q", ev.Payload.ObjectKind, ev.Payload.Name)
 		}
 	}
 

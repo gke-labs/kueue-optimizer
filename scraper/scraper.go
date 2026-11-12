@@ -944,7 +944,6 @@ func resolveWorkloadOwner(wl *kueuev1beta2.Workload, hasher SensitiveDataHasher)
 	if wl == nil {
 		return "", "", ""
 	}
-	hasher = ensureHasher(hasher)
 	for _, ref := range wl.OwnerReferences {
 		if ref.Controller != nil && *ref.Controller {
 			return ref.Kind, hasher.HashNameForKind(ref.Kind, ref.Name), ref.APIVersion
