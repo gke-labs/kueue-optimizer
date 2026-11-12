@@ -15,6 +15,8 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -156,9 +158,10 @@ var deniedNodeLabelKeys = []string{
 	"kubernetes.azure.com/subscription-id",
 }
 
-// deniedWorkflowLabelKeys lists default user/business metadata label keys (all lowercase) stripped
-// from workflow objects and templates. Users can extend this list via --deny-labels.
-var deniedWorkflowLabelKeys = []string{
+// hashedLabelKeys lists default user/business metadata label keys (all lowercase) whose values are
+// hashed across both infrastructure and workflow objects, templates, and selectors. Users can extend
+// this list via --hash-labels.
+var hashedLabelKeys = []string{
 	"owner",
 	"team",
 	"customer",
@@ -181,18 +184,117 @@ var deniedWorkflowLabelKeys = []string{
 	"account",
 }
 
-func mergeDeniedKeys(base []string, extra []string) []string {
-	if len(extra) == 0 {
-		return base
+// protectedLabelKeys lists Kueue control-plane label keys (all lowercase) whose values must never
+// be hashed even if matched by user-supplied --hash-labels patterns.
+var protectedLabelKeys = map[string]bool{
+	KueueQueueLabel:   true,
+	KueueManagedLabel: true,
+}
+
+func isAllowedDomain(domain string) bool {
+	if domain == "" || strings.HasPrefix(domain, ".") {
+		return false
 	}
-	merged := make([]string, 0, len(base)+len(extra))
-	merged = append(merged, base...)
-	for _, k := range extra {
-		if lower := strings.ToLower(strings.TrimSpace(k)); lower != "" {
-			merged = append(merged, lower)
+	for _, allowed := range allowedAnnotationDomains {
+		if domain == allowed || strings.HasSuffix(domain, "."+allowed) {
+			return true
 		}
 	}
-	return merged
+	return false
+}
+
+// defaultProcessSalt is a 256-bit ephemeral CSPRNG key used as a fail-safe when a zero-value
+// LabelHasher is called directly without an explicit per-Scraper salt, ensuring label values are
+// never hashed unsalted or with a hardcoded key.
+var defaultProcessSalt = NewRandomHashSalt()
+
+// NewRandomHashSalt generates a fresh 32-byte (256-bit) cryptographically random HMAC key from the OS CSPRNG.
+func NewRandomHashSalt() []byte {
+	salt := make([]byte, 32)
+	if _, err := rand.Read(salt); err != nil {
+		panic("crypto/rand.Read failed: " + err.Error())
+	}
+	return salt
+}
+
+// LabelHasher deterministically hashes sensitive label values using per-run HMAC-SHA256 so
+// low-entropy values (such as short team, project, or customer names) cannot be dictionary-guessed
+// while preserving 1-to-1 matching across all scraped objects and selectors within a capture session.
+type LabelHasher struct {
+	extraPatterns []string
+	salt          []byte
+}
+
+// NewLabelHasher constructs a LabelHasher with normalized --hash-labels patterns and an HMAC-SHA256 key.
+// When salt is empty, a fresh 256-bit CSPRNG key is generated via NewRandomHashSalt.
+func NewLabelHasher(extraKeys []string, salt []byte) LabelHasher {
+	var patterns []string
+	if len(extraKeys) > 0 {
+		patterns = make([]string, 0, len(extraKeys))
+		for _, raw := range extraKeys {
+			if p := strings.ToLower(strings.TrimSpace(raw)); p != "" && !slices.Contains(patterns, p) {
+				patterns = append(patterns, p)
+			}
+		}
+	}
+	var key []byte
+	if len(salt) > 0 {
+		key = slices.Clone(salt)
+	} else {
+		key = NewRandomHashSalt()
+	}
+	return LabelHasher{
+		extraPatterns: patterns,
+		salt:          key,
+	}
+}
+
+func (h LabelHasher) effectiveSalt() []byte {
+	if len(h.salt) > 0 {
+		return h.salt
+	}
+	return defaultProcessSalt
+}
+
+// HashValue returns a deterministic, Kubernetes-valid HMAC-SHA256 label value digest ("h-" + 32 hex chars,
+// 34 chars total <= 63-char Kubernetes label limit) for non-empty values.
+func (h LabelHasher) HashValue(val string) string {
+	if val == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, h.effectiveSalt())
+	_, _ = mac.Write([]byte(val))
+	sum := mac.Sum(nil)
+	return "h-" + hex.EncodeToString(sum[:16])
+}
+
+func (h LabelHasher) matchesExtraKey(lowerKey string) bool {
+	if len(h.extraPatterns) == 0 {
+		return false
+	}
+	domain, _, hasSlash := strings.Cut(lowerKey, "/")
+	for _, pattern := range h.extraPatterns {
+		if pattern == lowerKey {
+			return true
+		}
+		if prefix, ok := strings.CutSuffix(pattern, "/*"); ok && prefix != "" && hasSlash {
+			if domain == prefix || strings.HasSuffix(domain, "."+prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (h LabelHasher) shouldHashLabel(lowerKey string) bool {
+	if h.matchesExtraKey(lowerKey) {
+		return true
+	}
+	if slices.Contains(hashedLabelKeys, lowerKey) {
+		return true
+	}
+	domain, name, hasSlash := strings.Cut(lowerKey, "/")
+	return hasSlash && !isAllowedDomain(domain) && slices.Contains(hashedLabelKeys, name)
 }
 
 // ShouldKeepAnnotation returns true iff key is a domain-prefixed annotation ("<domain>/<name>")
@@ -207,12 +309,7 @@ func ShouldKeepAnnotation(key string) bool {
 	if !hasSlash || domain == "" || name == "" || strings.Contains(name, "/") {
 		return false
 	}
-	for _, allowed := range allowedAnnotationDomains {
-		if domain == allowed || strings.HasSuffix(domain, "."+allowed) {
-			return true
-		}
-	}
-	return false
+	return isAllowedDomain(domain)
 }
 
 // FilterAnnotations retains only allowed Kubernetes, SIG (x-k8s.io / k8s.io), and kueue-optimizer
@@ -256,54 +353,152 @@ func FilterLabels(labels map[string]string, deniedKeys []string) map[string]stri
 	return out
 }
 
-// SanitizeLabels filters workflow labels against deniedWorkflowLabelKeys (plus any extraDeniedKeys)
-// and hashes values that store workload/job/pod/deployment names when hashNames is true.
-// Queue names (kueue.x-k8s.io/queue-name) are never hashed.
-func SanitizeLabels(labels map[string]string, hashNames bool, extraDeniedKeys []string) map[string]string {
-	filtered := FilterLabels(labels, mergeDeniedKeys(deniedWorkflowLabelKeys, extraDeniedKeys))
-	if len(filtered) == 0 {
+// SanitizeLabels hashes sensitive label values (hashedLabelKeys plus any --hash-labels patterns) using
+// salted HMAC-SHA256 digests while keeping all label keys intact, and hashes values that store
+// workload/job/pod/deployment names when hashNames is true. Queue names (kueue.x-k8s.io/queue-name) are never hashed.
+func SanitizeLabels(labels map[string]string, hashNames bool, hasher LabelHasher) map[string]string {
+	if len(labels) == 0 {
 		return nil
 	}
-	if hashNames {
-		for k, v := range filtered {
-			if v != "" && labelKeysHoldingWorkloadNames[strings.ToLower(k)] {
-				filtered[k] = HashName(v, true)
-			}
+	out := make(map[string]string, len(labels))
+	for k, v := range labels {
+		lowerKey := strings.ToLower(k)
+		if !protectedLabelKeys[lowerKey] &&
+			(hasher.shouldHashLabel(lowerKey) || (hashNames && labelKeysHoldingWorkloadNames[lowerKey])) {
+			out[k] = hasher.HashValue(v)
+			continue
 		}
+		out[k] = v
 	}
-	return filtered
+	return out
 }
 
-// SanitizeLabelSelector sanitizes MatchLabels and MatchExpressions on a LabelSelector so denied
-// label keys are stripped and workload-name label values are hashed consistently with template labels.
-func SanitizeLabelSelector(sel *metav1.LabelSelector, hashNames bool, extraDeniedKeys []string) *metav1.LabelSelector {
+// SanitizeLabelSelector hashes MatchLabels and MatchExpressions values on a LabelSelector so
+// sensitive labels and (when hashNames is true) workload-name label values remain non-empty and consistent.
+func SanitizeLabelSelector(sel *metav1.LabelSelector, hashNames bool, hasher LabelHasher) *metav1.LabelSelector {
 	if sel == nil {
 		return nil
 	}
 	cp := sel.DeepCopy()
-	cp.MatchLabels = SanitizeLabels(cp.MatchLabels, hashNames, extraDeniedKeys)
-	if len(cp.MatchExpressions) > 0 {
-		denied := mergeDeniedKeys(deniedWorkflowLabelKeys, extraDeniedKeys)
-		exprs := make([]metav1.LabelSelectorRequirement, 0, len(cp.MatchExpressions))
-		for _, expr := range cp.MatchExpressions {
+	cp.MatchLabels = SanitizeLabels(cp.MatchLabels, hashNames, hasher)
+	for i := range cp.MatchExpressions {
+		expr := &cp.MatchExpressions[i]
+		lowerKey := strings.ToLower(expr.Key)
+		if !protectedLabelKeys[lowerKey] &&
+			(hasher.shouldHashLabel(lowerKey) || (hashNames && labelKeysHoldingWorkloadNames[lowerKey])) {
+			for j, v := range expr.Values {
+				expr.Values[j] = hasher.HashValue(v)
+			}
+		}
+	}
+	return cp
+}
+
+// SanitizeInfraLabels hashes sensitive label values (hashedLabelKeys plus --hash-labels) on infrastructure objects.
+func SanitizeInfraLabels(labels map[string]string, hasher LabelHasher) map[string]string {
+	return SanitizeLabels(labels, false, hasher)
+}
+
+// SanitizeInfraLabelSelector hashes sensitive MatchLabels and MatchExpressions values on an infrastructure
+// LabelSelector (such as ClusterQueue.spec.namespaceSelector or PodAffinityTerm.namespaceSelector).
+func SanitizeInfraLabelSelector(sel *metav1.LabelSelector, hasher LabelHasher) *metav1.LabelSelector {
+	return SanitizeLabelSelector(sel, false, hasher)
+}
+
+// SanitizeNodeLabels strips cloud/cluster-identifying node labels (deniedNodeLabelKeys) and hashes
+// sensitive label values (hashedLabelKeys plus --hash-labels) so Node, ResourceFlavor, and Pod nodeSelector stay consistent.
+func SanitizeNodeLabels(labels map[string]string, hasher LabelHasher) map[string]string {
+	return SanitizeInfraLabels(FilterLabels(labels, deniedNodeLabelKeys), hasher)
+}
+
+func sanitizeNodeSelectorTerm(term *corev1.NodeSelectorTerm, hasher LabelHasher) bool {
+	if len(term.MatchExpressions) > 0 {
+		exprs := make([]corev1.NodeSelectorRequirement, 0, len(term.MatchExpressions))
+		for _, expr := range term.MatchExpressions {
 			lowerKey := strings.ToLower(expr.Key)
-			if slices.Contains(denied, lowerKey) {
+			if slices.Contains(deniedNodeLabelKeys, lowerKey) {
 				continue
 			}
-			if hashNames && labelKeysHoldingWorkloadNames[lowerKey] && len(expr.Values) > 0 {
+			if !protectedLabelKeys[lowerKey] && hasher.shouldHashLabel(lowerKey) && len(expr.Values) > 0 {
 				vals := make([]string, len(expr.Values))
 				for i, v := range expr.Values {
-					vals[i] = HashName(v, v != "")
+					vals[i] = hasher.HashValue(v)
 				}
 				expr.Values = vals
 			}
 			exprs = append(exprs, expr)
 		}
 		if len(exprs) == 0 {
-			cp.MatchExpressions = nil
+			term.MatchExpressions = nil
 		} else {
-			cp.MatchExpressions = exprs
+			term.MatchExpressions = exprs
 		}
+	}
+	return len(term.MatchExpressions) > 0 || len(term.MatchFields) > 0
+}
+
+func sanitizePodAffinityTerm(term *corev1.PodAffinityTerm, hashNames bool, hasher LabelHasher) {
+	term.LabelSelector = SanitizeLabelSelector(term.LabelSelector, hashNames, hasher)
+	term.NamespaceSelector = SanitizeInfraLabelSelector(term.NamespaceSelector, hasher)
+}
+
+// SanitizeAffinity sanitizes NodeAffinity, PodAffinity, and PodAntiAffinity terms consistently with
+// Node, Namespace, and Pod label sanitization.
+func SanitizeAffinity(aff *corev1.Affinity, hashNames bool, hasher LabelHasher) *corev1.Affinity {
+	if aff == nil {
+		return nil
+	}
+	cp := aff.DeepCopy()
+	if cp.NodeAffinity != nil {
+		if req := cp.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; req != nil {
+			terms := make([]corev1.NodeSelectorTerm, 0, len(req.NodeSelectorTerms))
+			for _, t := range req.NodeSelectorTerms {
+				if sanitizeNodeSelectorTerm(&t, hasher) {
+					terms = append(terms, t)
+				}
+			}
+			if len(terms) == 0 {
+				cp.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
+			} else {
+				req.NodeSelectorTerms = terms
+			}
+		}
+		if len(cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution) > 0 {
+			prefs := make([]corev1.PreferredSchedulingTerm, 0, len(cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution))
+			for _, p := range cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
+				if sanitizeNodeSelectorTerm(&p.Preference, hasher) {
+					prefs = append(prefs, p)
+				}
+			}
+			if len(prefs) == 0 {
+				cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = nil
+			} else {
+				cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = prefs
+			}
+		}
+		if cp.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil &&
+			len(cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution) == 0 {
+			cp.NodeAffinity = nil
+		}
+	}
+	if cp.PodAffinity != nil {
+		for i := range cp.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+			sanitizePodAffinityTerm(&cp.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i], hashNames, hasher)
+		}
+		for i := range cp.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
+			sanitizePodAffinityTerm(&cp.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution[i].PodAffinityTerm, hashNames, hasher)
+		}
+	}
+	if cp.PodAntiAffinity != nil {
+		for i := range cp.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+			sanitizePodAffinityTerm(&cp.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i], hashNames, hasher)
+		}
+		for i := range cp.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
+			sanitizePodAffinityTerm(&cp.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[i].PodAffinityTerm, hashNames, hasher)
+		}
+	}
+	if cp.NodeAffinity == nil && cp.PodAffinity == nil && cp.PodAntiAffinity == nil {
+		return nil
 	}
 	return cp
 }
@@ -325,7 +520,7 @@ func SanitizeOwnerReferences(refs []metav1.OwnerReference, hashNames bool) []met
 }
 
 // SanitizeWorkflowObjectMeta sanitizes top-level ObjectMeta on workflow objects.
-func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hashNames bool, extraDeniedKeys []string) {
+func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hashNames bool, hasher LabelHasher) {
 	meta.ManagedFields = nil
 	if hashNames {
 		meta.Name = HashName(meta.Name, true)
@@ -334,18 +529,19 @@ func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hashNames bool, extraDe
 		}
 	}
 	meta.Annotations = FilterAnnotations(meta.Annotations, hashNames)
-	meta.Labels = SanitizeLabels(meta.Labels, hashNames, extraDeniedKeys)
+	meta.Labels = SanitizeLabels(meta.Labels, hashNames, hasher)
 	meta.OwnerReferences = SanitizeOwnerReferences(meta.OwnerReferences, hashNames)
 }
 
-// SanitizePodSpec strips business-specific fields from a PodSpec:
+// SanitizePodSpec strips business-specific fields and hashes sensitive label selectors in a PodSpec:
 //   - Replaces container images with pauseImage and clears Command and Args
 //   - Removes container probes (LivenessProbe, ReadinessProbe, StartupProbe) and Lifecycle hooks
 //   - Clears ServiceAccountName (and DeprecatedServiceAccount), Hostname, HostnameOverride, and Subdomain
 //   - Removes Volumes, VolumeMounts, and VolumeDevices
 //   - Removes Secrets (ImagePullSecrets, secret env/volumes)
 //   - Removes Environment variables (Env and EnvFrom)
-func SanitizePodSpec(spec *corev1.PodSpec, pauseImage string) {
+//   - Sanitizes NodeSelector, Affinity (NodeAffinity, PodAffinity, PodAntiAffinity), and TopologySpreadConstraints
+func SanitizePodSpec(spec *corev1.PodSpec, pauseImage string, hashNames bool, hasher LabelHasher) {
 	if spec == nil {
 		return
 	}
@@ -359,6 +555,12 @@ func SanitizePodSpec(spec *corev1.PodSpec, pauseImage string) {
 	spec.Hostname = ""
 	spec.HostnameOverride = nil
 	spec.Subdomain = ""
+	spec.NodeSelector = SanitizeNodeLabels(spec.NodeSelector, hasher)
+	spec.Affinity = SanitizeAffinity(spec.Affinity, hashNames, hasher)
+	for i := range spec.TopologySpreadConstraints {
+		tsc := &spec.TopologySpreadConstraints[i]
+		tsc.LabelSelector = SanitizeLabelSelector(tsc.LabelSelector, hashNames, hasher)
+	}
 
 	for i := range spec.Containers {
 		sanitizeContainer(&spec.Containers[i], pauseImage)
@@ -400,7 +602,7 @@ func sanitizeEphemeralContainer(c *corev1.EphemeralContainer, pauseImage string)
 }
 
 // SanitizePodTemplateSpec sanitizes both the template ObjectMeta and PodSpec.
-func SanitizePodTemplateSpec(tpl *corev1.PodTemplateSpec, pauseImage string, hashNames bool, extraDeniedKeys []string) {
+func SanitizePodTemplateSpec(tpl *corev1.PodTemplateSpec, pauseImage string, hashNames bool, hasher LabelHasher) {
 	if tpl == nil {
 		return
 	}
@@ -414,9 +616,9 @@ func SanitizePodTemplateSpec(tpl *corev1.PodTemplateSpec, pauseImage string, has
 		}
 	}
 	tpl.ObjectMeta.Annotations = FilterAnnotations(tpl.ObjectMeta.Annotations, hashNames)
-	tpl.ObjectMeta.Labels = SanitizeLabels(tpl.ObjectMeta.Labels, hashNames, extraDeniedKeys)
+	tpl.ObjectMeta.Labels = SanitizeLabels(tpl.ObjectMeta.Labels, hashNames, hasher)
 	tpl.ObjectMeta.OwnerReferences = SanitizeOwnerReferences(tpl.ObjectMeta.OwnerReferences, hashNames)
-	SanitizePodSpec(&tpl.Spec, pauseImage)
+	SanitizePodSpec(&tpl.Spec, pauseImage, hashNames, hasher)
 }
 
 func toMapWithoutStatus(obj any) map[string]any {
@@ -619,22 +821,24 @@ func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletion
 	}
 }
 
-func sanitizeInfraObjectMeta(meta *metav1.ObjectMeta, deniedLabelKeys []string) {
+func sanitizeInfraObjectMeta(meta *metav1.ObjectMeta, hasher LabelHasher) {
 	meta.ManagedFields = nil
 	meta.Annotations = FilterAnnotations(meta.Annotations, false)
-	meta.Labels = FilterLabels(meta.Labels, mergeDeniedKeys(nil, deniedLabelKeys))
+	meta.Labels = SanitizeInfraLabels(meta.Labels, hasher)
 }
 
 // SanitizeNode prepares a Node for infra.json, retaining only scheduling-relevant spec fields
 // (taints, unschedulable) and status fields (capacity, allocatable, conditions, phase), filtering
-// annotations, and stripping cloud/cluster-identifying (plus any user-denied) node labels.
-func SanitizeNode(node *corev1.Node, extraDeniedKeys []string) *corev1.Node {
+// annotations, stripping cloud/cluster-identifying node labels, and hashing sensitive/--hash-labels values.
+func SanitizeNode(node *corev1.Node, hasher LabelHasher) *corev1.Node {
 	if node == nil {
 		return nil
 	}
 	cp := node.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Node"}
-	sanitizeInfraObjectMeta(&cp.ObjectMeta, mergeDeniedKeys(deniedNodeLabelKeys, extraDeniedKeys))
+	cp.ManagedFields = nil
+	cp.Annotations = FilterAnnotations(cp.Annotations, false)
+	cp.Labels = SanitizeNodeLabels(cp.Labels, hasher)
 	cp.Spec = corev1.NodeSpec{
 		Taints:        cp.Spec.Taints,
 		Unschedulable: cp.Spec.Unschedulable,
@@ -648,157 +852,165 @@ func SanitizeNode(node *corev1.Node, extraDeniedKeys []string) *corev1.Node {
 	return cp
 }
 
-// SanitizeNamespace prepares a Namespace for infra.json (filtering annotations and omitting status).
-func SanitizeNamespace(ns *corev1.Namespace, extraDeniedKeys []string) map[string]any {
+// SanitizeNamespace prepares a Namespace for infra.json (filtering annotations, hashing sensitive/--hash-labels values, and omitting status).
+func SanitizeNamespace(ns *corev1.Namespace, hasher LabelHasher) map[string]any {
 	if ns == nil {
 		return nil
 	}
 	cp := ns.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"}
-	sanitizeInfraObjectMeta(&cp.ObjectMeta, extraDeniedKeys)
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeClusterQueue prepares a ClusterQueue for infra.json (filtering annotations and omitting status).
-func SanitizeClusterQueue(cq *kueuev1beta2.ClusterQueue, extraDeniedKeys []string) map[string]any {
+// SanitizeClusterQueue prepares a ClusterQueue for infra.json (filtering annotations, hashing sensitive/--hash-labels
+// values including spec.namespaceSelector, and omitting status).
+func SanitizeClusterQueue(cq *kueuev1beta2.ClusterQueue, hasher LabelHasher) map[string]any {
 	if cq == nil {
 		return nil
 	}
 	cp := cq.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "ClusterQueue"}
-	sanitizeInfraObjectMeta(&cp.ObjectMeta, extraDeniedKeys)
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
+	cp.Spec.NamespaceSelector = SanitizeInfraLabelSelector(cp.Spec.NamespaceSelector, hasher)
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeLocalQueue prepares a LocalQueue for infra.json (filtering annotations and omitting status).
-func SanitizeLocalQueue(lq *kueuev1beta2.LocalQueue, extraDeniedKeys []string) map[string]any {
+// SanitizeLocalQueue prepares a LocalQueue for infra.json (filtering annotations, hashing sensitive/--hash-labels values, and omitting status).
+func SanitizeLocalQueue(lq *kueuev1beta2.LocalQueue, hasher LabelHasher) map[string]any {
 	if lq == nil {
 		return nil
 	}
 	cp := lq.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "LocalQueue"}
-	sanitizeInfraObjectMeta(&cp.ObjectMeta, extraDeniedKeys)
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeResourceFlavor prepares a ResourceFlavor for infra.json (filtering annotations and omitting status).
-func SanitizeResourceFlavor(rf *kueuev1beta2.ResourceFlavor, extraDeniedKeys []string) map[string]any {
+// SanitizeResourceFlavor prepares a ResourceFlavor for infra.json (filtering annotations, hashing sensitive/--hash-labels
+// values including spec.nodeLabels, and omitting status).
+func SanitizeResourceFlavor(rf *kueuev1beta2.ResourceFlavor, hasher LabelHasher) map[string]any {
 	if rf == nil {
 		return nil
 	}
 	cp := rf.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "ResourceFlavor"}
-	sanitizeInfraObjectMeta(&cp.ObjectMeta, extraDeniedKeys)
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
+	cp.Spec.NodeLabels = SanitizeNodeLabels(cp.Spec.NodeLabels, hasher)
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeTopology prepares a Topology for infra.json (filtering annotations and omitting status).
-func SanitizeTopology(topo *kueuev1beta2.Topology, extraDeniedKeys []string) map[string]any {
+// SanitizeTopology prepares a Topology for infra.json (filtering annotations, hashing sensitive/--hash-labels values, and omitting status).
+func SanitizeTopology(topo *kueuev1beta2.Topology, hasher LabelHasher) map[string]any {
 	if topo == nil {
 		return nil
 	}
 	cp := topo.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "Topology"}
-	sanitizeInfraObjectMeta(&cp.ObjectMeta, extraDeniedKeys)
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
 	return toMapWithoutStatus(cp)
 }
 
 // SanitizeJob sanitizes a batch/v1 Job for workflows.json.
-func SanitizeJob(job *batchv1.Job, pauseImage string, hashNames bool, extraDeniedKeys []string) map[string]any {
+func SanitizeJob(job *batchv1.Job, pauseImage string, hashNames bool, hasher LabelHasher) map[string]any {
 	cp := job.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "batch/v1", Kind: "Job"}
-	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, extraDeniedKeys)
-	cp.Spec.Selector = SanitizeLabelSelector(cp.Spec.Selector, hashNames, extraDeniedKeys)
-	SanitizePodTemplateSpec(&cp.Spec.Template, pauseImage, hashNames, extraDeniedKeys)
+	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
+	cp.Spec.Selector = SanitizeLabelSelector(cp.Spec.Selector, hashNames, hasher)
+	SanitizePodTemplateSpec(&cp.Spec.Template, pauseImage, hashNames, hasher)
 	return toMapWithoutStatus(cp)
 }
 
 // SanitizeJobSet sanitizes a jobset.x-k8s.io/v1alpha2 JobSet for workflows.json.
-func SanitizeJobSet(js *jobsetv1alpha2.JobSet, pauseImage string, hashNames bool, extraDeniedKeys []string) map[string]any {
+func SanitizeJobSet(js *jobsetv1alpha2.JobSet, pauseImage string, hashNames bool, hasher LabelHasher) map[string]any {
 	cp := js.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: jobsetv1alpha2.GroupVersion.String(), Kind: "JobSet"}
-	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, extraDeniedKeys)
+	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
 	cp.Spec.VolumeClaimPolicies = nil
 	for i := range cp.Spec.ReplicatedJobs {
 		rj := &cp.Spec.ReplicatedJobs[i]
 		rj.Template.ObjectMeta.ManagedFields = nil
 		rj.Template.ObjectMeta.Annotations = FilterAnnotations(rj.Template.ObjectMeta.Annotations, hashNames)
-		rj.Template.ObjectMeta.Labels = SanitizeLabels(rj.Template.ObjectMeta.Labels, hashNames, extraDeniedKeys)
-		rj.Template.Spec.Selector = SanitizeLabelSelector(rj.Template.Spec.Selector, hashNames, extraDeniedKeys)
-		SanitizePodTemplateSpec(&rj.Template.Spec.Template, pauseImage, hashNames, extraDeniedKeys)
+		rj.Template.ObjectMeta.Labels = SanitizeLabels(rj.Template.ObjectMeta.Labels, hashNames, hasher)
+		rj.Template.Spec.Selector = SanitizeLabelSelector(rj.Template.Spec.Selector, hashNames, hasher)
+		SanitizePodTemplateSpec(&rj.Template.Spec.Template, pauseImage, hashNames, hasher)
 	}
 	return toMapWithoutStatus(cp)
 }
 
 // SanitizeLeaderWorkerSet sanitizes a leaderworkerset.x-k8s.io/v1 LeaderWorkerSet for workflows.json.
-func SanitizeLeaderWorkerSet(lws *leaderworkersetv1.LeaderWorkerSet, pauseImage string, hashNames bool, extraDeniedKeys []string) map[string]any {
+func SanitizeLeaderWorkerSet(lws *leaderworkersetv1.LeaderWorkerSet, pauseImage string, hashNames bool, hasher LabelHasher) map[string]any {
 	cp := lws.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: leaderworkersetv1.GroupVersion.String(), Kind: "LeaderWorkerSet"}
-	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, extraDeniedKeys)
+	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
 	cp.Spec.LeaderWorkerTemplate.VolumeClaimTemplates = nil
 	if cp.Spec.LeaderWorkerTemplate.LeaderTemplate != nil {
-		SanitizePodTemplateSpec(cp.Spec.LeaderWorkerTemplate.LeaderTemplate, pauseImage, hashNames, extraDeniedKeys)
+		SanitizePodTemplateSpec(cp.Spec.LeaderWorkerTemplate.LeaderTemplate, pauseImage, hashNames, hasher)
 	}
-	SanitizePodTemplateSpec(&cp.Spec.LeaderWorkerTemplate.WorkerTemplate, pauseImage, hashNames, extraDeniedKeys)
+	SanitizePodTemplateSpec(&cp.Spec.LeaderWorkerTemplate.WorkerTemplate, pauseImage, hashNames, hasher)
 	return toMapWithoutStatus(cp)
 }
 
 // SanitizeDeployment sanitizes an apps/v1 Deployment for workflows.json.
-func SanitizeDeployment(deploy *appsv1.Deployment, pauseImage string, hashNames bool, extraDeniedKeys []string) map[string]any {
+func SanitizeDeployment(deploy *appsv1.Deployment, pauseImage string, hashNames bool, hasher LabelHasher) map[string]any {
 	cp := deploy.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}
-	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, extraDeniedKeys)
-	cp.Spec.Selector = SanitizeLabelSelector(cp.Spec.Selector, hashNames, extraDeniedKeys)
-	SanitizePodTemplateSpec(&cp.Spec.Template, pauseImage, hashNames, extraDeniedKeys)
+	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
+	cp.Spec.Selector = SanitizeLabelSelector(cp.Spec.Selector, hashNames, hasher)
+	SanitizePodTemplateSpec(&cp.Spec.Template, pauseImage, hashNames, hasher)
 	return toMapWithoutStatus(cp)
 }
 
-func sanitizeRayClusterSpec(spec *rayv1.RayClusterSpec, pauseImage string, hashNames bool, extraDeniedKeys []string) {
+func sanitizeRayClusterSpec(spec *rayv1.RayClusterSpec, pauseImage string, hashNames bool, hasher LabelHasher) {
 	if spec == nil {
 		return
 	}
 	spec.HeadServiceAnnotations = FilterAnnotations(spec.HeadServiceAnnotations, hashNames)
 	spec.HeadGroupSpec.RayStartParams = nil
+	spec.HeadGroupSpec.Labels = SanitizeLabels(spec.HeadGroupSpec.Labels, hashNames, hasher)
 	if spec.HeadGroupSpec.HeadService != nil {
-		SanitizeWorkflowObjectMeta(&spec.HeadGroupSpec.HeadService.ObjectMeta, hashNames, extraDeniedKeys)
+		SanitizeWorkflowObjectMeta(&spec.HeadGroupSpec.HeadService.ObjectMeta, hashNames, hasher)
+		spec.HeadGroupSpec.HeadService.Spec.Selector = SanitizeLabels(spec.HeadGroupSpec.HeadService.Spec.Selector, hashNames, hasher)
 	}
-	SanitizePodTemplateSpec(&spec.HeadGroupSpec.Template, pauseImage, hashNames, extraDeniedKeys)
+	SanitizePodTemplateSpec(&spec.HeadGroupSpec.Template, pauseImage, hashNames, hasher)
 	for i := range spec.WorkerGroupSpecs {
 		w := &spec.WorkerGroupSpecs[i]
 		w.RayStartParams = nil
-		SanitizePodTemplateSpec(&w.Template, pauseImage, hashNames, extraDeniedKeys)
+		w.Labels = SanitizeLabels(w.Labels, hashNames, hasher)
+		SanitizePodTemplateSpec(&w.Template, pauseImage, hashNames, hasher)
 	}
 }
 
 // SanitizeRayJob sanitizes a ray.io/v1 RayJob for workflows.json.
-func SanitizeRayJob(rj *rayv1.RayJob, pauseImage string, hashNames bool, extraDeniedKeys []string) map[string]any {
+func SanitizeRayJob(rj *rayv1.RayJob, pauseImage string, hashNames bool, hasher LabelHasher) map[string]any {
 	cp := rj.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: rayv1.GroupVersion.String(), Kind: "RayJob"}
-	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, extraDeniedKeys)
+	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
 	cp.Spec.Entrypoint = ""
 	cp.Spec.RuntimeEnvYAML = ""
 	cp.Spec.Metadata = nil
+	cp.Spec.ClusterSelector = SanitizeLabels(cp.Spec.ClusterSelector, hashNames, hasher)
 	if cp.Spec.SubmitterPodTemplate != nil {
-		SanitizePodTemplateSpec(cp.Spec.SubmitterPodTemplate, pauseImage, hashNames, extraDeniedKeys)
+		SanitizePodTemplateSpec(cp.Spec.SubmitterPodTemplate, pauseImage, hashNames, hasher)
 	}
-	sanitizeRayClusterSpec(cp.Spec.RayClusterSpec, pauseImage, hashNames, extraDeniedKeys)
+	sanitizeRayClusterSpec(cp.Spec.RayClusterSpec, pauseImage, hashNames, hasher)
 	return toMapWithoutStatus(cp)
 }
 
 // SanitizeRayCluster sanitizes a ray.io/v1 RayCluster for workflows.json.
-func SanitizeRayCluster(rc *rayv1.RayCluster, pauseImage string, hashNames bool, extraDeniedKeys []string) map[string]any {
+func SanitizeRayCluster(rc *rayv1.RayCluster, pauseImage string, hashNames bool, hasher LabelHasher) map[string]any {
 	cp := rc.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: rayv1.GroupVersion.String(), Kind: "RayCluster"}
-	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, extraDeniedKeys)
-	sanitizeRayClusterSpec(&cp.Spec, pauseImage, hashNames, extraDeniedKeys)
+	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
+	sanitizeRayClusterSpec(&cp.Spec, pauseImage, hashNames, hasher)
 	return toMapWithoutStatus(cp)
 }
 
 // SanitizeStandaloneKueuePod sanitizes a standalone Kueue-managed v1/Pod for workflows.json.
-func SanitizeStandaloneKueuePod(pod *corev1.Pod, pauseImage string, hashNames bool, extraDeniedKeys []string) map[string]any {
+func SanitizeStandaloneKueuePod(pod *corev1.Pod, pauseImage string, hashNames bool, hasher LabelHasher) map[string]any {
 	cp := pod.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
-	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, extraDeniedKeys)
-	SanitizePodSpec(&cp.Spec, pauseImage)
+	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hashNames, hasher)
+	SanitizePodSpec(&cp.Spec, pauseImage, hashNames, hasher)
 	return toMapWithoutStatus(cp)
 }

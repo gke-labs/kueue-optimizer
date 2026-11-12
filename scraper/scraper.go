@@ -103,6 +103,7 @@ type workloadExecState struct {
 // pods, workflows, and Kueue workload execution times.
 type Scraper struct {
 	cfg           Config
+	labelHasher   LabelHasher
 	kubeClient    kubernetes.Interface
 	kueueClient   kueueclientset.Interface
 	jobsetClient  jobsetclientset.Interface
@@ -140,6 +141,7 @@ func NewScraper(
 	}
 	return &Scraper{
 		cfg:            cfg,
+		labelHasher:    NewLabelHasher(cfg.HashedLabels, cfg.HashSalt),
 		kubeClient:     kubeClient,
 		kueueClient:    kueueClient,
 		jobsetClient:   jobsetClient,
@@ -316,7 +318,7 @@ func (s *Scraper) scrapeNodes(ctx context.Context, now time.Time) {
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		node := &list.Items[i]
-		payload := SanitizeNode(node, s.cfg.DeniedLabels)
+		payload := SanitizeNode(node, s.labelHasher)
 		current[node.Name] = cachedObject{
 			name:    node.Name,
 			digest:  canonicalDigest(payload),
@@ -338,7 +340,7 @@ func (s *Scraper) scrapeNamespaces(ctx context.Context, now time.Time) {
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		ns := &list.Items[i]
-		payload := SanitizeNamespace(ns, s.cfg.DeniedLabels)
+		payload := SanitizeNamespace(ns, s.labelHasher)
 		current[ns.Name] = cachedObject{
 			name:    ns.Name,
 			digest:  canonicalDigest(payload),
@@ -359,7 +361,7 @@ func (s *Scraper) scrapeClusterQueues(ctx context.Context, now time.Time) {
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		cq := &list.Items[i]
-		payload := SanitizeClusterQueue(cq, s.cfg.DeniedLabels)
+		payload := SanitizeClusterQueue(cq, s.labelHasher)
 		current[cq.Name] = cachedObject{
 			name:    cq.Name,
 			digest:  canonicalDigest(payload),
@@ -380,7 +382,7 @@ func (s *Scraper) scrapeLocalQueues(ctx context.Context, now time.Time) {
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		lq := &list.Items[i]
-		payload := SanitizeLocalQueue(lq, s.cfg.DeniedLabels)
+		payload := SanitizeLocalQueue(lq, s.labelHasher)
 		key := lq.Namespace + "/" + lq.Name
 		current[key] = cachedObject{
 			name:      lq.Name,
@@ -403,7 +405,7 @@ func (s *Scraper) scrapeResourceFlavors(ctx context.Context, now time.Time) {
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		rf := &list.Items[i]
-		payload := SanitizeResourceFlavor(rf, s.cfg.DeniedLabels)
+		payload := SanitizeResourceFlavor(rf, s.labelHasher)
 		current[rf.Name] = cachedObject{
 			name:    rf.Name,
 			digest:  canonicalDigest(payload),
@@ -424,7 +426,7 @@ func (s *Scraper) scrapeTopologies(ctx context.Context, now time.Time) {
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		topo := &list.Items[i]
-		payload := SanitizeTopology(topo, s.cfg.DeniedLabels)
+		payload := SanitizeTopology(topo, s.labelHasher)
 		current[topo.Name] = cachedObject{
 			name:    topo.Name,
 			digest:  canonicalDigest(payload),
@@ -546,7 +548,7 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 		s.mu.Lock()
 		wlState := s.determinePodWorkloadStateLocked(pod.Namespace, pod.Name, hasAdmissionGate, hasTopologyGate)
 		s.mu.Unlock()
-		payload := SanitizeStandaloneKueuePod(pod, s.cfg.PauseImage, s.cfg.HashNames, s.cfg.DeniedLabels)
+		payload := SanitizeStandaloneKueuePod(pod, s.cfg.PauseImage, s.cfg.HashNames, s.labelHasher)
 		s.recordWorkflowEvent(
 			eventType,
 			"Pod",
@@ -812,7 +814,7 @@ func (s *Scraper) handleJobWatchEvent(eventType watch.EventType, job *batchv1.Jo
 	wlState := s.determineSuspendableWorkloadStateLocked("Job", job.Namespace, job.Name, suspended, parentJobSet)
 	s.mu.Unlock()
 
-	payload := SanitizeJob(job, s.cfg.PauseImage, s.cfg.HashNames, s.cfg.DeniedLabels)
+	payload := SanitizeJob(job, s.cfg.PauseImage, s.cfg.HashNames, s.labelHasher)
 	s.recordWorkflowEvent(eventType, "Job", job.Name, job.Namespace, job.CreationTimestamp, lq, wlState, payload, now)
 }
 
@@ -831,7 +833,7 @@ func (s *Scraper) handleJobSetWatchEvent(eventType watch.EventType, js *jobsetv1
 	wlState := s.determineSuspendableWorkloadStateLocked("JobSet", js.Namespace, js.Name, suspended, "")
 	s.mu.Unlock()
 
-	payload := SanitizeJobSet(js, s.cfg.PauseImage, s.cfg.HashNames, s.cfg.DeniedLabels)
+	payload := SanitizeJobSet(js, s.cfg.PauseImage, s.cfg.HashNames, s.labelHasher)
 	s.recordWorkflowEvent(eventType, "JobSet", js.Name, js.Namespace, js.CreationTimestamp, lq, wlState, payload, now)
 }
 
@@ -848,7 +850,7 @@ func (s *Scraper) handleDeploymentWatchEvent(eventType watch.EventType, deploy *
 	wlState := s.determineGroupWorkloadStateLocked("Deployment", deploy.Namespace, deploy.Name, deploy.Status.ReadyReplicas, deploy.Status.Replicas)
 	s.mu.Unlock()
 
-	payload := SanitizeDeployment(deploy, s.cfg.PauseImage, s.cfg.HashNames, s.cfg.DeniedLabels)
+	payload := SanitizeDeployment(deploy, s.cfg.PauseImage, s.cfg.HashNames, s.labelHasher)
 	s.recordWorkflowEvent(eventType, "Deployment", deploy.Name, deploy.Namespace, deploy.CreationTimestamp, lq, wlState, payload, now)
 }
 
@@ -865,7 +867,7 @@ func (s *Scraper) handleLeaderWorkerSetWatchEvent(eventType watch.EventType, lws
 	wlState := s.determineGroupWorkloadStateLocked("LeaderWorkerSet", lws.Namespace, lws.Name, lws.Status.ReadyReplicas, lws.Status.Replicas)
 	s.mu.Unlock()
 
-	payload := SanitizeLeaderWorkerSet(lws, s.cfg.PauseImage, s.cfg.HashNames, s.cfg.DeniedLabels)
+	payload := SanitizeLeaderWorkerSet(lws, s.cfg.PauseImage, s.cfg.HashNames, s.labelHasher)
 	s.recordWorkflowEvent(eventType, "LeaderWorkerSet", lws.Name, lws.Namespace, lws.CreationTimestamp, lq, wlState, payload, now)
 }
 
@@ -879,7 +881,7 @@ func (s *Scraper) handleRayJobWatchEvent(eventType watch.EventType, rj *rayv1.Ra
 	wlState := s.determineSuspendableWorkloadStateLocked("RayJob", rj.Namespace, rj.Name, rj.Spec.Suspend, "")
 	s.mu.Unlock()
 
-	payload := SanitizeRayJob(rj, s.cfg.PauseImage, s.cfg.HashNames, s.cfg.DeniedLabels)
+	payload := SanitizeRayJob(rj, s.cfg.PauseImage, s.cfg.HashNames, s.labelHasher)
 	s.recordWorkflowEvent(eventType, "RayJob", rj.Name, rj.Namespace, rj.CreationTimestamp, lq, wlState, payload, now)
 }
 
@@ -894,7 +896,7 @@ func (s *Scraper) handleRayClusterWatchEvent(eventType watch.EventType, rc *rayv
 	wlState := s.determineSuspendableWorkloadStateLocked("RayCluster", rc.Namespace, rc.Name, suspended, "")
 	s.mu.Unlock()
 
-	payload := SanitizeRayCluster(rc, s.cfg.PauseImage, s.cfg.HashNames, s.cfg.DeniedLabels)
+	payload := SanitizeRayCluster(rc, s.cfg.PauseImage, s.cfg.HashNames, s.labelHasher)
 	s.recordWorkflowEvent(eventType, "RayCluster", rc.Name, rc.Namespace, rc.CreationTimestamp, lq, wlState, payload, now)
 }
 

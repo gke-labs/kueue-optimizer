@@ -17,6 +17,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -34,7 +36,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubefake "k8s.io/client-go/kubernetes/fake"
@@ -177,6 +181,7 @@ func TestShouldKeepAnnotation(t *testing.T) {
 		{key: "kueue-optimizer", want: false},
 		{key: "kubernetes.io/", want: false},
 		{key: "/kubernetes.io", want: false},
+		{key: ".kubernetes.io/foo", want: false},
 		{key: "kubernetes.io/nested/slash", want: false},
 		{key: "", want: false},
 	}
@@ -229,7 +234,7 @@ func TestNodeLabelSanitization(t *testing.T) {
 			Labels: input,
 		},
 	}
-	sanitized := SanitizeNode(node, nil)
+	sanitized := SanitizeNode(node, NewLabelHasher(nil, nil))
 
 	for k, want := range savedLabels {
 		if got := sanitized.Labels[k]; got != want {
@@ -268,7 +273,7 @@ func TestSanitizationListsAreLowercase(t *testing.T) {
 		items []string
 	}{
 		{"deniedNodeLabelKeys", deniedNodeLabelKeys},
-		{"deniedWorkflowLabelKeys", deniedWorkflowLabelKeys},
+		{"hashedLabelKeys", hashedLabelKeys},
 		{"deniedAnnotationKeys", deniedAnnotationKeys},
 		{"allowedAnnotationDomains", allowedAnnotationDomains},
 	} {
@@ -276,6 +281,11 @@ func TestSanitizationListsAreLowercase(t *testing.T) {
 			if item != strings.ToLower(item) {
 				t.Errorf("%s entry %q must be lowercase", list.name, item)
 			}
+		}
+	}
+	for k := range protectedLabelKeys {
+		if k != strings.ToLower(k) {
+			t.Errorf("protectedLabelKeys key %q must be lowercase", k)
 		}
 	}
 	for k := range labelKeysHoldingWorkloadNames {
@@ -308,14 +318,17 @@ func TestSanitizeLabels(t *testing.T) {
 		KueuePrebuiltWorkloadLabel,
 		KueuePodGroupNameLabel,
 	}
-	omittedLabels := []string{
+	hashedValueLabels := []string{
 		"owner",
 		"TEAM",
 		"customer",
 		"cost-center",
 		"project",
 		"email",
-		"corp.io/custom-denied",
+		"custom-unprefixed",
+		"corp.io/owner",
+		"corp.io/custom-tag",
+		"sub.wildcard.io/secret-tag",
 	}
 
 	rawWorkloadRef := testSecretNamePrefix + "workload"
@@ -326,28 +339,328 @@ func TestSanitizeLabels(t *testing.T) {
 	for _, k := range hashedWorkloadLabels {
 		input[k] = rawWorkloadRef
 	}
-	for _, k := range omittedLabels {
+	for _, k := range hashedValueLabels {
 		input[k] = testSecretValue
 	}
 
-	sanitized := SanitizeLabels(input, true, []string{"Corp.IO/Custom-Denied"})
+	hasher := NewLabelHasher([]string{
+		"Corp.IO/Custom-Tag",
+		"custom-unprefixed",
+		"wildcard.io/*",
+		KueueQueueLabel, // protected control-plane key must never be hashed
+	}, nil)
+	sanitized := SanitizeLabels(input, true, hasher)
+
+	for k, v := range sanitized {
+		if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+			t.Errorf("sanitized label key %q is not a valid Kubernetes label key: %v", k, errs)
+		}
+		if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
+			t.Errorf("sanitized label %q=%q is not a valid Kubernetes label value: %v", k, v, errs)
+		}
+	}
 
 	for k, want := range savedPlain {
 		if got := sanitized[k]; got != want {
 			t.Errorf("expected label %q=%q to be preserved in plain text, got %q", k, want, got)
 		}
 	}
-	wantHash := HashName(rawWorkloadRef, true)
+	wantWorkloadHash := hasher.HashValue(rawWorkloadRef)
 	for _, k := range hashedWorkloadLabels {
-		if got := sanitized[k]; got != wantHash {
-			t.Errorf("expected workload-name label %q to be SHA-256 hashed to %q, got %q", k, wantHash, got)
+		if got := sanitized[k]; got != wantWorkloadHash {
+			t.Errorf("expected workload-name label %q to be hashed to %q, got %q", k, wantWorkloadHash, got)
 		}
 	}
-	for _, k := range omittedLabels {
-		for _, candidate := range []string{k, strings.ToLower(k)} {
-			if got, exists := sanitized[candidate]; exists {
-				t.Errorf("expected denied label %q to be omitted, got %q", candidate, got)
-			}
+	wantSecretHash := hasher.HashValue(testSecretValue)
+	for _, k := range hashedValueLabels {
+		if got := sanitized[k]; got != wantSecretHash {
+			t.Errorf("expected sensitive label %q to keep its key and have hashed value %q, got %q", k, wantSecretHash, got)
+		}
+	}
+}
+
+func TestSaltedLabelHashingPreventsDictionaryAndCrossRunCorrelation(t *testing.T) {
+	lowEntropyVal := "ai"
+	unsaltedSum := sha256.Sum256([]byte(lowEntropyVal))
+	unsaltedDigest := "h-" + hex.EncodeToString(unsaltedSum[:16])
+
+	run1 := NewLabelHasher(nil, nil)
+	run2 := NewLabelHasher(nil, nil)
+
+	h1 := run1.HashValue(lowEntropyVal)
+	h2 := run2.HashValue(lowEntropyVal)
+
+	if h1 == unsaltedDigest || h2 == unsaltedDigest {
+		t.Errorf("expected salted HMAC-SHA256 digest to differ from unsalted SHA-256 %q", unsaltedDigest)
+	}
+	if h1 == h2 {
+		t.Errorf("expected independent per-run CSPRNG salts to produce distinct digests, both produced %q", h1)
+	}
+	// Within the same run, hashing the same label value is deterministic.
+	if run1.HashValue(lowEntropyVal) != h1 {
+		t.Errorf("expected deterministic digest within the same LabelHasher run")
+	}
+
+	// Verify startup banner never leaks raw or hex-encoded salt bytes.
+	customSalt := []byte("super-secret-salt-must-not-print")
+	var banner bytes.Buffer
+	PrintStartupBanner(&banner, Config{
+		Interval:     60 * time.Second,
+		PauseImage:   DefaultPauseImage,
+		HashedLabels: []string{"corp.io/team"},
+		HashSalt:     customSalt,
+	})
+	bannerStr := banner.String()
+	if strings.Contains(bannerStr, string(customSalt)) || strings.Contains(bannerStr, hex.EncodeToString(customSalt)) {
+		t.Errorf("startup banner leaked HashSalt:\n%s", bannerStr)
+	}
+}
+
+func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
+	hasher := NewLabelHasher([]string{"corp.io/*"}, nil)
+	rawDeployName := testSecretNamePrefix + "ranker"
+
+	// 1. Deployment selecting pods ONLY via sensitive/hashed labels must keep a non-empty valid selector
+	// (with original keys and hashed values) that matches its sanitized PodTemplateSpec labels, and PodSpec
+	// affinities/spread constraints must match too.
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      rawDeployName,
+			Namespace: "ai-lab",
+			Labels: map[string]string{
+				"team":            testSecretValue,
+				"project":         testSecretValue,
+				"corp.io/service": testSecretValue,
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"team":            testSecretValue,
+					"project":         testSecretValue,
+					"corp.io/service": testSecretValue,
+				},
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Key:      "corp.io/tier",
+						Operator: metav1.LabelSelectorOpIn,
+						Values:   []string{testSecretValue},
+					},
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app":             rawDeployName,
+						"team":            testSecretValue,
+						"project":         testSecretValue,
+						"corp.io/service": testSecretValue,
+						"corp.io/tier":    testSecretValue,
+					},
+				},
+				Spec: corev1.PodSpec{
+					NodeSelector: map[string]string{
+						"cloud.google.com/gke-cluster-name": testSecretValue,
+						"corp.io/team":                      testSecretValue,
+						"instance":                          "gpu",
+					},
+					Affinity: &corev1.Affinity{
+						NodeAffinity: &corev1.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+								NodeSelectorTerms: []corev1.NodeSelectorTerm{
+									{
+										MatchExpressions: []corev1.NodeSelectorRequirement{
+											{
+												Key:      "cloud.google.com/gke-cluster-name",
+												Operator: corev1.NodeSelectorOpIn,
+												Values:   []string{testSecretValue},
+											},
+											{
+												Key:      "corp.io/team",
+												Operator: corev1.NodeSelectorOpIn,
+												Values:   []string{testSecretValue},
+											},
+										},
+									},
+								},
+							},
+						},
+						PodAntiAffinity: &corev1.PodAntiAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"app":  rawDeployName,
+											"team": testSecretValue,
+										},
+									},
+									NamespaceSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"corp.io/tenant": testSecretValue,
+										},
+									},
+									MatchLabelKeys:    []string{"corp.io/service", "app"},
+									MismatchLabelKeys: []string{"corp.io/tier"},
+									TopologyKey:       "corp.io/team",
+								},
+							},
+						},
+					},
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{
+						{
+							MaxSkew:           1,
+							TopologyKey:       "corp.io/team",
+							WhenUnsatisfiable: corev1.DoNotSchedule,
+							LabelSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"app":             rawDeployName,
+									"corp.io/service": testSecretValue,
+								},
+							},
+							MatchLabelKeys: []string{"corp.io/tier"},
+						},
+					},
+					Containers: []corev1.Container{{Name: "main", Image: testSecretImage}},
+				},
+			},
+		},
+	}
+
+	sanitizedMap := SanitizeDeployment(deploy, DefaultPauseImage, true, hasher)
+	rawJSON, err := json.Marshal(sanitizedMap)
+	if err != nil {
+		t.Fatalf("marshal sanitized deployment: %v", err)
+	}
+	jsonStr := string(rawJSON)
+	for _, secret := range testForbiddenSubstrings {
+		if strings.Contains(jsonStr, secret) {
+			t.Errorf("sanitized Deployment leaked %q:\n%s", secret, jsonStr)
+		}
+	}
+
+	var roundTrip appsv1.Deployment
+	if err := json.Unmarshal(rawJSON, &roundTrip); err != nil {
+		t.Fatalf("unmarshal sanitized deployment: %v", err)
+	}
+	if len(roundTrip.Spec.Selector.MatchLabels) == 0 {
+		t.Fatalf("expected Deployment.Spec.Selector.MatchLabels to remain non-empty")
+	}
+	sel, err := metav1.LabelSelectorAsSelector(roundTrip.Spec.Selector)
+	if err != nil {
+		t.Fatalf("Deployment.Spec.Selector invalid after sanitization: %v", err)
+	}
+	podLabels := labels.Set(roundTrip.Spec.Template.Labels)
+	if !sel.Matches(podLabels) {
+		t.Errorf("sanitized Deployment selector %v does not match sanitized pod template labels %v", roundTrip.Spec.Selector, podLabels)
+	}
+
+	antiTerm := roundTrip.Spec.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0]
+	antiSel, err := metav1.LabelSelectorAsSelector(antiTerm.LabelSelector)
+	if err != nil || !antiSel.Matches(podLabels) {
+		t.Errorf("sanitized PodAntiAffinity labelSelector %v failed to match pod labels %v (err=%v)", antiTerm.LabelSelector, podLabels, err)
+	}
+	tsc := roundTrip.Spec.Template.Spec.TopologySpreadConstraints[0]
+	tscSel, err := metav1.LabelSelectorAsSelector(tsc.LabelSelector)
+	if err != nil || !tscSel.Matches(podLabels) {
+		t.Errorf("sanitized TopologySpreadConstraint labelSelector %v failed to match pod labels %v (err=%v)", tsc.LabelSelector, podLabels, err)
+	}
+
+	// 2. Verify default hashedLabelKeys (e.g. "team") AND --hash-labels hash identically across
+	// Namespace <-> ClusterQueue.spec.namespaceSelector and Node <-> ResourceFlavor <-> PodSpec.nodeSelector,
+	// even when "team" is NOT passed via --hash-labels.
+	nsMap := SanitizeNamespace(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ai-lab",
+			Labels: map[string]string{
+				"team":           testSecretValue,
+				"corp.io/tenant": testSecretValue,
+			},
+		},
+	}, hasher)
+	cqMap := SanitizeClusterQueue(&kueuev1beta2.ClusterQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-lab-cq"},
+		Spec: kueuev1beta2.ClusterQueueSpec{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"team":           testSecretValue,
+					"corp.io/tenant": testSecretValue,
+				},
+			},
+		},
+	}, hasher)
+	nsBytes, _ := json.Marshal(nsMap)
+	cqBytes, _ := json.Marshal(cqMap)
+	var cleanNS corev1.Namespace
+	var cleanCQ kueuev1beta2.ClusterQueue
+	_ = json.Unmarshal(nsBytes, &cleanNS)
+	_ = json.Unmarshal(cqBytes, &cleanCQ)
+	if cleanNS.Labels["team"] != hasher.HashValue(testSecretValue) {
+		t.Errorf("expected default sensitive key 'team' to have hashed value on Namespace, got %v", cleanNS.Labels)
+	}
+	cqNsSel, err := metav1.LabelSelectorAsSelector(cleanCQ.Spec.NamespaceSelector)
+	if err != nil || !cqNsSel.Matches(labels.Set(cleanNS.Labels)) {
+		t.Errorf("sanitized ClusterQueue.Spec.NamespaceSelector %v does not match sanitized Namespace labels %v (err=%v)", cleanCQ.Spec.NamespaceSelector, cleanNS.Labels, err)
+	}
+	antiNsSel, err := metav1.LabelSelectorAsSelector(antiTerm.NamespaceSelector)
+	if err != nil || !antiNsSel.Matches(labels.Set(cleanNS.Labels)) {
+		t.Errorf("sanitized PodAntiAffinity.NamespaceSelector %v does not match sanitized Namespace labels %v (err=%v)", antiTerm.NamespaceSelector, cleanNS.Labels, err)
+	}
+
+	// Also verify default "team" hashing on Node + ResourceFlavor when extraKeys is nil.
+	defaultHasher := NewLabelHasher(nil, nil)
+	cleanNodeDefault := SanitizeNode(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-default",
+			Labels: map[string]string{"team": testSecretValue, "instance": "gpu"},
+		},
+	}, defaultHasher)
+	if cleanNodeDefault.Labels["team"] != defaultHasher.HashValue(testSecretValue) {
+		t.Errorf("expected default 'team' label on Node to be hashed even without --hash-labels, got %v", cleanNodeDefault.Labels)
+	}
+
+	cleanNode := SanitizeNode(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-0",
+			Labels: map[string]string{
+				"corp.io/team": testSecretValue,
+				"instance":     "gpu",
+			},
+		},
+	}, hasher)
+	rfMap := SanitizeResourceFlavor(&kueuev1beta2.ResourceFlavor{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-rf"},
+		Spec: kueuev1beta2.ResourceFlavorSpec{
+			NodeLabels: map[string]string{
+				"corp.io/team": testSecretValue,
+				"instance":     "gpu",
+			},
+		},
+	}, hasher)
+	topoMap := SanitizeTopology(&kueuev1beta2.Topology{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-topo"},
+		Spec: kueuev1beta2.TopologySpec{
+			Levels: []kueuev1beta2.TopologyLevel{{NodeLabel: "corp.io/team"}},
+		},
+	}, hasher)
+	rfBytes, _ := json.Marshal(rfMap)
+	topoBytes, _ := json.Marshal(topoMap)
+	var cleanRF kueuev1beta2.ResourceFlavor
+	var cleanTopo kueuev1beta2.Topology
+	_ = json.Unmarshal(rfBytes, &cleanRF)
+	_ = json.Unmarshal(topoBytes, &cleanTopo)
+
+	if cleanNode.Labels["corp.io/team"] != hasher.HashValue(testSecretValue) {
+		t.Errorf("expected preserved key 'corp.io/team' with hashed value on Node, got %v", cleanNode.Labels)
+	}
+	if cleanRF.Spec.NodeLabels["corp.io/team"] != cleanNode.Labels["corp.io/team"] {
+		t.Errorf("ResourceFlavor.Spec.NodeLabels %v out of sync with Node.Labels %v", cleanRF.Spec.NodeLabels, cleanNode.Labels)
+	}
+	if cleanTopo.Spec.Levels[0].NodeLabel != "corp.io/team" || antiTerm.TopologyKey != "corp.io/team" || tsc.TopologyKey != "corp.io/team" {
+		t.Errorf("expected topology keys to remain 'corp.io/team'; got topo=%q anti=%q tsc=%q", cleanTopo.Spec.Levels[0].NodeLabel, antiTerm.TopologyKey, tsc.TopologyKey)
+	}
+	for k, v := range roundTrip.Spec.Template.Spec.NodeSelector {
+		if cleanNode.Labels[k] != v {
+			t.Errorf("PodSpec.NodeSelector[%q]=%q does not match Node.Labels %v", k, v, cleanNode.Labels)
 		}
 	}
 }
@@ -471,7 +784,7 @@ func TestPodSpecProbesLifecycleAndIdentitySanitization(t *testing.T) {
 		},
 	}
 
-	SanitizePodSpec(spec, DefaultPauseImage)
+	SanitizePodSpec(spec, DefaultPauseImage, true, NewLabelHasher(nil, nil))
 
 	for _, f := range []struct {
 		name  string
@@ -599,7 +912,7 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "ai-lab",
-			Labels: map[string]string{"team": "ai"},
+			Labels: map[string]string{"team": testSecretValue, "environment": "prod"},
 			Annotations: map[string]string{
 				"corp.internal/owner":              testSecretEmail,
 				"k8s.io/ns-note":                   "keep-ns-annot",
@@ -808,7 +1121,8 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		"KubeletReady",
 		"keep-ns-annot",
 		"keep-cq-annot",
-		`"team":"ai"`,
+		`"environment":"prod"`,
+		`"team":"` + scraper.labelHasher.HashValue(testSecretValue) + `"`,
 	} {
 		if !strings.Contains(infraStr, expected) {
 			t.Errorf("infra.json missing expected sanitized field/value %q:\n%s", expected, infraStr)
@@ -822,7 +1136,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		Interval:          60 * time.Second,
 		HashNames:         true,
 		PauseImage:        DefaultPauseImage,
-		DeniedLabels:      []string{"corp.io/custom-denied"},
+		HashedLabels:      []string{"corp.io/custom-hashed"},
 		InfraFile:         filepath.Join(tmpDir, "infra.json"),
 		WorkflowsFile:     filepath.Join(tmpDir, "workflows.json"),
 		ExecutionTimeFile: filepath.Join(tmpDir, "execution-time.json"),
@@ -864,7 +1178,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 				"owner":                 testSecretEmail,
 				"team":                  testSecretValue,
 				"customer":              testSecretValue,
-				"corp.io/custom-denied": testSecretValue,
+				"corp.io/custom-hashed": testSecretValue,
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -1003,7 +1317,20 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		"app":                    testSecretNamePrefix + "deployment",
 		"app.kubernetes.io/name": testSecretNamePrefix + "deployment",
 		"owner":                  testSecretEmail,
-		"corp.io/custom-denied":  testSecretValue,
+		"corp.io/custom-hashed":  testSecretValue,
+	}
+	deployTpl.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{
+		{
+			MaxSkew:           1,
+			TopologyKey:       "kubernetes.io/hostname",
+			WhenUnsatisfiable: corev1.DoNotSchedule,
+			LabelSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app":   testSecretNamePrefix + "deployment",
+					"owner": testSecretEmail,
+				},
+			},
+		},
 	}
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1040,9 +1367,17 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		Spec: rayv1.RayJobSpec{
 			Entrypoint:           testSecretValue,
 			RuntimeEnvYAML:       testSecretValue,
+			ClusterSelector:      map[string]string{"ray.io/cluster": testSecretNamePrefix + "raycluster", "owner": testSecretEmail},
 			SubmitterPodTemplate: secretPodTemplate.DeepCopy(),
 			RayClusterSpec: &rayv1.RayClusterSpec{
 				HeadGroupSpec: rayv1.HeadGroupSpec{
+					Labels: map[string]string{"owner": testSecretEmail, "corp.io/custom-hashed": testSecretValue},
+					HeadService: &corev1.Service{
+						ObjectMeta: metav1.ObjectMeta{Name: testSecretNamePrefix + "ray-head-svc"},
+						Spec: corev1.ServiceSpec{
+							Selector: map[string]string{"ray.io/cluster": testSecretNamePrefix + "raycluster", "owner": testSecretEmail},
+						},
+					},
 					RayStartParams: map[string]string{
 						testSecretValue:  "1",
 						"redis-password": testSecretValue,
@@ -1064,12 +1399,14 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 		},
 		Spec: rayv1.RayClusterSpec{
 			HeadGroupSpec: rayv1.HeadGroupSpec{
+				Labels:         map[string]string{"owner": testSecretEmail},
 				RayStartParams: map[string]string{"redis-password": testSecretValue},
 				Template:       secretPodTemplate,
 			},
 			WorkerGroupSpecs: []rayv1.WorkerGroupSpec{
 				{
 					GroupName:      "gpu-group",
+					Labels:         map[string]string{"team": testSecretValue},
 					RayStartParams: map[string]string{"token": testSecretValue},
 					Template:       secretPodTemplate,
 				},
@@ -1378,16 +1715,16 @@ func TestParseFlags(t *testing.T) {
 		"-n", "15",
 		"--duration", "5m",
 		"--sha256-names",
-		"--deny-labels", "Corp.IO/Custom-Denied, billing-code",
-		"--deny-labels", "extra-tag",
+		"--hash-labels", "Corp.IO/Custom-Hashed, billing-code",
+		"--hash-labels", "extra-tag",
 		"--qps", "150",
 		"--burst", "300",
 	}, &errBuf)
 	if err != nil {
 		t.Fatalf("parseFlags returned unexpected error: %v", err)
 	}
-	if !slices.Equal(cfg.DeniedLabels, []string{"corp.io/custom-denied", "billing-code", "extra-tag"}) {
-		t.Errorf("unexpected DeniedLabels: %v", cfg.DeniedLabels)
+	if !slices.Equal(cfg.HashedLabels, []string{"corp.io/custom-hashed", "billing-code", "extra-tag"}) {
+		t.Errorf("unexpected HashedLabels: %v", cfg.HashedLabels)
 	}
 	if cfg.Kubeconfig != "/tmp/test-kubeconfig" {
 		t.Errorf("expected Kubeconfig=/tmp/test-kubeconfig, got %q", cfg.Kubeconfig)
@@ -1441,8 +1778,9 @@ func TestCanonicalDigestIgnoresResourceVersion(t *testing.T) {
 	nodeV2 := nodeV1.DeepCopy()
 	nodeV2.ResourceVersion = "205"
 
-	payloadV1 := SanitizeNode(nodeV1, nil)
-	payloadV2 := SanitizeNode(nodeV2, nil)
+	hasher := NewLabelHasher(nil, nil)
+	payloadV1 := SanitizeNode(nodeV1, hasher)
+	payloadV2 := SanitizeNode(nodeV2, hasher)
 
 	digestV1 := canonicalDigest(payloadV1)
 	digestV2 := canonicalDigest(payloadV2)
@@ -1456,7 +1794,7 @@ func TestCanonicalDigestIgnoresResourceVersion(t *testing.T) {
 	// Verify that changing a non-resourceVersion field changes the digest.
 	nodeV3 := nodeV2.DeepCopy()
 	nodeV3.Labels["role"] = "gpu-worker"
-	digestV3 := canonicalDigest(SanitizeNode(nodeV3, nil))
+	digestV3 := canonicalDigest(SanitizeNode(nodeV3, hasher))
 	if digestV3 == digestV1 {
 		t.Errorf("expected digest to change when metadata.labels changes")
 	}

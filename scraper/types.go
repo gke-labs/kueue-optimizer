@@ -66,7 +66,8 @@ type Config struct {
 	Duration          time.Duration
 	HashNames         bool
 	PauseImage        string
-	DeniedLabels      []string
+	HashedLabels      []string
+	HashSalt          []byte
 	InfraFile         string
 	WorkflowsFile     string
 	ExecutionTimeFile string
@@ -238,8 +239,8 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 		b.WriteString("Run Duration Limit       : until interrupted (SIGINT/SIGTERM)\n")
 	}
 	b.WriteString(fmt.Sprintf("Pause Container Image    : %s\n", cfg.PauseImage))
-	if len(cfg.DeniedLabels) > 0 {
-		b.WriteString(fmt.Sprintf("Extra Denied Labels      : %s\n", strings.Join(cfg.DeniedLabels, ", ")))
+	if len(cfg.HashedLabels) > 0 {
+		b.WriteString(fmt.Sprintf("Extra Hashed Labels      : %s\n", strings.Join(cfg.HashedLabels, ", ")))
 	}
 	b.WriteString("\n")
 	b.WriteString("Output JSON Event Logs:\n")
@@ -261,9 +262,9 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 	b.WriteString("Information Omitted / Sanitized:\n")
 	b.WriteString("  - Nodes (in infra.json):\n")
 	b.WriteString("      * Retained spec/status: spec.{taints, unschedulable} and status.{capacity, allocatable, conditions, phase}\n")
-	b.WriteString("      * Omitted: status.{images, addresses, nodeInfo, volumesInUse, volumesAttached, daemonEndpoints, config, runtimeHandlers, features}, spec.{providerID, podCIDR, podCIDRs, configSource}, metadata.managedFields, cloud/cluster-identifying labels, and disallowed/sensitive annotations\n")
+	b.WriteString("      * Omitted: status.{images, addresses, nodeInfo, volumesInUse, volumesAttached, daemonEndpoints, config, runtimeHandlers, features}, spec.{providerID, podCIDR, podCIDRs, configSource}, metadata.managedFields, cloud/cluster-identifying labels, and disallowed/sensitive annotations (sensitive/configured label values are hashed)\n")
 	b.WriteString("  - Namespaces, ClusterQueues, LocalQueues, ResourceFlavors, Topologies:\n")
-	b.WriteString("      * Omitted: status subresource, metadata.managedFields, and disallowed/sensitive annotations\n")
+	b.WriteString("      * Omitted: status subresource, metadata.managedFields, and disallowed/sensitive annotations (sensitive/configured label values are hashed)\n")
 	b.WriteString("  - Scheduled & Running Pods (in infra.json):\n")
 	b.WriteString("      * Omitted: ALL fields except placement, resource request, scheduling time, first notice time, and deletion time\n")
 	b.WriteString("      * Specifically omitted: container specs/statuses, images, execution arguments, commands, secrets, volumes, annotations, and labels\n")
@@ -276,7 +277,7 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 	b.WriteString("      * Secrets                        : Omitted (imagePullSecrets, secret volumes/env)\n")
 	b.WriteString("      * Environment variables          : Omitted (env, envFrom)\n")
 	b.WriteString("      * Annotations                    : Omitted unless domain is kubernetes.io, k8s.io, x-k8s.io, or kueue-optimizer.gke.io (or their subdomains, excluding sensitive keys like kubectl.kubernetes.io/last-applied-configuration)\n")
-	b.WriteString("      * Labels                         : Omitted if key matches sensitive user label denylist (owner, team, customer, ...) or --deny-labels\n")
+	b.WriteString("      * Labels                         : Values hashed with per-run HMAC-SHA256 salt if key matches sensitive user label list (owner, team, customer, ...) or --hash-labels (across metadata, selectors, and pod/node affinities)\n")
 	b.WriteString("      * Status & managedFields         : Omitted (stored as submitted to the cluster)\n")
 	b.WriteString("\n")
 	b.WriteString("SHA-256 Name Replacement:\n")

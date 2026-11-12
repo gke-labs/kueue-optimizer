@@ -111,7 +111,7 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 		hashNames         bool
 		sha256Names       bool
 		pauseImage        string
-		deniedLabels      csvLabelsFlag
+		hashedLabels      csvLabelsFlag
 		outputDir         string
 		infraFile         string
 		workflowsFile     string
@@ -134,7 +134,7 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 	fs.BoolVar(&hashNames, "hash-names", false, "Replace names of workloads, pods, jobs, jobsets, etc. with SHA-256 hashes")
 	fs.BoolVar(&sha256Names, "sha256-names", false, "Alias for --hash-names")
 	fs.StringVar(&pauseImage, "pause-image", DefaultPauseImage, "Pause container image used to replace container command lines")
-	fs.Var(&deniedLabels, "deny-labels", "Comma-separated list of additional label keys to strip (may be repeated)")
+	fs.Var(&hashedLabels, "hash-labels", "Comma-separated list of additional label keys or <domain>/* patterns to hash (may be repeated)")
 	fs.StringVar(&outputDir, "output-dir", ".", "Directory where infra.json, workflows.json, and execution-time.json are created")
 	fs.StringVar(&infraFile, "infra-file", "infra.json", "Path (or filename in --output-dir) for infrastructure & pod scrape events")
 	fs.StringVar(&workflowsFile, "workflows-file", "workflows.json", "Path (or filename in --output-dir) for workflow creation/update events")
@@ -167,7 +167,7 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 		Duration:          duration,
 		HashNames:         hashNames || sha256Names,
 		PauseImage:        pauseImage,
-		DeniedLabels:      []string(deniedLabels),
+		HashedLabels:      []string(hashedLabels),
 		InfraFile:         resolveOutputPath(outputDir, infraFile),
 		WorkflowsFile:     resolveOutputPath(outputDir, workflowsFile),
 		ExecutionTimeFile: resolveOutputPath(outputDir, executionTimeFile),
