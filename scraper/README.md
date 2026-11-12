@@ -14,13 +14,20 @@ For the complete output format, event envelope, `workloadState` state machine, a
   - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, and Kueue `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, and `Topology` objects, emitting events only when canonical object state changes.
   - Watches `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, and Kueue `Workload`s in real time to capture exact creation, admission, scheduling, preemption, completion, and deletion timestamps.
   - Gracefully handles optional CRDs (`JobSet`, `LeaderWorkerSet`, `RayJob`, `RayCluster`, Kueue APIs) if they are not installed on the target cluster, retrying periodically without failing.
-- **Strict Data Sanitization**:
-  - `Node` records in `infra.json` retain only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`) fields, stripping cached `.status.images`, `.status.addresses`, `.status.nodeInfo`, attached volumes, `.spec.providerID`/CIDRs, cloud/cluster-identifying node labels, and disallowed annotations.
-  - `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, and `Topology` records in `infra.json` omit `.status`, `metadata.managedFields`, and any disallowed/sensitive annotations.
-  - Scheduled/running `Pod` records in `infra.json` store **only** node placement, effective resource requests, scheduling time, first notice time, and deletion time.
-  - Workflow specs in `workflows.json` have container images replaced with a pause image (`registry.k8s.io/pause:3.10` by default), and strip commands, args, `env`/`envFrom`, probes (`livenessProbe`, `readinessProbe`, `startupProbe`), `lifecycle` hooks, `serviceAccountName`/`hostname`/`hostnameOverride`/`subdomain`/`hostAliases`/`dnsConfig` (and `JobSet.spec.network.subdomain`), volumes, secrets, `.status`, sensitive Kubernetes annotations (such as `kubectl.kubernetes.io/last-applied-configuration` and `kubernetes.io/change-cause`), and any annotations outside the official `kubernetes.io`, `k8s.io`, `x-k8s.io`, and `kueue-optimizer.gke.io` domains and their subdomains (e.g. `*.kubernetes.io`, `*.k8s.io`, `*.x-k8s.io`, `*.kueue-optimizer.gke.io`).
-- **Optional Salted HMAC-SHA256 Name & Label Anonymization (`--hash-names`)**:
-  - When `--hash-names` is enabled, deterministically hashes workload, pod, job, jobset, deployment, LWS, and Ray resource names (along with cross-referencing annotations and `ownerReferences`) **and** sensitive organizational label values (`owner`, `team`, `customer`, `project`, `cost-center`, ...), workload-referencing labels, and any additional label keys or `<domain>/*` patterns supplied via `--extra-hash-labels` across metadata, selectors, and pod/node affinities using a per-run CSPRNG `HMAC-SHA256` key, while keeping infrastructure names (`Node`, `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, `Topology`) and all label keys in plain text. When `--hash-names` is disabled, a no-op hasher leaves names and label values in plain text.
+- **Strict Data Sanitization** (see [`SCRAPER-SCHEMA.md`](SCRAPER-SCHEMA.md) for the full field-by-field specification):
+  - **Nodes (`infra.json`)**: Retains only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`), stripping node network/system metadata, cached images, attached volumes, cloud/cluster-identifying node labels, and disallowed annotations.
+  - **Queues & Topology (`infra.json`)**: `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, and `Topology` records omit `.status`, `metadata.managedFields`, and disallowed/sensitive annotations.
+  - **Scheduled Pods (`infra.json`)**: Stores **only** node placement, effective resource requests, scheduling time, first notice time, and deletion time.
+  - **Workflow Specs (`workflows.json`)**:
+    - Replaces container and Ray sidecar images with a pause image (`registry.k8s.io/pause:3.10` by default) and clears commands, arguments, and environment variables (`env` / `envFrom`).
+    - Strips probes, lifecycle hooks, volumes, secrets, credentials, pod/service/network identity fields, `.status`, and `metadata.managedFields`.
+    - Retains only official Kubernetes/Kueue domain annotations (`kubernetes.io`, `k8s.io`, `x-k8s.io`, `kueue-optimizer.gke.io`, and their subdomains) that are not on the sensitive annotation denylist.
+- **Optional Name & Label Anonymization (`--hash-names`)**:
+  - Disabled by default (names and label values remain unchanged).
+  - When enabled, uses a per-run 256-bit `HMAC-SHA256` key to deterministically hash:
+    - **Resource names & references**: Workload, Pod, Job, JobSet, Deployment, LeaderWorkerSet, and Ray object names, along with `ownerReferences` and name-holding annotations.
+    - **Label values**: Built-in organizational/identity labels (e.g. `owner`, `team`, `customer`, `project`, `cost-center`), workload-referencing labels, and any additional keys or `<domain>/*` patterns passed via `--extra-hash-labels` across metadata, selectors, and affinities.
+  - Infrastructure object names (`Node`, `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, `Topology`) remain in plain text so cluster topology and queue hierarchy stay inspectable.
 - **Streaming NDJSON Output**:
   - Appends and `fsync`s one compact JSON object per line with no outer array wrapper, enabling `O(1)`-memory streaming consumption.
 
