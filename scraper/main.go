@@ -111,7 +111,7 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 		hashNames         bool
 		sha256Names       bool
 		pauseImage        string
-		hashedLabels      csvLabelsFlag
+		extraHashLabels   csvLabelsFlag
 		outputDir         string
 		infraFile         string
 		workflowsFile     string
@@ -131,10 +131,10 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 	fs.StringVar(&intervalStr, "interval", "60s", "Periodic scrape interval (e.g. 60s or 60; default 60s)")
 	fs.StringVar(&intervalStr, "n", "60s", "Shorthand for --interval (periodic scrape interval, default 60s)")
 	fs.DurationVar(&duration, "duration", 0, "Optional total run duration (e.g. 5m; 0 runs until interrupted)")
-	fs.BoolVar(&hashNames, "hash-names", false, "Replace names of workloads, pods, jobs, jobsets, etc. with SHA-256 hashes")
+	fs.BoolVar(&hashNames, "hash-names", false, "Replace names of workloads, pods, jobs, jobsets, etc. and sensitive/workload label values with per-run HMAC-SHA256 hashes")
 	fs.BoolVar(&sha256Names, "sha256-names", false, "Alias for --hash-names")
 	fs.StringVar(&pauseImage, "pause-image", DefaultPauseImage, "Pause container image used to replace container command lines")
-	fs.Var(&hashedLabels, "hash-labels", "Comma-separated list of additional label keys or <domain>/* patterns to hash (may be repeated)")
+	fs.Var(&extraHashLabels, "extra-hash-labels", "Comma-separated additional list of label keys or <domain>/* patterns to hash when --hash-names is enabled (may be repeated)")
 	fs.StringVar(&outputDir, "output-dir", ".", "Directory where infra.json, workflows.json, and execution-time.json are created")
 	fs.StringVar(&infraFile, "infra-file", "infra.json", "Path (or filename in --output-dir) for infrastructure & pod scrape events")
 	fs.StringVar(&workflowsFile, "workflows-file", "workflows.json", "Path (or filename in --output-dir) for workflow creation/update events")
@@ -154,6 +154,14 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 		return Config{}, 0, 0, fmt.Errorf("invalid scrape interval: %w", err)
 	}
 
+	hashEnabled := hashNames || sha256Names
+	if len(extraHashLabels) > 0 && !hashEnabled {
+		if errOut != nil {
+			_, _ = fmt.Fprintln(errOut, "--extra-hash-labels requires --hash-names (or --sha256-names) to be enabled")
+		}
+		return Config{}, 0, 0, fmt.Errorf("--extra-hash-labels requires --hash-names to be enabled")
+	}
+
 	resolveOutputPath := func(dir, file string) string {
 		if filepath.IsAbs(file) || dir == "" || dir == "." {
 			return file
@@ -165,9 +173,9 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 		Kubeconfig:        kubeconfig,
 		Interval:          interval,
 		Duration:          duration,
-		HashNames:         hashNames || sha256Names,
+		HashNames:         hashEnabled,
 		PauseImage:        pauseImage,
-		HashedLabels:      []string(hashedLabels),
+		ExtraHashLabels:   []string(extraHashLabels),
 		InfraFile:         resolveOutputPath(outputDir, infraFile),
 		WorkflowsFile:     resolveOutputPath(outputDir, workflowsFile),
 		ExecutionTimeFile: resolveOutputPath(outputDir, executionTimeFile),
