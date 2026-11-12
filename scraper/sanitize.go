@@ -106,22 +106,17 @@ var parentWorkflowKinds = map[string]bool{
 	"RayCluster":      true,
 }
 
-// HashName returns the hex-encoded SHA-256 digest of name when enabled is true and name is non-empty.
+// HashName returns the 64-character hex-encoded HMAC-SHA256 digest of name (using the process
+// CSPRNG fallback salt) when enabled is true and name is non-empty. Prefer LabelHasher.HashName
+// when a per-Scraper session hasher is available.
 func HashName(name string, enabled bool) string {
-	if !enabled || name == "" {
-		return name
-	}
-	sum := sha256.Sum256([]byte(name))
-	return hex.EncodeToString(sum[:])
+	return (LabelHasher{}).HashName(name, enabled)
 }
 
 // HashNameForKind hashes name only if the object kind is a workload/pod/job/jobset/etc.
 // Names of namespaces, nodes, queues, resource flavors, and topologies are never hashed.
 func HashNameForKind(kind, name string, enabled bool) string {
-	if !enabled || name == "" || nonHashedKinds[kind] {
-		return name
-	}
-	return HashName(name, true)
+	return (LabelHasher{}).HashNameForKind(kind, name, enabled)
 }
 
 // allowedAnnotationDomains lists the official DNS domains (matched exactly or as a dot-separated
@@ -266,15 +261,40 @@ func (h LabelHasher) effectiveSalt() []byte {
 	return defaultProcessSalt
 }
 
+func (h LabelHasher) hmacSum(val string) [32]byte {
+	mac := hmac.New(sha256.New, h.effectiveSalt())
+	_, _ = mac.Write([]byte(val))
+	var sum [32]byte
+	copy(sum[:], mac.Sum(nil))
+	return sum
+}
+
+// HashName returns the 64-character hex-encoded HMAC-SHA256 digest of name using the per-run salt
+// when enabled is true and name is non-empty.
+func (h LabelHasher) HashName(name string, enabled bool) string {
+	if !enabled || name == "" {
+		return name
+	}
+	sum := h.hmacSum(name)
+	return hex.EncodeToString(sum[:])
+}
+
+// HashNameForKind hashes name using the per-run salt only if kind is a workload/pod/job/jobset/etc.
+// Names of namespaces, nodes, queues, resource flavors, and topologies are never hashed.
+func (h LabelHasher) HashNameForKind(kind, name string, enabled bool) string {
+	if !enabled || name == "" || nonHashedKinds[kind] {
+		return name
+	}
+	return h.HashName(name, true)
+}
+
 // HashValue returns a deterministic, Kubernetes-valid HMAC-SHA256 label value digest ("h-" + 32 hex chars,
 // 34 chars total <= 63-char Kubernetes label limit) for non-empty values.
 func (h LabelHasher) HashValue(val string) string {
 	if val == "" {
 		return ""
 	}
-	mac := hmac.New(sha256.New, h.effectiveSalt())
-	_, _ = mac.Write([]byte(val))
-	sum := mac.Sum(nil)
+	sum := h.hmacSum(val)
 	return "h-" + hex.EncodeToString(sum[:16])
 }
 
@@ -324,8 +344,8 @@ func ShouldKeepAnnotation(key string) bool {
 
 // FilterAnnotations retains only allowed Kubernetes, SIG (x-k8s.io / k8s.io), and kueue-optimizer
 // domain annotations (excluding sensitive keys like kubectl.kubernetes.io/last-applied-configuration),
-// and hashes any annotation value that holds a workload/job/pod name when hashNames is true.
-func FilterAnnotations(annotations map[string]string, hashNames bool) map[string]string {
+// and hashes any annotation value that holds a workload/job/pod name using the per-run HMAC-SHA256 key when hashNames is true.
+func FilterAnnotations(annotations map[string]string, hashNames bool, hasher LabelHasher) map[string]string {
 	if len(annotations) == 0 {
 		return nil
 	}
@@ -335,7 +355,7 @@ func FilterAnnotations(annotations map[string]string, hashNames bool) map[string
 			continue
 		}
 		if hashNames && annotationKeysHoldingWorkloadNames[strings.ToLower(k)] && v != "" {
-			v = HashName(v, true)
+			v = hasher.HashName(v, true)
 		}
 		filtered[k] = v
 	}
@@ -515,7 +535,7 @@ func SanitizeAffinity(aff *corev1.Affinity, hashNames bool, hasher LabelHasher) 
 
 // SanitizeOwnerReferences copies owner references and hashes the owner name if hashNames is true
 // and the owner is not a non-hashed infrastructure resource.
-func SanitizeOwnerReferences(refs []metav1.OwnerReference, hashNames bool) []metav1.OwnerReference {
+func SanitizeOwnerReferences(refs []metav1.OwnerReference, hashNames bool, hasher LabelHasher) []metav1.OwnerReference {
 	if len(refs) == 0 {
 		return nil
 	}
@@ -523,7 +543,7 @@ func SanitizeOwnerReferences(refs []metav1.OwnerReference, hashNames bool) []met
 	for i, r := range refs {
 		out[i] = r
 		if hashNames && !nonHashedKinds[r.Kind] {
-			out[i].Name = HashName(r.Name, true)
+			out[i].Name = hasher.HashName(r.Name, true)
 		}
 	}
 	return out
@@ -533,14 +553,14 @@ func SanitizeOwnerReferences(refs []metav1.OwnerReference, hashNames bool) []met
 func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hashNames bool, hasher LabelHasher) {
 	meta.ManagedFields = nil
 	if hashNames {
-		meta.Name = HashName(meta.Name, true)
+		meta.Name = hasher.HashName(meta.Name, true)
 		if meta.GenerateName != "" {
-			meta.GenerateName = HashName(meta.GenerateName, true)
+			meta.GenerateName = hasher.HashName(meta.GenerateName, true)
 		}
 	}
-	meta.Annotations = FilterAnnotations(meta.Annotations, hashNames)
+	meta.Annotations = FilterAnnotations(meta.Annotations, hashNames, hasher)
 	meta.Labels = SanitizeLabels(meta.Labels, hashNames, hasher)
-	meta.OwnerReferences = SanitizeOwnerReferences(meta.OwnerReferences, hashNames)
+	meta.OwnerReferences = SanitizeOwnerReferences(meta.OwnerReferences, hashNames, hasher)
 }
 
 // SanitizePodSpec strips business-specific fields and hashes sensitive label selectors in a PodSpec:
@@ -621,15 +641,15 @@ func SanitizePodTemplateSpec(tpl *corev1.PodTemplateSpec, pauseImage string, has
 	tpl.ObjectMeta.ManagedFields = nil
 	if hashNames {
 		if tpl.ObjectMeta.Name != "" {
-			tpl.ObjectMeta.Name = HashName(tpl.ObjectMeta.Name, true)
+			tpl.ObjectMeta.Name = hasher.HashName(tpl.ObjectMeta.Name, true)
 		}
 		if tpl.ObjectMeta.GenerateName != "" {
-			tpl.ObjectMeta.GenerateName = HashName(tpl.ObjectMeta.GenerateName, true)
+			tpl.ObjectMeta.GenerateName = hasher.HashName(tpl.ObjectMeta.GenerateName, true)
 		}
 	}
-	tpl.ObjectMeta.Annotations = FilterAnnotations(tpl.ObjectMeta.Annotations, hashNames)
+	tpl.ObjectMeta.Annotations = FilterAnnotations(tpl.ObjectMeta.Annotations, hashNames, hasher)
 	tpl.ObjectMeta.Labels = SanitizeLabels(tpl.ObjectMeta.Labels, hashNames, hasher)
-	tpl.ObjectMeta.OwnerReferences = SanitizeOwnerReferences(tpl.ObjectMeta.OwnerReferences, hashNames)
+	tpl.ObjectMeta.OwnerReferences = SanitizeOwnerReferences(tpl.ObjectMeta.OwnerReferences, hashNames, hasher)
 	SanitizePodSpec(&tpl.Spec, pauseImage, hashNames, hasher)
 }
 
@@ -814,7 +834,7 @@ func ExtractPodSchedulingTime(pod *corev1.Pod) *metav1.Time {
 }
 
 // BuildScrapedPodPayload constructs the strictly-scoped ScrapedPodPayload for infra.json.
-func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletionTime *time.Time, hashNames bool) ScrapedPodPayload {
+func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletionTime *time.Time, hashNames bool, hasher LabelHasher) ScrapedPodPayload {
 	var delTime *metav1.Time
 	if deletionTime != nil && !deletionTime.IsZero() {
 		t := metav1.NewTime(deletionTime.UTC())
@@ -823,7 +843,7 @@ func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletion
 	return ScrapedPodPayload{
 		APIVersion:      "v1",
 		Kind:            "Pod",
-		Name:            HashName(pod.Name, hashNames),
+		Name:            hasher.HashName(pod.Name, hashNames),
 		Namespace:       pod.Namespace,
 		Placement:       pod.Spec.NodeName,
 		ResourceRequest: ComputePodResourceRequest(pod),
@@ -835,7 +855,7 @@ func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletion
 
 func sanitizeInfraObjectMeta(meta *metav1.ObjectMeta, hasher LabelHasher) {
 	meta.ManagedFields = nil
-	meta.Annotations = FilterAnnotations(meta.Annotations, false)
+	meta.Annotations = FilterAnnotations(meta.Annotations, false, hasher)
 	meta.Labels = SanitizeInfraLabels(meta.Labels, hasher)
 }
 
@@ -849,7 +869,7 @@ func SanitizeNode(node *corev1.Node, hasher LabelHasher) *corev1.Node {
 	cp := node.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Node"}
 	cp.ManagedFields = nil
-	cp.Annotations = FilterAnnotations(cp.Annotations, false)
+	cp.Annotations = FilterAnnotations(cp.Annotations, false, hasher)
 	cp.Labels = SanitizeNodeLabels(cp.Labels, hasher)
 	cp.Spec = corev1.NodeSpec{
 		Taints:        cp.Spec.Taints,
@@ -945,7 +965,7 @@ func SanitizeJobSet(js *jobsetv1alpha2.JobSet, pauseImage string, hashNames bool
 	for i := range cp.Spec.ReplicatedJobs {
 		rj := &cp.Spec.ReplicatedJobs[i]
 		rj.Template.ObjectMeta.ManagedFields = nil
-		rj.Template.ObjectMeta.Annotations = FilterAnnotations(rj.Template.ObjectMeta.Annotations, hashNames)
+		rj.Template.ObjectMeta.Annotations = FilterAnnotations(rj.Template.ObjectMeta.Annotations, hashNames, hasher)
 		rj.Template.ObjectMeta.Labels = SanitizeLabels(rj.Template.ObjectMeta.Labels, hashNames, hasher)
 		rj.Template.Spec.Selector = SanitizeLabelSelector(rj.Template.Spec.Selector, hashNames, hasher)
 		SanitizePodTemplateSpec(&rj.Template.Spec.Template, pauseImage, hashNames, hasher)
@@ -1003,7 +1023,7 @@ func sanitizeRayClusterSpec(spec *rayv1.RayClusterSpec, pauseImage string, hashN
 	if pauseImage == "" {
 		pauseImage = DefaultPauseImage
 	}
-	spec.HeadServiceAnnotations = FilterAnnotations(spec.HeadServiceAnnotations, hashNames)
+	spec.HeadServiceAnnotations = FilterAnnotations(spec.HeadServiceAnnotations, hashNames, hasher)
 	if spec.AutoscalerOptions != nil {
 		if spec.AutoscalerOptions.Image != nil && *spec.AutoscalerOptions.Image != "" {
 			img := pauseImage

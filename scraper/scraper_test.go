@@ -408,6 +408,28 @@ func TestSaltedLabelHashingPreventsDictionaryAndCrossRunCorrelation(t *testing.T
 		t.Errorf("expected deterministic digest within the same LabelHasher run")
 	}
 
+	// Verify --hash-names (HashName) also uses the per-run HMAC-SHA256 salt rather than unsalted SHA-256.
+	rawName := "jobset-train-01"
+	unsaltedNameSum := sha256.Sum256([]byte(rawName))
+	unsaltedNameDigest := hex.EncodeToString(unsaltedNameSum[:])
+	nh1 := run1.HashName(rawName, true)
+	nh2 := run2.HashName(rawName, true)
+	if len(nh1) != 64 || len(nh2) != 64 {
+		t.Errorf("expected 64-char hex HMAC-SHA256 name digest, got len=%d (%q) and len=%d (%q)", len(nh1), nh1, len(nh2), nh2)
+	}
+	if nh1 == unsaltedNameDigest || nh2 == unsaltedNameDigest {
+		t.Errorf("expected salted HMAC-SHA256 name digest to differ from unsalted SHA-256 %q", unsaltedNameDigest)
+	}
+	if nh1 == nh2 {
+		t.Errorf("expected independent per-run CSPRNG salts to produce distinct name digests, both produced %q", nh1)
+	}
+	if run1.HashName(rawName, true) != nh1 {
+		t.Errorf("expected deterministic name digest within the same LabelHasher run")
+	}
+	if run1.HashName(rawName, false) != rawName {
+		t.Errorf("expected HashName(..., false) to preserve plain name %q", rawName)
+	}
+
 	// Verify startup banner never leaks raw or hex-encoded salt bytes.
 	customSalt := []byte("super-secret-salt-must-not-print")
 	var banner bytes.Buffer
@@ -702,7 +724,8 @@ func TestFilterAnnotations(t *testing.T) {
 		"leaderworkerset.sigs.k8s.io/leader-address":        secretLeaderAddr,
 	}
 
-	filtered := FilterAnnotations(ann, true)
+	hasher := NewLabelHasher(nil, nil)
+	filtered := FilterAnnotations(ann, true, hasher)
 	for _, strippedKey := range []string{
 		"business.corp.com/cost-center",
 		"team.internal/owner",
@@ -740,8 +763,8 @@ func TestFilterAnnotations(t *testing.T) {
 		"leaderworkerset.sigs.k8s.io/leader-name":    secretLeaderPod,
 		"leaderworkerset.sigs.k8s.io/leader-address": secretLeaderAddr,
 	} {
-		if filtered[k] != HashName(rawVal, true) {
-			t.Errorf("expected %q annotation value to be SHA-256 hashed, got %q", k, filtered[k])
+		if filtered[k] != hasher.HashName(rawVal, true) {
+			t.Errorf("expected %q annotation value to be HMAC-SHA256 hashed, got %q", k, filtered[k])
 		}
 	}
 }
@@ -1121,9 +1144,9 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 			}
 		case "Pod":
 			name := payload["name"].(string)
-			expectedHash := HashName(rawPodName, true)
+			expectedHash := scraper.labelHasher.HashName(rawPodName, true)
 			if name != expectedHash {
-				t.Errorf("Pod name should be SHA-256 hashed to %q, got %q", expectedHash, name)
+				t.Errorf("Pod name should be HMAC-SHA256 hashed to %q, got %q", expectedHash, name)
 			}
 			if payload["placement"] != "kwok-node-0" {
 				t.Errorf("Pod placement must be kwok-node-0 (unhashed), got %v", payload["placement"])
@@ -1725,10 +1748,10 @@ func TestWorkloadExecutionTimeTracking(t *testing.T) {
 		if ev.EventType == "" || ev.EventType[0] < 'A' || ev.EventType[0] > 'Z' {
 			t.Errorf("expected eventType to start with uppercase letter, got %q", ev.EventType)
 		}
-		if ev.Payload.WorkloadName != HashName("jobset-train-01-wl", true) {
+		if ev.Payload.WorkloadName != scraper.labelHasher.HashName("jobset-train-01-wl", true) {
 			t.Errorf("expected hashed workloadName, got %q", ev.Payload.WorkloadName)
 		}
-		if ev.Payload.OwnerName != HashName("jobset-train-01", true) {
+		if ev.Payload.OwnerName != scraper.labelHasher.HashName("jobset-train-01", true) {
 			t.Errorf("expected hashed ownerName, got %q", ev.Payload.OwnerName)
 		}
 		if ev.Payload.Namespace != "ai-lab" || ev.Payload.LocalQueueName != "ai-lab-lq" || ev.Payload.ClusterQueueName != "ai-lab-cq" {

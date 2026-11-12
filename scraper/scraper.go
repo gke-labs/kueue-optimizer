@@ -499,7 +499,7 @@ func (s *Scraper) observeScheduledRunningPodLocked(pod *corev1.Pod, now time.Tim
 		return nil
 	}
 
-	payload := BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.cfg.HashNames)
+	payload := BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.cfg.HashNames, s.labelHasher)
 	if st.lastPayload.SchedulingTime != nil {
 		payload.SchedulingTime = st.lastPayload.SchedulingTime
 	}
@@ -581,7 +581,7 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 			// Keep lastPayload fresh so if the pod is deleted or finishes before the next
 			// periodic scrape we still have its exact placement, resource request, and initial scheduling time.
 			prevSched := st.lastPayload.SchedulingTime
-			st.lastPayload = BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.cfg.HashNames)
+			st.lastPayload = BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.cfg.HashNames, s.labelHasher)
 			if prevSched != nil {
 				st.lastPayload.SchedulingTime = prevSched
 			}
@@ -604,7 +604,7 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 			if !st.emittedNew {
 				newPayload := st.lastPayload
 				if newPayload.Name == "" {
-					newPayload = BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.cfg.HashNames)
+					newPayload = BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.cfg.HashNames, s.labelHasher)
 				}
 				st.emittedNew = true
 				st.lastPayload = newPayload
@@ -615,7 +615,7 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 				})
 			}
 
-			delPayload := BuildScrapedPodPayload(pod, st.firstNoticeTime, &delTime, s.cfg.HashNames)
+			delPayload := BuildScrapedPodPayload(pod, st.firstNoticeTime, &delTime, s.cfg.HashNames, s.labelHasher)
 			if delPayload.Placement == "" && st.lastPayload.Placement != "" {
 				delPayload.Placement = st.lastPayload.Placement
 			}
@@ -696,7 +696,7 @@ func (s *Scraper) recordWorkflowEvent(
 	now time.Time,
 ) {
 	key := kind + "/" + namespace + "/" + rawName
-	displayName := HashNameForKind(kind, rawName, s.cfg.HashNames)
+	displayName := s.labelHasher.HashNameForKind(kind, rawName, s.cfg.HashNames)
 	digest := canonicalDigest(payload)
 
 	var ev *WorkflowEvent
@@ -936,18 +936,18 @@ func (s *Scraper) handleRayClusterUnstructured(eventType watch.EventType, u *uns
 	s.handleRayClusterWatchEvent(eventType, &rc)
 }
 
-func resolveWorkloadOwner(wl *kueuev1beta2.Workload, hashNames bool) (ownerKind, ownerName, ownerAPIVersion string) {
+func resolveWorkloadOwner(wl *kueuev1beta2.Workload, hashNames bool, hasher LabelHasher) (ownerKind, ownerName, ownerAPIVersion string) {
 	if wl == nil {
 		return "", "", ""
 	}
 	for _, ref := range wl.OwnerReferences {
 		if ref.Controller != nil && *ref.Controller {
-			return ref.Kind, HashNameForKind(ref.Kind, ref.Name, hashNames), ref.APIVersion
+			return ref.Kind, hasher.HashNameForKind(ref.Kind, ref.Name, hashNames), ref.APIVersion
 		}
 	}
 	if len(wl.OwnerReferences) > 0 {
 		ref := wl.OwnerReferences[0]
-		return ref.Kind, HashNameForKind(ref.Kind, ref.Name, hashNames), ref.APIVersion
+		return ref.Kind, hasher.HashNameForKind(ref.Kind, ref.Name, hashNames), ref.APIVersion
 	}
 	if wl.Annotations != nil {
 		ownerName = wl.Annotations[KueueJobOwnerNameAnnotation]
@@ -958,7 +958,7 @@ func resolveWorkloadOwner(wl *kueuev1beta2.Workload, hashNames bool) (ownerKind,
 			ownerAPIVersion = ownerGVK
 		}
 		if ownerName != "" {
-			ownerName = HashNameForKind(ownerKind, ownerName, hashNames)
+			ownerName = hasher.HashNameForKind(ownerKind, ownerName, hashNames)
 		}
 	}
 	return ownerKind, ownerName, ownerAPIVersion
@@ -974,9 +974,9 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 	now := time.Now().UTC()
 	key := wl.Namespace + "/" + wl.Name
 
-	rawOwnerKind, rawOwnerName, _ := resolveWorkloadOwner(wl, false)
-	ownerKind, ownerName, ownerAPIVersion := resolveWorkloadOwner(wl, s.cfg.HashNames)
-	workloadName := HashName(wl.Name, s.cfg.HashNames)
+	rawOwnerKind, rawOwnerName, _ := resolveWorkloadOwner(wl, false, s.labelHasher)
+	ownerKind, ownerName, ownerAPIVersion := resolveWorkloadOwner(wl, s.cfg.HashNames, s.labelHasher)
+	workloadName := s.labelHasher.HashName(wl.Name, s.cfg.HashNames)
 	localQueueName := string(wl.Spec.QueueName)
 
 	admittedCond := apimeta.FindStatusCondition(wl.Status.Conditions, kueuev1beta2.WorkloadAdmitted)

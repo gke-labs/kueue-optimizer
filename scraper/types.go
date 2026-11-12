@@ -280,7 +280,7 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 	b.WriteString("      * Labels                         : Values hashed with per-run HMAC-SHA256 salt if key matches sensitive user label list (owner, team, customer, ...) or --hash-labels (across metadata, selectors, and pod/node affinities)\n")
 	b.WriteString("      * Status & managedFields         : Omitted (stored as submitted to the cluster)\n")
 	b.WriteString("\n")
-	b.WriteString("SHA-256 Name Replacement:\n")
+	b.WriteString("SHA-256 Name Replacement (per-run HMAC-SHA256):\n")
 	b.WriteString(fmt.Sprintf("  - Enabled                            : %t\n", cfg.HashNames))
 	b.WriteString("  - Objects with SHA-256 hashed names  : Workloads, Pods, Jobs, JobSets, LeaderWorkerSets, Deployments, RayJobs, RayClusters\n")
 	b.WriteString("  - Objects NEVER hashed (plain names) : Namespaces, Nodes, ClusterQueues, LocalQueues, ResourceFlavors, Topologies\n")
