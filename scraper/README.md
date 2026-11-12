@@ -26,7 +26,7 @@ For the complete output format, event envelope, `workloadState` state machine, a
   - Disabled by default (names and label values remain unchanged).
   - When enabled, uses a per-run 256-bit `HMAC-SHA256` key to deterministically hash:
     - **Resource names & references**: Workload, Pod, Job, JobSet, Deployment, LeaderWorkerSet, and Ray object names, along with `ownerReferences` and name-holding annotations.
-    - **Label values**: Built-in organizational/identity labels (e.g. `owner`, `team`, `customer`, `project`, `cost-center`), workload-referencing labels, and any additional keys or `<domain>/*` patterns passed via `--extra-hash-labels` across metadata, selectors, and affinities.
+    - **Label values (keys are never hashed)**: Values of built-in organizational/identity labels (e.g. `owner`, `team`, `customer`, `project`, `cost-center`), workload-referencing labels, and any additional keys or `<domain>/*` patterns passed via `--extra-hash-labels` across metadata, selectors, and affinities.
   - Infrastructure object names (`Node`, `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, `Topology`) remain in plain text so cluster topology and queue hierarchy stay inspectable.
 - **Streaming NDJSON Output**:
   - Appends and `fsync`s one compact JSON object per line with no outer array wrapper, enabling `O(1)`-memory streaming consumption.
