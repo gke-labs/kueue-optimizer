@@ -420,18 +420,25 @@ func TestSaltedLabelHashingPreventsDictionaryAndCrossRunCorrelation(t *testing.T
 	if run1.HashName(lowEntropyVal) != h1 {
 		t.Errorf("expected deterministic digest within the same SensitiveDataHasher run")
 	}
+}
 
-	// Verify NoopHasher preserves both names and label values unchanged.
+func TestNoopHasherPreservesPlainNamesAndLabels(t *testing.T) {
 	rawName := "jobset-train-01"
+	rawLabelVal := "ai"
 	noop := NewNoopHasher()
+
 	if noop.HashName(rawName) != rawName || noop.HashNameForKind("JobSet", rawName) != rawName {
 		t.Errorf("expected NoopHasher to preserve plain name %q", rawName)
 	}
-	if noop.HashName(lowEntropyVal) != lowEntropyVal {
-		t.Errorf("expected NoopHasher to preserve plain label value %q", lowEntropyVal)
+	if noop.HashName(rawLabelVal) != rawLabelVal {
+		t.Errorf("expected NoopHasher to preserve plain label value %q", rawLabelVal)
 	}
+	if noop.ShouldHashLabel("team") || noop.ShouldHashWorkloadLabel("app") {
+		t.Errorf("expected NoopHasher ShouldHashLabel/ShouldHashWorkloadLabel to return false")
+	}
+}
 
-	// Verify startup banner never leaks raw or hex-encoded salt bytes.
+func TestStartupBannerDoesNotLeakHashSalt(t *testing.T) {
 	customSalt := []byte("super-secret-salt-must-not-print")
 	var banner bytes.Buffer
 	PrintStartupBanner(&banner, Config{
@@ -450,8 +457,10 @@ func TestSaltedLabelHashingPreventsDictionaryAndCrossRunCorrelation(t *testing.T
 func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 	hasher := NewSensitiveDataHasher([]string{"corp.io/*"}, nil)
 	rawDeployName := testSecretNamePrefix + "ranker"
+	wantDeployHash := hasher.HashName(rawDeployName)
+	wantSecretHash := hasher.HashName(testSecretValue)
 
-	// 1. Deployment selecting pods ONLY via sensitive/hashed labels must keep a non-empty valid selector
+	// Deployment selecting pods ONLY via sensitive/hashed labels must keep a non-empty valid selector
 	// (with original keys and hashed values) that matches its sanitized PodTemplateSpec labels, and PodSpec
 	// affinities/spread constraints must match too.
 	deploy := &appsv1.Deployment{
@@ -490,32 +499,7 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 					},
 				},
 				Spec: corev1.PodSpec{
-					NodeSelector: map[string]string{
-						"cloud.google.com/gke-cluster-name": testSecretValue,
-						"corp.io/team":                      testSecretValue,
-						"instance":                          "gpu",
-					},
 					Affinity: &corev1.Affinity{
-						NodeAffinity: &corev1.NodeAffinity{
-							RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-								NodeSelectorTerms: []corev1.NodeSelectorTerm{
-									{
-										MatchExpressions: []corev1.NodeSelectorRequirement{
-											{
-												Key:      "cloud.google.com/gke-cluster-name",
-												Operator: corev1.NodeSelectorOpIn,
-												Values:   []string{testSecretValue},
-											},
-											{
-												Key:      "corp.io/team",
-												Operator: corev1.NodeSelectorOpIn,
-												Values:   []string{testSecretValue},
-											},
-										},
-									},
-								},
-							},
-						},
 						PodAntiAffinity: &corev1.PodAntiAffinity{
 							RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
 								{
@@ -523,11 +507,6 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 										MatchLabels: map[string]string{
 											"app":  rawDeployName,
 											"team": testSecretValue,
-										},
-									},
-									NamespaceSelector: &metav1.LabelSelector{
-										MatchLabels: map[string]string{
-											"corp.io/tenant": testSecretValue,
 										},
 									},
 									MatchLabelKeys:    []string{"corp.io/service", "app"},
@@ -573,12 +552,21 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 	if err := json.Unmarshal(rawJSON, &roundTrip); err != nil {
 		t.Fatalf("unmarshal sanitized deployment: %v", err)
 	}
-	if roundTrip.Name != roundTrip.Spec.Template.Labels["app"] {
-		t.Errorf("expected sanitized Deployment.Name %q to match sanitized pod template label app=%q", roundTrip.Name, roundTrip.Spec.Template.Labels["app"])
+	if roundTrip.Name != wantDeployHash || roundTrip.Spec.Template.Labels["app"] != wantDeployHash {
+		t.Errorf("expected sanitized Deployment.Name and template app label to equal %q; got name=%q app=%q", wantDeployHash, roundTrip.Name, roundTrip.Spec.Template.Labels["app"])
 	}
-	if len(roundTrip.Spec.Selector.MatchLabels) == 0 {
-		t.Fatalf("expected Deployment.Spec.Selector.MatchLabels to remain non-empty")
+	// Explicitly verify exact hashed selector values so a tautological/always-true selector cannot pass silently.
+	for _, key := range []string{"team", "project", "corp.io/service"} {
+		if got := roundTrip.Spec.Selector.MatchLabels[key]; got != wantSecretHash {
+			t.Errorf("expected Deployment.Spec.Selector.MatchLabels[%q]=%q, got %q", key, wantSecretHash, got)
+		}
 	}
+	if len(roundTrip.Spec.Selector.MatchExpressions) != 1 ||
+		roundTrip.Spec.Selector.MatchExpressions[0].Key != "corp.io/tier" ||
+		!slices.Equal(roundTrip.Spec.Selector.MatchExpressions[0].Values, []string{wantSecretHash}) {
+		t.Errorf("unexpected Deployment.Spec.Selector.MatchExpressions: %+v", roundTrip.Spec.Selector.MatchExpressions)
+	}
+
 	sel, err := metav1.LabelSelectorAsSelector(roundTrip.Spec.Selector)
 	if err != nil {
 		t.Fatalf("Deployment.Spec.Selector invalid after sanitization: %v", err)
@@ -587,21 +575,79 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 	if !sel.Matches(podLabels) {
 		t.Errorf("sanitized Deployment selector %v does not match sanitized pod template labels %v", roundTrip.Spec.Selector, podLabels)
 	}
+	if sel.Matches(labels.Set{"team": "other"}) {
+		t.Errorf("sanitized Deployment selector %v unexpectedly matched unrelated labels", roundTrip.Spec.Selector)
+	}
 
 	antiTerm := roundTrip.Spec.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0]
+	if antiTerm.LabelSelector.MatchLabels["app"] != wantDeployHash || antiTerm.LabelSelector.MatchLabels["team"] != wantSecretHash {
+		t.Errorf("unexpected PodAntiAffinity MatchLabels: %v", antiTerm.LabelSelector.MatchLabels)
+	}
 	antiSel, err := metav1.LabelSelectorAsSelector(antiTerm.LabelSelector)
 	if err != nil || !antiSel.Matches(podLabels) {
 		t.Errorf("sanitized PodAntiAffinity labelSelector %v failed to match pod labels %v (err=%v)", antiTerm.LabelSelector, podLabels, err)
 	}
 	tsc := roundTrip.Spec.Template.Spec.TopologySpreadConstraints[0]
+	if tsc.LabelSelector.MatchLabels["app"] != wantDeployHash || tsc.LabelSelector.MatchLabels["corp.io/service"] != wantSecretHash {
+		t.Errorf("unexpected TopologySpreadConstraint MatchLabels: %v", tsc.LabelSelector.MatchLabels)
+	}
 	tscSel, err := metav1.LabelSelectorAsSelector(tsc.LabelSelector)
 	if err != nil || !tscSel.Matches(podLabels) {
 		t.Errorf("sanitized TopologySpreadConstraint labelSelector %v failed to match pod labels %v (err=%v)", tsc.LabelSelector, podLabels, err)
 	}
+	if antiTerm.TopologyKey != "corp.io/team" || tsc.TopologyKey != "corp.io/team" {
+		t.Errorf("expected topology keys to remain 'corp.io/team'; got anti=%q tsc=%q", antiTerm.TopologyKey, tsc.TopologyKey)
+	}
+}
 
-	// 2. Verify default hashedLabelKeys (e.g. "team") AND --extra-hash-labels hash identically across
-	// Namespace <-> ClusterQueue.spec.namespaceSelector and Node <-> ResourceFlavor <-> PodSpec.nodeSelector,
-	// even when "team" is NOT passed via --extra-hash-labels.
+func TestInfraAndWorkloadLabelHashingConsistency(t *testing.T) {
+	hasher := NewSensitiveDataHasher([]string{"corp.io/*"}, nil)
+	wantSecretHash := hasher.HashName(testSecretValue)
+
+	podSpec := &corev1.PodSpec{
+		NodeSelector: map[string]string{
+			"cloud.google.com/gke-cluster-name": testSecretValue,
+			"corp.io/team":                      testSecretValue,
+			"instance":                          "gpu",
+		},
+		Affinity: &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "cloud.google.com/gke-cluster-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{testSecretValue},
+								},
+								{
+									Key:      "corp.io/team",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{testSecretValue},
+								},
+							},
+						},
+					},
+				},
+			},
+			PodAntiAffinity: &corev1.PodAntiAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+					{
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"corp.io/tenant": testSecretValue,
+							},
+						},
+						TopologyKey: "corp.io/team",
+					},
+				},
+			},
+		},
+		Containers: []corev1.Container{{Name: "main", Image: testSecretImage}},
+	}
+	SanitizePodSpec(podSpec, DefaultPauseImage, hasher)
+
 	nsMap := SanitizeNamespace(&corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "ai-lab",
@@ -628,28 +674,17 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 	var cleanCQ kueuev1beta2.ClusterQueue
 	_ = json.Unmarshal(nsBytes, &cleanNS)
 	_ = json.Unmarshal(cqBytes, &cleanCQ)
-	if cleanNS.Labels["team"] != hasher.HashName(testSecretValue) {
-		t.Errorf("expected default sensitive key 'team' to have hashed value on Namespace, got %v", cleanNS.Labels)
+	if cleanNS.Labels["team"] != wantSecretHash || cleanCQ.Spec.NamespaceSelector.MatchLabels["team"] != wantSecretHash {
+		t.Errorf("expected default sensitive key 'team' to have hashed value %q across Namespace and ClusterQueue, got ns=%v cq=%v", wantSecretHash, cleanNS.Labels, cleanCQ.Spec.NamespaceSelector)
 	}
 	cqNsSel, err := metav1.LabelSelectorAsSelector(cleanCQ.Spec.NamespaceSelector)
 	if err != nil || !cqNsSel.Matches(labels.Set(cleanNS.Labels)) {
 		t.Errorf("sanitized ClusterQueue.Spec.NamespaceSelector %v does not match sanitized Namespace labels %v (err=%v)", cleanCQ.Spec.NamespaceSelector, cleanNS.Labels, err)
 	}
+	antiTerm := podSpec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0]
 	antiNsSel, err := metav1.LabelSelectorAsSelector(antiTerm.NamespaceSelector)
 	if err != nil || !antiNsSel.Matches(labels.Set(cleanNS.Labels)) {
 		t.Errorf("sanitized PodAntiAffinity.NamespaceSelector %v does not match sanitized Namespace labels %v (err=%v)", antiTerm.NamespaceSelector, cleanNS.Labels, err)
-	}
-
-	// Also verify default "team" hashing on Node + ResourceFlavor when extraLabelPatterns is nil.
-	defaultHasher := NewSensitiveDataHasher(nil, nil)
-	cleanNodeDefault := SanitizeNode(&corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   "node-default",
-			Labels: map[string]string{"team": testSecretValue, "instance": "gpu"},
-		},
-	}, defaultHasher)
-	if cleanNodeDefault.Labels["team"] != defaultHasher.HashName(testSecretValue) {
-		t.Errorf("expected default 'team' label on Node to be hashed even without --extra-hash-labels, got %v", cleanNodeDefault.Labels)
 	}
 
 	cleanNode := SanitizeNode(&corev1.Node{
@@ -683,19 +718,53 @@ func TestSelectorAndPodAffinityLabelHashingConsistency(t *testing.T) {
 	_ = json.Unmarshal(rfBytes, &cleanRF)
 	_ = json.Unmarshal(topoBytes, &cleanTopo)
 
-	if cleanNode.Labels["corp.io/team"] != hasher.HashName(testSecretValue) {
+	if cleanNode.Labels["corp.io/team"] != wantSecretHash {
 		t.Errorf("expected preserved key 'corp.io/team' with hashed value on Node, got %v", cleanNode.Labels)
 	}
 	if cleanRF.Spec.NodeLabels["corp.io/team"] != cleanNode.Labels["corp.io/team"] {
 		t.Errorf("ResourceFlavor.Spec.NodeLabels %v out of sync with Node.Labels %v", cleanRF.Spec.NodeLabels, cleanNode.Labels)
 	}
-	if cleanTopo.Spec.Levels[0].NodeLabel != "corp.io/team" || antiTerm.TopologyKey != "corp.io/team" || tsc.TopologyKey != "corp.io/team" {
-		t.Errorf("expected topology keys to remain 'corp.io/team'; got topo=%q anti=%q tsc=%q", cleanTopo.Spec.Levels[0].NodeLabel, antiTerm.TopologyKey, tsc.TopologyKey)
+	if cleanTopo.Spec.Levels[0].NodeLabel != "corp.io/team" {
+		t.Errorf("expected Topology level NodeLabel to remain 'corp.io/team', got %q", cleanTopo.Spec.Levels[0].NodeLabel)
 	}
-	for k, v := range roundTrip.Spec.Template.Spec.NodeSelector {
+	for k, v := range podSpec.NodeSelector {
 		if cleanNode.Labels[k] != v {
 			t.Errorf("PodSpec.NodeSelector[%q]=%q does not match Node.Labels %v", k, v, cleanNode.Labels)
 		}
+	}
+	nodeTerms := podSpec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(nodeTerms) != 1 || len(nodeTerms[0].MatchExpressions) != 1 ||
+		nodeTerms[0].MatchExpressions[0].Key != "corp.io/team" ||
+		!slices.Equal(nodeTerms[0].MatchExpressions[0].Values, []string{wantSecretHash}) {
+		t.Errorf("unexpected sanitized NodeAffinity terms: %+v", nodeTerms)
+	}
+}
+
+func TestDefaultSensitiveNodeAndResourceFlavorLabelHashing(t *testing.T) {
+	defaultHasher := NewSensitiveDataHasher(nil, nil)
+	wantHash := defaultHasher.HashName(testSecretValue)
+
+	cleanNode := SanitizeNode(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-default",
+			Labels: map[string]string{"team": testSecretValue, "instance": "gpu"},
+		},
+	}, defaultHasher)
+	rfMap := SanitizeResourceFlavor(&kueuev1beta2.ResourceFlavor{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-rf"},
+		Spec: kueuev1beta2.ResourceFlavorSpec{
+			NodeLabels: map[string]string{"team": testSecretValue, "instance": "gpu"},
+		},
+	}, defaultHasher)
+	rfBytes, _ := json.Marshal(rfMap)
+	var cleanRF kueuev1beta2.ResourceFlavor
+	_ = json.Unmarshal(rfBytes, &cleanRF)
+
+	if cleanNode.Labels["team"] != wantHash {
+		t.Errorf("expected default 'team' label on Node to be hashed to %q without --extra-hash-labels, got %v", wantHash, cleanNode.Labels)
+	}
+	if cleanRF.Spec.NodeLabels["team"] != wantHash {
+		t.Errorf("expected default 'team' label on ResourceFlavor to be hashed to %q without --extra-hash-labels, got %v", wantHash, cleanRF.Spec.NodeLabels)
 	}
 }
 
