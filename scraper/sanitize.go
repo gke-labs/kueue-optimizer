@@ -479,6 +479,22 @@ func SanitizeNodeLabels(labels map[string]string, hasher SensitiveDataHasher) ma
 	return SanitizeInfraLabels(FilterLabels(labels, deniedNodeLabelKeys), hasher)
 }
 
+func sanitizeSlice[T any](items []T, hasher SensitiveDataHasher, sanitize func(T, SensitiveDataHasher) *T) []T {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]T, 0, len(items))
+	for _, item := range items {
+		if clean := sanitize(item, hasher); clean != nil {
+			out = append(out, *clean)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func sanitizeNodeSelectorTerm(term corev1.NodeSelectorTerm, hasher SensitiveDataHasher) *corev1.NodeSelectorTerm {
 	out := corev1.NodeSelectorTerm{
 		MatchFields: slices.Clone(term.MatchFields),
@@ -512,55 +528,28 @@ func sanitizeNodeSelectorTerm(term corev1.NodeSelectorTerm, hasher SensitiveData
 	return &out
 }
 
-func sanitizeNodeSelectorTerms[T any](
-	items []T,
-	getTerm func(T) corev1.NodeSelectorTerm,
-	withTerm func(T, corev1.NodeSelectorTerm) T,
-	hasher SensitiveDataHasher,
-) []T {
-	if len(items) == 0 {
+func sanitizePreferredSchedulingTerm(pref corev1.PreferredSchedulingTerm, hasher SensitiveDataHasher) *corev1.PreferredSchedulingTerm {
+	clean := sanitizeNodeSelectorTerm(pref.Preference, hasher)
+	if clean == nil {
 		return nil
 	}
-	out := make([]T, 0, len(items))
-	for _, item := range items {
-		if sanitized := sanitizeNodeSelectorTerm(getTerm(item), hasher); sanitized != nil {
-			out = append(out, withTerm(item, *sanitized))
-		}
+	return &corev1.PreferredSchedulingTerm{
+		Weight:     pref.Weight,
+		Preference: *clean,
 	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
-func sanitizePodAffinityTerm(term corev1.PodAffinityTerm, hasher SensitiveDataHasher) corev1.PodAffinityTerm {
-	out := *term.DeepCopy()
+func sanitizePodAffinityTerm(term corev1.PodAffinityTerm, hasher SensitiveDataHasher) *corev1.PodAffinityTerm {
+	out := term.DeepCopy()
 	out.LabelSelector = SanitizeLabelSelector(out.LabelSelector, hasher)
 	out.NamespaceSelector = SanitizeInfraLabelSelector(out.NamespaceSelector, hasher)
 	return out
 }
 
-func sanitizePodAffinityTerms(terms []corev1.PodAffinityTerm, hasher SensitiveDataHasher) []corev1.PodAffinityTerm {
-	if len(terms) == 0 {
-		return nil
-	}
-	out := make([]corev1.PodAffinityTerm, len(terms))
-	for i, t := range terms {
-		out[i] = sanitizePodAffinityTerm(t, hasher)
-	}
-	return out
-}
-
-func sanitizeWeightedPodAffinityTerms(terms []corev1.WeightedPodAffinityTerm, hasher SensitiveDataHasher) []corev1.WeightedPodAffinityTerm {
-	if len(terms) == 0 {
-		return nil
-	}
-	out := make([]corev1.WeightedPodAffinityTerm, len(terms))
-	for i, t := range terms {
-		out[i] = t
-		out[i].PodAffinityTerm = sanitizePodAffinityTerm(t.PodAffinityTerm, hasher)
-	}
-	return out
+func sanitizeWeightedPodAffinityTerm(term corev1.WeightedPodAffinityTerm, hasher SensitiveDataHasher) *corev1.WeightedPodAffinityTerm {
+	out := term
+	out.PodAffinityTerm = *sanitizePodAffinityTerm(term.PodAffinityTerm, hasher)
+	return &out
 }
 
 // SanitizeAffinity sanitizes NodeAffinity, PodAffinity, and PodAntiAffinity terms consistently with
@@ -572,24 +561,13 @@ func SanitizeAffinity(aff *corev1.Affinity, hasher SensitiveDataHasher) *corev1.
 	cp := aff.DeepCopy()
 	if cp.NodeAffinity != nil {
 		if req := cp.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution; req != nil {
-			req.NodeSelectorTerms = sanitizeNodeSelectorTerms(
-				req.NodeSelectorTerms,
-				func(t corev1.NodeSelectorTerm) corev1.NodeSelectorTerm { return t },
-				func(_ corev1.NodeSelectorTerm, clean corev1.NodeSelectorTerm) corev1.NodeSelectorTerm { return clean },
-				hasher,
-			)
+			req.NodeSelectorTerms = sanitizeSlice(req.NodeSelectorTerms, hasher, sanitizeNodeSelectorTerm)
 			if len(req.NodeSelectorTerms) == 0 {
 				cp.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
 			}
 		}
-		cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = sanitizeNodeSelectorTerms(
-			cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution,
-			func(p corev1.PreferredSchedulingTerm) corev1.NodeSelectorTerm { return p.Preference },
-			func(p corev1.PreferredSchedulingTerm, clean corev1.NodeSelectorTerm) corev1.PreferredSchedulingTerm {
-				p.Preference = clean
-				return p
-			},
-			hasher,
+		cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = sanitizeSlice(
+			cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution, hasher, sanitizePreferredSchedulingTerm,
 		)
 		if cp.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil &&
 			len(cp.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution) == 0 {
@@ -597,19 +575,19 @@ func SanitizeAffinity(aff *corev1.Affinity, hasher SensitiveDataHasher) *corev1.
 		}
 	}
 	if cp.PodAffinity != nil {
-		cp.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = sanitizePodAffinityTerms(
-			cp.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution, hasher,
+		cp.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution = sanitizeSlice(
+			cp.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution, hasher, sanitizePodAffinityTerm,
 		)
-		cp.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution = sanitizeWeightedPodAffinityTerms(
-			cp.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution, hasher,
+		cp.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution = sanitizeSlice(
+			cp.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution, hasher, sanitizeWeightedPodAffinityTerm,
 		)
 	}
 	if cp.PodAntiAffinity != nil {
-		cp.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution = sanitizePodAffinityTerms(
-			cp.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution, hasher,
+		cp.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution = sanitizeSlice(
+			cp.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution, hasher, sanitizePodAffinityTerm,
 		)
-		cp.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution = sanitizeWeightedPodAffinityTerms(
-			cp.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution, hasher,
+		cp.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution = sanitizeSlice(
+			cp.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution, hasher, sanitizeWeightedPodAffinityTerm,
 		)
 	}
 	if cp.NodeAffinity == nil && cp.PodAffinity == nil && cp.PodAntiAffinity == nil {
