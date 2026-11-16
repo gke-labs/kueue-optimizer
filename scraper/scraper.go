@@ -215,13 +215,14 @@ func (s *Scraper) Run(ctx context.Context) error {
 }
 
 // ScrapeOnce executes a single periodic scrape of Nodes, Namespaces, ClusterQueues,
-// LocalQueues, ResourceFlavors, Topologies, and Scheduled/Running Pods.
+// Cohorts, LocalQueues, ResourceFlavors, Topologies, and Scheduled/Running Pods.
 func (s *Scraper) ScrapeOnce(ctx context.Context) {
 	now := time.Now().UTC()
 	s.scrapeNodes(ctx, now)
 	s.scrapeNamespaces(ctx, now)
 	if s.kueueClient != nil {
 		s.scrapeClusterQueues(ctx, now)
+		s.scrapeCohorts(ctx, now)
 		s.scrapeLocalQueues(ctx, now)
 		s.scrapeResourceFlavors(ctx, now)
 		s.scrapeTopologies(ctx, now)
@@ -373,6 +374,27 @@ func (s *Scraper) scrapeClusterQueues(ctx context.Context, now time.Time) {
 		}
 	}
 	s.reconcileInfraKind("ClusterQueue", now, current)
+}
+
+func (s *Scraper) scrapeCohorts(ctx context.Context, now time.Time) {
+	list, err := s.kueueClient.KueueV1beta2().Cohorts().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("WARN failed to list Cohorts: %v", err)
+		}
+		return
+	}
+	current := make(map[string]cachedObject, len(list.Items))
+	for i := range list.Items {
+		cohort := &list.Items[i]
+		payload := SanitizeCohort(cohort, s.hasher)
+		current[cohort.Name] = cachedObject{
+			name:    cohort.Name,
+			digest:  canonicalDigest(payload),
+			payload: payload,
+		}
+	}
+	s.reconcileInfraKind("Cohort", now, current)
 }
 
 func (s *Scraper) scrapeLocalQueues(ctx context.Context, now time.Time) {
