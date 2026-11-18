@@ -10,7 +10,7 @@ This document specifies the exact JSON Lines (NDJSON) file format, event envelop
 
 | File | Default Flag | Purpose |
 | :--- | :--- | :--- |
-| `infra.json` | `--infra-file` | Periodic state & changes of `Node`s (with status), `Namespace`s, `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without status), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
+| `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
 | `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s, with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
 | `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), preempted runs (`PartialExecution`), and non-preempted completions (`FullExecution`), with top-level `workloadState` metadata. |
 
@@ -108,7 +108,7 @@ Every `payload` object in `infra.json` contains top-level `"apiVersion"` and `"k
 
 | `payload.kind` | `payload.apiVersion` | Includes `.status`? | Name Hashed with `--hash-names`? |
 | :--- | :--- | :--- | :--- |
-| `"Node"` | `"v1"` | **Yes** (full node spec + status) | **No** (plain name) |
+| `"Node"` | `"v1"` | **Yes** (scheduling-only: `capacity`, `allocatable`, `conditions`, `phase`) | **No** (plain name) |
 | `"Namespace"` | `"v1"` | **No** (status omitted) | **No** (plain name) |
 | `"ClusterQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"LocalQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
@@ -120,7 +120,10 @@ Every `payload` object in `infra.json` contains top-level `"apiVersion"` and `"k
 
 ### 3.3 `Node` Payload (`payload.kind == "Node"`)
 
-Stores the complete Kubernetes `v1/Node` object **including `.status`** (capacity, allocatable, conditions, addresses, nodeInfo, images, etc.), with only `metadata.managedFields` stripped.
+Stores a sanitized Kubernetes `v1/Node` object retaining only scheduling-relevant fields:
+- `metadata`: `metadata.managedFields` is stripped, `metadata.annotations` retains only keys under the `kubernetes.io`, `k8s.io`, `x-k8s.io`, and `kueue-optimizer.gke.io` domains and their subdomains (excluding sensitive keys such as `kubectl.kubernetes.io/last-applied-configuration`, `csi.volume.kubernetes.io/nodeid`, and `alpha.kubernetes.io/provided-node-ip`), and `metadata.labels` preserves scheduling/topology/hardware labels while stripping cloud/cluster-identifying keys (such as `cloud.google.com/gke-cluster-name`, `cloud.google.com/project`, `iam.gke.io/node-service-account`, `alpha.eksctl.io/cluster-name`, and `kubernetes.azure.com/cluster`) and (when `--hash-names` is enabled) deterministically hashing values for sensitive keys (`owner`, `team`, `customer`, `project`, `cost-center`, ...) and `--extra-hash-labels`.
+- `spec`: retains only `taints` and `unschedulable` (omitting `providerID`, `podCIDR`, `podCIDRs`, and `configSource`).
+- `status`: retains only `capacity`, `allocatable`, `conditions`, and `phase` (omitting `images`, `addresses`, `nodeInfo`, `volumesInUse`, `volumesAttached`, `daemonEndpoints`, `config`, `runtimeHandlers`, and `features`).
 
 On disk (single line in `infra.json`):
 ```json
@@ -131,7 +134,7 @@ On disk (single line in `infra.json`):
 
 ### 3.4 `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, and `Topology` Payloads
 
-Stores the full Kubernetes/Kueue object (`apiVersion`, `kind`, `metadata`, `spec`), **excluding `.status`** and `metadata.managedFields`.
+Stores the Kubernetes/Kueue object (`apiVersion`, `kind`, `metadata`, `spec`), **excluding `.status`**, `metadata.managedFields`, and any `metadata.annotations` outside the allowed `kubernetes.io`, `k8s.io`, `x-k8s.io`, and `kueue-optimizer.gke.io` domains (and their subdomains) or on the sensitive annotation denylist. When `--hash-names` is enabled, values for sensitive label keys (`owner`, `team`, `customer`, `project`, `cost-center`, ...) and `--extra-hash-labels` (including `ClusterQueue.spec.namespaceSelector` and `ResourceFlavor.spec.nodeLabels`) are deterministically hashed (`h-<32-hex>`) identically to workflow objects.
 
 On disk (single line in `infra.json` for `ClusterQueue`):
 ```json
@@ -152,7 +155,7 @@ To guarantee strict data hygiene, **no other pod fields are ever written to `inf
 | :--- | :--- | :--- | :--- |
 | `apiVersion` | `string` | **Yes** | Always `"v1"`. |
 | `kind` | `string` | **Yes** | Always `"Pod"`. |
-| `name` | `string` | **Yes** | Pod name (or 64-character hex SHA-256 hash when `--hash-names` is enabled). |
+| `name` | `string` | **Yes** | Pod name (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). |
 | `namespace` | `string` | **Yes** | Plain (unhashed) namespace name. |
 | `placement` | `string` | **Yes** | Plain (unhashed) node name (`spec.nodeName`) where the pod is scheduled and running. |
 | `resourceRequest` | `map[string]Quantity` | **Yes** | Effective pod resource requests (e.g., `{"cpu": "1", "memory": "11Gi"}`). Computed using Kubernetes scheduling rules:<br>$\text{Request}(r) = \max\Big(\text{PodRequest}(r),\; \max_{i \in \text{Init}}(\text{Init}_i(r)),\; \sum_{c \in \text{Containers}} \text{Container}_c(r) + \sum_{s \in \text{Sidecars}} \text{Sidecar}_s(r)\Big) + \text{PodOverhead}(r)$ |
@@ -206,7 +209,7 @@ stateDiagram-v2
 | Field | JSON Type | Required | Description |
 | :--- | :--- | :--- | :--- |
 | `objectKind` | `string` | **Yes** | One of `"Job"`, `"JobSet"`, `"LeaderWorkerSet"`, `"Deployment"`, `"RayJob"`, `"RayCluster"`, `"Pod"`. |
-| `name` | `string` | **Yes** | Workflow object name (or 64-character hex SHA-256 hash when `--hash-names` is enabled). |
+| `name` | `string` | **Yes** | Workflow object name (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). |
 | `namespace` | `string` | **Yes** | Plain (unhashed) namespace name. |
 | `creationTime` | `string` (RFC3339 UTC) | **Yes** | `metadata.creationTimestamp` of the workflow object. |
 | `localQueueName` | `string` | **Yes** | Plain (unhashed) Kueue `LocalQueue` name extracted from `kueue.x-k8s.io/queue-name` (on the object's labels/annotations, pod template labels, or inherited from the parent `JobSet` for child `Job`s). Empty string `""` if the object is not associated with a Kueue queue. |
@@ -217,21 +220,34 @@ stateDiagram-v2
 Every workflow object in `workflows.json` is sanitized before being hashed for change detection or written to disk:
 
 1. **Container Image & Command Replacement**:
-   - All `containers`, `initContainers`, and `ephemeralContainers` have their `image` replaced with the pause container image (`registry.k8s.io/pause:3.10` by default, configurable via `--pause-image`) and `command` set to `nil`.
-2. **Command-Line Arguments Stripped**:
-   - Container `args` are set to `nil`.
-   - `RayJob.spec.entrypoint` and `RayJob.spec.runtimeEnvYAML` are cleared (`""`).
+   - All `containers`, `initContainers`, and `ephemeralContainers` (as well as `RayCluster` `autoscalerOptions.image` and `historyServerOptions.collectorOptions.image` when set) have their `image` replaced with the pause container image (`registry.k8s.io/pause:3.10` by default, configurable via `--pause-image`) and `command` set to `nil`.
+2. **Command-Line Arguments & Job Metadata Stripped**:
+   - Container and `RayCluster.spec.autoscalerOptions` `args` are set to `nil`.
+   - `RayJob.spec.entrypoint`, `RayJob.spec.runtimeEnvYAML`, and `RayJob.spec.jobId` are cleared (`""`), and `RayJob.spec.metadata` is set to `nil`.
    - `RayCluster` head and worker group `rayStartParams` are cleared (`nil`).
 3. **Volumes Stripped**:
-   - `spec.volumes`, container `volumeMounts`, and container `volumeDevices` are set to `nil`.
+   - `spec.volumes`, container/`autoscalerOptions` `volumeMounts`, and container `volumeDevices` are set to `nil`.
    - `LeaderWorkerSet.spec.leaderWorkerTemplate.volumeClaimTemplates` and `JobSet.spec.volumeClaimPolicies` are set to `nil`.
-4. **Secrets Stripped**:
-   - `spec.imagePullSecrets`, secret volumes, and secret environment references are set to `nil`.
+4. **Secrets, Credentials & Endpoints Stripped**:
+   - `spec.imagePullSecrets`, secret volumes, secret environment references, `RayCluster.spec.gcsFaultToleranceOptions`, `RayCluster.spec.authOptions.secretName`, `RayCluster.spec.networkPolicy`, `HeadGroupSpec.ingressOptions`/`enableIngress`, and `HeadService.spec` static IPs/CIDRs/`externalName` (preserving `clusterIP: "None"` for headless services) are cleared.
 5. **Environment Variables Stripped**:
-   - Container `env` and `envFrom` slices are set to `nil`.
-6. **Annotation Filtering**:
-   - On both top-level `metadata.annotations` and all nested `JobTemplateSpec` / `PodTemplateSpec` `metadata.annotations`, an annotation is **retained if and only if** its key (case-insensitively) contains `"k8s"`, `"kubernetes"`, `"k8s-x"`, or `"kueue-optimizer"`. All other business or user annotations are removed.
-7. **Status & ManagedFields Stripped**:
+   - `env` and `envFrom` are omitted across all containers (`containers`, `initContainers`, `ephemeralContainers`), as well as `RayCluster` `autoscalerOptions` (`env`, `envFrom`) and `historyServerOptions.collectorOptions` (`env`).
+6. **Probes, Lifecycle Hooks, and Pod/JobSet Identity & Network Fields Stripped**:
+   - Container `livenessProbe`, `readinessProbe`, `startupProbe`, and `lifecycle` (`postStart` / `preStop`) fields are omitted across `containers`, `initContainers`, and `ephemeralContainers`.
+   - Pod `serviceAccountName` (and legacy `serviceAccount`), `hostname`, `hostnameOverride`, `subdomain`, `hostAliases`, and `dnsConfig` fields, as well as `JobSet.spec.network.subdomain`, are omitted.
+7. **Annotation Filtering**:
+   - Applied to top-level `metadata.annotations` and nested `JobTemplateSpec`, `PodTemplateSpec`, and `Service` `metadata.annotations`.
+   - **Allowed domains** (exact or subdomain, case-insensitive): `kubernetes.io`, `k8s.io`, `x-k8s.io`, `kueue-optimizer.gke.io`. Custom domains (even if containing `k8s` or `kubernetes` as substrings) and unprefixed keys are stripped.
+   - **Sensitive denylist** (always stripped even under allowed domains): `kubectl.kubernetes.io/last-applied-configuration`, `kubernetes.io/change-cause`, `kubernetes.io/description`, `kubernetes.io/service-account.name`, `kubernetes.io/service-account.uid`, `pod.alpha.kubernetes.io/init-containers`, `pod.beta.kubernetes.io/init-containers`, `pod.alpha.kubernetes.io/init-container-statuses`, `pod.beta.kubernetes.io/init-container-statuses`, `csi.volume.kubernetes.io/nodeid`, `alpha.kubernetes.io/provided-node-ip`.
+8. **Salted Deterministic Label Value Hashing (When `--hash-names` Is Enabled)**:
+   - **Only label values are hashed**: Matching labels have their **values** replaced with `h-<first-32-hex-chars>` (34 characters `<= 63`-char Kubernetes label limit); label **keys** are never hashed.
+   - **Key management**: When `--hash-names` is enabled, `Scraper` initializes `SensitiveDataHasher` with a fresh in-memory 256-bit `crypto/rand` key (never logged or written to disk) to compute `HMAC-SHA256` digests. When `--hash-names` is disabled, `NoopHasher` leaves names and label values unchanged.
+   - **Where applied (values only)**: Top-level `metadata.labels`, nested `JobTemplateSpec` / `PodTemplateSpec` / `Ray` group `labels`, `spec.selector` (`matchLabels` values and `matchExpressions[].values`), `HeadService.spec.selector`, `RayJob.spec.clusterSelector`, and `PodSpec` scheduling constraints (`nodeSelector`, `affinity`, `topologySpreadConstraints`).
+   - **Matched keys**:
+     - Organizational/identity keys (unprefixed or `<domain>/<name>`): `owner`, `team`, `customer`, `client`, `user`, `username`, `author`, `creator`, `maintainer`, `contact`, `email`, `department`, `org`, `organization`, `cost-center`, `cost_center`, `costcenter`, `billing`, `project`, `account`.
+     - Workload-referencing label keys (see Section 6 table).
+     - Any additional keys or `<domain>/*` patterns passed via `--extra-hash-labels`.
+9. **Status & ManagedFields Stripped**:
    - `.status` and `metadata.managedFields` are removed so only the submitted specification is stored.
 
 ### 4.4 On-Disk Single-Line Examples (`New` and `Update` `JobSet` Events in `workflows.json`)
@@ -270,10 +286,10 @@ stateDiagram-v2
 | Field | JSON Type | Required | Description |
 | :--- | :--- | :--- | :--- |
 | `executionType` | `string` | On execution completion | `"Partial"` on `"PartialExecution"` events; `"Full"` on `"FullExecution"` events; omitted on `"Admitted"` events. |
-| `workloadName` | `string` | **Yes** | Kueue `Workload` object name (or 64-character hex SHA-256 hash when `--hash-names` is enabled). |
+| `workloadName` | `string` | **Yes** | Kueue `Workload` object name (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). |
 | `namespace` | `string` | **Yes** | Plain (unhashed) namespace name. |
 | `ownerKind` | `string` | Optional | Kind of the owning workflow object (e.g., `"JobSet"`, `"Job"`, `"LeaderWorkerSet"`, `"Deployment"`, `"RayJob"`, `"RayCluster"`, `"Pod"`). |
-| `ownerName` | `string` | Optional | Name of the owning workflow object (or 64-character hex SHA-256 hash when `--hash-names` is enabled). |
+| `ownerName` | `string` | Optional | Name of the owning workflow object (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). |
 | `ownerAPIVersion` | `string` | Optional | API group/version of the owning workflow object (e.g., `"jobset.x-k8s.io/v1alpha2"`). |
 | `localQueueName` | `string` | Optional | Plain (unhashed) `LocalQueue` name (`workload.spec.queueName`). |
 | `clusterQueueName` | `string` | Optional | Plain (unhashed) `ClusterQueue` name (`workload.status.admission.clusterQueue`). |
@@ -297,9 +313,13 @@ stateDiagram-v2
 
 ---
 
-## 6. SHA-256 Name Anonymization (`--hash-names` / `--sha256-names`)
+## 6. Salted HMAC-SHA256 Name & Label Anonymization (`--hash-names` / `--sha256-names`)
 
-When `--hash-names` (or `--sha256-names`) is passed on the command line, `cluster-scraper` deterministically replaces workload/workflow/pod names with their lowercase 64-character hex-encoded SHA-256 digest (`sha256(name)`), while preserving infrastructure names in plain text so cluster topology and queue hierarchy remain directly inspectable.
+- **Disabled (`--hash-names=false`, default)**: `Scraper` uses `NoopHasher`; names and label values remain in plain text (`--extra-hash-labels` requires `--hash-names`).
+- **Enabled (`--hash-names` / `--sha256-names`)**: `Scraper` uses a per-run 256-bit CSPRNG `HMAC-SHA256` key (`HashName`) to deterministically hash both resource names and label values into the same `h-<32-hex>` format (34 characters `<= 63`-char Kubernetes DNS/label limit) so cross-references between object names and label values match 1-to-1:
+  - **Workload/workflow/pod names** (plus `ownerReferences` and name-holding annotations).
+  - **Sensitive, workload-referencing, and `--extra-hash-labels` label values** (label keys are never hashed).
+- **Infrastructure names**: Always kept in plain text so cluster topology and queue hierarchy remain directly inspectable.
 
 | Object Kind | Hashed When `--hash-names` Is Enabled? | Cross-References Also Hashed |
 | :--- | :--- | :--- |
@@ -312,8 +332,8 @@ When `--hash-names` (or `--sha256-names`) is passed on the command line, `cluste
 | `Workload` | **SHA-256 hashed** | `ExecutionTimePayload.workloadName`, `kueue.x-k8s.io/workload`, `kueue.x-k8s.io/workload-slice-name`, `kueue.x-k8s.io/workload-slice-replacement-for` |
 | `Pod` | **SHA-256 hashed** | `ScrapedPodPayload.name`, `WorkflowPayload.name`, `metadata.name`, `metadata.generateName` |
 | `Job` | **SHA-256 hashed** | `WorkflowPayload.name`, `ExecutionTimePayload.ownerName`, `metadata.ownerReferences`, `job-name`, `batch.kubernetes.io/job-name` |
-| `JobSet` | **SHA-256 hashed** | `WorkflowPayload.name`, `ExecutionTimePayload.ownerName`, `metadata.ownerReferences`, `jobset.sigs.k8s.io/jobset-name` |
-| `LeaderWorkerSet` | **SHA-256 hashed** | `WorkflowPayload.name`, `ExecutionTimePayload.ownerName`, `metadata.ownerReferences`, `leaderworkerset.sigs.k8s.io/name` |
+| `JobSet` | **SHA-256 hashed** | `WorkflowPayload.name`, `ExecutionTimePayload.ownerName`, `metadata.ownerReferences`, `jobset.sigs.k8s.io/jobset-name`, `jobset.sigs.k8s.io/coordinator`, `alpha.jobset.sigs.k8s.io/namespaced-job` |
+| `LeaderWorkerSet` | **SHA-256 hashed** | `WorkflowPayload.name`, `ExecutionTimePayload.ownerName`, `metadata.ownerReferences`, `leaderworkerset.sigs.k8s.io/name`, `leaderworkerset.sigs.k8s.io/leader-name`, `leaderworkerset.sigs.k8s.io/leader-address` |
 | `Deployment` | **SHA-256 hashed** | `WorkflowPayload.name`, `ExecutionTimePayload.ownerName`, `metadata.ownerReferences`, `app`, `app.kubernetes.io/name`, `app.kubernetes.io/instance` |
 | `RayJob` | **SHA-256 hashed** | `WorkflowPayload.name`, `ExecutionTimePayload.ownerName`, `metadata.ownerReferences`, `ray.io/cluster` |
 | `RayCluster` | **SHA-256 hashed** | `WorkflowPayload.name`, `ExecutionTimePayload.ownerName`, `metadata.ownerReferences`, `ray.io/cluster` |

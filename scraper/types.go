@@ -66,6 +66,8 @@ type Config struct {
 	Duration          time.Duration
 	HashNames         bool
 	PauseImage        string
+	ExtraHashLabels   []string
+	HashSalt          []byte
 	InfraFile         string
 	WorkflowsFile     string
 	ExecutionTimeFile string
@@ -237,6 +239,9 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 		b.WriteString("Run Duration Limit       : until interrupted (SIGINT/SIGTERM)\n")
 	}
 	b.WriteString(fmt.Sprintf("Pause Container Image    : %s\n", cfg.PauseImage))
+	if len(cfg.ExtraHashLabels) > 0 {
+		b.WriteString(fmt.Sprintf("Extra Hashed Labels      : %s\n", strings.Join(cfg.ExtraHashLabels, ", ")))
+	}
 	b.WriteString("\n")
 	b.WriteString("Output JSON Event Logs:\n")
 	b.WriteString(fmt.Sprintf("  1. %-22s : Nodes, Namespaces, ClusterQueues, LocalQueues, ResourceFlavors, Topologies, and Scheduled/Running Pods\n", cfg.InfraFile))
@@ -244,35 +249,42 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 	b.WriteString(fmt.Sprintf("  3. %-22s : Kueue Workload admission, partial execution (preempted), and full execution (completed without preemption)\n", cfg.ExecutionTimeFile))
 	b.WriteString("\n")
 	b.WriteString("Objects Being Scraped:\n")
-	b.WriteString("  - Nodes (v1/Node)                                   : Full object information including status (periodic)\n")
-	b.WriteString("  - Namespaces (v1/Namespace)                         : Full object information without status (periodic)\n")
-	b.WriteString("  - ClusterQueues (kueue.x-k8s.io/v1beta2)            : Full object information without status (periodic)\n")
-	b.WriteString("  - LocalQueues (kueue.x-k8s.io/v1beta2)              : Full object information without status (periodic)\n")
-	b.WriteString("  - ResourceFlavors (kueue.x-k8s.io/v1beta2)          : Full object information without status (periodic)\n")
-	b.WriteString("  - Topologies (kueue.x-k8s.io/v1beta2)               : Full object information without status (periodic)\n")
+	b.WriteString("  - Nodes (v1/Node)                                   : Sanitized scheduling-relevant spec & status (periodic)\n")
+	b.WriteString("  - Namespaces (v1/Namespace)                         : Sanitized object information without status (periodic)\n")
+	b.WriteString("  - ClusterQueues (kueue.x-k8s.io/v1beta2)            : Sanitized object information without status (periodic)\n")
+	b.WriteString("  - LocalQueues (kueue.x-k8s.io/v1beta2)              : Sanitized object information without status (periodic)\n")
+	b.WriteString("  - ResourceFlavors (kueue.x-k8s.io/v1beta2)          : Sanitized object information without status (periodic)\n")
+	b.WriteString("  - Topologies (kueue.x-k8s.io/v1beta2)               : Sanitized object information without status (periodic)\n")
 	b.WriteString("  - Scheduled & Running Pods (v1/Pod)                 : Placement (nodeName), resource request, scheduling time, first notice time, and deletion time via watch\n")
 	b.WriteString("  - Workflow Creations/Updates (via watch)            : Jobs, JobSets, LeaderWorkerSets, Deployments, RayJobs, RayClusters, and standalone Kueue-managed Pods (recording creation time and LocalQueue name)\n")
 	b.WriteString("  - Kueue Workloads (kueue.x-k8s.io/v1beta2, watch)   : Admission timestamp, partial execution (on preemption), and full execution (on completion without preemption)\n")
 	b.WriteString("\n")
 	b.WriteString("Information Omitted / Sanitized:\n")
+	b.WriteString("  - Nodes (in infra.json):\n")
+	b.WriteString("      * Retained spec/status: spec.{taints, unschedulable} and status.{capacity, allocatable, conditions, phase}\n")
+	b.WriteString("      * Omitted: status.{images, addresses, nodeInfo, volumesInUse, volumesAttached, daemonEndpoints, config, runtimeHandlers, features}, spec.{providerID, podCIDR, podCIDRs, configSource}, metadata.managedFields, cloud/cluster-identifying labels, and disallowed/sensitive annotations (sensitive/--extra-hash-labels label values hashed when --hash-names is enabled)\n")
 	b.WriteString("  - Namespaces, ClusterQueues, LocalQueues, ResourceFlavors, Topologies:\n")
-	b.WriteString("      * Omitted: status subresource and metadata.managedFields\n")
+	b.WriteString("      * Omitted: status subresource, metadata.managedFields, and disallowed/sensitive annotations (sensitive/--extra-hash-labels label values hashed when --hash-names is enabled)\n")
 	b.WriteString("  - Scheduled & Running Pods (in infra.json):\n")
 	b.WriteString("      * Omitted: ALL fields except placement, resource request, scheduling time, first notice time, and deletion time\n")
 	b.WriteString("      * Specifically omitted: container specs/statuses, images, execution arguments, commands, secrets, volumes, annotations, and labels\n")
 	b.WriteString("  - Workflow Objects (Jobs, JobSets, LeaderWorkerSets, Deployments, RayJobs, RayClusters, standalone Kueue Pods in workflows.json):\n")
 	b.WriteString(fmt.Sprintf("      * Command line / container image : Replaced with pause container (%s) and command cleared\n", cfg.PauseImage))
 	b.WriteString("      * Command line arguments         : Omitted (args, Ray entrypoint/runtimeEnvYAML/rayStartParams cleared)\n")
+	b.WriteString("      * Probes & lifecycle hooks       : Omitted (livenessProbe, readinessProbe, startupProbe, lifecycle)\n")
+	b.WriteString("      * Pod identity & network names   : Omitted (serviceAccountName, serviceAccount, hostname, hostnameOverride, subdomain, hostAliases, dnsConfig, JobSet network.subdomain)\n")
 	b.WriteString("      * Volumes                        : Omitted (volumes, volumeMounts, volumeDevices, volumeClaimTemplates, volumeClaimPolicies)\n")
 	b.WriteString("      * Secrets                        : Omitted (imagePullSecrets, secret volumes/env)\n")
 	b.WriteString("      * Environment variables          : Omitted (env, envFrom)\n")
-	b.WriteString("      * Annotations                    : Omitted if annotation key does not contain 'k8s', 'kubernetes', 'k8s-x', or 'kueue-optimizer' (in both top-level metadata and pod/job templates)\n")
+	b.WriteString("      * Annotations                    : Omitted unless domain is kubernetes.io, k8s.io, x-k8s.io, or kueue-optimizer.gke.io (or their subdomains, excluding sensitive keys like kubectl.kubernetes.io/last-applied-configuration)\n")
+	b.WriteString("      * Labels                         : Values hashed with per-run HMAC-SHA256 when --hash-names is enabled if key matches sensitive user label list (owner, team, customer, ...), workload-name labels, or --extra-hash-labels (across metadata, selectors, and pod/node affinities)\n")
 	b.WriteString("      * Status & managedFields         : Omitted (stored as submitted to the cluster)\n")
 	b.WriteString("\n")
-	b.WriteString("SHA-256 Name Replacement:\n")
+	b.WriteString("SHA-256 Name Replacement & Label Hashing (per-run HMAC-SHA256):\n")
 	b.WriteString(fmt.Sprintf("  - Enabled                            : %t\n", cfg.HashNames))
 	b.WriteString("  - Objects with SHA-256 hashed names  : Workloads, Pods, Jobs, JobSets, LeaderWorkerSets, Deployments, RayJobs, RayClusters\n")
 	b.WriteString("  - Objects NEVER hashed (plain names) : Namespaces, Nodes, ClusterQueues, LocalQueues, ResourceFlavors, Topologies\n")
+	b.WriteString("  - Hashed label values (when enabled) : Sensitive organizational labels (owner, team, customer, ...), workload-referencing labels, and --extra-hash-labels\n")
 	b.WriteString("================================================================================\n")
 	_, _ = io.WriteString(w, b.String())
 }
