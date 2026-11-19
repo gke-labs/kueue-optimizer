@@ -55,6 +55,7 @@ var nonHashedKinds = map[string]bool{
 	"Namespace":      true,
 	"Node":           true,
 	"ClusterQueue":   true,
+	"Cohort":         true,
 	"LocalQueue":     true,
 	"ResourceFlavor": true,
 	"Topology":       true,
@@ -315,7 +316,7 @@ func (h hmacSensitiveDataHasher) HashName(val string) string {
 }
 
 // HashNameForKind hashes name only if kind is a workload/pod/job/jobset/etc.
-// Names of namespaces, nodes, queues, resource flavors, and topologies are never hashed.
+// Names of namespaces, nodes, queues, cohorts, resource flavors, and topologies are never hashed.
 func (h hmacSensitiveDataHasher) HashNameForKind(kind, name string) string {
 	if name == "" || nonHashedKinds[kind] {
 		return name
@@ -961,6 +962,17 @@ func SanitizeClusterQueue(cq *kueuev1beta2.ClusterQueue, hasher SensitiveDataHas
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "ClusterQueue"}
 	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
 	cp.Spec.NamespaceSelector = SanitizeInfraLabelSelector(cp.Spec.NamespaceSelector, hasher)
+	return toMapWithoutStatus(cp)
+}
+
+// SanitizeCohort prepares a Cohort for infra.json (filtering annotations, hashing sensitive/--extra-hash-labels values via hasher, and omitting status).
+func SanitizeCohort(cohort *kueuev1beta2.Cohort, hasher SensitiveDataHasher) map[string]any {
+	if cohort == nil {
+		return nil
+	}
+	cp := cohort.DeepCopy()
+	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "Cohort"}
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
 	return toMapWithoutStatus(cp)
 }
 

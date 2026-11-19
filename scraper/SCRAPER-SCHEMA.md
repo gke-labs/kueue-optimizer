@@ -10,7 +10,7 @@ This document specifies the exact JSON Lines (NDJSON) file format, event envelop
 
 | File | Default Flag | Purpose |
 | :--- | :--- | :--- |
-| `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `ClusterQueue`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
+| `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
 | `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s, with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
 | `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), preempted runs (`PartialExecution`), and non-preempted completions (`FullExecution`), with top-level `workloadState` metadata. |
 
@@ -83,7 +83,7 @@ flowchart LR
         WS["workloadState: 'NotAdmitted' | 'AdmissionInProgress' | 'Admitted'\n(in workflows.json & execution-time.json)"]
         PL["payload: { ... }"]
     end
-    PL --> Infra["infra.json Payload\n(Node, Namespace, ClusterQueue, LocalQueue,\nResourceFlavor, Topology, ScrapedPodPayload)"]
+    PL --> Infra["infra.json Payload\n(Node, Namespace, ClusterQueue, Cohort, LocalQueue,\nResourceFlavor, Topology, ScrapedPodPayload)"]
     PL --> Workflows["workflows.json Payload\n(WorkflowPayload wrapping sanitized\nJob, JobSet, LWS, Deployment, RayJob, RayCluster, Pod)"]
     PL --> ExecTime["execution-time.json Payload\n(ExecutionTimePayload for Kueue Workload\nadmission & partial/full execution)"]
 ```
@@ -98,7 +98,7 @@ flowchart LR
 
 | `eventType` | Emission Trigger |
 | :--- | :--- |
-| `"New"` | Emitted the first time an object (`Node`, `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, `Topology`, or scheduled/running `Pod`) is observed by the scraper. |
+| `"New"` | Emitted the first time an object (`Node`, `Namespace`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, or scheduled/running `Pod`) is observed by the scraper. |
 | `"Update"` | Emitted on a periodic scrape tick when a tracked object's canonical SHA-256 digest (ignoring volatile `metadata.resourceVersion`) changes compared to its previously recorded state. |
 | `"Deleted"` | Emitted when a previously observed infrastructure object disappears between periodic scrapes, or immediately when a tracked `Pod` receives a `DELETED` watch event. |
 
@@ -111,6 +111,7 @@ Every `payload` object in `infra.json` contains top-level `"apiVersion"` and `"k
 | `"Node"` | `"v1"` | **Yes** (scheduling-only: `capacity`, `allocatable`, `conditions`, `phase`) | **No** (plain name) |
 | `"Namespace"` | `"v1"` | **No** (status omitted) | **No** (plain name) |
 | `"ClusterQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
+| `"Cohort"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"LocalQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"ResourceFlavor"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"Topology"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
@@ -132,13 +133,18 @@ On disk (single line in `infra.json`):
 
 ---
 
-### 3.4 `Namespace`, `ClusterQueue`, `LocalQueue`, `ResourceFlavor`, and `Topology` Payloads
+### 3.4 `Namespace`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, and `Topology` Payloads
 
 Stores the Kubernetes/Kueue object (`apiVersion`, `kind`, `metadata`, `spec`), **excluding `.status`**, `metadata.managedFields`, and any `metadata.annotations` outside the allowed `kubernetes.io`, `k8s.io`, `x-k8s.io`, and `kueue-optimizer.gke.io` domains (and their subdomains) or on the sensitive annotation denylist. When `--hash-names` is enabled, values for sensitive label keys (`owner`, `team`, `customer`, `project`, `cost-center`, ...) and `--extra-hash-labels` (including `ClusterQueue.spec.namespaceSelector` and `ResourceFlavor.spec.nodeLabels`) are deterministically hashed (`h-<32-hex>`) identically to workflow objects.
 
 On disk (single line in `infra.json` for `ClusterQueue`):
 ```json
 {"timestamp":"2026-10-30T12:05:53.443652256Z","eventType":"New","payload":{"apiVersion":"kueue.x-k8s.io/v1beta2","kind":"ClusterQueue","metadata":{"creationTimestamp":"2026-10-30T12:05:14Z","finalizers":["kueue.x-k8s.io/resource-in-use"],"generation":1,"name":"ai-lab-cq","resourceVersion":"249","uid":"68ce46db-48b0-4271-903a-d6eb4819ab56"},"spec":{"namespaceSelector":{},"preemption":{"reclaimWithinCohort":"Never","withinClusterQueue":"Never"},"queueingStrategy":"StrictFIFO","resourceGroups":[{"coveredResources":["cpu","memory"],"flavors":[{"name":"default-flavor","resources":[{"name":"cpu","nominalQuota":"40"},{"name":"memory","nominalQuota":"160Gi"}]}]}]}}}
+```
+
+On disk (single line in `infra.json` for `Cohort`):
+```json
+{"timestamp":"2026-10-30T12:05:53.450112904Z","eventType":"New","payload":{"apiVersion":"kueue.x-k8s.io/v1beta2","kind":"Cohort","metadata":{"creationTimestamp":"2026-10-30T12:05:14Z","generation":1,"name":"main-cohort","resourceVersion":"245","uid":"9f2b1b24-1b7d-4e54-8f31-18e62f9a3d10"},"spec":{"fairSharing":{"weight":"2"},"parentName":"root-cohort","resourceGroups":[{"coveredResources":["cpu"],"flavors":[{"name":"default-flavor","resources":[{"borrowingLimit":"8","lendingLimit":"4","name":"cpu","nominalQuota":"16"}]}]}]}}}
 ```
 
 ---
@@ -326,6 +332,7 @@ stateDiagram-v2
 | `Node` | **Never hashed** (plain name) | `ScrapedPodPayload.placement` (`spec.nodeName`) is also kept plain |
 | `Namespace` | **Never hashed** (plain name) | `metadata.namespace` across all events is kept plain |
 | `ClusterQueue` | **Never hashed** (plain name) | `ExecutionTimePayload.clusterQueueName` is kept plain |
+| `Cohort` | **Never hashed** (plain name) | `ClusterQueue.spec.cohortName` and `Cohort.spec.parentName` are kept plain |
 | `LocalQueue` | **Never hashed** (plain name) | `kueue.x-k8s.io/queue-name`, `WorkflowPayload.localQueueName`, and `ExecutionTimePayload.localQueueName` are kept plain |
 | `ResourceFlavor` | **Never hashed** (plain name) | Flavor references in `ClusterQueue` are kept plain |
 | `Topology` | **Never hashed** (plain name) | Topology references in `ResourceFlavor` are kept plain |

@@ -34,19 +34,25 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 	jobsetfake "sigs.k8s.io/jobset/client-go/clientset/versioned/fake"
 	kueuev1beta2 "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	kueueclientset "sigs.k8s.io/kueue/client-go/clientset/versioned"
 	kueuefake "sigs.k8s.io/kueue/client-go/clientset/versioned/fake"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 )
@@ -93,6 +99,67 @@ func readJSONLines[T any](t *testing.T, raw []byte) []T {
 	return results
 }
 
+func newTestScraper(
+	t *testing.T,
+	cfg Config,
+	kubeClient kubernetes.Interface,
+	kueueClient kueueclientset.Interface,
+	dynamicClient dynamic.Interface,
+) *Scraper {
+	t.Helper()
+	tmpDir := t.TempDir()
+	if cfg.Interval == 0 {
+		cfg.Interval = 60 * time.Second
+	}
+	if cfg.PauseImage == "" {
+		cfg.PauseImage = DefaultPauseImage
+	}
+	if cfg.InfraFile == "" {
+		cfg.InfraFile = filepath.Join(tmpDir, "infra.json")
+	}
+	if cfg.WorkflowsFile == "" {
+		cfg.WorkflowsFile = filepath.Join(tmpDir, "workflows.json")
+	}
+	if cfg.ExecutionTimeFile == "" {
+		cfg.ExecutionTimeFile = filepath.Join(tmpDir, "execution-time.json")
+	}
+	if kubeClient == nil {
+		kubeClient = kubefake.NewSimpleClientset()
+	}
+	if kueueClient == nil {
+		kueueClient = kueuefake.NewSimpleClientset()
+	}
+
+	infraLog, err := NewJSONEventLog(cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("create infraLog: %v", err)
+	}
+	t.Cleanup(func() { _ = infraLog.Close() })
+
+	workflowsLog, err := NewJSONEventLog(cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("create workflowsLog: %v", err)
+	}
+	t.Cleanup(func() { _ = workflowsLog.Close() })
+
+	execTimeLog, err := NewJSONEventLog(cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("create execTimeLog: %v", err)
+	}
+	t.Cleanup(func() { _ = execTimeLog.Close() })
+
+	return NewScraper(
+		cfg,
+		kubeClient,
+		kueueClient,
+		jobsetfake.NewSimpleClientset(),
+		dynamicClient,
+		infraLog,
+		workflowsLog,
+		execTimeLog,
+	)
+}
+
 func TestStartupBanner(t *testing.T) {
 	var buf bytes.Buffer
 	cfg := Config{
@@ -114,6 +181,7 @@ func TestStartupBanner(t *testing.T) {
 		"Nodes (v1/Node)",
 		"Namespaces (v1/Namespace)",
 		"ClusterQueues",
+		"Cohorts",
 		"LocalQueues",
 		"ResourceFlavors",
 		"Topologies",
@@ -122,7 +190,7 @@ func TestStartupBanner(t *testing.T) {
 		"SHA-256 Name Replacement",
 		"Enabled                            : true",
 		"Workloads, Pods, Jobs, JobSets, LeaderWorkerSets, Deployments, RayJobs, RayClusters",
-		"Namespaces, Nodes, ClusterQueues, LocalQueues, ResourceFlavors, Topologies",
+		"Namespaces, Nodes, ClusterQueues, Cohorts, LocalQueues, ResourceFlavors, Topologies",
 	}
 	for _, sub := range requiredSubstrings {
 		if !strings.Contains(out, sub) {
@@ -435,6 +503,49 @@ func TestNoopHasherPreservesPlainNamesAndLabels(t *testing.T) {
 	}
 	if noop.ShouldHashLabel("team") || noop.ShouldHashWorkloadLabel("app") {
 		t.Errorf("expected NoopHasher ShouldHashLabel/ShouldHashWorkloadLabel to return false")
+	}
+}
+
+func TestHashNameForKind(t *testing.T) {
+	hasher := NewSensitiveDataHasher(nil, nil)
+	rawName := "sample-object-name"
+
+	infraKinds := []string{
+		"Namespace",
+		"Node",
+		"ClusterQueue",
+		"Cohort",
+		"LocalQueue",
+		"ResourceFlavor",
+		"Topology",
+	}
+	for _, kind := range infraKinds {
+		if got := hasher.HashNameForKind(kind, rawName); got != rawName {
+			t.Errorf("HashNameForKind(%q, %q) = %q, want plain %q", kind, rawName, got, rawName)
+		}
+		if got := hasher.HashNameForKind(kind, ""); got != "" {
+			t.Errorf("HashNameForKind(%q, \"\") = %q, want empty string", kind, got)
+		}
+	}
+
+	wantHashed := hasher.HashName(rawName)
+	workloadKinds := []string{
+		"Workload",
+		"Pod",
+		"Job",
+		"JobSet",
+		"LeaderWorkerSet",
+		"Deployment",
+		"RayJob",
+		"RayCluster",
+	}
+	for _, kind := range workloadKinds {
+		if got := hasher.HashNameForKind(kind, rawName); got != wantHashed {
+			t.Errorf("HashNameForKind(%q, %q) = %q, want hashed %q", kind, rawName, got, wantHashed)
+		}
+		if got := hasher.HashNameForKind(kind, ""); got != "" {
+			t.Errorf("HashNameForKind(%q, \"\") = %q, want empty string", kind, got)
+		}
 	}
 }
 
@@ -979,16 +1090,6 @@ func TestPodSpecProbesLifecycleAndIdentitySanitization(t *testing.T) {
 }
 
 func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
-	tmpDir := t.TempDir()
-	cfg := Config{
-		Interval:          60 * time.Second,
-		HashNames:         true,
-		PauseImage:        DefaultPauseImage,
-		InfraFile:         filepath.Join(tmpDir, "infra.json"),
-		WorkflowsFile:     filepath.Join(tmpDir, "workflows.json"),
-		ExecutionTimeFile: filepath.Join(tmpDir, "execution-time.json"),
-	}
-
 	schedTime := metav1.NewTime(time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC))
 	rawPodName := testSecretNamePrefix + "train-pod-0"
 
@@ -1117,6 +1218,49 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 			AdmittedWorkloads: 5,
 		},
 	}
+	cohort := &kueuev1beta2.Cohort{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "main-cohort",
+			Labels: map[string]string{
+				"team": testSecretValue,
+				"tier": "shared",
+			},
+			Annotations: map[string]string{
+				"finance.corp.com/cost-center":     testSecretValue,
+				corev1.LastAppliedConfigAnnotation: testSecretValue,
+				"kueue.x-k8s.io/cohort-note":       "keep-cohort-annot",
+			},
+		},
+		Spec: kueuev1beta2.CohortSpec{
+			ParentName: "root-cohort",
+			FairSharing: &kueuev1beta2.FairSharing{
+				Weight: ptr.To(resource.MustParse("2")),
+			},
+			ResourceGroups: []kueuev1beta2.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{corev1.ResourceCPU},
+					Flavors: []kueuev1beta2.FlavorQuotas{
+						{
+							Name: "default-flavor",
+							Resources: []kueuev1beta2.ResourceQuota{
+								{
+									Name:           corev1.ResourceCPU,
+									NominalQuota:   resource.MustParse("16"),
+									BorrowingLimit: ptr.To(resource.MustParse("8")),
+									LendingLimit:   ptr.To(resource.MustParse("4")),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: kueuev1beta2.CohortStatus{
+			FairSharing: &kueuev1beta2.FairSharingStatus{
+				WeightedShare: 100,
+			},
+		},
+	}
 	lq := &kueuev1beta2.LocalQueue{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "ai-lab-lq",
@@ -1156,28 +1300,8 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 	}
 
 	kubeClient := kubefake.NewSimpleClientset(node, ns, runningPod)
-	kueueClient := kueuefake.NewSimpleClientset(cq, lq, rf, topo)
-	jobsetClient := jobsetfake.NewSimpleClientset()
-
-	infraLog, err := NewJSONEventLog(cfg.InfraFile)
-	if err != nil {
-		t.Fatalf("create infraLog: %v", err)
-	}
-	defer func() { _ = infraLog.Close() }()
-
-	workflowsLog, err := NewJSONEventLog(cfg.WorkflowsFile)
-	if err != nil {
-		t.Fatalf("create workflowsLog: %v", err)
-	}
-	defer func() { _ = workflowsLog.Close() }()
-
-	execTimeLog, err := NewJSONEventLog(cfg.ExecutionTimeFile)
-	if err != nil {
-		t.Fatalf("create execTimeLog: %v", err)
-	}
-	defer func() { _ = execTimeLog.Close() }()
-
-	scraper := NewScraper(cfg, kubeClient, kueueClient, jobsetClient, nil, infraLog, workflowsLog, execTimeLog)
+	kueueClient := kueuefake.NewSimpleClientset(cq, cohort, lq, rf, topo)
+	scraper := newTestScraper(t, Config{HashNames: true}, kubeClient, kueueClient, nil)
 
 	ctx := context.Background()
 	scraper.ScrapeOnce(ctx)
@@ -1185,14 +1309,14 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 	// Simulate watch deletion of the running pod.
 	scraper.handlePodWatchEvent(watch.Deleted, runningPod)
 
-	rawInfra, err := os.ReadFile(cfg.InfraFile)
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
 	if err != nil {
 		t.Fatalf("read infra.json: %v", err)
 	}
 	events := readJSONLines[map[string]any](t, rawInfra)
 
-	if len(events) != 8 {
-		t.Fatalf("expected 8 infra events (6 infra objects + 1 pod new + 1 pod deleted), got %d", len(events))
+	if len(events) != 9 {
+		t.Fatalf("expected 9 infra events (7 infra objects + 1 pod new + 1 pod deleted), got %d", len(events))
 	}
 
 	for _, ev := range events {
@@ -1216,7 +1340,7 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 			if _, hasStatus := payload["status"]; !hasStatus {
 				t.Errorf("Node payload must include status")
 			}
-		case "Namespace", "ClusterQueue", "LocalQueue", "ResourceFlavor", "Topology":
+		case "Namespace", "ClusterQueue", "Cohort", "LocalQueue", "ResourceFlavor", "Topology":
 			meta := payload["metadata"].(map[string]any)
 			name := meta["name"].(string)
 			if _, hasStatus := payload["status"]; hasStatus {
@@ -1261,6 +1385,8 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		"KubeletReady",
 		"keep-ns-annot",
 		"keep-cq-annot",
+		"keep-cohort-annot",
+		"root-cohort",
 		`"environment":"prod"`,
 		`"team":"` + scraper.hasher.HashName(testSecretValue) + `"`,
 	} {
@@ -1271,39 +1397,15 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 }
 
 func TestWorkflowsSanitizationAndRecording(t *testing.T) {
-	tmpDir := t.TempDir()
-	cfg := Config{
-		Interval:          60 * time.Second,
-		HashNames:         true,
-		PauseImage:        DefaultPauseImage,
-		ExtraHashLabels:   []string{"corp.io/custom-hashed"},
-		InfraFile:         filepath.Join(tmpDir, "infra.json"),
-		WorkflowsFile:     filepath.Join(tmpDir, "workflows.json"),
-		ExecutionTimeFile: filepath.Join(tmpDir, "execution-time.json"),
-	}
-
-	infraLog, _ := NewJSONEventLog(cfg.InfraFile)
-	defer func() { _ = infraLog.Close() }()
-	workflowsLog, _ := NewJSONEventLog(cfg.WorkflowsFile)
-	defer func() { _ = workflowsLog.Close() }()
-	execTimeLog, _ := NewJSONEventLog(cfg.ExecutionTimeFile)
-	defer func() { _ = execTimeLog.Close() }()
-
 	scheme := runtime.NewScheme()
 	_ = leaderworkersetv1.AddToScheme(scheme)
 	_ = rayv1.AddToScheme(scheme)
 	dynClient := dynamicfake.NewSimpleDynamicClient(scheme)
 
-	scraper := NewScraper(
-		cfg,
-		kubefake.NewSimpleClientset(),
-		kueuefake.NewSimpleClientset(),
-		jobsetfake.NewSimpleClientset(),
-		dynClient,
-		infraLog,
-		workflowsLog,
-		execTimeLog,
-	)
+	scraper := newTestScraper(t, Config{
+		HashNames:       true,
+		ExtraHashLabels: []string{"corp.io/custom-hashed"},
+	}, nil, nil, dynClient)
 
 	createTime := metav1.NewTime(time.Date(2026, 10, 30, 10, 5, 0, 0, time.UTC))
 
@@ -1631,7 +1733,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 	uMap, _ := runtime.DefaultUnstructuredConverter.ToUnstructured(lws)
 	scraper.handleLeaderWorkerSetUnstructured(watch.Modified, &unstructured.Unstructured{Object: uMap})
 
-	rawWorkflows, err := os.ReadFile(cfg.WorkflowsFile)
+	rawWorkflows, err := os.ReadFile(scraper.cfg.WorkflowsFile)
 	if err != nil {
 		t.Fatalf("read workflows.json: %v", err)
 	}
@@ -1683,33 +1785,7 @@ func TestWorkflowsSanitizationAndRecording(t *testing.T) {
 }
 
 func TestWorkloadExecutionTimeTracking(t *testing.T) {
-	tmpDir := t.TempDir()
-	cfg := Config{
-		Interval:          60 * time.Second,
-		HashNames:         true,
-		PauseImage:        DefaultPauseImage,
-		InfraFile:         filepath.Join(tmpDir, "infra.json"),
-		WorkflowsFile:     filepath.Join(tmpDir, "workflows.json"),
-		ExecutionTimeFile: filepath.Join(tmpDir, "execution-time.json"),
-	}
-
-	infraLog, _ := NewJSONEventLog(cfg.InfraFile)
-	defer func() { _ = infraLog.Close() }()
-	workflowsLog, _ := NewJSONEventLog(cfg.WorkflowsFile)
-	defer func() { _ = workflowsLog.Close() }()
-	execTimeLog, _ := NewJSONEventLog(cfg.ExecutionTimeFile)
-	defer func() { _ = execTimeLog.Close() }()
-
-	scraper := NewScraper(
-		cfg,
-		kubefake.NewSimpleClientset(),
-		kueuefake.NewSimpleClientset(),
-		jobsetfake.NewSimpleClientset(),
-		nil,
-		infraLog,
-		workflowsLog,
-		execTimeLog,
-	)
+	scraper := newTestScraper(t, Config{HashNames: true}, nil, nil, nil)
 
 	t0 := time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC)
 	tAdmit1 := t0.Add(5 * time.Second)
@@ -1797,7 +1873,7 @@ func TestWorkloadExecutionTimeTracking(t *testing.T) {
 	// 5. Subsequent metadata/finalizer update on finished workload must NOT re-emit Admitted.
 	scraper.handleWorkloadWatchEvent(watch.Modified, wlFinished)
 
-	rawExec, err := os.ReadFile(cfg.ExecutionTimeFile)
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
 	if err != nil {
 		t.Fatalf("read execution-time.json: %v", err)
 	}
@@ -1879,7 +1955,7 @@ func TestWorkloadExecutionTimeTracking(t *testing.T) {
 	childJobUnsuspended.Spec.Suspend = ptr.To(false)
 	scraper.handleJobWatchEvent(watch.Modified, childJobUnsuspended)
 
-	rawWf, err := os.ReadFile(cfg.WorkflowsFile)
+	rawWf, err := os.ReadFile(scraper.cfg.WorkflowsFile)
 	if err != nil {
 		t.Fatalf("read workflows.json: %v", err)
 	}
@@ -1967,38 +2043,13 @@ func TestParseFlags(t *testing.T) {
 }
 
 func TestScraperUsesNoopHasherWhenHashNamesDisabled(t *testing.T) {
-	tmpDir := t.TempDir()
-	cfg := Config{
-		Interval:          60 * time.Second,
-		HashNames:         false,
-		PauseImage:        DefaultPauseImage,
-		InfraFile:         filepath.Join(tmpDir, "infra.json"),
-		WorkflowsFile:     filepath.Join(tmpDir, "workflows.json"),
-		ExecutionTimeFile: filepath.Join(tmpDir, "execution-time.json"),
-	}
-	infraLog, _ := NewJSONEventLog(cfg.InfraFile)
-	defer func() { _ = infraLog.Close() }()
-	workflowsLog, _ := NewJSONEventLog(cfg.WorkflowsFile)
-	defer func() { _ = workflowsLog.Close() }()
-	execTimeLog, _ := NewJSONEventLog(cfg.ExecutionTimeFile)
-	defer func() { _ = execTimeLog.Close() }()
-
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "ai-lab",
 			Labels: map[string]string{"team": "research-alpha"},
 		},
 	}
-	scraper := NewScraper(
-		cfg,
-		kubefake.NewSimpleClientset(ns),
-		kueuefake.NewSimpleClientset(),
-		jobsetfake.NewSimpleClientset(),
-		nil,
-		infraLog,
-		workflowsLog,
-		execTimeLog,
-	)
+	scraper := newTestScraper(t, Config{HashNames: false}, kubefake.NewSimpleClientset(ns), nil, nil)
 	scraper.ScrapeOnce(context.Background())
 
 	job := &batchv1.Job{
@@ -2021,11 +2072,11 @@ func TestScraperUsesNoopHasherWhenHashNamesDisabled(t *testing.T) {
 	}
 	scraper.handleJobWatchEvent(watch.Added, job)
 
-	rawInfra, _ := os.ReadFile(cfg.InfraFile)
+	rawInfra, _ := os.ReadFile(scraper.cfg.InfraFile)
 	if !strings.Contains(string(rawInfra), `"team":"research-alpha"`) {
 		t.Errorf("expected plain label value in infra.json when HashNames=false, got:\n%s", string(rawInfra))
 	}
-	rawWf, _ := os.ReadFile(cfg.WorkflowsFile)
+	rawWf, _ := os.ReadFile(scraper.cfg.WorkflowsFile)
 	for _, want := range []string{`"name":"plain-job-name"`, `"team":"research-alpha"`, `"app":"plain-job-name"`} {
 		if !strings.Contains(string(rawWf), want) {
 			t.Errorf("expected %s in workflows.json when HashNames=false, got:\n%s", want, string(rawWf))
@@ -2067,5 +2118,187 @@ func TestCanonicalDigestIgnoresResourceVersion(t *testing.T) {
 	digestV3 := canonicalDigest(SanitizeNode(nodeV3, hasher))
 	if digestV3 == digestV1 {
 		t.Errorf("expected digest to change when metadata.labels changes")
+	}
+}
+
+func TestCohortScrapeLifecycle(t *testing.T) {
+	const (
+		initialCohortWeight = "2"
+		updatedCohortWeight = "5"
+	)
+
+	cohort := &kueuev1beta2.Cohort{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "main-cohort",
+			ResourceVersion: "1",
+			ManagedFields: []metav1.ManagedFieldsEntry{
+				{Manager: "kueue-controller", Operation: metav1.ManagedFieldsOperationApply},
+			},
+			Labels: map[string]string{
+				"team":             testSecretValue,
+				"corp.io/org-unit": testSecretValue,
+				"tier":             "shared",
+			},
+			Annotations: map[string]string{
+				"corp.internal/owner":              testSecretEmail,
+				corev1.LastAppliedConfigAnnotation: testSecretValue,
+				"kueue.x-k8s.io/cohort-note":       "keep-cohort-annot",
+			},
+		},
+		Spec: kueuev1beta2.CohortSpec{
+			ParentName: "root-cohort",
+			FairSharing: &kueuev1beta2.FairSharing{
+				Weight: ptr.To(resource.MustParse(initialCohortWeight)),
+			},
+			ResourceGroups: []kueuev1beta2.ResourceGroup{
+				{
+					CoveredResources: []corev1.ResourceName{corev1.ResourceCPU},
+					Flavors: []kueuev1beta2.FlavorQuotas{
+						{
+							Name: "default-flavor",
+							Resources: []kueuev1beta2.ResourceQuota{
+								{
+									Name:           corev1.ResourceCPU,
+									NominalQuota:   resource.MustParse("32"),
+									BorrowingLimit: ptr.To(resource.MustParse("16")),
+									LendingLimit:   ptr.To(resource.MustParse("8")),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: kueuev1beta2.CohortStatus{
+			FairSharing: &kueuev1beta2.FairSharingStatus{
+				WeightedShare: 50,
+			},
+		},
+	}
+
+	kueueClient := kueuefake.NewSimpleClientset(cohort)
+	scraper := newTestScraper(t, Config{
+		HashNames:       true,
+		ExtraHashLabels: []string{"corp.io/org-unit"},
+	}, nil, kueueClient, nil)
+
+	if got := SanitizeCohort(nil, scraper.hasher); got != nil {
+		t.Errorf("expected SanitizeCohort(nil, hasher) == nil, got %v", got)
+	}
+
+	ctx := context.Background()
+
+	// 1. Initial scrape emits "New" for Cohort.
+	scraper.ScrapeOnce(ctx)
+
+	// 2. Second scrape with only ResourceVersion and Status modified must NOT emit an Update.
+	modifiedMeta := cohort.DeepCopy()
+	modifiedMeta.ResourceVersion = "2"
+	modifiedMeta.Status.FairSharing.WeightedShare = 99
+	if _, err := kueueClient.KueueV1beta2().Cohorts().Update(ctx, modifiedMeta, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update cohort status/resourceVersion: %v", err)
+	}
+	scraper.ScrapeOnce(ctx)
+
+	// 3. Updating Spec.FairSharing.Weight emits "Update".
+	modifiedSpec := modifiedMeta.DeepCopy()
+	modifiedSpec.Spec.FairSharing.Weight = ptr.To(resource.MustParse(updatedCohortWeight))
+	if _, err := kueueClient.KueueV1beta2().Cohorts().Update(ctx, modifiedSpec, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update cohort spec: %v", err)
+	}
+	scraper.ScrapeOnce(ctx)
+
+	// 4. Deleting the Cohort emits "Deleted".
+	if err := kueueClient.KueueV1beta2().Cohorts().Delete(ctx, cohort.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete cohort: %v", err)
+	}
+	scraper.ScrapeOnce(ctx)
+
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read infra.json: %v", err)
+	}
+	events := readJSONLines[InfraEvent](t, rawInfra)
+	if len(events) != 3 {
+		t.Fatalf("expected 3 Cohort lifecycle events (New, Update, Deleted), got %d:\n%s", len(events), string(rawInfra))
+	}
+
+	wantEventTypes := []EventType{EventNew, EventUpdate, EventDeleted}
+	wantWeights := []string{initialCohortWeight, updatedCohortWeight, updatedCohortWeight}
+	for i, wantType := range wantEventTypes {
+		if events[i].EventType != wantType {
+			t.Errorf("events[%d].EventType = %q, want %q", i, events[i].EventType, wantType)
+		}
+		payloadMap, ok := events[i].Payload.(map[string]any)
+		if !ok {
+			t.Fatalf("events[%d].Payload is not a map", i)
+		}
+		if payloadMap["apiVersion"] != kueuev1beta2.SchemeGroupVersion.String() || payloadMap["kind"] != "Cohort" {
+			t.Errorf("events[%d] unexpected apiVersion/kind: %v / %v", i, payloadMap["apiVersion"], payloadMap["kind"])
+		}
+		if _, hasStatus := payloadMap["status"]; hasStatus {
+			t.Errorf("events[%d] Cohort payload must omit status", i)
+		}
+		meta := payloadMap["metadata"].(map[string]any)
+		if meta["name"] != "main-cohort" {
+			t.Errorf("events[%d] Cohort name must remain plain 'main-cohort', got %v", i, meta["name"])
+		}
+		if _, hasManagedFields := meta["managedFields"]; hasManagedFields {
+			t.Errorf("events[%d] Cohort metadata must omit managedFields", i)
+		}
+		spec := payloadMap["spec"].(map[string]any)
+		fairSharing := spec["fairSharing"].(map[string]any)
+		if fairSharing["weight"] != wantWeights[i] {
+			t.Errorf("events[%d] Cohort spec.fairSharing.weight = %v, want %q", i, fairSharing["weight"], wantWeights[i])
+		}
+	}
+
+	// Verify hashed label values, preserved spec fields, and zero secret leaks.
+	infraStr := string(rawInfra)
+	for _, secret := range testForbiddenSubstrings {
+		if strings.Contains(infraStr, secret) {
+			t.Errorf("infra.json leaked sensitive information %q:\n%s", secret, infraStr)
+		}
+	}
+	wantSecretHash := scraper.hasher.HashName(testSecretValue)
+	for _, expected := range []string{
+		`"team":"` + wantSecretHash + `"`,
+		`"corp.io/org-unit":"` + wantSecretHash + `"`,
+		`"tier":"shared"`,
+		`"kueue.x-k8s.io/cohort-note":"keep-cohort-annot"`,
+		`"parentName":"root-cohort"`,
+		`"nominalQuota":"32"`,
+		`"borrowingLimit":"16"`,
+		`"lendingLimit":"8"`,
+		`"weight":"` + initialCohortWeight + `"`,
+		`"weight":"` + updatedCohortWeight + `"`,
+	} {
+		if !strings.Contains(infraStr, expected) {
+			t.Errorf("infra.json missing expected Cohort content %q:\n%s", expected, infraStr)
+		}
+	}
+}
+
+func TestCohortScrapeMissingCRD(t *testing.T) {
+	cqOnlyClient := kueuefake.NewSimpleClientset(&kueuev1beta2.ClusterQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "ai-lab-cq"},
+	})
+	cqOnlyClient.PrependReactor("list", "cohorts", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "kueue.x-k8s.io", Resource: "cohorts"}, "")
+	})
+	scraper := newTestScraper(t, Config{}, nil, cqOnlyClient, nil)
+	scraper.ScrapeOnce(context.Background())
+
+	rawMissing, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read missing-CRD infra.json: %v", err)
+	}
+	missingEvents := readJSONLines[InfraEvent](t, rawMissing)
+	if len(missingEvents) != 1 {
+		t.Fatalf("expected 1 ClusterQueue event when Cohort CRD is absent, got %d", len(missingEvents))
+	}
+	cqPayload := missingEvents[0].Payload.(map[string]any)
+	if cqPayload["kind"] != "ClusterQueue" {
+		t.Errorf("expected ClusterQueue event, got %v", cqPayload["kind"])
 	}
 }
