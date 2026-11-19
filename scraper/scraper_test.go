@@ -34,6 +34,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	nodev1 "k8s.io/api/node/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -180,17 +181,19 @@ func TestStartupBanner(t *testing.T) {
 		"execution-time.json",
 		"Nodes (v1/Node)",
 		"Namespaces (v1/Namespace)",
+		"RuntimeClasses (node.k8s.io/v1)",
 		"ClusterQueues",
 		"Cohorts",
 		"LocalQueues",
 		"ResourceFlavors",
 		"Topologies",
+		"WorkloadPriorityClasses",
 		"Scheduled & Running Pods",
 		"Information Omitted / Sanitized",
 		"SHA-256 Name Replacement",
 		"Enabled                            : true",
 		"Workloads, Pods, Jobs, JobSets, LeaderWorkerSets, Deployments, RayJobs, RayClusters",
-		"Namespaces, Nodes, ClusterQueues, Cohorts, LocalQueues, ResourceFlavors, Topologies",
+		"Namespaces, Nodes, ClusterQueues, Cohorts, LocalQueues, ResourceFlavors, Topologies, WorkloadPriorityClasses, RuntimeClasses",
 	}
 	for _, sub := range requiredSubstrings {
 		if !strings.Contains(out, sub) {
@@ -305,8 +308,34 @@ func TestNodeLabelSanitization(t *testing.T) {
 			Name:   "kwok-node-0",
 			Labels: input,
 		},
+		Status: corev1.NodeStatus{
+			DaemonEndpoints: corev1.NodeDaemonEndpoints{
+				KubeletEndpoint: corev1.DaemonEndpoint{Port: 10250},
+			},
+			NodeInfo: corev1.NodeSystemInfo{
+				MachineID: testSecretValue,
+			},
+		},
 	}
-	sanitized := SanitizeNode(node, NewSensitiveDataHasher(nil, nil))
+	sanitizedMap := SanitizeNode(node, NewSensitiveDataHasher(nil, nil))
+	if status, ok := sanitizedMap["status"].(map[string]any); ok {
+		if _, hasNodeInfo := status["nodeInfo"]; hasNodeInfo {
+			t.Errorf("expected SanitizeNode to strip status.nodeInfo, got %v", status["nodeInfo"])
+		}
+		if _, hasDaemonEndpoints := status["daemonEndpoints"]; hasDaemonEndpoints {
+			t.Errorf("expected SanitizeNode to strip status.daemonEndpoints, got %v", status["daemonEndpoints"])
+		}
+	} else {
+		t.Fatalf("expected SanitizeNode map to contain status map, got %T", sanitizedMap["status"])
+	}
+	sanitizedBytes, err := json.Marshal(sanitizedMap)
+	if err != nil {
+		t.Fatalf("marshal sanitized node: %v", err)
+	}
+	var sanitized corev1.Node
+	if err := json.Unmarshal(sanitizedBytes, &sanitized); err != nil {
+		t.Fatalf("unmarshal sanitized node: %v", err)
+	}
 
 	for k, want := range savedLabels {
 		if got := sanitized.Labels[k]; got != want {
@@ -374,9 +403,10 @@ func TestSanitizationListsAreLowercase(t *testing.T) {
 
 func TestSanitizeLabels(t *testing.T) {
 	savedPlain := map[string]string{
-		KueueQueueLabel:   "main-lq",
-		KueueManagedLabel: "true",
-		"component":       "trainer",
+		KueueQueueLabel:         "main-lq",
+		KueueManagedLabel:       "true",
+		KueuePriorityClassLabel: "high-priority",
+		"component":             "trainer",
 	}
 	hashedWorkloadLabels := []string{
 		"app",
@@ -424,7 +454,8 @@ func TestSanitizeLabels(t *testing.T) {
 		"Corp.IO/Custom-Tag",
 		"custom-unprefixed",
 		"wildcard.io/*",
-		KueueQueueLabel, // protected control-plane key must never be hashed
+		KueueQueueLabel,         // protected control-plane key must never be hashed
+		KueuePriorityClassLabel, // protected priority-class key must never be hashed
 	}, nil)
 	sanitized := SanitizeLabels(input, hasher)
 
@@ -518,6 +549,8 @@ func TestHashNameForKind(t *testing.T) {
 		"LocalQueue",
 		"ResourceFlavor",
 		"Topology",
+		"WorkloadPriorityClass",
+		"RuntimeClass",
 	}
 	for _, kind := range infraKinds {
 		if got := hasher.HashNameForKind(kind, rawName); got != rawName {
@@ -798,7 +831,7 @@ func TestInfraAndWorkloadLabelHashingConsistency(t *testing.T) {
 		t.Errorf("sanitized PodAntiAffinity.NamespaceSelector %v does not match sanitized Namespace labels %v (err=%v)", antiTerm.NamespaceSelector, cleanNS.Labels, err)
 	}
 
-	cleanNode := SanitizeNode(&corev1.Node{
+	nodeMap := SanitizeNode(&corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "node-0",
 			Labels: map[string]string{
@@ -822,18 +855,41 @@ func TestInfraAndWorkloadLabelHashingConsistency(t *testing.T) {
 			Levels: []kueuev1beta2.TopologyLevel{{NodeLabel: "corp.io/team"}},
 		},
 	}, hasher)
+	rcMap := SanitizeRuntimeClass(&nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-runtime"},
+		Handler:    "nvidia",
+		Scheduling: &nodev1.Scheduling{
+			NodeSelector: map[string]string{
+				"cloud.google.com/gke-cluster-name": testSecretValue,
+				"corp.io/team":                      testSecretValue,
+				"instance":                          "gpu",
+			},
+		},
+	}, hasher)
+	nodeBytes, _ := json.Marshal(nodeMap)
 	rfBytes, _ := json.Marshal(rfMap)
 	topoBytes, _ := json.Marshal(topoMap)
+	rcBytes, _ := json.Marshal(rcMap)
+	var cleanNode corev1.Node
 	var cleanRF kueuev1beta2.ResourceFlavor
 	var cleanTopo kueuev1beta2.Topology
+	var cleanRC nodev1.RuntimeClass
+	_ = json.Unmarshal(nodeBytes, &cleanNode)
 	_ = json.Unmarshal(rfBytes, &cleanRF)
 	_ = json.Unmarshal(topoBytes, &cleanTopo)
+	_ = json.Unmarshal(rcBytes, &cleanRC)
 
 	if cleanNode.Labels["corp.io/team"] != wantSecretHash {
 		t.Errorf("expected preserved key 'corp.io/team' with hashed value on Node, got %v", cleanNode.Labels)
 	}
 	if cleanRF.Spec.NodeLabels["corp.io/team"] != cleanNode.Labels["corp.io/team"] {
 		t.Errorf("ResourceFlavor.Spec.NodeLabels %v out of sync with Node.Labels %v", cleanRF.Spec.NodeLabels, cleanNode.Labels)
+	}
+	if cleanRC.Scheduling == nil || cleanRC.Scheduling.NodeSelector["corp.io/team"] != cleanNode.Labels["corp.io/team"] {
+		t.Errorf("RuntimeClass.Scheduling.NodeSelector %v out of sync with Node.Labels %v", cleanRC.Scheduling, cleanNode.Labels)
+	}
+	if _, leaked := cleanRC.Scheduling.NodeSelector["cloud.google.com/gke-cluster-name"]; leaked {
+		t.Errorf("RuntimeClass.Scheduling.NodeSelector must strip cloud-identifying label")
 	}
 	if cleanTopo.Spec.Levels[0].NodeLabel != "corp.io/team" {
 		t.Errorf("expected Topology level NodeLabel to remain 'corp.io/team', got %q", cleanTopo.Spec.Levels[0].NodeLabel)
@@ -855,7 +911,7 @@ func TestDefaultSensitiveNodeAndResourceFlavorLabelHashing(t *testing.T) {
 	defaultHasher := NewSensitiveDataHasher(nil, nil)
 	wantHash := defaultHasher.HashName(testSecretValue)
 
-	cleanNode := SanitizeNode(&corev1.Node{
+	nodeMap := SanitizeNode(&corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "node-default",
 			Labels: map[string]string{"team": testSecretValue, "instance": "gpu"},
@@ -867,8 +923,11 @@ func TestDefaultSensitiveNodeAndResourceFlavorLabelHashing(t *testing.T) {
 			NodeLabels: map[string]string{"team": testSecretValue, "instance": "gpu"},
 		},
 	}, defaultHasher)
+	nodeBytes, _ := json.Marshal(nodeMap)
 	rfBytes, _ := json.Marshal(rfMap)
+	var cleanNode corev1.Node
 	var cleanRF kueuev1beta2.ResourceFlavor
+	_ = json.Unmarshal(nodeBytes, &cleanNode)
 	_ = json.Unmarshal(rfBytes, &cleanRF)
 
 	if cleanNode.Labels["team"] != wantHash {
@@ -1298,9 +1357,44 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 			Levels: []kueuev1beta2.TopologyLevel{{NodeLabel: "kubernetes.io/hostname"}},
 		},
 	}
+	wpc := &kueuev1beta2.WorkloadPriorityClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "high-priority",
+			Labels: map[string]string{"team": testSecretValue},
+			Annotations: map[string]string{
+				"corp.internal/owner": testSecretEmail,
+				"kueue.x-k8s.io/note": "keep-wpc-annot",
+			},
+		},
+		Value:       1000,
+		Description: testSecretValue,
+	}
+	runtimeClass := &nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "gvisor",
+			Labels: map[string]string{"team": testSecretValue},
+			Annotations: map[string]string{
+				"corp.internal/owner": testSecretEmail,
+				"k8s.io/rc-note":      "keep-rc-annot",
+			},
+		},
+		Handler: "runsc",
+		Overhead: &nodev1.Overhead{
+			PodFixed: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("250m"),
+			},
+		},
+		Scheduling: &nodev1.Scheduling{
+			NodeSelector: map[string]string{
+				"instance":                          "gpu",
+				"team":                              testSecretValue,
+				"cloud.google.com/gke-cluster-name": testSecretValue,
+			},
+		},
+	}
 
-	kubeClient := kubefake.NewSimpleClientset(node, ns, runningPod)
-	kueueClient := kueuefake.NewSimpleClientset(cq, cohort, lq, rf, topo)
+	kubeClient := kubefake.NewSimpleClientset(node, ns, runtimeClass, runningPod)
+	kueueClient := kueuefake.NewSimpleClientset(cq, cohort, lq, rf, topo, wpc)
 	scraper := newTestScraper(t, Config{HashNames: true}, kubeClient, kueueClient, nil)
 
 	ctx := context.Background()
@@ -1315,10 +1409,11 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 	}
 	events := readJSONLines[map[string]any](t, rawInfra)
 
-	if len(events) != 9 {
-		t.Fatalf("expected 9 infra events (7 infra objects + 1 pod new + 1 pod deleted), got %d", len(events))
+	if len(events) != 11 {
+		t.Fatalf("expected 11 infra events (9 infra objects + 1 pod new + 1 pod deleted), got %d", len(events))
 	}
 
+	seenKinds := make(map[string]int)
 	for _, ev := range events {
 		if len(ev) != 3 {
 			t.Errorf("expected InfraEvent to have strictly 3 top-level keys (timestamp, eventType, payload), got %v", ev)
@@ -1329,6 +1424,7 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		}
 		payload := ev["payload"].(map[string]any)
 		kind := payload["kind"].(string)
+		seenKinds[kind]++
 
 		switch kind {
 		case "Node":
@@ -1337,10 +1433,18 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 			if name != "kwok-node-0" {
 				t.Errorf("Node name must not be hashed, got %q", name)
 			}
-			if _, hasStatus := payload["status"]; !hasStatus {
+			status, hasStatus := payload["status"].(map[string]any)
+			if !hasStatus {
 				t.Errorf("Node payload must include status")
+			} else {
+				if _, hasNodeInfo := status["nodeInfo"]; hasNodeInfo {
+					t.Errorf("Node payload status must NOT include zero-valued nodeInfo, got %v", status["nodeInfo"])
+				}
+				if _, hasDaemonEndpoints := status["daemonEndpoints"]; hasDaemonEndpoints {
+					t.Errorf("Node payload status must NOT include zero-valued daemonEndpoints, got %v", status["daemonEndpoints"])
+				}
 			}
-		case "Namespace", "ClusterQueue", "Cohort", "LocalQueue", "ResourceFlavor", "Topology":
+		case "Namespace", "RuntimeClass", "ClusterQueue", "Cohort", "LocalQueue", "ResourceFlavor", "Topology", "WorkloadPriorityClass":
 			meta := payload["metadata"].(map[string]any)
 			name := meta["name"].(string)
 			if _, hasStatus := payload["status"]; hasStatus {
@@ -1348,6 +1452,19 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 			}
 			if strings.HasPrefix(name, "h-") && len(name) == 34 {
 				t.Errorf("%s name must not be hashed, got %q", kind, name)
+			}
+			if kind == "WorkloadPriorityClass" {
+				if gotVal, _ := payload["value"].(float64); gotVal != 1000 {
+					t.Errorf("WorkloadPriorityClass expected value=1000, got %v", payload["value"])
+				}
+				if _, hasDesc := payload["description"]; hasDesc {
+					t.Errorf("WorkloadPriorityClass must strip free-form description, got %v", payload["description"])
+				}
+			}
+			if kind == "RuntimeClass" {
+				if payload["handler"] != "runsc" {
+					t.Errorf("RuntimeClass expected handler=runsc, got %v", payload["handler"])
+				}
 			}
 		case "Pod":
 			name := payload["name"].(string)
@@ -1378,7 +1495,7 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		}
 	}
 
-	// Ensure scheduling-relevant Node/Namespace fields and allowed annotations WERE preserved in infra.json.
+	// Ensure scheduling-relevant Node/Namespace/Cohort/RuntimeClass/WorkloadPriorityClass fields and allowed annotations WERE preserved in infra.json.
 	for _, expected := range []string{
 		"kwok.x-k8s.io/node",
 		"nvidia-tesla-a100",
@@ -1387,12 +1504,25 @@ func TestInfraScrapeAndPodWatchEvents(t *testing.T) {
 		"keep-cq-annot",
 		"keep-cohort-annot",
 		"root-cohort",
+		"keep-wpc-annot",
+		"keep-rc-annot",
+		"high-priority",
+		"gvisor",
+		"runsc",
 		`"environment":"prod"`,
 		`"team":"` + scraper.hasher.HashName(testSecretValue) + `"`,
 	} {
 		if !strings.Contains(infraStr, expected) {
 			t.Errorf("infra.json missing expected sanitized field/value %q:\n%s", expected, infraStr)
 		}
+	}
+	for _, k := range []string{"Node", "Namespace", "RuntimeClass", "ClusterQueue", "Cohort", "LocalQueue", "ResourceFlavor", "Topology", "WorkloadPriorityClass"} {
+		if seenKinds[k] != 1 {
+			t.Errorf("expected 1 %s event in infra.json, got %d", k, seenKinds[k])
+		}
+	}
+	if strings.Contains(infraStr, `"nodeInfo"`) || strings.Contains(infraStr, `"daemonEndpoints"`) {
+		t.Errorf("infra.json must not contain zero-valued nodeInfo or daemonEndpoints:\n%s", infraStr)
 	}
 }
 
@@ -2300,5 +2430,446 @@ func TestCohortScrapeMissingCRD(t *testing.T) {
 	cqPayload := missingEvents[0].Payload.(map[string]any)
 	if cqPayload["kind"] != "ClusterQueue" {
 		t.Errorf("expected ClusterQueue event, got %v", cqPayload["kind"])
+	}
+}
+
+func TestSuppressStaleAdmittedDuringActiveEvictionAndPreemption(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+
+	t0 := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	tAdmit1 := t0.Add(5 * time.Second)
+	tPreempt := t0.Add(20 * time.Second)
+	tAdmit2 := t0.Add(35 * time.Second)
+
+	wl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-stale-admit",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "ai-lab-lq"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "ai-lab-cq"},
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Admitted",
+					LastTransitionTime: metav1.NewTime(tAdmit1),
+				},
+			},
+		},
+	}
+
+	// 1. Initial admission at tAdmit1.
+	scraper.handleWorkloadWatchEvent(watch.Added, wl)
+
+	// 2. Preemption starts at tPreempt while Admitted=True (tAdmit1) is STILL latched during two-phase eviction.
+	wlEvicting := wl.DeepCopy()
+	wlEvicting.Status.Conditions = []metav1.Condition{
+		{
+			Type:               kueuev1beta2.WorkloadAdmitted,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Admitted",
+			LastTransitionTime: metav1.NewTime(tAdmit1),
+		},
+		{
+			Type:               kueuev1beta2.WorkloadEvicted,
+			Status:             metav1.ConditionTrue,
+			Reason:             kueuev1beta2.WorkloadEvictedByPreemption,
+			Message:            "Preempted to accommodate higher-priority workload",
+			LastTransitionTime: metav1.NewTime(tPreempt),
+		},
+		{
+			Type:               kueuev1beta2.WorkloadPreempted,
+			Status:             metav1.ConditionTrue,
+			Reason:             kueuev1beta2.InClusterQueueReason,
+			Message:            "Preempted in ClusterQueue",
+			LastTransitionTime: metav1.NewTime(tPreempt),
+		},
+	}
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlEvicting)
+
+	// 3. Additional pod/condition updates arrive while eviction is STILL active and Admitted=True (tAdmit1) remains latched.
+	wlEvictingUpdate := wlEvicting.DeepCopy()
+	wlEvictingUpdate.Status.Conditions = append(wlEvictingUpdate.Status.Conditions, metav1.Condition{
+		Type:               kueuev1beta2.WorkloadPodsReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             "PodsTerminating",
+		LastTransitionTime: metav1.NewTime(tPreempt.Add(1 * time.Second)),
+	})
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlEvictingUpdate)
+
+	// 4. Even if Preempted/Evicted are cleared before Admitted updates its LastTransitionTime away from tAdmit1,
+	// stale tAdmit1 must NOT re-emit Admitted.
+	wlStaleAdmittedTimestamp := wl.DeepCopy()
+	wlStaleAdmittedTimestamp.Status.Conditions = []metav1.Condition{
+		{
+			Type:               kueuev1beta2.WorkloadAdmitted,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Admitted",
+			LastTransitionTime: metav1.NewTime(tAdmit1),
+		},
+	}
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlStaleAdmittedTimestamp)
+
+	// 5. Genuine re-admission at tAdmit2 emits a fresh Admitted event.
+	wlReadmitted := wl.DeepCopy()
+	wlReadmitted.Status.Conditions = []metav1.Condition{
+		{
+			Type:               kueuev1beta2.WorkloadAdmitted,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Admitted",
+			LastTransitionTime: metav1.NewTime(tAdmit2),
+		},
+	}
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlReadmitted)
+
+	// 6. Non-preemption eviction (e.g. PodsReadyTimeout) while Admitted=True (tAdmit2) is still latched must NOT emit Admitted.
+	wlNonPreemptEvict := wlReadmitted.DeepCopy()
+	wlNonPreemptEvict.Status.Conditions = append(wlNonPreemptEvict.Status.Conditions, metav1.Condition{
+		Type:               kueuev1beta2.WorkloadEvicted,
+		Status:             metav1.ConditionTrue,
+		Reason:             kueuev1beta2.WorkloadEvictedByPodsReadyTimeout,
+		LastTransitionTime: metav1.NewTime(tAdmit2.Add(10 * time.Second)),
+	})
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlNonPreemptEvict)
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlNonPreemptEvict)
+
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	execEvents := readJSONLines[ExecutionTimeEvent](t, rawExec)
+	if len(execEvents) != 3 {
+		t.Fatalf("expected strictly 3 events (Admitted@tAdmit1, PartialExecution@tPreempt, Admitted@tAdmit2), got %d:\n%s", len(execEvents), string(rawExec))
+	}
+	if execEvents[0].EventType != ExecutionEventAdmitted || !execEvents[0].Payload.AdmittedTime.Time.Equal(tAdmit1) {
+		t.Errorf("event[0] expected Admitted at %v, got %+v", tAdmit1, execEvents[0])
+	}
+	if execEvents[1].EventType != ExecutionEventPartial || *execEvents[1].Payload.ExecutionDurationSeconds != 15.0 {
+		t.Errorf("event[1] expected PartialExecution (15s), got %+v", execEvents[1])
+	}
+	if execEvents[2].EventType != ExecutionEventAdmitted || !execEvents[2].Payload.AdmittedTime.Time.Equal(tAdmit2) || execEvents[2].Payload.PreemptionCount != 1 {
+		t.Errorf("event[2] expected Admitted at %v with preemptionCount=1, got %+v", tAdmit2, execEvents[2])
+	}
+}
+
+func TestFullExecutionWhenCompletionWinsPreemptionRace(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+
+	t0 := time.Date(2026, 11, 1, 13, 0, 0, 0, time.UTC)
+	tAdmit := t0.Add(5 * time.Second)
+	tPreempt := t0.Add(24 * time.Second)
+	tFinish := t0.Add(25 * time.Second)
+
+	// Case A: Two-event race — Preempted=True arrives at tPreempt, then Job finishes cleanly
+	// (Reason: Succeeded) at tFinish before suspension while Preempted=True remains latched.
+	wlRace := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-preempt-race-two-step",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "ai-lab-lq"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "ai-lab-cq"},
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Admitted",
+					LastTransitionTime: metav1.NewTime(tAdmit),
+				},
+			},
+		},
+	}
+	scraper.handleWorkloadWatchEvent(watch.Added, wlRace)
+
+	wlRacePreempt := wlRace.DeepCopy()
+	wlRacePreempt.Status.Conditions = append(wlRacePreempt.Status.Conditions, metav1.Condition{
+		Type:               kueuev1beta2.WorkloadPreempted,
+		Status:             metav1.ConditionTrue,
+		Reason:             kueuev1beta2.InClusterQueueReason,
+		LastTransitionTime: metav1.NewTime(tPreempt),
+	})
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlRacePreempt)
+
+	wlRaceSucceeded := wlRacePreempt.DeepCopy()
+	wlRaceSucceeded.Status.Conditions = append(wlRaceSucceeded.Status.Conditions, metav1.Condition{
+		Type:               kueuev1beta2.WorkloadFinished,
+		Status:             metav1.ConditionTrue,
+		Reason:             kueuev1beta2.WorkloadFinishedReasonSucceeded,
+		Message:            "Job completed successfully before eviction",
+		LastTransitionTime: metav1.NewTime(tFinish),
+	})
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlRaceSucceeded)
+
+	// Case B: Coalesced single-event race — Workload observed with Admitted=True, Preempted=True,
+	// and Finished=True (Reason: Succeeded) simultaneously. Should emit Admitted + FullExecution (no PartialExecution).
+	wlCoalesced := wlRaceSucceeded.DeepCopy()
+	wlCoalesced.Name = "wl-preempt-race-coalesced"
+	scraper.handleWorkloadWatchEvent(watch.Added, wlCoalesced)
+
+	// Case C: Preempted and suspended (Admitted=False), then Finished=True with Reason=Failed / OwnerNotFound.
+	// Must NOT emit FullExecution because the workload did not complete cleanly.
+	wlFailedPreempted := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-preempt-failed",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "ai-lab-lq"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionFalse,
+					Reason:             kueuev1beta2.WorkloadAdmittedReasonNoReservation,
+					LastTransitionTime: metav1.NewTime(tPreempt),
+				},
+				{
+					Type:               kueuev1beta2.WorkloadPreempted,
+					Status:             metav1.ConditionTrue,
+					Reason:             kueuev1beta2.InClusterQueueReason,
+					LastTransitionTime: metav1.NewTime(tPreempt),
+				},
+				{
+					Type:               kueuev1beta2.WorkloadFinished,
+					Status:             metav1.ConditionTrue,
+					Reason:             kueuev1beta2.WorkloadFinishedReasonFailed,
+					LastTransitionTime: metav1.NewTime(tFinish),
+				},
+			},
+		},
+	}
+	scraper.handleWorkloadWatchEvent(watch.Added, wlFailedPreempted)
+
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	execEvents := readJSONLines[ExecutionTimeEvent](t, rawExec)
+
+	var twoStepFull, coalescedFull, coalescedPartial, failedFull int
+	for _, ev := range execEvents {
+		switch ev.Payload.WorkloadName {
+		case "wl-preempt-race-two-step":
+			if ev.EventType == ExecutionEventFull {
+				twoStepFull++
+				if ev.Payload.ExecutionDurationSeconds == nil || *ev.Payload.ExecutionDurationSeconds != 20.0 {
+					t.Errorf("expected 20s FullExecution on two-step race, got %+v", ev.Payload)
+				}
+			}
+		case "wl-preempt-race-coalesced":
+			if ev.EventType == ExecutionEventFull {
+				coalescedFull++
+				if ev.Payload.ExecutionDurationSeconds == nil || *ev.Payload.ExecutionDurationSeconds != 20.0 {
+					t.Errorf("expected 20s FullExecution on coalesced race, got %+v", ev.Payload)
+				}
+			}
+			if ev.EventType == ExecutionEventPartial {
+				coalescedPartial++
+			}
+		case "wl-preempt-failed":
+			if ev.EventType == ExecutionEventFull {
+				failedFull++
+			}
+		}
+	}
+	if twoStepFull != 1 {
+		t.Errorf("expected 1 FullExecution for wl-preempt-race-two-step, got %d\n%s", twoStepFull, string(rawExec))
+	}
+	if coalescedFull != 1 || coalescedPartial != 0 {
+		t.Errorf("expected 1 FullExecution and 0 PartialExecution for wl-preempt-race-coalesced, got full=%d partial=%d\n%s", coalescedFull, coalescedPartial, string(rawExec))
+	}
+	if failedFull != 0 {
+		t.Errorf("expected 0 FullExecution for wl-preempt-failed, got %d\n%s", failedFull, string(rawExec))
+	}
+}
+
+func TestSubSecondPartialExecutionDoesNotUseCumulativePastSeconds(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+
+	t0 := time.Date(2026, 11, 1, 14, 0, 0, 0, time.UTC)
+	tAdmit1 := t0.Add(5 * time.Second)
+	tPreempt1 := t0.Add(25 * time.Second) // 20s first run
+	tAdmit2 := t0.Add(40 * time.Second)
+	tPreempt2 := t0.Add(40 * time.Second) // sub-second second run in same RFC3339 second
+
+	wl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-subsec-preempt",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "ai-lab-lq"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "ai-lab-cq"},
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Admitted",
+					LastTransitionTime: metav1.NewTime(tAdmit1),
+				},
+			},
+		},
+	}
+
+	// Cycle 1: Admitted at tAdmit1, preempted at tPreempt1 (20s).
+	scraper.handleWorkloadWatchEvent(watch.Added, wl)
+
+	wlPreempt1 := wl.DeepCopy()
+	wlPreempt1.Status.AccumulatedPastExecutionTimeSeconds = ptr.To[int32](20)
+	wlPreempt1.Status.Conditions = []metav1.Condition{
+		{
+			Type:               kueuev1beta2.WorkloadAdmitted,
+			Status:             metav1.ConditionFalse,
+			Reason:             kueuev1beta2.WorkloadAdmittedReasonNoReservation,
+			LastTransitionTime: metav1.NewTime(tPreempt1),
+		},
+		{
+			Type:               kueuev1beta2.WorkloadPreempted,
+			Status:             metav1.ConditionTrue,
+			Reason:             kueuev1beta2.InClusterQueueReason,
+			LastTransitionTime: metav1.NewTime(tPreempt1),
+		},
+	}
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlPreempt1)
+
+	// Cycle 2: Re-admitted at tAdmit2, then preempted within the same second (tPreempt2 == tAdmit2)
+	// while cumulative AccumulatedPastExecutionTimeSeconds is still 20 from Cycle 1.
+	wlAdmit2 := wl.DeepCopy()
+	wlAdmit2.Status.AccumulatedPastExecutionTimeSeconds = ptr.To[int32](20)
+	wlAdmit2.Status.Conditions = []metav1.Condition{
+		{
+			Type:               kueuev1beta2.WorkloadAdmitted,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Admitted",
+			LastTransitionTime: metav1.NewTime(tAdmit2),
+		},
+	}
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlAdmit2)
+
+	wlPreempt2 := wlAdmit2.DeepCopy()
+	wlPreempt2.Status.Conditions = []metav1.Condition{
+		{
+			Type:               kueuev1beta2.WorkloadAdmitted,
+			Status:             metav1.ConditionFalse,
+			Reason:             kueuev1beta2.WorkloadAdmittedReasonNoReservation,
+			LastTransitionTime: metav1.NewTime(tPreempt2),
+		},
+		{
+			Type:               kueuev1beta2.WorkloadPreempted,
+			Status:             metav1.ConditionTrue,
+			Reason:             kueuev1beta2.InClusterQueueReason,
+			LastTransitionTime: metav1.NewTime(tPreempt2),
+		},
+	}
+	scraper.handleWorkloadWatchEvent(watch.Modified, wlPreempt2)
+
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	execEvents := readJSONLines[ExecutionTimeEvent](t, rawExec)
+	if len(execEvents) != 4 {
+		t.Fatalf("expected 4 execution-time events, got %d:\n%s", len(execEvents), string(rawExec))
+	}
+	if execEvents[1].EventType != ExecutionEventPartial || *execEvents[1].Payload.ExecutionDurationSeconds != 20.0 {
+		t.Errorf("cycle 1 expected 20s PartialExecution, got %+v", execEvents[1].Payload)
+	}
+	if execEvents[3].EventType != ExecutionEventPartial || execEvents[3].Payload.ExecutionDurationSeconds == nil || *execEvents[3].Payload.ExecutionDurationSeconds != 0.0 || execEvents[3].Payload.ExecutionDuration != "0s" {
+		t.Errorf("cycle 2 sub-second preemption expected 0s PartialExecution (must NOT substitute cumulative 20s), got %+v", execEvents[3].Payload)
+	}
+}
+
+func TestWatchDeploymentsFiltersUnqueuedSystemNamespaces(t *testing.T) {
+	mkDeploy := func(ns, name, queueLabel string) *appsv1.Deployment {
+		var lbls map[string]string
+		if queueLabel != "" {
+			lbls = map[string]string{KueueQueueLabel: queueLabel}
+		}
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         ns,
+				CreationTimestamp: metav1.NewTime(time.Date(2026, 11, 1, 15, 0, 0, 0, time.UTC)),
+				Labels:            lbls,
+			},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "main", Image: testSecretImage}},
+					},
+				},
+			},
+		}
+	}
+
+	kubeSystemDeploy := mkDeploy("kube-system", "coredns", "")
+	kueueSystemDeploy := mkDeploy("kueue-system", "kueue-controller-manager", "")
+	jobsetSystemDeploy := mkDeploy("jobset-system", "jobset-controller-manager", "")
+	gkeManagedDeploy := mkDeploy("gke-managed-cim", "cim-agent", "")
+	queuedSystemDeploy := mkDeploy("kueue-system", "queued-canary", "system-lq")
+	userUnqueuedDeploy := mkDeploy("ai-lab", "inference-gateway", "")
+	userQueuedDeploy := mkDeploy("ai-lab", "serving-pool", "serving-lq")
+
+	kubeClient := kubefake.NewSimpleClientset(
+		kubeSystemDeploy,
+		kueueSystemDeploy,
+		jobsetSystemDeploy,
+		gkeManagedDeploy,
+		queuedSystemDeploy,
+		userUnqueuedDeploy,
+		userQueuedDeploy,
+	)
+	scraper := newTestScraper(t, Config{}, kubeClient, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		scraper.watchDeploymentsLoop(ctx)
+	}()
+
+	// Wait briefly for initial list + watch setup, then inject a live watch event for an unqueued system Deployment.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if scraper.workflowsLog.Count() >= 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, _ = scraper.kubeClient.AppsV1().Deployments("gmp-system").Create(
+		ctx,
+		mkDeploy("gmp-system", "collector", ""),
+		metav1.CreateOptions{},
+	)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	rawWf, err := os.ReadFile(scraper.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	wfEvents := readJSONLines[WorkflowEvent](t, rawWf)
+
+	var recordedNames []string
+	for _, ev := range wfEvents {
+		recordedNames = append(recordedNames, ev.Payload.Namespace+"/"+ev.Payload.Name)
+	}
+	slices.Sort(recordedNames)
+	want := []string{
+		"ai-lab/inference-gateway",
+		"ai-lab/serving-pool",
+		"kueue-system/queued-canary",
+	}
+	if !slices.Equal(recordedNames, want) {
+		t.Errorf("unexpected recorded Deployments: got %v, want %v", recordedNames, want)
 	}
 }
