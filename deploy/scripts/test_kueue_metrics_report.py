@@ -1104,7 +1104,6 @@ class TestRegressionFixesForDiscrepanciesD1ToD10(unittest.TestCase):
         """load_or_fetch_cluster_snapshot never reads os.environ['KUBECONFIG'] or /tmp/kueue-optimizer-*.kubeconfig."""
         from unittest import mock
         import subprocess
-        import tempfile
 
         ns = "kueue-optimizer-chamber-kc-unit-test"
         with tempfile.TemporaryDirectory() as tmp:
