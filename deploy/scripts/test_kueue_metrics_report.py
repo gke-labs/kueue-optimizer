@@ -1103,6 +1103,7 @@ class TestRegressionFixesForDiscrepanciesD1ToD10(unittest.TestCase):
     def test_load_or_fetch_cluster_snapshot_ignores_env_and_tmp_kubeconfigs(self) -> None:
         """load_or_fetch_cluster_snapshot never reads os.environ['KUBECONFIG'] or /tmp/kueue-optimizer-*.kubeconfig."""
         from unittest import mock
+        import subprocess
         import tempfile
 
         ns = "kueue-optimizer-chamber-kc-unit-test"
@@ -1116,7 +1117,7 @@ class TestRegressionFixesForDiscrepanciesD1ToD10(unittest.TestCase):
             try:
                 with (
                     mock.patch.dict("os.environ", {"KUBECONFIG": str(host_kc)}, clear=False),
-                    mock.patch("kueue_metrics_report.subprocess.run") as m_run,
+                    mock.patch("metrics.saturation.subprocess.run") as m_run,
                 ):
                     # 1. Without kwok-<ns>.kubeconfig in repo_root or --kubeconfig, must return None without running kubectl
                     res = kmr.load_or_fetch_cluster_snapshot("", ns)
@@ -1124,7 +1125,7 @@ class TestRegressionFixesForDiscrepanciesD1ToD10(unittest.TestCase):
                     m_run.assert_not_called()
 
                     # 2. With explicit kubeconfig_path, uses ONLY explicit_kc (never host_kc or /tmp)
-                    fake_ok = kmr.subprocess.CompletedProcess(
+                    fake_ok = subprocess.CompletedProcess(
                         args=["kubectl"], returncode=0, stdout='{"items": []}', stderr=""
                     )
                     m_run.return_value = fake_ok
