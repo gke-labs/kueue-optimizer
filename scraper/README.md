@@ -12,7 +12,7 @@ For the complete output format, event envelope, `workloadState` state machine, a
 
 - **Hybrid Periodic + Watch Recording**:
   - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, and `WorkloadPriorityClass`es, emitting events only when canonical object state changes.
-  - Watches `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s (filtering out unqueued system-namespace `Deployment`s), `RayJob`s, `RayCluster`s, and Kueue `Workload`s in real time to capture exact creation, admission, scheduling, preemption, completion, and deletion timestamps.
+  - Watches `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, Kueue-managed `Deployment`s, `RayJob`s, `RayCluster`s, and Kueue `Workload`s in real time to capture exact creation, admission, scheduling, preemption, completion, and deletion timestamps.
   - Gracefully handles optional CRDs (`JobSet`, `LeaderWorkerSet`, `RayJob`, `RayCluster`, Kueue APIs) if they are not installed on the target cluster, retrying periodically without failing.
 - **Strict Data Sanitization** (see [`SCRAPER-SCHEMA.md`](SCRAPER-SCHEMA.md) for the full field-by-field specification):
   - **Nodes (`infra.json`)**: Retains only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`), stripping node network/system metadata (`nodeInfo`, `daemonEndpoints`, `addresses`), cached images, attached volumes, cloud/cluster-identifying node labels, and disallowed annotations.
@@ -124,7 +124,7 @@ Each run produces three append-only **JSON Lines (NDJSON)** files (one compact J
 | File | Recorded Resources & Events |
 | :--- | :--- |
 | `infra.json` | `"New"`, `"Update"`, and `"Deleted"` events for sanitized `Node`s (scheduling-relevant `.spec` + `.status`), `Namespace`s, `RuntimeClass`es, `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es (without `.status`, with annotations filtered), and scheduled/running `Pod` placements and resource requests. |
-| `workflows.json` | Watch-driven `"New"`, `"Update"`, and `"Deleted"` events for `Job`, `JobSet`, `LeaderWorkerSet`, `Deployment` (excluding unqueued system-namespace `Deployment`s), `RayJob`, `RayCluster`, and standalone Kueue-managed `Pod` specs, annotated with top-level `workloadState` (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`). |
+| `workflows.json` | Watch-driven `"New"`, `"Update"`, and `"Deleted"` events for `Job`, `JobSet`, `LeaderWorkerSet`, Kueue-managed `Deployment`, `RayJob`, `RayCluster`, and standalone Kueue-managed `Pod` specs, annotated with top-level `workloadState` (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`). |
 | `execution-time.json` | Watch-driven `"Admitted"`, `"PartialExecution"` (preempted), and `"FullExecution"` (completed without preemption) timing records for Kueue `Workload` objects. |
 
 ### Inspecting Traces with `jq`

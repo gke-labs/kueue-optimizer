@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"slices"
 	"strings"
 	"time"
@@ -718,10 +719,12 @@ func SanitizePodTemplateSpec(tpl *corev1.PodTemplateSpec, pauseImage string, has
 func toMapWithoutStatus(obj any) map[string]any {
 	raw, err := json.Marshal(obj)
 	if err != nil {
+		log.Printf("WARN failed to marshal sanitized object %T: %v", obj, err)
 		return nil
 	}
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
+		log.Printf("WARN failed to unmarshal sanitized object %T: %v", obj, err)
 		return nil
 	}
 	delete(m, "status")
@@ -744,6 +747,34 @@ func ExtractLocalQueueName(obj metav1.Object) string {
 		}
 	}
 	return ""
+}
+
+// ExtractDeploymentLocalQueueName returns the Kueue LocalQueue name from a Deployment's
+// metadata or its PodTemplateSpec metadata.
+func ExtractDeploymentLocalQueueName(deploy *appsv1.Deployment) string {
+	if deploy == nil {
+		return ""
+	}
+	if lq := ExtractLocalQueueName(deploy); lq != "" {
+		return lq
+	}
+	return ExtractLocalQueueName(&deploy.Spec.Template.ObjectMeta)
+}
+
+// IsKueueManagedDeployment returns true if the Deployment (or its PodTemplateSpec)
+// is marked to be scheduled with Kueue regardless of namespace.
+func IsKueueManagedDeployment(deploy *appsv1.Deployment) bool {
+	if deploy == nil {
+		return false
+	}
+	if ExtractDeploymentLocalQueueName(deploy) != "" {
+		return true
+	}
+	if (deploy.Labels != nil && deploy.Labels[KueueManagedLabel] == "true") ||
+		(deploy.Spec.Template.Labels != nil && deploy.Spec.Template.Labels[KueueManagedLabel] == "true") {
+		return true
+	}
+	return false
 }
 
 // IsKueueManagedPod returns true if the Pod is marked to be scheduled with Kueue.
@@ -946,10 +977,12 @@ func SanitizeNode(node *corev1.Node, hasher SensitiveDataHasher) map[string]any 
 	}
 	raw, err := json.Marshal(cp)
 	if err != nil {
+		log.Printf("WARN failed to marshal sanitized Node %q: %v", cp.Name, err)
 		return nil
 	}
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
+		log.Printf("WARN failed to unmarshal sanitized Node %q: %v", cp.Name, err)
 		return nil
 	}
 	if status, ok := m["status"].(map[string]any); ok {
@@ -1052,6 +1085,8 @@ func SanitizeRuntimeClass(rc *nodev1.RuntimeClass, hasher SensitiveDataHasher) m
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: nodev1.SchemeGroupVersion.String(), Kind: "RuntimeClass"}
 	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
 	if cp.Scheduling != nil {
+		// RuntimeClass scheduling.nodeSelector is a plain labels map (map[string]string) and does
+		// not support matchExpressions, so label map sanitization via SanitizeNodeLabels is sufficient.
 		cp.Scheduling.NodeSelector = SanitizeNodeLabels(cp.Scheduling.NodeSelector, hasher)
 		if len(cp.Scheduling.NodeSelector) == 0 && len(cp.Scheduling.Tolerations) == 0 {
 			cp.Scheduling = nil

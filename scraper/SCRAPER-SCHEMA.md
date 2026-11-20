@@ -11,7 +11,7 @@ This document specifies the exact JSON Lines (NDJSON) file format, event envelop
 | File | Default Flag | Purpose |
 | :--- | :--- | :--- |
 | `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
-| `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s (excluding unqueued system-namespace `Deployment`s), `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s, with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
+| `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of `Job`s, `JobSet`s, `LeaderWorkerSet`s, Kueue-managed `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s, with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
 | `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), preempted runs (`PartialExecution`), and non-preempted completions (`FullExecution`), with top-level `workloadState` metadata. |
 
 ### On-Disk File Format (One Event Per Line / JSON Lines)
@@ -186,7 +186,7 @@ To guarantee strict data hygiene, **no other pod fields are ever written to `inf
 1. `Job` (`batch/v1`)
 2. `JobSet` (`jobset.x-k8s.io/v1alpha2`)
 3. `LeaderWorkerSet` (`leaderworkerset.x-k8s.io/v1`)
-4. `Deployment` (`apps/v1`) — unqueued `Deployment`s in Kubernetes/GKE/controller system namespaces (`kube-*`, `kueue-system`, `jobset-system`, `leaderworkerset-system`, `ray-system`, `cert-manager`, `gmp-*`, `gke-managed-*`, etc.) are automatically filtered out.
+4. `Deployment` (`apps/v1`) — only `Deployment`s marked for Kueue scheduling (`kueue.x-k8s.io/queue-name` label/annotation or `kueue.x-k8s.io/managed=true` label on the `Deployment` or its `PodTemplateSpec`) are recorded, regardless of namespace.
 5. `RayJob` (`ray.io/v1`)
 6. `RayCluster` (`ray.io/v1`)
 7. Standalone Kueue-managed `Pod` (`v1/Pod`) — a Pod that is marked for Kueue scheduling (`kueue.x-k8s.io/queue-name` label/annotation, `kueue.x-k8s.io/managed=true` label, or Kueue scheduling gates) **and** does not belong to any of the parent workflow APIs above (`ownerReferences`, `kueue.x-k8s.io/pod-suspending-parent`, `job-name`, `jobset.sigs.k8s.io/jobset-name`, `leaderworkerset.sigs.k8s.io/name`, or `ray.io/cluster`).

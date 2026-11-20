@@ -61,25 +61,6 @@ var (
 		Version:  rayv1.GroupVersion.Version,
 		Resource: "rayclusters",
 	}
-
-	// systemNamespaces lists Kubernetes, GKE, and controller-plane system namespaces whose
-	// unqueued Deployments are excluded from workflows.json.
-	systemNamespaces = map[string]bool{
-		metav1.NamespaceSystem:    true, // "kube-system"
-		metav1.NamespacePublic:    true, // "kube-public"
-		corev1.NamespaceNodeLease: true, // "kube-node-lease"
-		"kueue-system":            true,
-		"jobset-system":           true,
-		"leaderworkerset-system":  true,
-		"lws-system":              true,
-		"ray-system":              true,
-		"kuberay-system":          true,
-		"cert-manager":            true,
-		"gmp-system":              true,
-		"gmp-public":              true,
-		"gke-mcs":                 true,
-		"istio-system":            true,
-	}
 )
 
 type cachedObject struct {
@@ -931,39 +912,8 @@ func (s *Scraper) handleJobSetWatchEvent(eventType watch.EventType, js *jobsetv1
 	s.recordWorkflowEvent(eventType, "JobSet", js.Name, js.Namespace, js.CreationTimestamp, lq, wlState, payload, now)
 }
 
-func isSystemNamespace(ns string) bool {
-	return systemNamespaces[ns] ||
-		strings.HasPrefix(ns, "kube-") ||
-		strings.HasPrefix(ns, "gke-managed-") ||
-		strings.HasPrefix(ns, "gke-system")
-}
-
-func extractDeploymentLocalQueueName(deploy *appsv1.Deployment) string {
-	if deploy == nil {
-		return ""
-	}
-	if lq := ExtractLocalQueueName(deploy); lq != "" {
-		return lq
-	}
-	return ExtractLocalQueueName(&deploy.Spec.Template.ObjectMeta)
-}
-
-func isUnqueuedSystemDeployment(deploy *appsv1.Deployment) bool {
-	if deploy == nil || !isSystemNamespace(deploy.Namespace) {
-		return false
-	}
-	if extractDeploymentLocalQueueName(deploy) != "" {
-		return false
-	}
-	if (deploy.Labels != nil && deploy.Labels[KueueManagedLabel] == "true") ||
-		(deploy.Spec.Template.Labels != nil && deploy.Spec.Template.Labels[KueueManagedLabel] == "true") {
-		return false
-	}
-	return true
-}
-
 func (s *Scraper) shouldSkipDeployment(deploy *appsv1.Deployment) bool {
-	if !isUnqueuedSystemDeployment(deploy) {
+	if IsKueueManagedDeployment(deploy) {
 		return false
 	}
 	s.mu.Lock()
@@ -977,7 +927,7 @@ func (s *Scraper) handleDeploymentWatchEvent(eventType watch.EventType, deploy *
 		return
 	}
 	now := time.Now().UTC()
-	lq := extractDeploymentLocalQueueName(deploy)
+	lq := ExtractDeploymentLocalQueueName(deploy)
 	s.mu.Lock()
 	wlState := s.determineGroupWorkloadStateLocked("Deployment", deploy.Namespace, deploy.Name, deploy.Status.ReadyReplicas, deploy.Status.Replicas)
 	s.mu.Unlock()
@@ -1107,6 +1057,10 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 	key := wl.Namespace + "/" + wl.Name
 
 	rawOwnerKind, rawOwnerName, _ := resolveWorkloadOwner(wl, NoopHasher{})
+	if rawOwnerKind == "" || rawOwnerName == "" {
+		return
+	}
+	ownerKey := rawOwnerKind + "/" + wl.Namespace + "/" + rawOwnerName
 	ownerKind, ownerName, ownerAPIVersion := resolveWorkloadOwner(wl, s.hasher)
 	workloadName := s.hasher.HashName(wl.Name)
 	localQueueName := string(wl.Spec.QueueName)
@@ -1141,10 +1095,8 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 
 	s.mu.Lock()
 	ownerUnsuspended := isAdmitted
-	if rawOwnerKind != "" && rawOwnerName != "" {
-		if wfSt, ok := s.workflowStates[rawOwnerKind+"/"+wl.Namespace+"/"+rawOwnerName]; ok && wfSt.workloadState != WorkloadStateAdmitted {
-			ownerUnsuspended = false
-		}
+	if wfSt, ok := s.workflowStates[ownerKey]; ok && wfSt.workloadState != WorkloadStateAdmitted {
+		ownerUnsuspended = false
 	}
 	// Allow FullExecution when Finished=True transitioned cleanly (Reason == Succeeded, or Workload
 	// completed without pods/owner being suspended) even when Preempted=True remains latched on wl.Status.Conditions.
@@ -1154,20 +1106,17 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 			finishedCond.Reason != kueuev1beta2.WorkloadFinishedReasonOwnerNotFound &&
 			finishedCond.Reason != kueuev1beta2.WorkloadFinishedReasonOutOfSync))
 
-	if rawOwnerKind != "" && rawOwnerName != "" {
-		ownerKey := rawOwnerKind + "/" + wl.Namespace + "/" + rawOwnerName
-		switch {
-		case finishedCleanly:
-			s.ownerStates[ownerKey] = WorkloadStateAdmitted
-		case isPreempted || isEvicted:
-			s.ownerStates[ownerKey] = WorkloadStateNotAdmitted
-		case isAdmitted:
-			s.ownerStates[ownerKey] = WorkloadStateAdmitted
-		case (quotaReservedCond != nil && quotaReservedCond.Status == metav1.ConditionTrue) || wl.Status.Admission != nil:
-			s.ownerStates[ownerKey] = WorkloadStateAdmissionInProgress
-		default:
-			s.ownerStates[ownerKey] = WorkloadStateNotAdmitted
-		}
+	switch {
+	case finishedCleanly:
+		s.ownerStates[ownerKey] = WorkloadStateAdmitted
+	case isPreempted || isEvicted:
+		s.ownerStates[ownerKey] = WorkloadStateNotAdmitted
+	case isAdmitted:
+		s.ownerStates[ownerKey] = WorkloadStateAdmitted
+	case (quotaReservedCond != nil && quotaReservedCond.Status == metav1.ConditionTrue) || wl.Status.Admission != nil:
+		s.ownerStates[ownerKey] = WorkloadStateAdmissionInProgress
+	default:
+		s.ownerStates[ownerKey] = WorkloadStateNotAdmitted
 	}
 
 	st, ok := s.workloadStates[key]
@@ -1182,16 +1131,18 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 	}
 	clusterQueueName := st.clusterQueueName
 
-	// 1. Check if Workload is currently Admitted (skipping stale Admitted=True while eviction/preemption is active).
-	if isAdmitted && !isPreempted && !isEvicted && !st.recordedFull {
+	// 1. Check if Workload is currently Admitted.
+	// During Kueue's two-phase eviction, Evicted=True / Preempted=True are set before pods
+	// terminate and before Admitted flips to False; skip emitting Admitted while eviction is active.
+	evictionActive := isPreempted || isEvicted
+	if isAdmitted && !evictionActive && !st.recordedFull {
 		admittedAt := admittedCond.LastTransitionTime.Time.UTC()
 		if admittedAt.IsZero() {
 			admittedAt = now
 		}
-		isNewAdmission := (!st.currentlyAdmitted || !st.currentAdmittedTime.Equal(admittedAt)) &&
-			(st.lastRecordedAdmittedTime.IsZero() || !admittedAt.Equal(st.lastRecordedAdmittedTime)) &&
-			(st.preemptionCount == 0 || !admittedAt.Equal(st.lastAdmittedTime))
-		if isNewAdmission {
+		alreadyRecorded := !st.lastRecordedAdmittedTime.IsZero() && admittedAt.Equal(st.lastRecordedAdmittedTime)
+		alreadyConsumedByPreemption := st.preemptionCount > 0 && !st.lastAdmittedTime.IsZero() && admittedAt.Equal(st.lastAdmittedTime)
+		if !alreadyRecorded && !alreadyConsumedByPreemption {
 			st.currentlyAdmitted = true
 			st.currentAdmittedTime = admittedAt
 			st.lastAdmittedTime = admittedAt
@@ -1239,7 +1190,7 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 					observedAdmittedAt = true
 				}
 			}
-			if admittedAt.IsZero() {
+			if !observedAdmittedAt {
 				if st.preemptionCount == 1 {
 					if wl.Status.AccumulatedPastExecutionTimeSeconds != nil && *wl.Status.AccumulatedPastExecutionTimeSeconds > 0 {
 						admittedAt = preemptTime.Add(-time.Duration(*wl.Status.AccumulatedPastExecutionTimeSeconds) * time.Second)
@@ -1264,7 +1215,7 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 			durStr := time.Duration(durSec * float64(time.Second)).Round(time.Millisecond).String()
 			endMetaTime := metav1.NewTime(preemptTime)
 
-			st.currentlyAdmitted = false
+			st.currentlyAdmitted = isAdmitted
 			st.currentAdmittedTime = time.Time{}
 
 			events = append(events, ExecutionTimeEvent{
@@ -1317,7 +1268,7 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 
 		// If the workload was admitted and finished before its admission was separately observed,
 		// emit the admission event first.
-		if !st.currentlyAdmitted && st.lastRecordedAdmittedTime.IsZero() {
+		if st.lastRecordedAdmittedTime.IsZero() {
 			st.lastAdmittedTime = admittedAt
 			st.lastRecordedAdmittedTime = admittedAt
 			events = append(events, ExecutionTimeEvent{
@@ -1349,7 +1300,7 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 		endMetaTime := metav1.NewTime(finishedAt)
 
 		st.recordedFull = true
-		st.currentlyAdmitted = true
+		st.currentlyAdmitted = isAdmitted
 
 		events = append(events, ExecutionTimeEvent{
 			Timestamp:     now,
@@ -1377,7 +1328,7 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 		})
 	}
 
-	if (!isAdmitted || isEvicted || isPreempted) && !st.recordedFull {
+	if !isAdmitted && !st.recordedFull {
 		st.currentlyAdmitted = false
 		st.currentAdmittedTime = time.Time{}
 	}
@@ -1512,9 +1463,6 @@ func (s *Scraper) watchDeploymentsLoop(ctx context.Context) {
 			continue
 		}
 		for i := range list.Items {
-			if s.shouldSkipDeployment(&list.Items[i]) {
-				continue
-			}
 			s.handleDeploymentWatchEvent(watch.Added, &list.Items[i])
 		}
 
@@ -1540,9 +1488,6 @@ func (s *Scraper) watchDeploymentsLoop(ctx context.Context) {
 						return
 					}
 					if deploy, ok := ev.Object.(*appsv1.Deployment); ok {
-						if s.shouldSkipDeployment(deploy) {
-							continue
-						}
 						s.handleDeploymentWatchEvent(ev.Type, deploy)
 					}
 				}
