@@ -1,3 +1,10 @@
-scraper/cluster-scraper
-
-**/traces
+/kwok/
+/kueue/
+/jobset/
+/deploy/base/pki/
+/kwok-*.kubeconfig
+/kueue-optimizer-*.kubeconfig
+/scraper/cluster-scraper
+/scraper/vendor/
+__pycache__/
+*.py[cod]

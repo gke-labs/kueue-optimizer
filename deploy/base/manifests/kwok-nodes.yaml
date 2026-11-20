@@ -1,0 +1,363 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-0
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-0
+spec:
+  podCIDR: 10.244.0.0/24
+  podCIDRs:
+  - 10.244.0.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-1
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-1
+spec:
+  podCIDR: 10.244.1.0/24
+  podCIDRs:
+  - 10.244.1.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-2
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-2
+spec:
+  podCIDR: 10.244.2.0/24
+  podCIDRs:
+  - 10.244.2.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-3
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-3
+spec:
+  podCIDR: 10.244.3.0/24
+  podCIDRs:
+  - 10.244.3.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-4
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-4
+spec:
+  podCIDR: 10.244.4.0/24
+  podCIDRs:
+  - 10.244.4.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-5
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-5
+spec:
+  podCIDR: 10.244.5.0/24
+  podCIDRs:
+  - 10.244.5.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-6
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-6
+spec:
+  podCIDR: 10.244.6.0/24
+  podCIDRs:
+  - 10.244.6.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-7
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-7
+spec:
+  podCIDR: 10.244.7.0/24
+  podCIDRs:
+  - 10.244.7.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-8
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-8
+spec:
+  podCIDR: 10.244.8.0/24
+  podCIDRs:
+  - 10.244.8.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux
+---
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    kwok.x-k8s.io/node: fake
+    node.alpha.kubernetes.io/ttl: "0"
+  labels:
+    beta.kubernetes.io/arch: amd64
+    beta.kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+    kubernetes.io/hostname: kwok-node-9
+    kubernetes.io/os: linux
+    kubernetes.io/role: agent
+    node-role.kubernetes.io/agent: ""
+    type: kwok
+  name: kwok-node-9
+spec:
+  podCIDR: 10.244.9.0/24
+  podCIDRs:
+  - 10.244.9.0/24
+status:
+  allocatable:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  capacity:
+    cpu: "4"
+    memory: 16Gi
+    pods: "110"
+  nodeInfo:
+    architecture: amd64
+    kubeProxyVersion: fake
+    kubeletVersion: fake
+    operatingSystem: linux

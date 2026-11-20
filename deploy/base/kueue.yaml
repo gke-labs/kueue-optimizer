@@ -1,0 +1,277 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: kwok-kueue
+  labels:
+    app.kubernetes.io/component: kueue-controller-manager
+    app.kubernetes.io/name: kueue
+    app.kubernetes.io/part-of: kueue-optimizer
+spec:
+  selector:
+    app.kubernetes.io/component: kueue-controller-manager
+  ports:
+  - name: webhook
+    port: 9443
+    targetPort: 9443
+    protocol: TCP
+  - name: visibility
+    port: 8082
+    targetPort: 8082
+    protocol: TCP
+  - name: metrics
+    port: 8443
+    targetPort: 8443
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kueue-controller-manager
+  labels:
+    app.kubernetes.io/component: kueue-controller-manager
+    app.kubernetes.io/name: kueue
+    app.kubernetes.io/part-of: kueue-optimizer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: kueue-controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        app.kubernetes.io/component: kueue-controller-manager
+        app.kubernetes.io/name: kueue
+        app.kubernetes.io/part-of: kueue-optimizer
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: apply-kueue-crds
+        image: registry.k8s.io/kubectl:v1.36.4
+        imagePullPolicy: IfNotPresent
+        args:
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --cache-dir=/tmp/kube-cache
+        - apply
+        - --server-side
+        - --force-conflicts
+        - -f
+        - /etc/kueue-manifests/crds/
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: kueue-crds
+          mountPath: /etc/kueue-manifests/crds
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      - name: wait-kueue-crds
+        image: registry.k8s.io/kubectl:v1.36.4
+        imagePullPolicy: IfNotPresent
+        args:
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --cache-dir=/tmp/kube-cache
+        - wait
+        - --for=condition=Established
+        - --timeout=120s
+        - -f
+        - /etc/kueue-manifests/crds/
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: kueue-crds
+          mountPath: /etc/kueue-manifests/crds
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      - name: apply-kueue-bootstrap
+        image: registry.k8s.io/kubectl:v1.36.4
+        imagePullPolicy: IfNotPresent
+        args:
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --cache-dir=/tmp/kube-cache
+        - apply
+        - --server-side
+        - --force-conflicts
+        - -f
+        - /etc/kueue-manifests/bootstrap/kueue-bootstrap.yaml
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: kueue-bootstrap
+          mountPath: /etc/kueue-manifests/bootstrap
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      containers:
+      - name: manager
+        image: us-central1-docker.pkg.dev/k8s-staging-images/kueue/kueue:main
+        imagePullPolicy: IfNotPresent
+        command:
+        - /manager
+        args:
+        - --config=/controller_manager_config.yaml
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --zap-log-level=2
+        env:
+        - name: NAMESPACE
+          value: kueue-system
+        - name: KUBECONFIG
+          value: /etc/kubernetes/pki/kubeconfig
+        ports:
+        - name: webhook
+          containerPort: 9443
+          protocol: TCP
+        - name: visibility
+          containerPort: 8082
+          protocol: TCP
+        - name: metrics
+          containerPort: 8443
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 10
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: 1350m
+            memory: 1382Mi
+          limits:
+            cpu: 5400m
+            memory: 11059Mi
+        volumeMounts:
+        - name: manager-config
+          mountPath: /controller_manager_config.yaml
+          subPath: controller_manager_config.yaml
+          readOnly: true
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: webhook-certs
+          mountPath: /tmp/k8s-webhook-server/serving-certs
+          readOnly: true
+        - name: metrics-certs
+          mountPath: /etc/kueue/metrics/certs
+          readOnly: true
+        - name: visibility-certs
+          mountPath: /visibility
+          readOnly: true
+      volumes:
+      - name: manager-config
+        configMap:
+          name: kueue-manager-config
+      - name: pki
+        secret:
+          secretName: kwok-pki
+          defaultMode: 0444
+      - name: webhook-certs
+        secret:
+          secretName: kwok-pki
+          defaultMode: 0444
+          items:
+          - key: ca.crt
+            path: ca.crt
+          - key: admin.crt
+            path: tls.crt
+          - key: admin.key
+            path: tls.key
+      - name: metrics-certs
+        secret:
+          secretName: kwok-pki
+          defaultMode: 0444
+          items:
+          - key: ca.crt
+            path: ca.crt
+          - key: admin.crt
+            path: tls.crt
+          - key: admin.key
+            path: tls.key
+      - name: visibility-certs
+        secret:
+          secretName: kwok-pki
+          defaultMode: 0444
+          items:
+          - key: ca.crt
+            path: ca.crt
+          - key: admin.crt
+            path: tls.crt
+          - key: admin.key
+            path: tls.key
+      - name: kueue-crds
+        projected:
+          sources:
+          - configMap:
+              name: kueue-crds
+          - configMap:
+              name: kueue-workloads-crd
+          - configMap:
+              name: jobset-crds
+      - name: kueue-bootstrap
+        configMap:
+          name: kueue-bootstrap
+      - name: tmp
+        emptyDir: {}
+      terminationGracePeriodSeconds: 10

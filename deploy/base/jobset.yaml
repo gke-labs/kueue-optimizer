@@ -1,0 +1,250 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: kwok-jobset
+  labels:
+    app.kubernetes.io/component: jobset-controller-manager
+    app.kubernetes.io/name: jobset
+    app.kubernetes.io/part-of: kueue-optimizer
+spec:
+  selector:
+    app.kubernetes.io/component: jobset-controller-manager
+  ports:
+  - name: webhook
+    port: 9443
+    targetPort: 9443
+    protocol: TCP
+  - name: metrics
+    port: 8443
+    targetPort: 8443
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jobset-controller-manager
+  labels:
+    app.kubernetes.io/component: jobset-controller-manager
+    app.kubernetes.io/name: jobset
+    app.kubernetes.io/part-of: kueue-optimizer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: jobset-controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        app.kubernetes.io/component: jobset-controller-manager
+        app.kubernetes.io/name: jobset
+        app.kubernetes.io/part-of: kueue-optimizer
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: apply-jobset-crds
+        image: registry.k8s.io/kubectl:v1.36.4
+        imagePullPolicy: IfNotPresent
+        args:
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --cache-dir=/tmp/kube-cache
+        - apply
+        - --server-side
+        - --force-conflicts
+        - -f
+        - /etc/jobset-manifests/crds/
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: jobset-crds
+          mountPath: /etc/jobset-manifests/crds
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      - name: wait-jobset-crds
+        image: registry.k8s.io/kubectl:v1.36.4
+        imagePullPolicy: IfNotPresent
+        args:
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --cache-dir=/tmp/kube-cache
+        - wait
+        - --for=condition=Established
+        - --timeout=120s
+        - -f
+        - /etc/jobset-manifests/crds/
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: jobset-crds
+          mountPath: /etc/jobset-manifests/crds
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      - name: apply-jobset-bootstrap
+        image: registry.k8s.io/kubectl:v1.36.4
+        imagePullPolicy: IfNotPresent
+        args:
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --cache-dir=/tmp/kube-cache
+        - apply
+        - --server-side
+        - --force-conflicts
+        - -f
+        - /etc/jobset-manifests/bootstrap/jobset-bootstrap.yaml
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: jobset-bootstrap
+          mountPath: /etc/jobset-manifests/bootstrap
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      containers:
+      - name: manager
+        image: us-central1-docker.pkg.dev/k8s-staging-images/jobset/jobset:main
+        imagePullPolicy: IfNotPresent
+        command:
+        - /manager
+        args:
+        - --config=/controller_manager_config.yaml
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --zap-log-level=2
+        env:
+        - name: NAMESPACE
+          value: jobset-system
+        - name: KUBECONFIG
+          value: /etc/kubernetes/pki/kubeconfig
+        ports:
+        - name: webhook
+          containerPort: 9443
+          protocol: TCP
+        - name: metrics
+          containerPort: 8443
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 10
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: 1350m
+            memory: 1382Mi
+          limits:
+            cpu: 5400m
+            memory: 11059Mi
+        volumeMounts:
+        - name: manager-config
+          mountPath: /controller_manager_config.yaml
+          subPath: jobset_controller_manager_config.yaml
+          readOnly: true
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: webhook-certs
+          mountPath: /tmp/k8s-webhook-server/serving-certs
+          readOnly: true
+        - name: metrics-certs
+          mountPath: /tmp/k8s-metrics-server/serving-certs
+          readOnly: true
+      volumes:
+      - name: manager-config
+        configMap:
+          name: jobset-manager-config
+      - name: pki
+        secret:
+          secretName: kwok-pki
+          defaultMode: 0444
+      - name: webhook-certs
+        secret:
+          secretName: kwok-pki
+          defaultMode: 0444
+          items:
+          - key: ca.crt
+            path: ca.crt
+          - key: admin.crt
+            path: tls.crt
+          - key: admin.key
+            path: tls.key
+      - name: metrics-certs
+        secret:
+          secretName: kwok-pki
+          defaultMode: 0444
+          items:
+          - key: ca.crt
+            path: ca.crt
+          - key: admin.crt
+            path: tls.crt
+          - key: admin.key
+            path: tls.key
+      - name: jobset-crds
+        configMap:
+          name: jobset-crds
+      - name: jobset-bootstrap
+        configMap:
+          name: jobset-bootstrap
+      - name: tmp
+        emptyDir: {}
+      terminationGracePeriodSeconds: 10
