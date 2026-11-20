@@ -1,0 +1,112 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kueue-optimizer-chamber-01
+
+resources:
+- namespace.yaml
+- registry.yaml
+- etcd.yaml
+- kube-apiserver.yaml
+- kube-controller-manager.yaml
+- kube-scheduler.yaml
+- kwok-controller.yaml
+- jobset.yaml
+- kueue.yaml
+- prometheus.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+secretGenerator:
+- name: kwok-pki
+  files:
+  - pki/ca.crt
+  - pki/ca.key
+  - pki/admin.crt
+  - pki/admin.key
+  - pki/kubeconfig
+  - pki/external-kubeconfig
+  - pki/token.csv
+
+configMapGenerator:
+- name: kwok-config
+  files:
+  - config/kwok.yaml
+- name: kwok-crds
+  files:
+  - manifests/kwok-crds.yaml
+- name: kwok-bootstrap
+  files:
+  - manifests/kwok-stages.yaml
+  - manifests/kwok-nodes.yaml
+- name: kueue-manager-config
+  files:
+  - config/controller_manager_config.yaml
+- name: kueue-crds
+  files:
+  - manifests/kueue-crds.yaml
+- name: kueue-workloads-crd
+  files:
+  - manifests/kueue-workloads-crd.json
+- name: kueue-bootstrap
+  files:
+  - manifests/kueue-bootstrap.yaml
+- name: jobset-manager-config
+  files:
+  - config/jobset_controller_manager_config.yaml
+- name: jobset-crds
+  files:
+  - manifests/jobset-crds.json
+- name: jobset-bootstrap
+  files:
+  - manifests/jobset-bootstrap.yaml
+- name: prometheus-config
+  files:
+  - config/prometheus.yaml
+
+images:
+- name: mirror.gcr.io/library/registry
+  newName: mirror.gcr.io/library/registry
+  newTag: "2"
+- name: registry.k8s.io/etcd
+  newName: registry.k8s.io/etcd
+  newTag: 3.6.10-0
+- name: registry.k8s.io/kube-apiserver
+  newName: registry.k8s.io/kube-apiserver
+  newTag: v1.36.4
+- name: registry.k8s.io/kube-controller-manager
+  newName: registry.k8s.io/kube-controller-manager
+  newTag: v1.36.4
+- name: registry.k8s.io/kube-scheduler
+  newName: registry.k8s.io/kube-scheduler
+  newTag: v1.36.4
+- name: registry.k8s.io/kubectl
+  newName: registry.k8s.io/kubectl
+  newTag: v1.36.4
+- name: registry.k8s.io/kwok/kwok
+  newName: registry.k8s.io/kwok/kwok
+  newTag: v0.8.0
+- name: us-central1-docker.pkg.dev/k8s-staging-images/jobset/jobset
+  newName: us-central1-docker.pkg.dev/k8s-staging-images/jobset/jobset
+  newTag: main
+- name: us-central1-docker.pkg.dev/k8s-staging-images/kueue/kueue
+  newName: us-central1-docker.pkg.dev/k8s-staging-images/kueue/kueue
+  newTag: main
+- name: quay.io/prometheus/prometheus
+  newName: quay.io/prometheus/prometheus
+  newTag: v3.15.1

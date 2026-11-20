@@ -1,0 +1,74 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kueue-sample-queues-setup
+  labels:
+    app.kubernetes.io/component: sample-queues-setup
+    app.kubernetes.io/part-of: kueue-optimizer
+spec:
+  backoffLimit: 20
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: sample-queues-setup
+        app.kubernetes.io/part-of: kueue-optimizer
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: apply-sample-queues
+        image: registry.k8s.io/kubectl:v1.36.4
+        imagePullPolicy: IfNotPresent
+        args:
+        - --kubeconfig=/etc/kubernetes/pki/kubeconfig
+        - --cache-dir=/tmp/kube-cache
+        - apply
+        - --server-side
+        - --force-conflicts
+        - -f
+        - /etc/kueue-samples/sample-queues.yaml
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: pki
+          mountPath: /etc/kubernetes/pki
+          readOnly: true
+        - name: sample-queues
+          mountPath: /etc/kueue-samples
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: pki
+        secret:
+          secretName: kwok-pki
+          defaultMode: 0444
+      - name: sample-queues
+        configMap:
+          name: kueue-sample-queues
+      - name: tmp
+        emptyDir: {}
