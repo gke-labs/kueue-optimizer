@@ -144,8 +144,13 @@ def extract_workload_resource_size_and_cfg_duration(
         ps_count = max(1, int(ps.get("count") if ps.get("count") is not None else 1))
         tpl = ps.get("template") or {}
         tpl_meta = tpl.get("metadata") or {}
-        ps_dur = parse_positive_duration_annotation(
-            tpl_meta.get("annotations"), "kueue-optimizer.gke.io/pod-execution-time-seconds"
+        tpl_anns = tpl_meta.get("annotations") or {}
+        ps_dur = (
+            None
+            if str(tpl_anns.get("kueue-optimizer.gke.io/infinite-duration") or "").lower() == "true"
+            else parse_positive_duration_annotation(
+                tpl_anns, "kueue-optimizer.gke.io/pod-execution-time-seconds"
+            )
         )
         if ps_dur is not None:
             cfg_dur_candidates.append(ps_dur)
@@ -188,8 +193,13 @@ def extract_workload_resource_size_and_cfg_duration(
             if not isinstance(pod, dict):
                 continue
             p_meta = pod.get("metadata") or {}
-            p_dur = parse_positive_duration_annotation(
-                p_meta.get("annotations"), "kueue-optimizer.gke.io/pod-execution-time-seconds"
+            p_anns = p_meta.get("annotations") or {}
+            p_dur = (
+                None
+                if str(p_anns.get("kueue-optimizer.gke.io/infinite-duration") or "").lower() == "true"
+                else parse_positive_duration_annotation(
+                    p_anns, "kueue-optimizer.gke.io/pod-execution-time-seconds"
+                )
             )
             if p_dur is not None:
                 cfg_dur_candidates.append(p_dur)
@@ -288,6 +298,7 @@ def _index_pods_by_owner(pods: list[dict]) -> dict[tuple[str, str], list[dict]]:
         candidate_keys: set[str] = set()
         for k_name in (
             p_labels.get("kueue.x-k8s.io/prebuilt-workload-name"),
+            p_labels.get("kueue.x-k8s.io/pod-group-name"),
             p_anns.get("kueue.x-k8s.io/workload"),
             p_labels.get("jobset.sigs.k8s.io/jobset-name"),
             p_labels.get("batch.kubernetes.io/job-name"),
@@ -498,8 +509,13 @@ def _accumulate_infra_pods(
         if not per_pod_res:
             continue
         per_pod_res["pods"] = 1.0
-        cfg_dur = parse_positive_duration_annotation(
-            p_meta.get("annotations"), "kueue-optimizer.gke.io/pod-execution-time-seconds"
+        p_anns = p_meta.get("annotations") or {}
+        cfg_dur = (
+            None
+            if str(p_anns.get("kueue-optimizer.gke.io/infinite-duration") or "").lower() == "true"
+            else parse_positive_duration_annotation(
+                p_anns, "kueue-optimizer.gke.io/pod-execution-time-seconds"
+            )
         )
         phase = str(p_status.get("phase") or "")
         t_start = (

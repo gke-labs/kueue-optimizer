@@ -37,7 +37,12 @@ class WorkloadExecutionInfo:
     owner_name: str
     local_queue_name: str = ""
     cluster_queue_name: str = ""
+    priority_class_name: str = ""
+    priority: int | None = None
+    pod_set_assignments: list[dict[str, Any]] = field(default_factory=list)
+    creation_epoch: float | None = None
     full_duration_sec: float | None = None
+    full_end_epoch: float | None = None
     partial_durations_sec: list[float] = field(default_factory=list)
     admitted_epochs: list[float] = field(default_factory=list)
     preempted_epochs: list[float] = field(default_factory=list)
@@ -159,6 +164,16 @@ def index_execution_times(
             info.local_queue_name = lq_name
         if cq_name and not info.cluster_queue_name:
             info.cluster_queue_name = cq_name
+        pc_name = str(pl.get("priorityClassName") or "")
+        if pc_name and not info.priority_class_name:
+            info.priority_class_name = pc_name
+        if pl.get("priority") is not None and info.priority is None:
+            try:
+                info.priority = int(pl["priority"])
+            except (TypeError, ValueError):
+                pass
+        if info.creation_epoch is None and pl.get("creationTime"):
+            info.creation_epoch = parse_rfc3339_epoch(pl.get("creationTime"), strict=strict_timestamps)
 
         dur_raw = pl.get("executionDurationSeconds")
         dur_val = float(dur_raw) if dur_raw is not None else None
@@ -173,6 +188,9 @@ def index_execution_times(
             adm_ts = parse_rfc3339_epoch(pl.get("admittedTime"), strict=strict_timestamps) or ev_ts
             if adm_ts is not None:
                 info.admitted_epochs.append(adm_ts)
+            psa_raw = pl.get("podSetAssignments")
+            if isinstance(psa_raw, list) and psa_raw:
+                info.pod_set_assignments = [dict(x) for x in psa_raw if isinstance(x, dict)]
         elif ev_type == "PartialExecution":
             idx.partial_events += 1
             if dur_val is not None and dur_val > 0:
@@ -184,6 +202,9 @@ def index_execution_times(
             idx.full_events += 1
             if dur_val is not None and dur_val > 0:
                 info.full_duration_sec = dur_val
+            end_ts = parse_rfc3339_epoch(pl.get("endTime"), strict=strict_timestamps) or ev_ts
+            if end_ts is not None:
+                info.full_end_epoch = end_ts
 
         if wl_name:
             idx.by_workload_name[(ns, wl_name)] = info
@@ -507,3 +528,71 @@ def filter_initial_running_pods(
         qualifying.append((p_ns, p_name, ev_epoch, pl, del_ep))
 
     return qualifying, expired_count
+
+
+def build_topology_assignment(
+    placements: list[str],
+    topology_levels: list[str],
+    nodes_by_name: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Build a valid Kueue v1beta2 `TopologyAssignment` from pod placements and Topology levels.
+
+    Respects Kueue's `tasCache` hostname-lowest-level shortcut (`levels = ["kubernetes.io/hostname"]`
+    whenever `topology_levels[-1] == "kubernetes.io/hostname"`) and CEL slice invariants.
+    """
+    valid_placements = [p for p in placements if p]
+    clean_levels = [str(lv).strip() for lv in topology_levels if str(lv).strip()]
+    if not valid_placements or not clean_levels:
+        return None
+
+    eff_levels = (
+        ["kubernetes.io/hostname"]
+        if clean_levels[-1] == "kubernetes.io/hostname"
+        else list(clean_levels)
+    )
+
+    domain_counts: dict[tuple[str, ...], int] = {}
+    for node_name in valid_placements:
+        nd = nodes_by_name.get(node_name) or {}
+        labels = (nd.get("metadata") or {}).get("labels") or {}
+        vals: list[str] = []
+        for lk in eff_levels:
+            if lk == "kubernetes.io/hostname":
+                vals.append(str(labels.get(lk) or node_name))
+            else:
+                v = str(labels.get(lk) or "")
+                if not v:
+                    return None
+                vals.append(v)
+        dom = tuple(vals)
+        domain_counts[dom] = domain_counts.get(dom, 0) + 1
+
+    if not domain_counts:
+        return None
+
+    domains = list(domain_counts.keys())
+    counts = [domain_counts[d] for d in domains]
+    dom_cnt = len(domains)
+
+    values_per_level: list[dict[str, Any]] = []
+    for li in range(len(eff_levels)):
+        level_vals = [d[li] for d in domains]
+        if len(set(level_vals)) == 1:
+            values_per_level.append({"universal": level_vals[0]})
+        else:
+            values_per_level.append({"individual": {"roots": level_vals}})
+
+    pod_counts: dict[str, Any] = (
+        {"universal": counts[0]} if len(set(counts)) == 1 else {"individual": counts}
+    )
+
+    return {
+        "levels": eff_levels,
+        "slices": [
+            {
+                "domainCount": dom_cnt,
+                "valuesPerLevel": values_per_level,
+                "podCounts": pod_counts,
+            }
+        ],
+    }

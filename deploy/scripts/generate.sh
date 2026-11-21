@@ -555,6 +555,20 @@ for doc in docs:
             cc = wh.setdefault("clientConfig", {})
             cc["caBundle"] = ca_bundle
             cc.setdefault("service", {})["port"] = 9443
+            if kind == "MutatingWebhookConfiguration" and wh.get("name") == "mpod.kb.io":
+                obj_sel = wh.setdefault("objectSelector", {})
+                obj_exprs = obj_sel.setdefault("matchExpressions", [])
+                if not any(
+                    ex.get("key") == "kueue-optimizer.gke.io/initial-pod" and ex.get("operator") == "NotIn"
+                    for ex in obj_exprs
+                ):
+                    obj_exprs.append(
+                        {
+                            "key": "kueue-optimizer.gke.io/initial-pod",
+                            "operator": "NotIn",
+                            "values": ["true"],
+                        }
+                    )
         bootstrap_docs.append(doc)
         continue
 
@@ -660,6 +674,20 @@ for doc in docs:
             cc = wh.setdefault("clientConfig", {})
             cc["caBundle"] = ca_bundle
             cc.setdefault("service", {})["port"] = 9443
+            if kind == "MutatingWebhookConfiguration" and wh.get("name") == "mpod.kb.io":
+                obj_sel = wh.setdefault("objectSelector", {})
+                obj_exprs = obj_sel.setdefault("matchExpressions", [])
+                if not any(
+                    ex.get("key") == "kueue-optimizer.gke.io/initial-pod" and ex.get("operator") == "NotIn"
+                    for ex in obj_exprs
+                ):
+                    obj_exprs.append(
+                        {
+                            "key": "kueue-optimizer.gke.io/initial-pod",
+                            "operator": "NotIn",
+                            "values": ["true"],
+                        }
+                    )
         bootstrap_docs.append(doc)
         continue
 

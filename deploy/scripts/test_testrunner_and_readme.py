@@ -36,10 +36,13 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from chamber_common import (
     ChamberManager,
+    ClusterStatusSnapshot,
     build_cluster_queue_manifest,
+    build_topology_assignment,
     extract_workflow_pods_and_requests,
     format_pod_execution_seconds,
     index_execution_times,
+    multiply_k8s_quantity_exact,
     parse_k8s_quantity,
     parse_positive_duration_annotation,
     to_clean_yaml,
@@ -843,6 +846,640 @@ class ScenarioParsingAndReadmeConsistencyTests(unittest.TestCase):
             anon_md = generate_scenario_readme.generate_readme_for_scenario(anon_dir)
             self.assertIn("**1** pods across **1** / 10 nodes", anon_md)
             self.assertIn("**20** `NotAdmitted` arrivals (154 total pods;", anon_md)
+
+
+class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
+    def test_multiply_k8s_quantity_exact_and_build_topology_assignment(self) -> None:
+        self.assertEqual(multiply_k8s_quantity_exact("250m", 4, "cpu"), "1")
+        self.assertEqual(multiply_k8s_quantity_exact("250m", 3, "cpu"), "750m")
+        self.assertEqual(multiply_k8s_quantity_exact("0.5", 3, "cpu"), "1500m")
+        self.assertEqual(multiply_k8s_quantity_exact("16Gi", 4, "memory"), "64Gi")
+        self.assertEqual(multiply_k8s_quantity_exact("1.5Gi", 2, "memory"), "3Gi")
+        self.assertEqual(multiply_k8s_quantity_exact("512Mi", 3, "memory"), "1536Mi")
+        self.assertEqual(multiply_k8s_quantity_exact("4", 8, "google.com/tpu"), "32")
+
+        nodes = {
+            "n-0": {"metadata": {"labels": {"kubernetes.io/hostname": "n-0", "rack": "r0", "sub": "s0"}}},
+            "n-1": {"metadata": {"labels": {"kubernetes.io/hostname": "n-1", "rack": "r0", "sub": "s1"}}},
+        }
+        # Hostname lowest-level shortcut
+        ta_host = build_topology_assignment(
+            ["n-0", "n-0", "n-1", "n-1"],
+            ["rack", "kubernetes.io/hostname"],
+            nodes,
+        )
+        self.assertEqual(
+            ta_host,
+            {
+                "levels": ["kubernetes.io/hostname"],
+                "slices": [
+                    {
+                        "domainCount": 2,
+                        "valuesPerLevel": [{"individual": {"roots": ["n-0", "n-1"]}}],
+                        "podCounts": {"universal": 2},
+                    }
+                ],
+            },
+        )
+        # Multi-level non-hostname topology
+        ta_rack = build_topology_assignment(["n-0", "n-0", "n-1"], ["rack", "sub"], nodes)
+        self.assertEqual(
+            ta_rack,
+            {
+                "levels": ["rack", "sub"],
+                "slices": [
+                    {
+                        "domainCount": 2,
+                        "valuesPerLevel": [
+                            {"universal": "r0"},
+                            {"individual": {"roots": ["s0", "s1"]}},
+                        ],
+                        "podCounts": {"individual": [2, 1]},
+                    }
+                ],
+            },
+        )
+
+    def test_t0_podgroup_bootstrap_separates_kueue_workloads_and_infra_pods(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            scen = Path(tmp) / "t0_sync"
+            scen.mkdir(parents=True, exist_ok=True)
+            t0 = "2026-11-20T10:00:00Z"
+            t_arr = "2026-11-20T10:00:05Z"
+            t_del = "2026-11-20T10:00:45Z"
+
+            infra_events = [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "node-0", "labels": {"kubernetes.io/hostname": "node-0", "rack": "r0", "instance": "tpu"}},
+                        "status": {"allocatable": {"cpu": "16", "memory": "64Gi", "google.com/tpu": "4", "pods": "110"}},
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "node-1", "labels": {"kubernetes.io/hostname": "node-1", "rack": "r0", "instance": "tpu"}},
+                        "status": {"allocatable": {"cpu": "16", "memory": "64Gi", "google.com/tpu": "4", "pods": "110"}},
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "Topology",
+                        "metadata": {"name": "tpu-topo"},
+                        "spec": {"levels": [{"nodeLabel": "rack"}, {"nodeLabel": "kubernetes.io/hostname"}]},
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ResourceFlavor",
+                        "metadata": {"name": "tpu-rf"},
+                        "spec": {"nodeLabels": {"instance": "tpu"}, "topologyName": "tpu-topo"},
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "tpu-cq"},
+                        "spec": {
+                            "queueingStrategy": "BestEffortFIFO",
+                            "resourceGroups": [
+                                {
+                                    "coveredResources": ["google.com/tpu", "cpu", "memory"],
+                                    "flavors": [
+                                        {
+                                            "name": "tpu-rf",
+                                            "resources": [
+                                                {"name": "google.com/tpu", "nominalQuota": "8"},
+                                                {"name": "cpu", "nominalQuota": "32"},
+                                                {"name": "memory", "nominalQuota": "128Gi"},
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "LocalQueue",
+                        "metadata": {"name": "tpu-lq", "namespace": "ai-lab"},
+                        "spec": {"clusterQueue": "tpu-cq"},
+                    },
+                },
+                # Class 1 pod #0 (Kueue-admitted JobSet at t0)
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "running-js-w-0",
+                        "namespace": "ai-lab",
+                        "placement": "node-0",
+                        "resourceRequest": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "4"},
+                        "firstNoticeTime": t0,
+                        "schedulingTime": t0,
+                        "workloadName": "jobset-running-js-111",
+                        "ownerKind": "JobSet",
+                        "ownerName": "running-js",
+                        "podSetName": "worker",
+                        "isTAS": True,
+                    },
+                },
+                # Class 1 pod #1
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "running-js-w-1",
+                        "namespace": "ai-lab",
+                        "placement": "node-1",
+                        "resourceRequest": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "2"},
+                        "firstNoticeTime": t0,
+                        "schedulingTime": t0,
+                        "workloadName": "jobset-running-js-111",
+                        "ownerKind": "JobSet",
+                        "ownerName": "running-js",
+                        "podSetName": "head",
+                        "isTAS": True,
+                    },
+                },
+                {
+                    "timestamp": t_del,
+                    "eventType": "Deleted",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "running-js-w-0",
+                        "namespace": "ai-lab",
+                        "placement": "node-0",
+                        "resourceRequest": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "4"},
+                        "firstNoticeTime": t0,
+                        "deletionTime": t_del,
+                    },
+                },
+                # Class 2 non-Kueue DaemonSet pod at t0 (no workloadName / ownerName)
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "node-exporter-0",
+                        "namespace": "kube-system",
+                        "placement": "node-0",
+                        "resourceRequest": {"cpu": "500m", "memory": "1Gi"},
+                        "firstNoticeTime": t0,
+                        "schedulingTime": t0,
+                    },
+                },
+            ]
+            wf_events = [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "JobSet",
+                        "name": "running-js",
+                        "namespace": "ai-lab",
+                        "creationTime": t0,
+                        "localQueueName": "tpu-lq",
+                        "object": {
+                            "apiVersion": "jobset.x-k8s.io/v1alpha2",
+                            "kind": "JobSet",
+                            "metadata": {
+                                "name": "running-js",
+                                "namespace": "ai-lab",
+                                "labels": {
+                                    "kueue.x-k8s.io/queue-name": "tpu-lq",
+                                    "kueue.x-k8s.io/priority-class": "low-prio",
+                                },
+                            },
+                            "spec": {
+                                "suspend": False,
+                                "replicatedJobs": [
+                                    {
+                                        "name": "worker",
+                                        "replicas": 2,
+                                        "template": {
+                                            "spec": {
+                                                "parallelism": 1,
+                                                "completions": 1,
+                                                "template": {
+                                                    "spec": {
+                                                        "containers": [
+                                                            {
+                                                                "name": "c",
+                                                                "image": "registry.k8s.io/pause:3.10",
+                                                                "resources": {"requests": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "4"}},
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                },
+                {
+                    "timestamp": t_arr,
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "JobSet",
+                        "name": "arrival-js",
+                        "namespace": "ai-lab",
+                        "creationTime": t_arr,
+                        "localQueueName": "tpu-lq",
+                        "object": {
+                            "apiVersion": "jobset.x-k8s.io/v1alpha2",
+                            "kind": "JobSet",
+                            "metadata": {
+                                "name": "arrival-js",
+                                "namespace": "ai-lab",
+                                "labels": {"kueue.x-k8s.io/queue-name": "tpu-lq"},
+                            },
+                            "spec": {
+                                "suspend": True,
+                                "replicatedJobs": [
+                                    {
+                                        "name": "worker",
+                                        "replicas": 1,
+                                        "template": {
+                                            "spec": {
+                                                "parallelism": 1,
+                                                "completions": 1,
+                                                "template": {
+                                                    "spec": {
+                                                        "containers": [
+                                                            {
+                                                                "name": "c",
+                                                                "image": "registry.k8s.io/pause:3.10",
+                                                                "resources": {"requests": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "2"}},
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                },
+            ]
+            exec_events = [
+                {
+                    "timestamp": t0,
+                    "eventType": "Admitted",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "workloadName": "jobset-running-js-111",
+                        "namespace": "ai-lab",
+                        "ownerKind": "JobSet",
+                        "ownerName": "running-js",
+                        "localQueueName": "tpu-lq",
+                        "clusterQueueName": "tpu-cq",
+                        "priorityClassName": "low-prio",
+                        "priority": 100,
+                        "creationTime": t0,
+                        "admittedTime": t0,
+                        "preempted": False,
+                    },
+                },
+                {
+                    "timestamp": t_del,
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "jobset-running-js-111",
+                        "namespace": "ai-lab",
+                        "ownerKind": "JobSet",
+                        "ownerName": "running-js",
+                        "localQueueName": "tpu-lq",
+                        "clusterQueueName": "tpu-cq",
+                        "creationTime": t0,
+                        "admittedTime": t0,
+                        "endTime": t_del,
+                        "executionDurationSeconds": 45.0,
+                        "preempted": False,
+                    },
+                },
+            ]
+            (scen / "infra.json").write_text("\n".join(json.dumps(e) for e in infra_events) + "\n", encoding="utf-8")
+            (scen / "workflows.json").write_text("\n".join(json.dumps(e) for e in wf_events) + "\n", encoding="utf-8")
+            (scen / "execution-time.json").write_text("\n".join(json.dumps(e) for e in exec_events) + "\n", encoding="utf-8")
+
+            bundle = testrunner.load_scenario_bundle(scenario_dir=scen, speedup=1.0)
+            self.assertEqual(len(bundle.initial_workloads), 1)
+            self.assertEqual(bundle.initial_workload_pods_count, 2)
+            self.assertEqual(len(bundle.initial_pods), 1)
+            self.assertEqual(bundle.initial_pods[0].namespace, "infra-pods")
+            self.assertNotIn(
+                "kueue.x-k8s.io/podset-unconstrained-topology",
+                bundle.initial_pods[0].manifest["metadata"]["annotations"],
+            )
+
+            iwl = bundle.initial_workloads[0]
+            self.assertEqual(iwl.namespace, "ai-lab")
+            self.assertEqual(iwl.cluster_queue_name, "tpu-cq")
+            self.assertEqual(iwl.local_queue_name, "tpu-lq")
+            self.assertTrue(iwl.is_tas)
+            self.assertEqual(iwl.priority_class_name, "low-prio")
+            self.assertEqual(iwl.priority, 100)
+            self.assertIsNotNone(iwl.resubmit_item)
+            self.assertTrue(iwl.resubmit_item.manifest["spec"]["suspend"])
+
+            # Check PodGroup & TAS invariants on Workload and member Pods
+            self.assertEqual(
+                iwl.workload_manifest["metadata"]["annotations"]["kueue.x-k8s.io/is-group-workload"],
+                "true",
+            )
+            self.assertEqual(len(iwl.workload_manifest["spec"]["podSets"]), 2)
+            psas = iwl.workload_status["admission"]["podSetAssignments"]
+            self.assertEqual(len(psas), 2)
+            for psa in psas:
+                self.assertIn("topologyAssignment", psa)
+            for p in iwl.pods:
+                self.assertEqual(p.namespace, "ai-lab")
+                p_lbl = p.manifest["metadata"]["labels"]
+                p_ann = p.manifest["metadata"]["annotations"]
+                self.assertEqual(p_lbl["kueue.x-k8s.io/managed"], "true")
+                self.assertEqual(p_lbl["kueue.x-k8s.io/pod-group-name"], iwl.workload_name)
+                self.assertEqual(p_lbl["kueue.x-k8s.io/queue-name"], "tpu-lq")
+                self.assertEqual(p_lbl["kueue-optimizer.gke.io/initial-pod"], "true")
+                self.assertEqual(p_ann["kueue.x-k8s.io/pod-group-total-count"], "2")
+                self.assertEqual(p_ann["kueue.x-k8s.io/retriable-in-group"], "false")
+                self.assertEqual(p_ann["kueue.x-k8s.io/workload"], iwl.workload_name)
+                self.assertEqual(p_ann["kueue.x-k8s.io/podset-unconstrained-topology"], "true")
+
+            # WorkloadPriorityClass `low-prio` referenced by initial_workloads must be synthesized
+            wpc_docs = [d for d in bundle.prereq_and_queue_docs if d.get("kind") == "WorkloadPriorityClass"]
+            self.assertEqual([d["metadata"]["name"] for d in wpc_docs], ["low-prio"])
+            self.assertEqual(wpc_docs[0]["value"], 100)
+
+    def test_webhook_mpod_object_selector_and_replay_bootstrap_order_and_eviction_resubmit(self) -> None:
+        # 1. Verify committed kueue-bootstrap.yaml sets objectSelector on mpod.kb.io only
+        bootstrap_yaml = (REPO_ROOT / "deploy/base/manifests/kueue-bootstrap.yaml").read_text(encoding="utf-8")
+        self.assertIn("key: kueue-optimizer.gke.io/initial-pod", bootstrap_yaml)
+        self.assertEqual(bootstrap_yaml.count("key: kueue-optimizer.gke.io/initial-pod"), 1)
+
+        # 2. Verify ensure_kueue_webhook_namespace_exclusions dynamically patches mpod.kb.io objectSelector
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-wh", apiserver_port=16495)
+        try:
+            mut_wh = {
+                "metadata": {"name": "kueue-mutating-webhook-configuration"},
+                "webhooks": [
+                    {
+                        "name": "mpod.kb.io",
+                        "namespaceSelector": {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]},
+                    },
+                    {
+                        "name": "mworkload.kb.io",
+                        "namespaceSelector": {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]},
+                    },
+                ],
+            }
+            val_wh = {
+                "metadata": {"name": "kueue-validating-webhook-configuration"},
+                "webhooks": [
+                    {
+                        "name": "vpod.kb.io",
+                        "namespaceSelector": {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]},
+                    }
+                ],
+            }
+
+            def fake_api_req(method: str, path: str, **kwargs: object) -> tuple[int, bytes]:
+                if "mutatingwebhookconfigurations" in path:
+                    return 200, json.dumps(mut_wh).encode("utf-8")
+                return 200, json.dumps(val_wh).encode("utf-8")
+
+            applied_wh_docs: list[dict] = []
+            with (
+                mock.patch.object(mgr, "api_request", side_effect=fake_api_req),
+                mock.patch.object(mgr, "ssa_apply_doc", side_effect=applied_wh_docs.append),
+            ):
+                mgr.ensure_kueue_webhook_namespace_exclusions(excluded_namespaces=("infra-pods",))
+
+            self.assertEqual(len(applied_wh_docs), 2)
+            mut_patched = next(d for d in applied_wh_docs if d["kind"] == "MutatingWebhookConfiguration")
+            mpod = next(w for w in mut_patched["webhooks"] if w["name"] == "mpod.kb.io")
+            mwl = next(w for w in mut_patched["webhooks"] if w["name"] == "mworkload.kb.io")
+            self.assertIn("objectSelector", mpod)
+            self.assertNotIn("objectSelector", mwl)
+            val_patched = next(d for d in applied_wh_docs if d["kind"] == "ValidatingWebhookConfiguration")
+            vpod = val_patched["webhooks"][0]
+            self.assertNotIn("objectSelector", vpod)
+
+            # 3. Verify apply_scenario_queues_and_wait bootstrap sequence AND run_scenario_replay dynamic resubmit + completion check
+            call_order: list[str] = []
+            iwl_doc = {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "Workload", "metadata": {"name": "pg-init-0", "namespace": "ai-lab"}}
+            iwl_st = {"admission": {"clusterQueue": "cq-a", "podSetAssignments": []}, "conditions": []}
+            ipod = testrunner.InitialPodSpec(
+                name="pg-init-0-p0",
+                namespace="ai-lab",
+                placement="node-0",
+                resource_request={"cpu": "2"},
+                remaining_duration_sec=5.0,
+                is_infinite=False,
+                manifest={"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "pg-init-0-p0", "namespace": "ai-lab"}},
+            )
+            resub_sw = testrunner.ScheduledWorkflowItem(
+                target_wall_offset_sec=0.0,
+                seq=100,
+                raw_offset_sec=0.0,
+                raw_offset_from_t0_sec=0.0,
+                event_timestamp="2026-11-20T10:00:00Z",
+                object_kind="JobSet",
+                name="init-js",
+                namespace="ai-lab",
+                local_queue_name="lq-a",
+                workload_state="NotAdmitted",
+                trigger_reason="preempted_after_initial_admission",
+                execution_duration_sec=10.0,
+                compressed_duration_sec=10.0,
+                indexed_from_execution_time=True,
+                pod_count=2,
+                manifest={"apiVersion": "jobset.x-k8s.io/v1alpha2", "kind": "JobSet", "metadata": {"name": "init-js", "namespace": "ai-lab"}},
+            )
+            iwl_obj = testrunner.InitialWorkloadPodGroup(
+                workload_name="pg-init-0",
+                namespace="ai-lab",
+                local_queue_name="lq-a",
+                cluster_queue_name="cq-a",
+                owner_kind="JobSet",
+                owner_name="init-js",
+                priority_class_name="",
+                priority=0,
+                is_tas=False,
+                pods=[ipod],
+                workload_manifest=iwl_doc,
+                workload_status=iwl_st,
+                resubmit_item=resub_sw,
+            )
+            prereq_docs = [
+                {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ai-lab"}},
+                {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ResourceFlavor", "metadata": {"name": "rf-a"}},
+                {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ClusterQueue", "metadata": {"name": "cq-a"}},
+                {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "LocalQueue", "metadata": {"name": "lq-a", "namespace": "ai-lab"}},
+            ]
+
+            def record_apply_parallel(docs: list[dict], **kw: object) -> None:
+                if docs:
+                    call_order.append("apply:" + ",".join(sorted({d["kind"] for d in docs})))
+
+            def fake_q_api(method: str, path: str, **kw: object) -> tuple[int, bytes]:
+                if path.endswith("/clusterqueues"):
+                    return 200, json.dumps({"items": [{"metadata": {"name": "cq-a"}, "status": {"conditions": [{"type": "Active", "status": "True"}]}}]}).encode()
+                return 200, json.dumps({"items": [{"metadata": {"name": "lq-a", "namespace": "ai-lab"}, "status": {"conditions": [{"type": "Active", "status": "True"}]}}]}).encode()
+
+            with (
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=record_apply_parallel),
+                mock.patch.object(mgr, "apply_pre_admitted_workloads_parallel", side_effect=lambda _: call_order.append("pre_admit_workloads")),
+                mock.patch.object(mgr, "wait_for_pods_running", side_effect=lambda _: call_order.append("wait_pods_running")),
+                mock.patch.object(mgr, "api_request", side_effect=fake_q_api),
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                testrunner.apply_scenario_queues_and_wait(
+                    mgr,
+                    prereq_docs,
+                    initial_workloads=[iwl_obj],
+                    initial_pods=[],
+                )
+
+            # ClusterQueue & LocalQueue MUST be applied strictly AFTER pre-admitted Workloads & Pods are running!
+            self.assertEqual(
+                call_order,
+                [
+                    "apply:Namespace",
+                    "apply:ResourceFlavor",
+                    "pre_admit_workloads",
+                    "apply:Pod",
+                    "wait_pods_running",
+                    "apply:ClusterQueue,LocalQueue",
+                ],
+            )
+
+            # Now test run_scenario_replay:
+            # Tick 1: initial workload finishes (must NOT finish replay early while arrival-js hasn't finished!),
+            #         WAIT - test eviction instead:
+            # Tick 1: arrival-js submitted; pg-init-0 is Evicted -> triggers dynamic resubmit of init-js (submitted becomes 2!)
+            # Tick 2: only arrival-js finished (done=1 < 2 -> must NOT exit early!)
+            # Tick 3: both arrival-js and resubmitted init-js finished (done=2 >= 2 -> exits cleanly!)
+            arrival_sw = testrunner.ScheduledWorkflowItem(
+                target_wall_offset_sec=0.0,
+                seq=0,
+                raw_offset_sec=0.0,
+                raw_offset_from_t0_sec=0.0,
+                event_timestamp="2026-11-20T10:00:00Z",
+                object_kind="JobSet",
+                name="arrival-js",
+                namespace="ai-lab",
+                local_queue_name="lq-a",
+                workload_state="NotAdmitted",
+                trigger_reason="initial_not_admitted",
+                execution_duration_sec=5.0,
+                compressed_duration_sec=5.0,
+                indexed_from_execution_time=True,
+                pod_count=1,
+                manifest={"apiVersion": "jobset.x-k8s.io/v1alpha2", "kind": "JobSet", "metadata": {"name": "arrival-js", "namespace": "ai-lab"}},
+            )
+            demo_bundle = testrunner.load_scenario_bundle(scenario_dir=REPO_ROOT / "testscenarios/demo")
+            demo_bundle.initial_workloads = [iwl_obj]
+            demo_bundle.initial_pods = []
+            demo_bundle.scheduled_workflows = [arrival_sw]
+
+            snaps = [
+                # Status #1: pg-init-0 pods deleted by preemption & GC removed pg-init-0 before poll -> still triggers dynamic resubmit!
+                ClusterStatusSnapshot(
+                    workloads_admitted=1,
+                    workloads_pending=0,
+                    workloads_finished=0,
+                    workloads_query_ok=True,
+                    present_workload_keys={("ai-lab", "jobset-arrival-js-1")},
+                    evicted_workload_keys=set(),
+                    finished_workload_keys=set(),
+                    jobsets_completed=0,
+                ),
+                # Status #2: arrival-js finished, resubmitted init-js still running (done=1 < 2 -> must NOT exit early!)
+                ClusterStatusSnapshot(
+                    workloads_admitted=1,
+                    workloads_pending=0,
+                    workloads_finished=1,
+                    workloads_query_ok=True,
+                    present_workload_keys={("ai-lab", "jobset-arrival-js-1"), ("ai-lab", "jobset-init-js-2")},
+                    evicted_workload_keys=set(),
+                    finished_workload_keys={("ai-lab", "jobset-arrival-js-1")},
+                    jobsets_completed=1,
+                ),
+                # Status #3: resubmitted init-js also finished!
+                ClusterStatusSnapshot(
+                    workloads_admitted=0,
+                    workloads_pending=0,
+                    workloads_finished=2,
+                    workloads_query_ok=True,
+                    present_workload_keys={("ai-lab", "jobset-arrival-js-1"), ("ai-lab", "jobset-init-js-2")},
+                    evicted_workload_keys=set(),
+                    finished_workload_keys={
+                        ("ai-lab", "jobset-arrival-js-1"),
+                        ("ai-lab", "jobset-init-js-2"),
+                    },
+                    jobsets_completed=2,
+                ),
+            ]
+            resubmitted_docs: list[dict] = []
+            with (
+                mock.patch.object(mgr, "apply_manifests_parallel"),
+                mock.patch.object(mgr, "ssa_apply_doc", side_effect=resubmitted_docs.append),
+                mock.patch("runner.replay.query_cluster_status", side_effect=snaps) as m_qcs,
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                _s, _e, sub_cnt, tot_pods = testrunner.run_scenario_replay(
+                    mgr=mgr,
+                    bundle=demo_bundle,
+                    speedup=1.0,
+                    max_run_seconds=10.0,
+                    status_interval_sec=0.02,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+
+            self.assertEqual(len(resubmitted_docs), 1)
+            self.assertEqual(resubmitted_docs[0]["metadata"]["name"], "init-js")
+            self.assertEqual(sub_cnt, 2)
+            self.assertEqual(tot_pods, 1 + 1 + 2)
+            self.assertEqual(m_qcs.call_count, 3)
+        finally:
+            mgr.close()
 
 
 if __name__ == "__main__":

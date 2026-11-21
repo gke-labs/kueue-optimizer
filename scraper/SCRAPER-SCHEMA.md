@@ -170,6 +170,11 @@ To guarantee strict data hygiene, **no other pod fields are ever written to `inf
 | `schedulingTime` | `string` (RFC3339 UTC) | Optional | Timestamp when the pod was scheduled onto its node, extracted from the `PodScheduled` condition's `lastTransitionTime` (falling back to `status.startTime` or `metadata.creationTimestamp`). Preserved across later pod status updates. |
 | `firstNoticeTime` | `string` (RFC3339 UTC) | **Yes** | Timestamp when the scraper first observed the scheduled pod (via watch or periodic scrape). |
 | `deletionTime` | `string` (RFC3339 UTC) | Optional | Present on `"Deleted"` events. Timestamp when the pod was deleted (`metadata.deletionTimestamp` if set on the watch event, or watch `DELETED` arrival time). |
+| `workloadName` | `string` | Optional | Kueue `Workload` object name backing this pod (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). Present only for pods belonging to a Kueue-managed workflow or `PodGroup`; omitted for non-Kueue system/DaemonSet/unmanaged pods so `testrunner.py` separates $t_0$ Kueue `PodGroup` workloads from `infra-pods`. |
+| `ownerKind` | `string` | Optional | Top-level Kueue workflow owner kind (`"JobSet"`, `"Job"`, `"LeaderWorkerSet"`, `"Deployment"`, `"RayJob"`, `"RayCluster"`, `"Pod"`, or `"PodGroup"`). Omitted for non-Kueue pods. |
+| `ownerName` | `string` | Optional | Top-level Kueue workflow owner name (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). Omitted for non-Kueue pods. |
+| `podSetName` | `string` | Optional | Kueue `PodSet` / `replicatedJob` / `role-hash` identifier within the parent workflow or `PodGroup`. |
+| `isTAS` | `boolean` | Optional | `true` when the pod or its backing Kueue `Workload` uses Topology-Aware Scheduling (`TAS`); omitted when `false`. |
 
 #### On-Disk Single-Line Examples (`New` and `Deleted` Pod Events in `infra.json`):
 ```json
@@ -301,6 +306,9 @@ stateDiagram-v2
 | `ownerAPIVersion` | `string` | Optional | API group/version of the owning workflow object (e.g., `"jobset.x-k8s.io/v1alpha2"`). |
 | `localQueueName` | `string` | Optional | Plain (unhashed) `LocalQueue` name (`workload.spec.queueName`). |
 | `clusterQueueName` | `string` | Optional | Plain (unhashed) `ClusterQueue` name (`workload.status.admission.clusterQueue`). |
+| `priorityClassName` | `string` | Optional | Plain (unhashed) `WorkloadPriorityClass` / `PriorityClass` name (`workload.spec.priorityClassRef.name` or `kueue.x-k8s.io/priority-class`), populated on `"Admitted"` events. |
+| `priority` | `integer` (`int32`) | Optional | Effective integer priority (`workload.spec.priority`), populated on `"Admitted"` events. |
+| `podSetAssignments` | `array<PodSetAssignment>` | Optional | Kueue `status.admission.podSetAssignments` (flavors, exact `resourceUsage`, and sanitized `topologyAssignment` with sensitive topology label values hashed when `--hash-names` is enabled), populated on `"Admitted"` events. |
 | `creationTime` | `string` (RFC3339 UTC) | **Yes** | `metadata.creationTimestamp` of the Kueue `Workload`. |
 | `admittedTime` | `string` (RFC3339 UTC) | **Yes** | Timestamp when the `Workload` was admitted (`Admitted` condition `lastTransitionTime`). |
 | `endTime` | `string` (RFC3339 UTC) | On `PartialExecution` / `FullExecution` | Preemption timestamp (for `PartialExecution`) or completion timestamp (for `FullExecution`). Omitted on `Admitted` events. |

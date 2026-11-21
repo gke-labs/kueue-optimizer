@@ -405,6 +405,80 @@ class ChamberK8sClientMixin:
         for fut in as_completed(futures):
             fut.result()
 
+    def apply_pre_admitted_workload(
+        self,
+        workload_doc: dict[str, Any],
+        status_body: dict[str, Any],
+    ) -> None:
+        """Create/apply a Kueue Workload CR and immediately patch its `/status` subresource."""
+        self.ssa_apply_doc(workload_doc)
+        meta = workload_doc.get("metadata") or {}
+        ns = str(meta.get("namespace") or "default")
+        name = str(meta.get("name") or "")
+        api_version = str(workload_doc.get("apiVersion") or "kueue.x-k8s.io/v1beta2")
+        status_path = f"/apis/{api_version}/namespaces/{ns}/workloads/{name}/status"
+        merge_payload = {"status": status_body}
+        st_code, raw = self.api_request(
+            "PATCH",
+            status_path,
+            body=json.dumps(merge_payload).encode("utf-8"),
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+        if st_code < 200 or st_code >= 300:
+            raise RuntimeError(
+                self._format_k8s_api_error(
+                    "MERGE PATCH",
+                    status_path,
+                    st_code,
+                    raw,
+                    obj={**workload_doc, "status": status_body},
+                )
+            )
+
+    def apply_pre_admitted_workloads_parallel(
+        self,
+        items: list[tuple[dict[str, Any], dict[str, Any]]],
+    ) -> None:
+        """Apply multiple pre-admitted Kueue Workloads + `/status` subresources concurrently."""
+        if not items:
+            return
+        if len(items) == 1:
+            self.apply_pre_admitted_workload(*items[0])
+            return
+        pool = self._get_executor()
+        futures = [pool.submit(self.apply_pre_admitted_workload, wl_doc, st_doc) for wl_doc, st_doc in items]
+        for fut in as_completed(futures):
+            fut.result()
+
+    def wait_for_pods_running(
+        self,
+        pod_keys: list[tuple[str, str]],
+        timeout_sec: float = 90.0,
+    ) -> None:
+        """Wait until all specified `(namespace, pod_name)` pods reach Running or Succeeded phase."""
+        if not pod_keys:
+            return
+        target = set(pod_keys)
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            st, raw = self.api_request("GET", "/api/v1/pods")
+            if st == 200 and raw:
+                ready_keys: set[tuple[str, str]] = set()
+                for it in json.loads(raw.decode("utf-8")).get("items", []):
+                    meta = it.get("metadata") or {}
+                    p_key = (str(meta.get("namespace") or "default"), str(meta.get("name") or ""))
+                    if p_key not in target:
+                        continue
+                    phase = str((it.get("status") or {}).get("phase") or "")
+                    if phase in ("Running", "Succeeded"):
+                        ready_keys.add(p_key)
+                if target.issubset(ready_keys):
+                    return
+            time.sleep(0.25)
+        raise RuntimeError(
+            f"Timed out waiting for {len(target)} initial pod(s) to reach Running phase on KWOK nodes"
+        )
+
     @staticmethod
     def _run_kubectl(
         cmd: list[str],
@@ -562,6 +636,21 @@ class ChamberK8sClientMixin:
                         }
                     )
                     changed = True
+                if kind == "MutatingWebhookConfiguration" and wh.get("name") == "mpod.kb.io":
+                    obj_sel = wh.setdefault("objectSelector", {})
+                    obj_exprs = obj_sel.setdefault("matchExpressions", [])
+                    if not any(
+                        ex.get("key") == "kueue-optimizer.gke.io/initial-pod" and ex.get("operator") == "NotIn"
+                        for ex in obj_exprs
+                    ):
+                        obj_exprs.append(
+                            {
+                                "key": "kueue-optimizer.gke.io/initial-pod",
+                                "operator": "NotIn",
+                                "values": ["true"],
+                            }
+                        )
+                        changed = True
             if changed:
                 patch_doc = {
                     "apiVersion": "admissionregistration.k8s.io/v1",

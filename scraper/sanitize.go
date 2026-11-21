@@ -46,12 +46,19 @@ const (
 	KueueJobOwnerNameAnnotation           = "kueue.x-k8s.io/job-owner-name"
 	KueueJobOwnerGVKAnnotation            = "kueue.x-k8s.io/job-owner-gvk"
 	KueuePodGroupNameLabel                = "kueue.x-k8s.io/pod-group-name"
+	KueueIsGroupWorkloadAnnotation        = "kueue.x-k8s.io/is-group-workload"
+	KueueRoleHashAnnotation               = "kueue.x-k8s.io/role-hash"
 	KueueSuspendedByParentAnnot           = "kueue.x-k8s.io/pod-suspending-parent"
 	KueueAdmissionGateName                = "kueue.x-k8s.io/admission"
 	KueueTopologyGateName                 = "kueue.x-k8s.io/topology"
 	KueueWorkloadAnnot                    = "kueue.x-k8s.io/workload"
 	KueueWorkloadSliceNameAnnot           = "kueue.x-k8s.io/workload-slice-name"
 	KueueWorkloadSliceReplacementForAnnot = "kueue.x-k8s.io/workload-slice-replacement-for"
+	KueuePodSetRequiredTopologyAnnot      = "kueue.x-k8s.io/podset-required-topology"
+	KueuePodSetPreferredTopologyAnnot     = "kueue.x-k8s.io/podset-preferred-topology"
+	KueuePodSetUnconstrainedTopologyAnnot = "kueue.x-k8s.io/podset-unconstrained-topology"
+	KueuePodSetSliceRequiredTopologyAnnot = "kueue.x-k8s.io/podset-slice-required-topology"
+	KueuePodSetSliceConstraintsAnnot      = "kueue.x-k8s.io/podset-slice-required-topology-constraints"
 )
 
 // nonHashedKinds lists object kinds whose names must NEVER be hashed even when --hash-names is enabled.
@@ -884,12 +891,115 @@ func ExtractPodSchedulingTime(pod *corev1.Pod) *metav1.Time {
 	return nil
 }
 
+// PodWorkloadLinkage holds raw (unhashed) Kueue workload and workflow owner identifiers
+// resolved for a scheduled/running Pod before HMAC-SHA256 name hashing is applied.
+type PodWorkloadLinkage struct {
+	RawWorkloadName string
+	OwnerKind       string
+	RawOwnerName    string
+	PodSetName      string
+	IsTAS           bool
+}
+
+// IsTASPod returns true if the Pod carries any Kueue Topology-Aware Scheduling annotation or gate.
+func IsTASPod(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	if pod.Annotations != nil {
+		for _, k := range []string{
+			KueuePodSetRequiredTopologyAnnot,
+			KueuePodSetPreferredTopologyAnnot,
+			KueuePodSetUnconstrainedTopologyAnnot,
+			KueuePodSetSliceRequiredTopologyAnnot,
+			KueuePodSetSliceConstraintsAnnot,
+		} {
+			if pod.Annotations[k] != "" {
+				return true
+			}
+		}
+	}
+	for _, g := range pod.Spec.SchedulingGates {
+		if g.Name == KueueTopologyGateName {
+			return true
+		}
+	}
+	return false
+}
+
+// SanitizePodSetAssignments returns a deep copy of Kueue PodSetAssignments with any sensitive
+// topology domain label values hashed via hasher so node labels and topology assignments stay consistent.
+func SanitizePodSetAssignments(in []kueuev1beta2.PodSetAssignment, hasher SensitiveDataHasher) []kueuev1beta2.PodSetAssignment {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]kueuev1beta2.PodSetAssignment, len(in))
+	for i := range in {
+		out[i] = *in[i].DeepCopy()
+		// If PodSet name came from a PodGroup role-hash or standard role name ("main", "worker", etc.),
+		// leave plain; only sanitize topology domain values for sensitive label keys.
+		ta := out[i].TopologyAssignment
+		if ta == nil {
+			continue
+		}
+		for sIdx := range ta.Slices {
+			sl := &ta.Slices[sIdx]
+			for lIdx := range sl.ValuesPerLevel {
+				if lIdx >= len(ta.Levels) || !hasher.ShouldHashLabel(ta.Levels[lIdx]) {
+					continue
+				}
+				lv := &sl.ValuesPerLevel[lIdx]
+				if lv.Universal != nil {
+					hashed := hasher.HashName(*lv.Universal)
+					lv.Universal = &hashed
+				}
+				if lv.Individual != nil {
+					var pfx, sfx string
+					if lv.Individual.Prefix != nil {
+						pfx = *lv.Individual.Prefix
+					}
+					if lv.Individual.Suffix != nil {
+						sfx = *lv.Individual.Suffix
+					}
+					hashedRoots := make([]string, len(lv.Individual.Roots))
+					for rIdx, r := range lv.Individual.Roots {
+						hashedRoots[rIdx] = hasher.HashName(pfx + r + sfx)
+					}
+					lv.Individual.Prefix = nil
+					lv.Individual.Suffix = nil
+					lv.Individual.Roots = hashedRoots
+				}
+			}
+		}
+	}
+	return out
+}
+
 // BuildScrapedPodPayload constructs the strictly-scoped ScrapedPodPayload for infra.json.
 func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletionTime *time.Time, hasher SensitiveDataHasher) ScrapedPodPayload {
+	return BuildScrapedPodPayloadWithLinkage(pod, firstNoticeTime, deletionTime, PodWorkloadLinkage{}, hasher)
+}
+
+// BuildScrapedPodPayloadWithLinkage constructs ScrapedPodPayload including optional sanitized
+// Kueue Workload and top-level workflow owner linkage for t0 pod-to-quota synchronization.
+func BuildScrapedPodPayloadWithLinkage(
+	pod *corev1.Pod,
+	firstNoticeTime time.Time,
+	deletionTime *time.Time,
+	linkage PodWorkloadLinkage,
+	hasher SensitiveDataHasher,
+) ScrapedPodPayload {
 	var delTime *metav1.Time
 	if deletionTime != nil && !deletionTime.IsZero() {
 		t := metav1.NewTime(deletionTime.UTC())
 		delTime = &t
+	}
+	var wlName, ownerName string
+	if linkage.RawWorkloadName != "" {
+		wlName = hasher.HashName(linkage.RawWorkloadName)
+	}
+	if linkage.RawOwnerName != "" {
+		ownerName = hasher.HashNameForKind(linkage.OwnerKind, linkage.RawOwnerName)
 	}
 	return ScrapedPodPayload{
 		APIVersion:      "v1",
@@ -901,6 +1011,11 @@ func BuildScrapedPodPayload(pod *corev1.Pod, firstNoticeTime time.Time, deletion
 		SchedulingTime:  ExtractPodSchedulingTime(pod),
 		FirstNoticeTime: metav1.NewTime(firstNoticeTime.UTC()),
 		DeletionTime:    delTime,
+		WorkloadName:    wlName,
+		OwnerKind:       linkage.OwnerKind,
+		OwnerName:       ownerName,
+		PodSetName:      linkage.PodSetName,
+		IsTAS:           linkage.IsTAS,
 	}
 }
 

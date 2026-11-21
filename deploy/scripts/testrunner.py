@@ -69,6 +69,7 @@ from runner.loader import (
     DEFAULT_INFINITE_POD_DURATION_SEC,
     DEFAULT_SCENARIO_DIR,
     InitialPodSpec,
+    InitialWorkloadPodGroup,
     ScenarioBundle,
     ScheduledWorkflowItem,
     load_scenario_bundle,
@@ -96,6 +97,7 @@ __all__ = [
     "DEFAULT_INFINITE_POD_DURATION_SEC",
     "DEFAULT_SCENARIO_DIR",
     "InitialPodSpec",
+    "InitialWorkloadPodGroup",
     "MAX_K8S_NAME_LEN",
     "SERVER_METADATA_FIELDS",
     "SYSTEM_NAMESPACES",
@@ -390,9 +392,21 @@ def main(argv: list[str] | None = None) -> int:
         print(docs_to_pretty_yaml(sample_nodes), end="")
         print("---\n# === Namespaces, ResourceFlavors, Topologies, ClusterQueues, LocalQueues ===")
         print(docs_to_pretty_yaml(bundle.prereq_and_queue_docs), end="")
+        if bundle.initial_workloads:
+            sample_iwls = bundle.initial_workloads[:limit] if limit > 0 else bundle.initial_workloads
+            print(
+                f"---\n# === Initial Pre-Admitted Kueue PodGroup Workloads at t0 "
+                f"(showing {len(sample_iwls)} of {len(bundle.initial_workloads)}) ==="
+            )
+            print(
+                docs_to_pretty_yaml(
+                    [{**w.workload_manifest, "status": w.workload_status} for w in sample_iwls]
+                ),
+                end="",
+            )
         if bundle.initial_pods:
             print(
-                f"---\n# === Initial Running Pods at t0 (showing {len(sample_pods)} of {len(bundle.initial_pods)}) ==="
+                f"---\n# === Initial Non-Kueue Running Pods at t0 (showing {len(sample_pods)} of {len(bundle.initial_pods)}) ==="
             )
             print(docs_to_pretty_yaml([p.manifest for p in sample_pods]), end="")
         print(
@@ -449,11 +463,16 @@ def main(argv: list[str] | None = None) -> int:
             mgr.sync_kwok_nodes(bundle.nodes, remove_stale=True)
 
         print(
-            f"==> Applying Namespaces, ResourceFlavors, ClusterQueues ({', '.join(bundle.cluster_queue_names)}), "
+            f"==> Applying Namespaces, ResourceFlavors, initial t0 state, ClusterQueues ({', '.join(bundle.cluster_queue_names)}), "
             f"and LocalQueues from infra.json...",
             flush=True,
         )
-        apply_scenario_queues_and_wait(mgr, bundle.prereq_and_queue_docs)
+        apply_scenario_queues_and_wait(
+            mgr,
+            bundle.prereq_and_queue_docs,
+            initial_workloads=bundle.initial_workloads,
+            initial_pods=bundle.initial_pods,
+        )
 
         start_epoch, end_epoch, submitted_count, total_pods = run_scenario_replay(
             mgr=mgr,
@@ -462,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
             max_run_seconds=max_run_seconds,
             status_interval_sec=status_interval_sec,
             wait_for_completion=args.wait_for_completion,
+            initial_state_already_bootstrapped=True,
         )
 
         final_snap = query_cluster_status(
@@ -490,9 +510,17 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  Wall-Clock Duration     : {end_epoch - start_epoch:.1f}s ({format_duration_hms(end_epoch - start_epoch)})"
         )
-        print(f"  Initial Pods Placed     : {len(bundle.initial_pods)}")
+        if bundle.initial_workloads:
+            print(
+                f"  Initial Kueue Workloads : {len(bundle.initial_workloads)} PodGroup(s) "
+                f"({bundle.initial_workload_pods_count} pod(s))"
+            )
+        print(f"  Initial Infra Pods      : {len(bundle.initial_pods)}")
+        planned_denom = max(len(bundle.scheduled_workflows), submitted_count)
+        resub_extra = max(0, submitted_count - len(bundle.scheduled_workflows))
+        resub_note = f" [+{resub_extra} preempted-t0 resubmit]" if resub_extra > 0 else ""
         print(
-            f"  Workflows Submitted     : {submitted_count}/{len(bundle.scheduled_workflows)} ({total_pods} total pods)"
+            f"  Workflows Submitted     : {submitted_count}/{planned_denom}{resub_note} ({total_pods} total pods)"
         )
         print(
             f"  Workloads Status        : admitted={final_snap.workloads_admitted}, "

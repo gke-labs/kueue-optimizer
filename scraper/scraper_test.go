@@ -3024,3 +3024,493 @@ func TestHandleDeploymentWatchEventFiltersUnqueuedDeployments(t *testing.T) {
 		t.Errorf("unexpected recorded Deployment events:\ngot:  %+v\nwant: %+v", got, want)
 	}
 }
+
+func TestRunStartupBarrierLinksKueuePodsAndSeparatesInfraPods(t *testing.T) {
+	t0 := metav1.NewTime(time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC))
+	secretJSName := testSecretNamePrefix + "train-js"
+	secretJobName := secretJSName + "-worker-0"
+	secretWlName := "jobset-" + secretJSName + "-abcde"
+	secretJSPodName := secretJobName + "-0-xyz"
+	secretPGName := testSecretNamePrefix + "pg-group"
+	secretPGPodName := secretPGName + "-0"
+	secretDeployName := testSecretNamePrefix + "serving-deploy"
+	secretRSName := secretDeployName + "-7f89c"
+	secretDeployWl := "deployment-" + secretDeployName + "-11111"
+	secretDeployPodName := secretRSName + "-p0"
+	unmanagedSysPodName := "fluentbit-ds-node0"
+	unmanagedJobName := testSecretNamePrefix + "cron-clean"
+	unmanagedJobPodName := unmanagedJobName + "-p0"
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "tpu-node-0",
+			Labels: map[string]string{
+				"kubernetes.io/hostname": "tpu-node-0",
+				"corp.io/rack":           testSecretValue,
+			},
+		},
+		Status: corev1.NodeStatus{
+			Phase:       corev1.NodeRunning,
+			Capacity:    corev1.ResourceList{"google.com/tpu": resource.MustParse("8")},
+			Allocatable: corev1.ResourceList{"google.com/tpu": resource.MustParse("8")},
+		},
+	}
+
+	js := &jobsetv1alpha2.JobSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretJSName,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				KueueQueueLabel:         "tpu-lq",
+				KueuePriorityClassLabel: "high-prio",
+			},
+		},
+		Spec: jobsetv1alpha2.JobSetSpec{
+			Suspend: ptr.To(false),
+			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
+				{
+					Name:     "worker",
+					Replicas: 1,
+					Template: batchv1.JobTemplateSpec{
+						Spec: batchv1.JobSpec{
+							Parallelism: ptr.To[int32](1),
+							Completions: ptr.To[int32](1),
+							Template: corev1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									Annotations: map[string]string{
+										KueuePodSetRequiredTopologyAnnot: "corp.io/rack",
+									},
+								},
+								Spec: corev1.PodSpec{
+									Containers: []corev1.Container{{
+										Name:  "trainer",
+										Image: testSecretImage,
+										Resources: corev1.ResourceRequirements{
+											Requests: corev1.ResourceList{"google.com/tpu": resource.MustParse("4")},
+										},
+									}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	childJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretJobName,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			Labels:            map[string]string{"jobset.sigs.k8s.io/jobset-name": secretJSName},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "jobset.x-k8s.io/v1alpha2",
+				Kind:       "JobSet",
+				Name:       secretJSName,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: batchv1.JobSpec{
+			Suspend:  ptr.To(false),
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: testSecretImage}}}},
+		},
+	}
+	jsWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretWlName,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "jobset.x-k8s.io/v1alpha2",
+				Kind:       "JobSet",
+				Name:       secretJSName,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{
+			QueueName:        "tpu-lq",
+			PriorityClassRef: kueuev1beta2.NewWorkloadPriorityClassRef("high-prio"),
+			Priority:         ptr.To[int32](500),
+			PodSets: []kueuev1beta2.PodSet{{
+				Name:  "worker",
+				Count: 1,
+				TopologyRequest: &kueuev1beta2.PodSetTopologyRequest{
+					Required: ptr.To("corp.io/rack"),
+				},
+			}},
+		},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{
+				ClusterQueue: "tpu-cq",
+				PodSetAssignments: []kueuev1beta2.PodSetAssignment{{
+					Name:          "worker",
+					Count:         ptr.To[int32](1),
+					Flavors:       map[corev1.ResourceName]kueuev1beta2.ResourceFlavorReference{"google.com/tpu": "tpu-rf"},
+					ResourceUsage: corev1.ResourceList{"google.com/tpu": resource.MustParse("4")},
+					TopologyAssignment: &kueuev1beta2.TopologyAssignment{
+						Levels: []string{"corp.io/rack", "kubernetes.io/hostname"},
+						Slices: []kueuev1beta2.TopologyAssignmentSlice{{
+							DomainCount: 1,
+							ValuesPerLevel: []kueuev1beta2.TopologyAssignmentSliceLevelValues{
+								{Universal: ptr.To(testSecretValue)},
+								{Universal: ptr.To("tpu-node-0")},
+							},
+							PodCounts: kueuev1beta2.TopologyAssignmentSlicePodCounts{Universal: ptr.To[int32](1)},
+						}},
+					},
+				}},
+			},
+			Conditions: []metav1.Condition{{
+				Type:               kueuev1beta2.WorkloadAdmitted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Admitted",
+				LastTransitionTime: t0,
+			}},
+		},
+	}
+	jsPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretJSPodName,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				"batch.kubernetes.io/job-name":       secretJobName,
+				"jobset.sigs.k8s.io/replicatedjob-name": "worker",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "batch/v1",
+				Kind:       "Job",
+				Name:       secretJobName,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "tpu-node-0",
+			Containers: []corev1.Container{{
+				Name:  "trainer",
+				Image: testSecretImage,
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{"google.com/tpu": resource.MustParse("4")},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	pgWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretPGName,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			Annotations:       map[string]string{KueueIsGroupWorkloadAnnotation: "true"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "Pod",
+				Name:       secretPGPodName,
+			}},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{
+			QueueName: "tpu-lq",
+			PodSets:   []kueuev1beta2.PodSet{{Name: "abcd1234", Count: 1}},
+		},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "tpu-cq"},
+			Conditions: []metav1.Condition{{
+				Type:               kueuev1beta2.WorkloadAdmitted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Admitted",
+				LastTransitionTime: t0,
+			}},
+		},
+	}
+	pgPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretPGPodName,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			Labels: map[string]string{
+				KueueQueueLabel:        "tpu-lq",
+				KueueManagedLabel:      "true",
+				KueuePodGroupNameLabel: secretPGName,
+			},
+			Annotations: map[string]string{
+				KueueRoleHashAnnotation: "abcd1234",
+				KueueWorkloadAnnot:      secretPGName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "tpu-node-0",
+			Containers: []corev1.Container{{
+				Name:      "w",
+				Image:     testSecretImage,
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{"google.com/tpu": resource.MustParse("2")}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretDeployName,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			Labels:            map[string]string{KueueQueueLabel: "tpu-lq"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": secretDeployName}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": secretDeployName, KueueQueueLabel: "tpu-lq"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "srv", Image: testSecretImage}}},
+			},
+		},
+		Status: appsv1.DeploymentStatus{Replicas: 1, ReadyReplicas: 1},
+	}
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretRSName,
+			Namespace: "ai-lab",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       secretDeployName,
+				Controller: ptr.To(true),
+			}},
+		},
+	}
+	deployWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretDeployWl,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       secretDeployName,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{
+			QueueName: "tpu-lq",
+			PodSets:   []kueuev1beta2.PodSet{{Name: "main", Count: 1}},
+		},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "tpu-cq"},
+			Conditions: []metav1.Condition{{
+				Type:               kueuev1beta2.WorkloadAdmitted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Admitted",
+				LastTransitionTime: t0,
+			}},
+		},
+	}
+	deployPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              secretDeployPodName,
+			Namespace:         "ai-lab",
+			CreationTimestamp: t0,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       secretRSName,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "tpu-node-0",
+			Containers: []corev1.Container{{
+				Name:      "srv",
+				Image:     testSecretImage,
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{"google.com/tpu": resource.MustParse("1")}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	unmanagedSysPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      unmanagedSysPodName,
+			Namespace: "kube-system",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "DaemonSet",
+				Name:       "fluentbit",
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "tpu-node-0",
+			Containers: []corev1.Container{{
+				Name:      "agent",
+				Image:     testSecretImage,
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	unmanagedJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: unmanagedJobName, Namespace: "ai-lab", CreationTimestamp: t0},
+		Spec:       batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: testSecretImage}}}}},
+	}
+	unmanagedJobPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      unmanagedJobPodName,
+			Namespace: "ai-lab",
+			Labels:    map[string]string{"job-name": unmanagedJobName},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "tpu-node-0",
+			Containers: []corev1.Container{{
+				Name:      "c",
+				Image:     testSecretImage,
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{"google.com/tpu": resource.MustParse("1")}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	kubeClient := kubefake.NewSimpleClientset(node, childJob, unmanagedJob, deploy, rs, jsPod, pgPod, deployPod, unmanagedSysPod, unmanagedJobPod)
+	kueueClient := kueuefake.NewSimpleClientset(jsWl, pgWl, deployWl)
+	jobsetClient := jobsetfake.NewSimpleClientset(js)
+	scraper := newTestScraper(t, Config{
+		HashNames:       true,
+		Interval:        10 * time.Hour,
+		ExtraHashLabels: []string{"corp.io/*"},
+	}, kubeClient, kueueClient, nil)
+	scraper.jobsetClient = jobsetClient
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- scraper.Run(ctx)
+	}()
+
+	// Wait briefly for the synchronous startup barrier + initial ScrapeOnce to flush, then stop Run().
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if scraper.infraLog.Count() >= 6 && scraper.execTimeLog.Count() >= 3 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run() returned unexpected error: %v", err)
+	}
+
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read infra.json: %v", err)
+	}
+	rawWf, err := os.ReadFile(scraper.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+
+	for name, blob := range map[string]string{
+		"infra.json":          string(rawInfra),
+		"workflows.json":      string(rawWf),
+		"execution-time.json": string(rawExec),
+	} {
+		for _, secret := range testForbiddenSubstrings {
+			if strings.Contains(blob, secret) {
+				t.Errorf("%s leaked sensitive substring %q:\n%s", name, secret, blob)
+			}
+		}
+	}
+
+	infraEvents := readJSONLines[map[string]any](t, rawInfra)
+	podByHashedName := make(map[string]map[string]any)
+	for _, ev := range infraEvents {
+		pl := ev["payload"].(map[string]any)
+		if pl["kind"] == "Pod" && ev["eventType"] == string(EventNew) {
+			podByHashedName[pl["name"].(string)] = pl
+		}
+	}
+
+	// 1. JobSet TAS pod must be linked to hashed JobSet Workload & JobSet owner with isTAS=true.
+	gotJSPod := podByHashedName[scraper.hasher.HashName(secretJSPodName)]
+	if gotJSPod == nil {
+		t.Fatalf("missing JobSet pod in infra.json")
+	}
+	if gotJSPod["workloadName"] != scraper.hasher.HashName(secretWlName) ||
+		gotJSPod["ownerKind"] != "JobSet" ||
+		gotJSPod["ownerName"] != scraper.hasher.HashName(secretJSName) ||
+		gotJSPod["podSetName"] != "worker" ||
+		gotJSPod["isTAS"] != true {
+		t.Errorf("unexpected JobSet pod linkage: %+v", gotJSPod)
+	}
+
+	// 2. PodGroup pod must be linked to hashed PodGroup Workload & PodGroup owner with role-hash podSetName.
+	gotPGPod := podByHashedName[scraper.hasher.HashName(secretPGPodName)]
+	if gotPGPod == nil {
+		t.Fatalf("missing PodGroup pod in infra.json")
+	}
+	if gotPGPod["workloadName"] != scraper.hasher.HashName(secretPGName) ||
+		gotPGPod["ownerKind"] != "PodGroup" ||
+		gotPGPod["ownerName"] != scraper.hasher.HashName(secretPGName) ||
+		gotPGPod["podSetName"] != "abcd1234" {
+		t.Errorf("unexpected PodGroup pod linkage: %+v", gotPGPod)
+	}
+
+	// 3. Kueue-managed Deployment ReplicaSet pod must resolve through ReplicaSet -> Deployment -> Workload.
+	gotDeployPod := podByHashedName[scraper.hasher.HashName(secretDeployPodName)]
+	if gotDeployPod == nil {
+		t.Fatalf("missing Deployment pod in infra.json")
+	}
+	if gotDeployPod["workloadName"] != scraper.hasher.HashName(secretDeployWl) ||
+		gotDeployPod["ownerKind"] != "Deployment" ||
+		gotDeployPod["ownerName"] != scraper.hasher.HashName(secretDeployName) ||
+		gotDeployPod["podSetName"] != "main" {
+		t.Errorf("unexpected Deployment pod linkage: %+v", gotDeployPod)
+	}
+
+	// 4. Non-Kueue DaemonSet and unmanaged Job pods must NOT carry workloadName/ownerName linkage.
+	for label, pName := range map[string]string{
+		"DaemonSet sys pod": unmanagedSysPodName,
+		"unmanaged Job pod": unmanagedJobPodName,
+	} {
+		gotUnmanaged := podByHashedName[scraper.hasher.HashName(pName)]
+		if gotUnmanaged == nil {
+			t.Fatalf("missing %s in infra.json", label)
+		}
+		for _, k := range []string{"workloadName", "ownerKind", "ownerName", "podSetName", "isTAS"} {
+			if _, hasKey := gotUnmanaged[k]; hasKey {
+				t.Errorf("expected %s to omit %q, got %+v", label, k, gotUnmanaged)
+			}
+		}
+	}
+
+	// 5. Admitted execution-time event must carry priorityClassName, priority, and sanitized TAS podSetAssignments.
+	execEvents := readJSONLines[ExecutionTimeEvent](t, rawExec)
+	var foundJSAdmit *ExecutionTimePayload
+	for i := range execEvents {
+		if execEvents[i].EventType == ExecutionEventAdmitted &&
+			execEvents[i].Payload.WorkloadName == scraper.hasher.HashName(secretWlName) {
+			foundJSAdmit = &execEvents[i].Payload
+			break
+		}
+	}
+	if foundJSAdmit == nil {
+		t.Fatalf("missing Admitted event for JobSet workload in execution-time.json")
+	}
+	if foundJSAdmit.PriorityClassName != "high-prio" || foundJSAdmit.Priority == nil || *foundJSAdmit.Priority != 500 {
+		t.Errorf("expected priorityClassName=high-prio priority=500, got %+v", foundJSAdmit)
+	}
+	if len(foundJSAdmit.PodSetAssignments) != 1 || foundJSAdmit.PodSetAssignments[0].TopologyAssignment == nil {
+		t.Fatalf("expected PodSetAssignments with TopologyAssignment on Admitted event, got %+v", foundJSAdmit.PodSetAssignments)
+	}
+	ta := foundJSAdmit.PodSetAssignments[0].TopologyAssignment
+	wantRackHash := scraper.hasher.HashName(testSecretValue)
+	if ta.Slices[0].ValuesPerLevel[0].Universal == nil || *ta.Slices[0].ValuesPerLevel[0].Universal != wantRackHash {
+		t.Errorf("expected corp.io/rack topology value to be hashed to %q, got %+v", wantRackHash, ta.Slices[0].ValuesPerLevel[0])
+	}
+	if ta.Slices[0].ValuesPerLevel[1].Universal == nil || *ta.Slices[0].ValuesPerLevel[1].Universal != "tpu-node-0" {
+		t.Errorf("expected kubernetes.io/hostname topology value to remain plain 'tpu-node-0', got %+v", ta.Slices[0].ValuesPerLevel[1])
+	}
+}

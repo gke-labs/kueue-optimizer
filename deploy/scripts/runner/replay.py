@@ -26,7 +26,7 @@ from typing import Any
 from chamber.constants import validate_dns_label
 from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot, query_cluster_status
 from chamber.parsers import format_duration_hms
-from runner.loader import ScenarioBundle, ScheduledWorkflowItem
+from runner.loader import InitialPodSpec, InitialWorkloadPodGroup, ScenarioBundle, ScheduledWorkflowItem
 from runner.validation import SYSTEM_NAMESPACES
 
 
@@ -34,8 +34,11 @@ def apply_scenario_queues_and_wait(
     mgr: ChamberManager,
     prereq_and_queue_docs: list[dict[str, Any]],
     timeout_sec: float = 60.0,
+    *,
+    initial_workloads: list[InitialWorkloadPodGroup] | None = None,
+    initial_pods: list[InitialPodSpec] | None = None,
 ) -> None:
-    """Apply Namespaces, Topologies, ResourceFlavors, Cohorts, PriorityClasses, ClusterQueues, and LocalQueues."""
+    """Apply prerequisites, optionally bootstrap t0 PodGroup Workloads & Pods, then activate ClusterQueues/LocalQueues."""
     cq_names = {d["metadata"]["name"] for d in prereq_and_queue_docs if d.get("kind") == "ClusterQueue"}
     lq_keys = {
         (d["metadata"].get("namespace", "default"), d["metadata"]["name"])
@@ -50,6 +53,54 @@ def apply_scenario_queues_and_wait(
     cq_lq_docs = [d for d in prereq_and_queue_docs if d.get("kind") in ("ClusterQueue", "LocalQueue")]
     mgr.apply_manifests_parallel(ns_docs, max_workers=16)
     mgr.apply_manifests_parallel(other_prereq_docs, max_workers=16)
+
+    # Bootstrap pre-admitted t0 Kueue PodGroup Workloads + member Pods + non-Kueue infra-pods BEFORE
+    # ClusterQueues/LocalQueues exist so Cache.AddClusterQueue loads quota, FairSharing, and TAS usage atomically.
+    if initial_workloads:
+        wl_pod_total = sum(len(w.pods) for w in initial_workloads)
+        print(
+            f"==> Bootstrapping {len(initial_workloads)} pre-admitted t0 Kueue PodGroup Workload(s) "
+            f"({wl_pod_total} pod(s)) before queue activation...",
+            flush=True,
+        )
+        mgr.apply_pre_admitted_workloads_parallel(
+            [(w.workload_manifest, w.workload_status) for w in initial_workloads]
+        )
+        for iwl in initial_workloads[:8]:
+            tas_tag = " [TAS]" if iwl.is_tas else ""
+            print(
+                f"    [Initial Workload] {iwl.namespace}/{iwl.workload_name} -> cq={iwl.cluster_queue_name} "
+                f"lq={iwl.local_queue_name} pods={len(iwl.pods)}{tas_tag}",
+                flush=True,
+            )
+        if len(initial_workloads) > 8:
+            print(f"    ... and {len(initial_workloads) - 8} more initial Kueue workloads.", flush=True)
+
+    all_bootstrap_pods: list[InitialPodSpec] = [
+        p for w in (initial_workloads or []) for p in w.pods
+    ] + list(initial_pods or [])
+    if all_bootstrap_pods:
+        if initial_pods:
+            print(
+                f"==> Placing {len(initial_pods)} non-Kueue initial Pod(s) into Kueue-excluded "
+                f"namespace '{initial_pods[0].namespace}' onto their nodes...",
+                flush=True,
+            )
+            for ipod in initial_pods[:8]:
+                dur_label = "infinite/super-long" if ipod.is_infinite else f"{ipod.remaining_duration_sec:.2f}s"
+                print(
+                    f"    [Initial Infra Pod] {ipod.namespace}/{ipod.name} -> node={ipod.placement} "
+                    f"requests={ipod.resource_request} remaining={dur_label}",
+                    flush=True,
+                )
+            if len(initial_pods) > 8:
+                print(f"    ... and {len(initial_pods) - 8} more initial infra pods.", flush=True)
+
+        mgr.apply_manifests_parallel([p.manifest for p in all_bootstrap_pods], max_workers=16)
+        mgr.wait_for_pods_running(
+            [(p.namespace, str((p.manifest.get("metadata") or {}).get("name") or p.name)) for p in all_bootstrap_pods]
+        )
+
     mgr.apply_manifests_parallel(cq_lq_docs, max_workers=16)
 
     if not cq_names and not lq_keys:
@@ -117,8 +168,10 @@ def run_scenario_replay(
     max_run_seconds: float | None,
     status_interval_sec: float,
     wait_for_completion: bool,
+    *,
+    initial_state_already_bootstrapped: bool = False,
 ) -> tuple[float, float, int, int]:
-    """Place initial pods and immediately start creating workflow objects from the first workload timestamp."""
+    """Run timed workflow arrivals and watch workloads until completion."""
     if bundle.initial_jump_raw_sec > 0:
         expired_msg = (
             f"; {bundle.expired_initial_pods_count} initial pod(s) from t0 already finished before jump"
@@ -131,29 +184,32 @@ def run_scenario_replay(
             flush=True,
         )
 
-    if bundle.initial_pods:
-        print(
-            f"==> Placing {len(bundle.initial_pods)} initial running Pod(s) into Kueue-excluded "
-            f"namespace '{bundle.infra_pods_namespace}' onto their nodes...",
-            flush=True,
-        )
-        mgr.apply_manifests_parallel([p.manifest for p in bundle.initial_pods], max_workers=16)
-        for ipod in bundle.initial_pods[:10]:
-            dur_label = "infinite/super-long" if ipod.is_infinite else f"{ipod.remaining_duration_sec:.2f}s"
+    if not initial_state_already_bootstrapped:
+        if bundle.initial_workloads:
+            mgr.apply_pre_admitted_workloads_parallel(
+                [(w.workload_manifest, w.workload_status) for w in bundle.initial_workloads]
+            )
+            mgr.apply_manifests_parallel(
+                [p.manifest for w in bundle.initial_workloads for p in w.pods], max_workers=16
+            )
+        if bundle.initial_pods:
             print(
-                f"    [Initial Pod] {ipod.namespace}/{ipod.name} -> node={ipod.placement} "
-                f"requests={ipod.resource_request} remaining={dur_label}",
+                f"==> Placing {len(bundle.initial_pods)} initial running Pod(s) into Kueue-excluded "
+                f"namespace '{bundle.infra_pods_namespace}' onto their nodes...",
                 flush=True,
             )
-        if len(bundle.initial_pods) > 10:
-            print(f"    ... and {len(bundle.initial_pods) - 10} more initial pods.", flush=True)
+            mgr.apply_manifests_parallel([p.manifest for p in bundle.initial_pods], max_workers=16)
 
     event_heap: list[ScheduledWorkflowItem] = list(bundle.scheduled_workflows)
     heapq.heapify(event_heap)
 
+    initial_wl_by_key = {(w.namespace, w.workload_name): w for w in bundle.initial_workloads}
+    initial_wl_keys = set(initial_wl_by_key.keys())
+    resubmitted_initial_wls: set[tuple[str, str]] = set()
+
     total_planned = len(bundle.scheduled_workflows)
     submitted_count = 0
-    total_pods_submitted = sum(1 for _ in bundle.initial_pods)
+    total_pods_submitted = bundle.initial_workload_pods_count + len(bundle.initial_pods)
 
     stop_requested = False
 
@@ -169,6 +225,46 @@ def run_scenario_replay(
     t0_mono = time.monotonic()
     next_status_mono = t0_mono
 
+    def _check_and_resubmit_evicted_initial_workloads(
+        snap: ClusterStatusSnapshot,
+        wall_elapsed: float,
+    ) -> None:
+        nonlocal total_planned, submitted_count, total_pods_submitted
+        if not initial_wl_keys:
+            return
+        detected_evicted = set(snap.evicted_workload_keys & initial_wl_keys)
+        if snap.workloads_query_ok:
+            # When Kueue preempts a PodGroup (`retriable-in-group: "false"`), its member Pods are deleted
+            # and Kubernetes GC may garbage-collect the PodGroup Workload within milliseconds before the next
+            # poll; normal completion leaves Succeeded Pods and the Finished Workload intact.
+            gc_after_preempt = (
+                initial_wl_keys - snap.present_workload_keys - snap.finished_workload_keys
+            )
+            detected_evicted |= gc_after_preempt
+        newly_evicted = sorted(detected_evicted - resubmitted_initial_wls)
+        for wl_key in newly_evicted:
+            resubmitted_initial_wls.add(wl_key)
+            iwl = initial_wl_by_key[wl_key]
+            if iwl.resubmit_item is None:
+                continue
+            it = iwl.resubmit_item
+            mgr.ssa_apply_doc(it.manifest)
+            total_planned += 1
+            submitted_count += 1
+            total_pods_submitted += it.pod_count
+            print(
+                f"  ~ [t={wall_elapsed:.2f}s wall] Initial t0 PodGroup Workload '{iwl.namespace}/{iwl.workload_name}' "
+                f"was preempted/evicted -> dynamically re-submitted {it.object_kind} '{it.namespace}/{it.name}' "
+                f"(queue={it.local_queue_name or '-'}, pods={it.pod_count}, pod_exec={it.compressed_duration_sec:.2f}s)",
+                flush=True,
+            )
+
+    def _scheduled_done_count(snap: ClusterStatusSnapshot) -> int:
+        if initial_wl_keys:
+            finished_sched = len(snap.finished_workload_keys - initial_wl_keys)
+            return max(finished_sched, snap.jobsets_completed + snap.jobsets_failed)
+        return max(snap.workloads_finished, snap.jobsets_completed + snap.jobsets_failed)
+
     def _emit_status(now_mono: float, note: str = "") -> ClusterStatusSnapshot:
         wall_elapsed = now_mono - t0_mono
         sim_elapsed = wall_elapsed * speedup
@@ -177,6 +273,7 @@ def run_scenario_replay(
             workload_namespaces=bundle.workload_namespaces,
             include_kueue_workloads=True,
         )
+        _check_and_resubmit_evicted_initial_workloads(snap, wall_elapsed)
         if event_heap:
             next_in = max(0.0, event_heap[0].target_wall_offset_sec - wall_elapsed)
             next_str = f"next_in={next_in:.2f}s"
@@ -186,7 +283,7 @@ def run_scenario_replay(
         cqs_str = " ".join(snap.cq_summary) if snap.cq_summary else "none"
         ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
         note_str = f" | {note}" if note else ""
-        done_count = max(snap.workloads_finished, snap.jobsets_completed + snap.jobsets_failed)
+        done_count = _scheduled_done_count(snap)
         print(
             f"[{ts_str}] wall={format_duration_hms(wall_elapsed)} sim={sim_elapsed:.1f}s "
             f"| submitted={submitted_count}/{total_planned} queued={len(event_heap)} ({next_str}) "
@@ -258,11 +355,11 @@ def run_scenario_replay(
                     if not wait_for_completion:
                         print("==> All scenario workflows submitted (--no-wait-for-completion).", flush=True)
                         break
-                    done_count = max(snap.workloads_finished, snap.jobsets_completed + snap.jobsets_failed)
+                    done_count = _scheduled_done_count(snap)
                     if submitted_count > 0 and done_count >= submitted_count:
                         print(f"==> All {submitted_count} submitted scenario workflows completed!", flush=True)
                         break
-                    if submitted_count == 0 and snap.pods_running == 0:
+                    if submitted_count == 0 and snap.pods_running == 0 and snap.workloads_admitted == 0:
                         print("==> No pending workflows or running initial pods remaining.", flush=True)
                         break
 

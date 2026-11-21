@@ -382,6 +382,12 @@ webhooks:
       operator: NotIn
       values:
       - "true"
+  objectSelector:
+    matchExpressions:
+    - key: kueue-optimizer.gke.io/initial-pod
+      operator: NotIn
+      values:
+      - "true"
   rules:
   - apiGroups:
     - ''

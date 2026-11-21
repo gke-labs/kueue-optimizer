@@ -595,6 +595,10 @@ class ClusterStatusSnapshot:
     workloads_pending: int = 0
     workloads_finished: int = 0
     workloads_evicted: int = 0
+    workloads_query_ok: bool = False
+    present_workload_keys: set[tuple[str, str]] = field(default_factory=set)
+    finished_workload_keys: set[tuple[str, str]] = field(default_factory=set)
+    evicted_workload_keys: set[tuple[str, str]] = field(default_factory=set)
 
     pods_running: int = 0
     pods_pending: int = 0
@@ -687,6 +691,7 @@ def query_cluster_status(
         try:
             st_wl, raw_wl = mgr.api_request("GET", "/apis/kueue.x-k8s.io/v1beta2/workloads")
             if st_wl == 200 and raw_wl:
+                snap.workloads_query_ok = True
                 items = json.loads(raw_wl.decode("utf-8")).get("items", [])
                 adm_cnt = pend_cnt = finished_cnt = evicted_cnt = 0
                 scoped_items = [
@@ -706,6 +711,9 @@ def query_cluster_status(
                 for it in scoped_items:
                     meta = it.get("metadata") or {}
                     ns = meta.get("namespace", "default")
+                    wl_key = (str(ns), str(meta.get("name") or ""))
+                    if wl_key[1]:
+                        snap.present_workload_keys.add(wl_key)
                     orefs = [o for o in (meta.get("ownerReferences") or []) if isinstance(o, dict)]
                     if js_wl_owners and not any(str(o.get("kind") or "") == "JobSet" for o in orefs):
                         parent_js = (meta.get("labels") or {}).get("jobset.sigs.k8s.io/jobset-name")
@@ -715,9 +723,16 @@ def query_cluster_status(
                         c.get("type"): c.get("status")
                         for c in ((it.get("status") or {}).get("conditions") or [])
                     }
+                    is_evicted_or_preempted = (
+                        conds.get("Evicted") == "True" or conds.get("Preempted") == "True"
+                    )
+                    if is_evicted_or_preempted and wl_key[1]:
+                        snap.evicted_workload_keys.add(wl_key)
                     if conds.get("Finished") == "True":
                         finished_cnt += 1
-                    elif conds.get("Evicted") == "True" or conds.get("Preempted") == "True":
+                        if wl_key[1] and not is_evicted_or_preempted:
+                            snap.finished_workload_keys.add(wl_key)
+                    elif is_evicted_or_preempted:
                         evicted_cnt += 1
                         pend_cnt += 1
                     elif conds.get("Admitted") == "True" or conds.get("QuotaReserved") == "True":

@@ -100,6 +100,11 @@ type workloadExecState struct {
 	clusterQueueName         string
 }
 
+type workloadOwnerRef struct {
+	kind string
+	name string
+}
+
 // Scraper coordinates periodic infrastructure/pod scraping and real-time watches for
 // pods, workflows, and Kueue workload execution times.
 type Scraper struct {
@@ -114,13 +119,20 @@ type Scraper struct {
 	workflowsLog *JSONEventLog
 	execTimeLog  *JSONEventLog
 
-	mu             sync.Mutex
-	infraCache     map[string]map[string]cachedObject // kind -> key -> cachedObject
-	podStates      map[string]*trackedPodState        // namespace/rawName -> trackedPodState
-	workflowStates map[string]*trackedWorkflowState   // kind/namespace/rawName -> trackedWorkflowState
-	ownerStates    map[string]WorkloadState           // kind/namespace/rawName -> WorkloadState from Kueue Workload
-	jobSetQueues   map[string]string                  // namespace/rawJobSetName -> localQueueName
-	workloadStates map[string]*workloadExecState      // namespace/rawWorkloadName -> workloadExecState
+	mu                     sync.Mutex
+	infraCache             map[string]map[string]cachedObject // kind -> key -> cachedObject
+	podStates              map[string]*trackedPodState        // namespace/rawName -> trackedPodState
+	workflowStates         map[string]*trackedWorkflowState   // kind/namespace/rawName -> trackedWorkflowState
+	ownerStates            map[string]WorkloadState           // kind/namespace/rawName -> WorkloadState from Kueue Workload
+	ownerToWorkload        map[string]string                  // kind/namespace/rawOwnerName -> rawWorkloadName
+	workloadToOwner        map[string]workloadOwnerRef        // namespace/rawWorkloadName -> raw owner
+	workloadIsTAS          map[string]bool                    // namespace/rawWorkloadName -> uses TAS
+	workloadPodSets        map[string][]string                // namespace/rawWorkloadName -> podSet names
+	jobSetQueues           map[string]string                  // namespace/rawJobSetName -> localQueueName
+	jobToJobSet            map[string]string                  // namespace/rawJobName -> rawJobSetName
+	rayClusterToRayJob     map[string]string                  // namespace/rawRayClusterName -> rawRayJobName
+	replicaSetToDeployment map[string]string                  // namespace/rawReplicaSetName -> rawDeploymentName
+	workloadStates         map[string]*workloadExecState      // namespace/rawWorkloadName -> workloadExecState
 }
 
 // NewScraper initializes a new Scraper with the given clients and configuration.
@@ -145,30 +157,65 @@ func NewScraper(
 		hasher = NewSensitiveDataHasher(cfg.ExtraHashLabels, cfg.HashSalt)
 	}
 	return &Scraper{
-		cfg:            cfg,
-		hasher:         hasher,
-		kubeClient:     kubeClient,
-		kueueClient:    kueueClient,
-		jobsetClient:   jobsetClient,
-		dynamicClient:  dynamicClient,
-		infraLog:       infraLog,
-		workflowsLog:   workflowsLog,
-		execTimeLog:    execTimeLog,
-		infraCache:     make(map[string]map[string]cachedObject),
-		podStates:      make(map[string]*trackedPodState),
-		workflowStates: make(map[string]*trackedWorkflowState),
-		ownerStates:    make(map[string]WorkloadState),
-		jobSetQueues:   make(map[string]string),
-		workloadStates: make(map[string]*workloadExecState),
+		cfg:                    cfg,
+		hasher:                 hasher,
+		kubeClient:             kubeClient,
+		kueueClient:            kueueClient,
+		jobsetClient:           jobsetClient,
+		dynamicClient:          dynamicClient,
+		infraLog:               infraLog,
+		workflowsLog:           workflowsLog,
+		execTimeLog:            execTimeLog,
+		infraCache:             make(map[string]map[string]cachedObject),
+		podStates:              make(map[string]*trackedPodState),
+		workflowStates:         make(map[string]*trackedWorkflowState),
+		ownerStates:            make(map[string]WorkloadState),
+		ownerToWorkload:        make(map[string]string),
+		workloadToOwner:        make(map[string]workloadOwnerRef),
+		workloadIsTAS:          make(map[string]bool),
+		workloadPodSets:        make(map[string][]string),
+		jobSetQueues:           make(map[string]string),
+		jobToJobSet:            make(map[string]string),
+		rayClusterToRayJob:     make(map[string]string),
+		replicaSetToDeployment: make(map[string]string),
+		workloadStates:         make(map[string]*workloadExecState),
 	}
 }
 
-// Run starts all watch loops, executes an initial scrape immediately, and then scrapes
-// periodically every cfg.Interval until ctx is canceled.
+// Run performs a deterministic synchronous initial List() barrier across Kueue Workloads,
+// parent/child workflows, and Pods so t0 ownership/queue/TAS linkage maps are populated,
+// executes an initial scrape immediately, starts real-time watch loops resuming from the
+// captured ResourceVersions, and then scrapes periodically every cfg.Interval until ctx is canceled.
 func (s *Scraper) Run(ctx context.Context) error {
-	var wg sync.WaitGroup
+	// 1. Synchronously index existing Kueue Workloads first so ownerStates, ownerToWorkload,
+	// workloadToOwner, workloadIsTAS, and Admitted records exist before workflow and pod events.
+	workloadsRV := s.syncInitialWorkloads(ctx)
 
-	startWatcher := func(name string, fn func(context.Context)) {
+	// 2. Synchronously index top-level parent workflows (JobSets, RayJobs) so child Jobs/RayClusters
+	// and Pods inherit LocalQueue and parent owner mappings deterministically.
+	jobSetsRV := s.syncInitialJobSets(ctx)
+	var rayJobsRV, lwsRV, rayClustersRV string
+	if s.dynamicClient != nil {
+		rayJobsRV = s.syncInitialDynamicResource(ctx, rayJobGVR, "RayJob", s.handleRayJobUnstructured)
+	}
+
+	// 3. Synchronously index single-tier and child workflows (Jobs, Deployments, ReplicaSets, LWS, RayClusters).
+	jobsRV := s.syncInitialJobs(ctx)
+	deploymentsRV := s.syncInitialDeployments(ctx)
+	replicaSetsRV := s.syncInitialReplicaSets(ctx)
+	if s.dynamicClient != nil {
+		lwsRV = s.syncInitialDynamicResource(ctx, lwsGVR, "LeaderWorkerSet", s.handleLeaderWorkerSetUnstructured)
+		rayClustersRV = s.syncInitialDynamicResource(ctx, rayClusterGVR, "RayCluster", s.handleRayClusterUnstructured)
+	}
+
+	// 4. Synchronously index existing Pods after all Workload and workflow ownership maps are warm.
+	podsRV := s.syncInitialPods(ctx)
+
+	// 5. Run initial periodic infrastructure & scheduled-pod scrape immediately with full linkage.
+	s.ScrapeOnce(ctx)
+
+	var wg sync.WaitGroup
+	startWatcher := func(fn func(context.Context)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -176,30 +223,28 @@ func (s *Scraper) Run(ctx context.Context) error {
 		}()
 	}
 
-	// Start real-time watchers for pod deletion/lifecycle, workflow creations, and Kueue Workloads.
-	startWatcher("pods", s.watchPodsLoop)
-	startWatcher("jobs", s.watchJobsLoop)
-	startWatcher("deployments", s.watchDeploymentsLoop)
+	// 6. Start real-time watchers resuming from the initial ResourceVersions captured above.
+	startWatcher(func(ctx context.Context) { s.watchPodsLoop(ctx, podsRV) })
+	startWatcher(func(ctx context.Context) { s.watchJobsLoop(ctx, jobsRV) })
+	startWatcher(func(ctx context.Context) { s.watchDeploymentsLoop(ctx, deploymentsRV) })
+	startWatcher(func(ctx context.Context) { s.watchReplicaSetsLoop(ctx, replicaSetsRV) })
 	if s.jobsetClient != nil {
-		startWatcher("jobsets", s.watchJobSetsLoop)
+		startWatcher(func(ctx context.Context) { s.watchJobSetsLoop(ctx, jobSetsRV) })
 	}
 	if s.kueueClient != nil {
-		startWatcher("workloads", s.watchWorkloadsLoop)
+		startWatcher(func(ctx context.Context) { s.watchWorkloadsLoop(ctx, workloadsRV) })
 	}
 	if s.dynamicClient != nil {
-		startWatcher("leaderworkersets", func(ctx context.Context) {
-			s.watchDynamicResourceLoop(ctx, lwsGVR, "LeaderWorkerSet", s.handleLeaderWorkerSetUnstructured)
+		startWatcher(func(ctx context.Context) {
+			s.watchDynamicResourceLoop(ctx, lwsGVR, "LeaderWorkerSet", lwsRV, s.handleLeaderWorkerSetUnstructured)
 		})
-		startWatcher("rayjobs", func(ctx context.Context) {
-			s.watchDynamicResourceLoop(ctx, rayJobGVR, "RayJob", s.handleRayJobUnstructured)
+		startWatcher(func(ctx context.Context) {
+			s.watchDynamicResourceLoop(ctx, rayJobGVR, "RayJob", rayJobsRV, s.handleRayJobUnstructured)
 		})
-		startWatcher("rayclusters", func(ctx context.Context) {
-			s.watchDynamicResourceLoop(ctx, rayClusterGVR, "RayCluster", s.handleRayClusterUnstructured)
+		startWatcher(func(ctx context.Context) {
+			s.watchDynamicResourceLoop(ctx, rayClusterGVR, "RayCluster", rayClustersRV, s.handleRayClusterUnstructured)
 		})
 	}
-
-	// Run initial scrape immediately at startup.
-	s.ScrapeOnce(ctx)
 
 	ticker := time.NewTicker(s.cfg.Interval)
 	defer ticker.Stop()
@@ -561,6 +606,204 @@ func (s *Scraper) scrapeScheduledAndRunningPods(ctx context.Context, now time.Ti
 	}
 }
 
+func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLinkage {
+	if pod == nil {
+		return PodWorkloadLinkage{}
+	}
+	ns := pod.Namespace
+	var rawWorkloadName, ownerKind, rawOwnerName, podSetName string
+
+	// 1. Direct Kueue Workload annotations/labels on the Pod.
+	if pod.Annotations != nil {
+		if wl := pod.Annotations[KueueWorkloadAnnot]; wl != "" {
+			rawWorkloadName = wl
+		} else if wl := pod.Annotations[KueueWorkloadSliceNameAnnot]; wl != "" {
+			rawWorkloadName = wl
+		}
+		if rh := pod.Annotations[KueueRoleHashAnnotation]; rh != "" {
+			podSetName = rh
+		}
+	}
+	if rawWorkloadName == "" && pod.Labels != nil {
+		if wl := pod.Labels[KueuePrebuiltWorkloadLabel]; wl != "" {
+			rawWorkloadName = wl
+		} else if pg := pod.Labels[KueuePodGroupNameLabel]; pg != "" {
+			rawWorkloadName = pg
+			ownerKind = "PodGroup"
+			rawOwnerName = pg
+		}
+	}
+
+	// 2. Resolve top-level workflow owner via Pod labels and OwnerReferences.
+	if pod.Labels != nil {
+		if jsName := pod.Labels["jobset.sigs.k8s.io/jobset-name"]; jsName != "" {
+			ownerKind = "JobSet"
+			rawOwnerName = jsName
+		} else if lwsName := pod.Labels["leaderworkerset.sigs.k8s.io/name"]; lwsName != "" {
+			ownerKind = "LeaderWorkerSet"
+			rawOwnerName = lwsName
+		} else if rcName := pod.Labels["ray.io/cluster"]; rcName != "" {
+			if rjName, ok := s.rayClusterToRayJob[ns+"/"+rcName]; ok && rjName != "" {
+				ownerKind = "RayJob"
+				rawOwnerName = rjName
+			} else {
+				ownerKind = "RayCluster"
+				rawOwnerName = rcName
+			}
+		} else {
+			jobName := pod.Labels["batch.kubernetes.io/job-name"]
+			if jobName == "" {
+				jobName = pod.Labels["job-name"]
+			}
+			if jobName != "" {
+				if jsName, ok := s.jobToJobSet[ns+"/"+jobName]; ok && jsName != "" {
+					ownerKind = "JobSet"
+					rawOwnerName = jsName
+				} else {
+					ownerKind = "Job"
+					rawOwnerName = jobName
+				}
+			}
+		}
+		if podSetName == "" {
+			if rj := pod.Labels["jobset.sigs.k8s.io/replicatedjob-name"]; rj != "" {
+				podSetName = rj
+			} else if rg := pod.Labels["ray.io/group"]; rg != "" {
+				podSetName = rg
+			} else if rgType := pod.Labels["ray.io/node-type"]; rgType == "head" {
+				podSetName = "head"
+			}
+		}
+	}
+
+	if ownerKind == "" {
+		for _, ref := range pod.OwnerReferences {
+			switch ref.Kind {
+			case "JobSet":
+				ownerKind = "JobSet"
+				rawOwnerName = ref.Name
+			case "Job":
+				if jsName, ok := s.jobToJobSet[ns+"/"+ref.Name]; ok && jsName != "" {
+					ownerKind = "JobSet"
+					rawOwnerName = jsName
+				} else {
+					ownerKind = "Job"
+					rawOwnerName = ref.Name
+				}
+			case "LeaderWorkerSet":
+				ownerKind = "LeaderWorkerSet"
+				rawOwnerName = ref.Name
+			case "RayJob":
+				ownerKind = "RayJob"
+				rawOwnerName = ref.Name
+			case "RayCluster":
+				if rjName, ok := s.rayClusterToRayJob[ns+"/"+ref.Name]; ok && rjName != "" {
+					ownerKind = "RayJob"
+					rawOwnerName = rjName
+				} else {
+					ownerKind = "RayCluster"
+					rawOwnerName = ref.Name
+				}
+			case "ReplicaSet":
+				if depName, ok := s.replicaSetToDeployment[ns+"/"+ref.Name]; ok && depName != "" {
+					ownerKind = "Deployment"
+					rawOwnerName = depName
+				}
+			case "Deployment":
+				if _, tracked := s.workflowStates["Deployment/"+ns+"/"+ref.Name]; tracked {
+					ownerKind = "Deployment"
+					rawOwnerName = ref.Name
+				}
+			}
+			if ownerKind != "" {
+				break
+			}
+		}
+	}
+
+	if ownerKind == "" && IsStandaloneKueuePod(pod) {
+		if pod.Labels != nil && pod.Labels[KueuePodGroupNameLabel] != "" {
+			ownerKind = "PodGroup"
+			rawOwnerName = pod.Labels[KueuePodGroupNameLabel]
+		} else {
+			ownerKind = "Pod"
+			rawOwnerName = pod.Name
+		}
+	}
+
+	// 3. Cross-link between owner and Kueue Workload maps.
+	if rawWorkloadName == "" && ownerKind != "" && rawOwnerName != "" {
+		if wl, ok := s.ownerToWorkload[ownerKind+"/"+ns+"/"+rawOwnerName]; ok {
+			rawWorkloadName = wl
+		}
+	}
+	if rawWorkloadName == "" {
+		if wl, ok := s.ownerToWorkload["Pod/"+ns+"/"+pod.Name]; ok {
+			rawWorkloadName = wl
+		}
+	}
+	if rawWorkloadName != "" && (ownerKind == "" || rawOwnerName == "") {
+		if ow, ok := s.workloadToOwner[ns+"/"+rawWorkloadName]; ok {
+			ownerKind = ow.kind
+			rawOwnerName = ow.name
+		}
+	}
+
+	// Only attach linkage if this Pod actually belongs to a Kueue-managed workflow or Workload.
+	// Unmanaged system/DaemonSet/ReplicaSet/standalone Jobs without Kueue management stay unlinked
+	// so chamber replay classifies them as non-Kueue infra-pods.
+	if rawWorkloadName == "" && ownerKind != "" && rawOwnerName != "" {
+		wfKey := ownerKind + "/" + ns + "/" + rawOwnerName
+		_, hasOwnerWl := s.ownerStates[wfKey]
+		var hasQueue bool
+		if wfSt, ok := s.workflowStates[wfKey]; ok && wfSt.localQueueName != "" {
+			hasQueue = true
+		}
+		if !hasOwnerWl && !hasQueue && !IsKueueManagedPod(pod) {
+			ownerKind = ""
+			rawOwnerName = ""
+			podSetName = ""
+		}
+	}
+
+	if rawWorkloadName == "" && ownerKind == "" {
+		return PodWorkloadLinkage{}
+	}
+
+	if podSetName == "" && rawWorkloadName != "" {
+		if psNames := s.workloadPodSets[ns+"/"+rawWorkloadName]; len(psNames) == 1 {
+			podSetName = psNames[0]
+		}
+	}
+	isTAS := IsTASPod(pod) || (rawWorkloadName != "" && s.workloadIsTAS[ns+"/"+rawWorkloadName])
+
+	return PodWorkloadLinkage{
+		RawWorkloadName: rawWorkloadName,
+		OwnerKind:       ownerKind,
+		RawOwnerName:    rawOwnerName,
+		PodSetName:      podSetName,
+		IsTAS:           isTAS,
+	}
+}
+
+func mergePreservedPodLinkage(dst *ScrapedPodPayload, prev ScrapedPodPayload) {
+	if dst.WorkloadName == "" && prev.WorkloadName != "" {
+		dst.WorkloadName = prev.WorkloadName
+	}
+	if dst.OwnerKind == "" && prev.OwnerKind != "" {
+		dst.OwnerKind = prev.OwnerKind
+	}
+	if dst.OwnerName == "" && prev.OwnerName != "" {
+		dst.OwnerName = prev.OwnerName
+	}
+	if dst.PodSetName == "" && prev.PodSetName != "" {
+		dst.PodSetName = prev.PodSetName
+	}
+	if !dst.IsTAS && prev.IsTAS {
+		dst.IsTAS = true
+	}
+}
+
 func (s *Scraper) observeScheduledRunningPodLocked(pod *corev1.Pod, now time.Time) *InfraEvent {
 	key := pod.Namespace + "/" + pod.Name
 	st, ok := s.podStates[key]
@@ -574,10 +817,12 @@ func (s *Scraper) observeScheduledRunningPodLocked(pod *corev1.Pod, now time.Tim
 		return nil
 	}
 
-	payload := BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.hasher)
+	linkage := s.resolvePodWorkloadLinkageLocked(pod)
+	payload := BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, nil, linkage, s.hasher)
 	if st.lastPayload.SchedulingTime != nil {
 		payload.SchedulingTime = st.lastPayload.SchedulingTime
 	}
+	mergePreservedPodLinkage(&payload, st.lastPayload)
 	digest := canonicalDigest(payload)
 
 	if !st.emittedNew {
@@ -655,11 +900,13 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 			st := s.podStates[key]
 			// Keep lastPayload fresh so if the pod is deleted or finishes before the next
 			// periodic scrape we still have its exact placement, resource request, and initial scheduling time.
-			prevSched := st.lastPayload.SchedulingTime
-			st.lastPayload = BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.hasher)
-			if prevSched != nil {
-				st.lastPayload.SchedulingTime = prevSched
+			prev := st.lastPayload
+			linkage := s.resolvePodWorkloadLinkageLocked(pod)
+			st.lastPayload = BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, nil, linkage, s.hasher)
+			if prev.SchedulingTime != nil {
+				st.lastPayload.SchedulingTime = prev.SchedulingTime
 			}
+			mergePreservedPodLinkage(&st.lastPayload, prev)
 		}
 	case watch.Deleted:
 		st, ok := s.podStates[key]
@@ -674,12 +921,13 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 			if pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero() {
 				delTime = pod.DeletionTimestamp.Time.UTC()
 			}
+			linkage := s.resolvePodWorkloadLinkageLocked(pod)
 			// If the pod ran and was deleted between periodic scrapes, emit its "New" event first
 			// so its creation/placement is also present in infra.json.
 			if !st.emittedNew {
 				newPayload := st.lastPayload
 				if newPayload.Name == "" {
-					newPayload = BuildScrapedPodPayload(pod, st.firstNoticeTime, nil, s.hasher)
+					newPayload = BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, nil, linkage, s.hasher)
 				}
 				st.emittedNew = true
 				st.lastPayload = newPayload
@@ -690,13 +938,14 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 				})
 			}
 
-			delPayload := BuildScrapedPodPayload(pod, st.firstNoticeTime, &delTime, s.hasher)
+			delPayload := BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, &delTime, linkage, s.hasher)
 			if delPayload.Placement == "" && st.lastPayload.Placement != "" {
 				delPayload.Placement = st.lastPayload.Placement
 			}
 			if delPayload.SchedulingTime == nil && st.lastPayload.SchedulingTime != nil {
 				delPayload.SchedulingTime = st.lastPayload.SchedulingTime
 			}
+			mergePreservedPodLinkage(&delPayload, st.lastPayload)
 			st.deleted = true
 			infraEvents = append(infraEvents, InfraEvent{
 				Timestamp: now,
@@ -881,6 +1130,13 @@ func (s *Scraper) handleJobWatchEvent(eventType watch.EventType, job *batchv1.Jo
 	suspended := job.Spec.Suspend != nil && *job.Spec.Suspend
 
 	s.mu.Lock()
+	if parentJobSet != "" {
+		if eventType == watch.Deleted {
+			delete(s.jobToJobSet, job.Namespace+"/"+job.Name)
+		} else {
+			s.jobToJobSet[job.Namespace+"/"+job.Name] = parentJobSet
+		}
+	}
 	if lq == "" && parentJobSet != "" {
 		if q, ok := s.jobSetQueues[job.Namespace+"/"+parentJobSet]; ok {
 			lq = q
@@ -967,14 +1223,55 @@ func (s *Scraper) handleRayJobWatchEvent(eventType watch.EventType, rj *rayv1.Ra
 	s.recordWorkflowEvent(eventType, "RayJob", rj.Name, rj.Namespace, rj.CreationTimestamp, lq, wlState, payload, now)
 }
 
+func (s *Scraper) handleReplicaSetWatchEvent(eventType watch.EventType, rs *appsv1.ReplicaSet) {
+	if rs == nil {
+		return
+	}
+	var parentDeploy string
+	for _, ref := range rs.OwnerReferences {
+		if ref.Kind == "Deployment" {
+			parentDeploy = ref.Name
+			break
+		}
+	}
+	if parentDeploy == "" {
+		return
+	}
+	key := rs.Namespace + "/" + rs.Name
+	s.mu.Lock()
+	if eventType == watch.Deleted {
+		delete(s.replicaSetToDeployment, key)
+	} else if _, tracked := s.workflowStates["Deployment/"+rs.Namespace+"/"+parentDeploy]; tracked ||
+		ExtractLocalQueueName(rs) != "" ||
+		(rs.Labels != nil && rs.Labels[KueueManagedLabel] == "true") ||
+		(rs.Spec.Template.Labels != nil && (rs.Spec.Template.Labels[KueueQueueLabel] != "" || rs.Spec.Template.Labels[KueueManagedLabel] == "true")) {
+		s.replicaSetToDeployment[key] = parentDeploy
+	}
+	s.mu.Unlock()
+}
+
 func (s *Scraper) handleRayClusterWatchEvent(eventType watch.EventType, rc *rayv1.RayCluster) {
 	if rc == nil {
 		return
 	}
 	now := time.Now().UTC()
 	lq := ExtractLocalQueueName(rc)
+	var parentRayJob string
+	for _, ref := range rc.OwnerReferences {
+		if ref.Kind == "RayJob" {
+			parentRayJob = ref.Name
+			break
+		}
+	}
 	suspended := rc.Spec.Suspend != nil && *rc.Spec.Suspend
 	s.mu.Lock()
+	if parentRayJob != "" {
+		if eventType == watch.Deleted {
+			delete(s.rayClusterToRayJob, rc.Namespace+"/"+rc.Name)
+		} else {
+			s.rayClusterToRayJob[rc.Namespace+"/"+rc.Name] = parentRayJob
+		}
+	}
 	wlState := s.determineSuspendableWorkloadStateLocked("RayCluster", rc.Namespace, rc.Name, suspended, "")
 	s.mu.Unlock()
 
@@ -1022,6 +1319,9 @@ func resolveWorkloadOwner(wl *kueuev1beta2.Workload, hasher SensitiveDataHasher)
 	if wl == nil {
 		return "", "", ""
 	}
+	if wl.Annotations != nil && wl.Annotations[KueueIsGroupWorkloadAnnotation] == "true" {
+		return "PodGroup", hasher.HashName(wl.Name), "v1"
+	}
 	for _, ref := range wl.OwnerReferences {
 		if ref.Controller != nil && *ref.Controller {
 			return ref.Kind, hasher.HashNameForKind(ref.Kind, ref.Name), ref.APIVersion
@@ -1046,15 +1346,55 @@ func resolveWorkloadOwner(wl *kueuev1beta2.Workload, hasher SensitiveDataHasher)
 	return ownerKind, ownerName, ownerAPIVersion
 }
 
+func extractWorkloadPriorityClassName(wl *kueuev1beta2.Workload) string {
+	if wl == nil {
+		return ""
+	}
+	if wl.Spec.PriorityClassRef != nil && wl.Spec.PriorityClassRef.Name != "" {
+		return wl.Spec.PriorityClassRef.Name
+	}
+	if wl.Labels != nil && wl.Labels[KueuePriorityClassLabel] != "" {
+		return wl.Labels[KueuePriorityClassLabel]
+	}
+	return ""
+}
+
+func workloadUsesTAS(wl *kueuev1beta2.Workload) bool {
+	if wl == nil {
+		return false
+	}
+	for i := range wl.Spec.PodSets {
+		if wl.Spec.PodSets[i].TopologyRequest != nil {
+			return true
+		}
+	}
+	if wl.Status.Admission != nil {
+		for i := range wl.Status.Admission.PodSetAssignments {
+			if wl.Status.Admission.PodSetAssignments[i].TopologyAssignment != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // handleWorkloadWatchEvent processes a Kueue Workload event and emits Admitted,
 // PartialExecution (when preempted), and FullExecution (when finished without preemption,
 // or when clean completion wins a race against in-flight preemption) records into execution-time.json.
 func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev1beta2.Workload) {
-	if wl == nil || eventType == watch.Deleted {
+	if wl == nil {
+		return
+	}
+	key := wl.Namespace + "/" + wl.Name
+	if eventType == watch.Deleted {
+		s.mu.Lock()
+		delete(s.workloadToOwner, key)
+		delete(s.workloadIsTAS, key)
+		delete(s.workloadPodSets, key)
+		s.mu.Unlock()
 		return
 	}
 	now := time.Now().UTC()
-	key := wl.Namespace + "/" + wl.Name
 
 	rawOwnerKind, rawOwnerName, _ := resolveWorkloadOwner(wl, NoopHasher{})
 	if rawOwnerKind == "" || rawOwnerName == "" {
@@ -1064,6 +1404,24 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 	ownerKind, ownerName, ownerAPIVersion := resolveWorkloadOwner(wl, s.hasher)
 	workloadName := s.hasher.HashName(wl.Name)
 	localQueueName := string(wl.Spec.QueueName)
+	priorityClassName := extractWorkloadPriorityClassName(wl)
+	var priorityCopy *int32
+	if wl.Spec.Priority != nil {
+		p := *wl.Spec.Priority
+		priorityCopy = &p
+	}
+	var podSetAssignments []kueuev1beta2.PodSetAssignment
+	if wl.Status.Admission != nil && len(wl.Status.Admission.PodSetAssignments) > 0 {
+		podSetAssignments = SanitizePodSetAssignments(wl.Status.Admission.PodSetAssignments, s.hasher)
+	}
+	usesTAS := workloadUsesTAS(wl)
+	var podSetNames []string
+	if len(wl.Spec.PodSets) > 0 {
+		podSetNames = make([]string, len(wl.Spec.PodSets))
+		for i := range wl.Spec.PodSets {
+			podSetNames[i] = string(wl.Spec.PodSets[i].Name)
+		}
+	}
 
 	admittedCond := apimeta.FindStatusCondition(wl.Status.Conditions, kueuev1beta2.WorkloadAdmitted)
 	quotaReservedCond := apimeta.FindStatusCondition(wl.Status.Conditions, kueuev1beta2.WorkloadQuotaReserved)
@@ -1094,6 +1452,17 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 	var events []ExecutionTimeEvent
 
 	s.mu.Lock()
+	s.ownerToWorkload[ownerKey] = wl.Name
+	for _, ref := range wl.OwnerReferences {
+		if ref.Kind != "" && ref.Name != "" {
+			s.ownerToWorkload[ref.Kind+"/"+wl.Namespace+"/"+ref.Name] = wl.Name
+		}
+	}
+	s.workloadToOwner[key] = workloadOwnerRef{kind: rawOwnerKind, name: rawOwnerName}
+	s.workloadIsTAS[key] = usesTAS
+	if len(podSetNames) > 0 {
+		s.workloadPodSets[key] = podSetNames
+	}
 	ownerUnsuspended := isAdmitted
 	if wfSt, ok := s.workflowStates[ownerKey]; ok && wfSt.workloadState != WorkloadStateAdmitted {
 		ownerUnsuspended = false
@@ -1152,19 +1521,22 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 				EventType:     ExecutionEventAdmitted,
 				WorkloadState: WorkloadStateAdmitted,
 				Payload: ExecutionTimePayload{
-					WorkloadName:     workloadName,
-					Namespace:        wl.Namespace,
-					OwnerKind:        ownerKind,
-					OwnerName:        ownerName,
-					OwnerAPIVersion:  ownerAPIVersion,
-					LocalQueueName:   localQueueName,
-					ClusterQueueName: clusterQueueName,
-					CreationTime:     wl.CreationTimestamp,
-					AdmittedTime:     metav1.NewTime(admittedAt),
-					Preempted:        false,
-					PreemptionCount:  st.preemptionCount,
-					Reason:           admittedCond.Reason,
-					Message:          admittedCond.Message,
+					WorkloadName:      workloadName,
+					Namespace:         wl.Namespace,
+					OwnerKind:         ownerKind,
+					OwnerName:         ownerName,
+					OwnerAPIVersion:   ownerAPIVersion,
+					LocalQueueName:    localQueueName,
+					ClusterQueueName:  clusterQueueName,
+					PriorityClassName: priorityClassName,
+					Priority:          priorityCopy,
+					PodSetAssignments: podSetAssignments,
+					CreationTime:      wl.CreationTimestamp,
+					AdmittedTime:      metav1.NewTime(admittedAt),
+					Preempted:         false,
+					PreemptionCount:   st.preemptionCount,
+					Reason:            admittedCond.Reason,
+					Message:           admittedCond.Message,
 				},
 			})
 		}
@@ -1276,18 +1648,21 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 				EventType:     ExecutionEventAdmitted,
 				WorkloadState: WorkloadStateAdmitted,
 				Payload: ExecutionTimePayload{
-					WorkloadName:     workloadName,
-					Namespace:        wl.Namespace,
-					OwnerKind:        ownerKind,
-					OwnerName:        ownerName,
-					OwnerAPIVersion:  ownerAPIVersion,
-					LocalQueueName:   localQueueName,
-					ClusterQueueName: clusterQueueName,
-					CreationTime:     wl.CreationTimestamp,
-					AdmittedTime:     metav1.NewTime(admittedAt),
-					Preempted:        false,
-					PreemptionCount:  st.preemptionCount,
-					Reason:           "Admitted",
+					WorkloadName:      workloadName,
+					Namespace:         wl.Namespace,
+					OwnerKind:         ownerKind,
+					OwnerName:         ownerName,
+					OwnerAPIVersion:   ownerAPIVersion,
+					LocalQueueName:    localQueueName,
+					ClusterQueueName:  clusterQueueName,
+					PriorityClassName: priorityClassName,
+					Priority:          priorityCopy,
+					PodSetAssignments: podSetAssignments,
+					CreationTime:      wl.CreationTimestamp,
+					AdmittedTime:      metav1.NewTime(admittedAt),
+					Preempted:         false,
+					PreemptionCount:   st.preemptionCount,
+					Reason:            "Admitted",
 				},
 			})
 		}
@@ -1341,30 +1716,181 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 	}
 }
 
-func (s *Scraper) watchPodsLoop(ctx context.Context) {
+func (s *Scraper) syncInitialWorkloads(ctx context.Context) string {
+	if s.kueueClient == nil || ctx.Err() != nil {
+		return ""
+	}
+	list, err := s.kueueClient.KueueV1beta2().Workloads("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("WARN failed to list Kueue Workloads at startup: %v", err)
+		}
+		return ""
+	}
+	for i := range list.Items {
+		s.handleWorkloadWatchEvent(watch.Added, &list.Items[i])
+	}
+	if list.ResourceVersion != "" {
+		return list.ResourceVersion
+	}
+	return "0"
+}
+
+func (s *Scraper) syncInitialJobSets(ctx context.Context) string {
+	if s.jobsetClient == nil || ctx.Err() != nil {
+		return ""
+	}
+	list, err := s.jobsetClient.JobsetV1alpha2().JobSets("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("WARN failed to list JobSets at startup: %v", err)
+		}
+		return ""
+	}
+	for i := range list.Items {
+		s.handleJobSetWatchEvent(watch.Added, &list.Items[i])
+	}
+	if list.ResourceVersion != "" {
+		return list.ResourceVersion
+	}
+	return "0"
+}
+
+func (s *Scraper) syncInitialJobs(ctx context.Context) string {
+	if s.kubeClient == nil || ctx.Err() != nil {
+		return ""
+	}
+	list, err := s.kubeClient.BatchV1().Jobs("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Printf("WARN failed to list Jobs at startup: %v", err)
+		return ""
+	}
+	for i := range list.Items {
+		s.handleJobWatchEvent(watch.Added, &list.Items[i])
+	}
+	if list.ResourceVersion != "" {
+		return list.ResourceVersion
+	}
+	return "0"
+}
+
+func (s *Scraper) syncInitialDeployments(ctx context.Context) string {
+	if s.kubeClient == nil || ctx.Err() != nil {
+		return ""
+	}
+	list, err := s.kubeClient.AppsV1().Deployments("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Printf("WARN failed to list Deployments at startup: %v", err)
+		return ""
+	}
+	for i := range list.Items {
+		s.handleDeploymentWatchEvent(watch.Added, &list.Items[i])
+	}
+	if list.ResourceVersion != "" {
+		return list.ResourceVersion
+	}
+	return "0"
+}
+
+func (s *Scraper) syncInitialReplicaSets(ctx context.Context) string {
+	if s.kubeClient == nil || ctx.Err() != nil {
+		return ""
+	}
+	list, err := s.kubeClient.AppsV1().ReplicaSets("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Printf("WARN failed to list ReplicaSets at startup: %v", err)
+		return ""
+	}
+	for i := range list.Items {
+		s.handleReplicaSetWatchEvent(watch.Added, &list.Items[i])
+	}
+	if list.ResourceVersion != "" {
+		return list.ResourceVersion
+	}
+	return "0"
+}
+
+func (s *Scraper) syncInitialPods(ctx context.Context) string {
+	if s.kubeClient == nil || ctx.Err() != nil {
+		return ""
+	}
+	list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Printf("WARN failed to list Pods at startup: %v", err)
+		return ""
+	}
+	for i := range list.Items {
+		s.handlePodWatchEvent(watch.Added, &list.Items[i])
+	}
+	if list.ResourceVersion != "" {
+		return list.ResourceVersion
+	}
+	return "0"
+}
+
+func (s *Scraper) syncInitialDynamicResource(
+	ctx context.Context,
+	gvr schema.GroupVersionResource,
+	kindName string,
+	handler func(watch.EventType, *unstructured.Unstructured),
+) string {
+	if s.dynamicClient == nil || ctx.Err() != nil {
+		return ""
+	}
+	list, err := s.dynamicClient.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Printf("WARN failed to list %s at startup: %v", kindName, err)
+		}
+		return ""
+	}
+	for i := range list.Items {
+		handler(watch.Added, &list.Items[i])
+	}
+	if rv := list.GetResourceVersion(); rv != "" {
+		return rv
+	}
+	return "0"
+}
+
+func watchOptionsFromSentinel(rv string) metav1.ListOptions {
+	if rv == "0" {
+		return metav1.ListOptions{}
+	}
+	return metav1.ListOptions{ResourceVersion: rv}
+}
+
+func (s *Scraper) watchPodsLoop(ctx context.Context, initialRV string) {
 	if s.kubeClient == nil {
 		return
 	}
+	rv := initialRV
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+		if rv == "" {
+			list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("WARN failed to list Pods for watch initialization: %v", err)
+				sleepContext(ctx, 2*time.Second)
+				continue
 			}
-			log.Printf("WARN failed to list Pods for watch initialization: %v", err)
-			sleepContext(ctx, 2*time.Second)
-			continue
-		}
-		for i := range list.Items {
-			s.handlePodWatchEvent(watch.Added, &list.Items[i])
+			for i := range list.Items {
+				s.handlePodWatchEvent(watch.Added, &list.Items[i])
+			}
+			rv = list.ResourceVersion
+			if rv == "" {
+				rv = "0"
+			}
 		}
 
-		w, err := s.kubeClient.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
-			ResourceVersion: list.ResourceVersion,
-		})
+		watchOpts := watchOptionsFromSentinel(rv)
+		rv = ""
+		w, err := s.kubeClient.CoreV1().Pods("").Watch(ctx, watchOpts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -1394,30 +1920,37 @@ func (s *Scraper) consumePodWatch(ctx context.Context, w watch.Interface) {
 	}
 }
 
-func (s *Scraper) watchJobsLoop(ctx context.Context) {
+func (s *Scraper) watchJobsLoop(ctx context.Context, initialRV string) {
 	if s.kubeClient == nil {
 		return
 	}
+	rv := initialRV
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		list, err := s.kubeClient.BatchV1().Jobs("").List(ctx, metav1.ListOptions{})
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+		if rv == "" {
+			list, err := s.kubeClient.BatchV1().Jobs("").List(ctx, metav1.ListOptions{})
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("WARN failed to list Jobs: %v", err)
+				sleepContext(ctx, 2*time.Second)
+				continue
 			}
-			log.Printf("WARN failed to list Jobs: %v", err)
-			sleepContext(ctx, 2*time.Second)
-			continue
-		}
-		for i := range list.Items {
-			s.handleJobWatchEvent(watch.Added, &list.Items[i])
+			for i := range list.Items {
+				s.handleJobWatchEvent(watch.Added, &list.Items[i])
+			}
+			rv = list.ResourceVersion
+			if rv == "" {
+				rv = "0"
+			}
 		}
 
-		w, err := s.kubeClient.BatchV1().Jobs("").Watch(ctx, metav1.ListOptions{
-			ResourceVersion: list.ResourceVersion,
-		})
+		watchOpts := watchOptionsFromSentinel(rv)
+		rv = ""
+		w, err := s.kubeClient.BatchV1().Jobs("").Watch(ctx, watchOpts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -1445,30 +1978,37 @@ func (s *Scraper) watchJobsLoop(ctx context.Context) {
 	}
 }
 
-func (s *Scraper) watchDeploymentsLoop(ctx context.Context) {
+func (s *Scraper) watchDeploymentsLoop(ctx context.Context, initialRV string) {
 	if s.kubeClient == nil {
 		return
 	}
+	rv := initialRV
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		list, err := s.kubeClient.AppsV1().Deployments("").List(ctx, metav1.ListOptions{})
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+		if rv == "" {
+			list, err := s.kubeClient.AppsV1().Deployments("").List(ctx, metav1.ListOptions{})
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("WARN failed to list Deployments: %v", err)
+				sleepContext(ctx, 2*time.Second)
+				continue
 			}
-			log.Printf("WARN failed to list Deployments: %v", err)
-			sleepContext(ctx, 2*time.Second)
-			continue
-		}
-		for i := range list.Items {
-			s.handleDeploymentWatchEvent(watch.Added, &list.Items[i])
+			for i := range list.Items {
+				s.handleDeploymentWatchEvent(watch.Added, &list.Items[i])
+			}
+			rv = list.ResourceVersion
+			if rv == "" {
+				rv = "0"
+			}
 		}
 
-		w, err := s.kubeClient.AppsV1().Deployments("").Watch(ctx, metav1.ListOptions{
-			ResourceVersion: list.ResourceVersion,
-		})
+		watchOpts := watchOptionsFromSentinel(rv)
+		rv = ""
+		w, err := s.kubeClient.AppsV1().Deployments("").Watch(ctx, watchOpts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -1496,32 +2036,97 @@ func (s *Scraper) watchDeploymentsLoop(ctx context.Context) {
 	}
 }
 
-func (s *Scraper) watchJobSetsLoop(ctx context.Context) {
-	if s.jobsetClient == nil {
+func (s *Scraper) watchReplicaSetsLoop(ctx context.Context, initialRV string) {
+	if s.kubeClient == nil {
 		return
 	}
+	rv := initialRV
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		list, err := s.jobsetClient.JobsetV1alpha2().JobSets("").List(ctx, metav1.ListOptions{})
+		if rv == "" {
+			list, err := s.kubeClient.AppsV1().ReplicaSets("").List(ctx, metav1.ListOptions{})
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("WARN failed to list ReplicaSets: %v", err)
+				sleepContext(ctx, 2*time.Second)
+				continue
+			}
+			for i := range list.Items {
+				s.handleReplicaSetWatchEvent(watch.Added, &list.Items[i])
+			}
+			rv = list.ResourceVersion
+			if rv == "" {
+				rv = "0"
+			}
+		}
+
+		watchOpts := watchOptionsFromSentinel(rv)
+		rv = ""
+		w, err := s.kubeClient.AppsV1().ReplicaSets("").Watch(ctx, watchOpts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			if !apierrors.IsNotFound(err) {
-				log.Printf("WARN failed to list JobSets: %v", err)
-			}
-			sleepContext(ctx, 5*time.Second)
+			log.Printf("WARN failed to watch ReplicaSets: %v", err)
+			sleepContext(ctx, 2*time.Second)
 			continue
 		}
-		for i := range list.Items {
-			s.handleJobSetWatchEvent(watch.Added, &list.Items[i])
+		func() {
+			defer w.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ev, ok := <-w.ResultChan():
+					if !ok {
+						return
+					}
+					if rs, ok := ev.Object.(*appsv1.ReplicaSet); ok {
+						s.handleReplicaSetWatchEvent(ev.Type, rs)
+					}
+				}
+			}
+		}()
+	}
+}
+
+func (s *Scraper) watchJobSetsLoop(ctx context.Context, initialRV string) {
+	if s.jobsetClient == nil {
+		return
+	}
+	rv := initialRV
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if rv == "" {
+			list, err := s.jobsetClient.JobsetV1alpha2().JobSets("").List(ctx, metav1.ListOptions{})
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if !apierrors.IsNotFound(err) {
+					log.Printf("WARN failed to list JobSets: %v", err)
+				}
+				sleepContext(ctx, 5*time.Second)
+				continue
+			}
+			for i := range list.Items {
+				s.handleJobSetWatchEvent(watch.Added, &list.Items[i])
+			}
+			rv = list.ResourceVersion
+			if rv == "" {
+				rv = "0"
+			}
 		}
 
-		w, err := s.jobsetClient.JobsetV1alpha2().JobSets("").Watch(ctx, metav1.ListOptions{
-			ResourceVersion: list.ResourceVersion,
-		})
+		watchOpts := watchOptionsFromSentinel(rv)
+		rv = ""
+		w, err := s.jobsetClient.JobsetV1alpha2().JobSets("").Watch(ctx, watchOpts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -1549,32 +2154,39 @@ func (s *Scraper) watchJobSetsLoop(ctx context.Context) {
 	}
 }
 
-func (s *Scraper) watchWorkloadsLoop(ctx context.Context) {
+func (s *Scraper) watchWorkloadsLoop(ctx context.Context, initialRV string) {
 	if s.kueueClient == nil {
 		return
 	}
+	rv := initialRV
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		list, err := s.kueueClient.KueueV1beta2().Workloads("").List(ctx, metav1.ListOptions{})
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+		if rv == "" {
+			list, err := s.kueueClient.KueueV1beta2().Workloads("").List(ctx, metav1.ListOptions{})
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if !apierrors.IsNotFound(err) {
+					log.Printf("WARN failed to list Kueue Workloads: %v", err)
+				}
+				sleepContext(ctx, 5*time.Second)
+				continue
 			}
-			if !apierrors.IsNotFound(err) {
-				log.Printf("WARN failed to list Kueue Workloads: %v", err)
+			for i := range list.Items {
+				s.handleWorkloadWatchEvent(watch.Added, &list.Items[i])
 			}
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		for i := range list.Items {
-			s.handleWorkloadWatchEvent(watch.Added, &list.Items[i])
+			rv = list.ResourceVersion
+			if rv == "" {
+				rv = "0"
+			}
 		}
 
-		w, err := s.kueueClient.KueueV1beta2().Workloads("").Watch(ctx, metav1.ListOptions{
-			ResourceVersion: list.ResourceVersion,
-		})
+		watchOpts := watchOptionsFromSentinel(rv)
+		rv = ""
+		w, err := s.kueueClient.KueueV1beta2().Workloads("").Watch(ctx, watchOpts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -1606,41 +2218,49 @@ func (s *Scraper) watchDynamicResourceLoop(
 	ctx context.Context,
 	gvr schema.GroupVersionResource,
 	kindName string,
+	initialRV string,
 	handler func(watch.EventType, *unstructured.Unstructured),
 ) {
 	if s.dynamicClient == nil {
 		return
 	}
 	loggedMissingCRD := false
+	rv := initialRV
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		list, err := s.dynamicClient.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if apierrors.IsNotFound(err) {
-				if !loggedMissingCRD {
-					log.Printf("INFO CRD for %s (%s) is not installed on cluster; will retry periodically", kindName, gvr.String())
-					loggedMissingCRD = true
+		if rv == "" {
+			list, err := s.dynamicClient.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				if ctx.Err() != nil {
+					return
 				}
-				sleepContext(ctx, 30*time.Second)
+				if apierrors.IsNotFound(err) {
+					if !loggedMissingCRD {
+						log.Printf("INFO CRD for %s (%s) is not installed on cluster; will retry periodically", kindName, gvr.String())
+						loggedMissingCRD = true
+					}
+					sleepContext(ctx, 30*time.Second)
+					continue
+				}
+				log.Printf("WARN failed to list %s: %v", kindName, err)
+				sleepContext(ctx, 5*time.Second)
 				continue
 			}
-			log.Printf("WARN failed to list %s: %v", kindName, err)
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		loggedMissingCRD = false
-		for i := range list.Items {
-			handler(watch.Added, &list.Items[i])
+			loggedMissingCRD = false
+			for i := range list.Items {
+				handler(watch.Added, &list.Items[i])
+			}
+			rv = list.GetResourceVersion()
+			if rv == "" {
+				rv = "0"
+			}
 		}
 
-		w, err := s.dynamicClient.Resource(gvr).Namespace(metav1.NamespaceAll).Watch(ctx, metav1.ListOptions{
-			ResourceVersion: list.GetResourceVersion(),
-		})
+		watchOpts := watchOptionsFromSentinel(rv)
+		rv = ""
+		w, err := s.dynamicClient.Resource(gvr).Namespace(metav1.NamespaceAll).Watch(ctx, watchOpts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return

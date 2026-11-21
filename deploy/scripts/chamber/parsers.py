@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import math
 import os
 from pathlib import Path
@@ -245,6 +246,69 @@ def parse_k8s_quantity(raw: Any, resource_name: str = "") -> float:
     if resource_name in ("memory", "ephemeral-storage"):
         return base_val / (1024.0**3)
     return base_val
+
+
+def multiply_k8s_quantity_exact(raw: Any, count: int, resource_name: str = "") -> str:
+    """Multiply a per-pod Kubernetes resource.Quantity by integer `count` with exact integer divisibility.
+
+    Guarantees Kueue's `WorkloadWebhook` invariant (`AmountFromQuantity(k, v).RemInt64(count) == 0`),
+    where `cpu` is accounted in integer milliCPU and all other resources in integer whole units/bytes.
+    """
+    if count <= 0:
+        return "0"
+    s = str(raw if raw is not None else "0").strip().strip("\"'").strip()
+    if not s:
+        return "0"
+
+    is_binary = False
+    mult = Decimal(1)
+    num_str = s
+    for suf, factor in BINARY_SI_FACTORS.items():
+        if s.endswith(suf):
+            num_str = s[: -len(suf)]
+            mult = Decimal(int(factor))
+            is_binary = True
+            break
+    else:
+        dec_exponents = {
+            "n": Decimal("1e-9"),
+            "u": Decimal("1e-6"),
+            "m": Decimal("1e-3"),
+            "k": Decimal("1e3"),
+            "M": Decimal("1e6"),
+            "G": Decimal("1e9"),
+            "T": Decimal("1e12"),
+            "P": Decimal("1e15"),
+            "E": Decimal("1e18"),
+        }
+        for suf, dec_mult in dec_exponents.items():
+            if s.endswith(suf):
+                num_str = s[: -len(suf)]
+                mult = dec_mult
+                break
+
+    try:
+        dec_val = Decimal(num_str) * mult
+    except InvalidOperation:
+        dec_val = Decimal(str(parse_k8s_quantity(raw, resource_name)))
+        if resource_name in ("memory", "ephemeral-storage"):
+            dec_val *= Decimal(1024**3)
+            is_binary = True
+
+    if resource_name == "cpu":
+        per_pod_mcpu = int((dec_val * Decimal(1000)).to_integral_value(rounding=ROUND_CEILING))
+        tot_mcpu = per_pod_mcpu * int(count)
+        if tot_mcpu % 1000 == 0:
+            return str(tot_mcpu // 1000)
+        return f"{tot_mcpu}m"
+
+    per_pod_units = int(dec_val.to_integral_value(rounding=ROUND_CEILING))
+    tot_units = per_pod_units * int(count)
+    if is_binary or resource_name in ("memory", "ephemeral-storage") or resource_name.startswith("hugepages-"):
+        for suf, unit_bytes in (("Ti", 1024**4), ("Gi", 1024**3), ("Mi", 1024**2), ("Ki", 1024)):
+            if tot_units > 0 and tot_units % unit_bytes == 0:
+                return f"{tot_units // unit_bytes}{suf}"
+    return str(tot_units)
 
 
 def format_resource_quantity(val: float, resource_name: str = "", *, show_tib_paren: bool = False) -> str:

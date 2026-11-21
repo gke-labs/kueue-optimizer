@@ -331,12 +331,13 @@ def _print_nodes_and_initial_usage(
     node_summary: _ClusterNodeSummary,
     init_usage: _InitialUsageSummary,
 ) -> None:
+    total_init_pods = bundle.initial_workload_pods_count + len(bundle.initial_pods)
     cpu_util_pct = (100.0 * init_usage.cpu_used / node_summary.total_cpu) if node_summary.total_cpu > 0 else 0.0
     mem_util_pct = (
         (100.0 * init_usage.mem_used_gi / node_summary.total_mem_gi) if node_summary.total_mem_gi > 0 else 0.0
     )
     pod_util_pct = (
-        (100.0 * len(bundle.initial_pods) / node_summary.total_pods) if node_summary.total_pods > 0 else 0.0
+        (100.0 * total_init_pods / node_summary.total_pods) if node_summary.total_pods > 0 else 0.0
     )
     active_init_nodes = len([n for n in init_usage.pods_by_node if n != "<unassigned>"])
 
@@ -384,12 +385,21 @@ def _print_nodes_and_initial_usage(
         if bundle.expired_initial_pods_count > 0
         else ""
     )
-    print(
-        f"      Initial Usage at Start: {len(bundle.initial_pods)} running pod(s) in Kueue-excluded namespace "
-        f"'{bundle.infra_pods_namespace}' (kueue.x-k8s.io/exclude=true) across "
-        f"{active_init_nodes}/{len(bundle.nodes)} active node(s) "
-        f"({len(bundle.nodes) - active_init_nodes} idle){expired_note}"
-    )
+    if bundle.initial_workloads:
+        print(
+            f"      Initial Usage at Start: {total_init_pods} running pod(s) "
+            f"({len(bundle.initial_workloads)} pre-admitted Kueue PodGroup workload(s) "
+            f"[{bundle.initial_workload_pods_count} pod(s)] + {len(bundle.initial_pods)} non-Kueue pod(s) in "
+            f"'{bundle.infra_pods_namespace}') across {active_init_nodes}/{len(bundle.nodes)} active node(s) "
+            f"({len(bundle.nodes) - active_init_nodes} idle){expired_note}"
+        )
+    else:
+        print(
+            f"      Initial Usage at Start: {len(bundle.initial_pods)} running pod(s) in Kueue-excluded namespace "
+            f"'{bundle.infra_pods_namespace}' (kueue.x-k8s.io/exclude=true) across "
+            f"{active_init_nodes}/{len(bundle.nodes)} active node(s) "
+            f"({len(bundle.nodes) - active_init_nodes} idle){expired_note}"
+        )
     accel_load_parts: list[str] = []
     for rk, tot_acc in sorted(node_summary.total_accels.items()):
         used_acc = init_usage.accels_used.get(rk, 0)
@@ -399,9 +409,9 @@ def _print_nodes_and_initial_usage(
     print(
         f"      Initial Resource Load : CPU={init_usage.cpu_used:g}/{node_summary.total_cpu:g} cores ({cpu_util_pct:.1f}%), "
         f"Memory={init_usage.mem_used_gi:g}/{node_summary.total_mem_gi:g}Gi ({mem_util_pct:.1f}%), "
-        f"Pods={len(bundle.initial_pods)}/{node_summary.total_pods} ({pod_util_pct:.1f}%){accel_load_str}"
+        f"Pods={total_init_pods}/{node_summary.total_pods} ({pod_util_pct:.1f}%){accel_load_str}"
     )
-    if bundle.initial_pods:
+    if total_init_pods > 0:
         if init_usage.finite_durs:
             fin_str = (
                 f"{len(init_usage.finite_durs)} finite (remaining {min(init_usage.finite_durs):.1f}s .. "
@@ -578,8 +588,9 @@ def print_scenario_outline(
     topo_docs = [d for d in bundle.prereq_and_queue_docs if d.get("kind") == "Topology"]
     cohort_docs = [d for d in bundle.prereq_and_queue_docs if d.get("kind") == "Cohort"]
 
+    all_init_pods = [p for w in bundle.initial_workloads for p in w.pods] + list(bundle.initial_pods)
     node_summary = _summarize_node_groups(bundle.nodes)
-    init_usage = _summarize_initial_pod_usage(bundle.initial_pods)
+    init_usage = _summarize_initial_pod_usage(all_init_pods)
     queue_load = _summarize_queue_load(lq_docs, bundle.scheduled_workflows)
 
     _print_timeline_and_index(bundle, speedup, enable_fair_sharing, reused_chamber)

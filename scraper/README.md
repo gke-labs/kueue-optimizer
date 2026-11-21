@@ -17,7 +17,7 @@ For the complete output format, event envelope, `workloadState` state machine, a
 - **Strict Data Sanitization** (see [`SCRAPER-SCHEMA.md`](SCRAPER-SCHEMA.md) for the full field-by-field specification):
   - **Nodes (`infra.json`)**: Retains only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`), stripping node network/system metadata (`nodeInfo`, `daemonEndpoints`, `addresses`), cached images, attached volumes, cloud/cluster-identifying node labels, and disallowed annotations.
   - **Queues, Cohorts, RuntimeClasses & Topology (`infra.json`)**: `Namespace`, `RuntimeClass`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, and `WorkloadPriorityClass` records omit `.status` (and free-form `WorkloadPriorityClass.description`), `metadata.managedFields`, and disallowed/sensitive annotations.
-  - **Scheduled Pods (`infra.json`)**: Stores **only** node placement, effective resource requests, scheduling time, first notice time, and deletion time.
+  - **Scheduled Pods (`infra.json`)**: Stores **only** node placement, effective resource requests, scheduling time, first notice time, deletion time, and optional sanitized Kueue workload/owner linkage (`workloadName`, `ownerKind`, `ownerName`, `podSetName`, `isTAS`).
   - **Workflow Specs (`workflows.json`)**:
     - Replaces container and Ray sidecar images with a pause image (`registry.k8s.io/pause:3.10` by default) and clears commands, arguments, and environment variables (`env` / `envFrom`).
     - Strips probes, lifecycle hooks, volumes, secrets, credentials, pod/service/network identity fields, `.status`, and `metadata.managedFields`.
@@ -165,7 +165,7 @@ rules:
     resources: ["runtimeclasses"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
