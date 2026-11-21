@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"slices"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
@@ -38,6 +40,7 @@ import (
 const (
 	KueueQueueLabel                       = "kueue.x-k8s.io/queue-name"
 	KueueManagedLabel                     = "kueue.x-k8s.io/managed"
+	KueuePriorityClassLabel               = "kueue.x-k8s.io/priority-class"
 	KueuePrebuiltWorkloadLabel            = "kueue.x-k8s.io/prebuilt-workload-name"
 	KueueJobOwnerNameAnnotation           = "kueue.x-k8s.io/job-owner-name"
 	KueueJobOwnerGVKAnnotation            = "kueue.x-k8s.io/job-owner-gvk"
@@ -52,13 +55,15 @@ const (
 
 // nonHashedKinds lists object kinds whose names must NEVER be hashed even when --hash-names is enabled.
 var nonHashedKinds = map[string]bool{
-	"Namespace":      true,
-	"Node":           true,
-	"ClusterQueue":   true,
-	"Cohort":         true,
-	"LocalQueue":     true,
-	"ResourceFlavor": true,
-	"Topology":       true,
+	"Namespace":             true,
+	"Node":                  true,
+	"ClusterQueue":          true,
+	"Cohort":                true,
+	"LocalQueue":            true,
+	"ResourceFlavor":        true,
+	"Topology":              true,
+	"WorkloadPriorityClass": true,
+	"RuntimeClass":          true,
 }
 
 // labelKeysHoldingWorkloadNames lists label keys (all lowercase) whose values represent
@@ -180,8 +185,9 @@ var hashedLabelKeys = []string{
 // protectedLabelKeys lists Kueue control-plane label keys (all lowercase) whose values must never
 // be hashed even if matched by user-supplied --extra-hash-labels patterns.
 var protectedLabelKeys = map[string]bool{
-	KueueQueueLabel:   true,
-	KueueManagedLabel: true,
+	KueueQueueLabel:         true,
+	KueueManagedLabel:       true,
+	KueuePriorityClassLabel: true,
 }
 
 func isAllowedDomain(domain string) bool {
@@ -316,7 +322,7 @@ func (h hmacSensitiveDataHasher) HashName(val string) string {
 }
 
 // HashNameForKind hashes name only if kind is a workload/pod/job/jobset/etc.
-// Names of namespaces, nodes, queues, cohorts, resource flavors, and topologies are never hashed.
+// Names of namespaces, nodes, queues, cohorts, resource flavors, topologies, workload priority classes, and runtime classes are never hashed.
 func (h hmacSensitiveDataHasher) HashNameForKind(kind, name string) string {
 	if name == "" || nonHashedKinds[kind] {
 		return name
@@ -713,10 +719,12 @@ func SanitizePodTemplateSpec(tpl *corev1.PodTemplateSpec, pauseImage string, has
 func toMapWithoutStatus(obj any) map[string]any {
 	raw, err := json.Marshal(obj)
 	if err != nil {
+		log.Printf("WARN failed to marshal sanitized object %T: %v", obj, err)
 		return nil
 	}
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
+		log.Printf("WARN failed to unmarshal sanitized object %T: %v", obj, err)
 		return nil
 	}
 	delete(m, "status")
@@ -739,6 +747,34 @@ func ExtractLocalQueueName(obj metav1.Object) string {
 		}
 	}
 	return ""
+}
+
+// ExtractDeploymentLocalQueueName returns the Kueue LocalQueue name from a Deployment's
+// metadata or its PodTemplateSpec metadata.
+func ExtractDeploymentLocalQueueName(deploy *appsv1.Deployment) string {
+	if deploy == nil {
+		return ""
+	}
+	if lq := ExtractLocalQueueName(deploy); lq != "" {
+		return lq
+	}
+	return ExtractLocalQueueName(&deploy.Spec.Template.ObjectMeta)
+}
+
+// IsKueueManagedDeployment returns true if the Deployment (or its PodTemplateSpec)
+// is marked to be scheduled with Kueue regardless of namespace.
+func IsKueueManagedDeployment(deploy *appsv1.Deployment) bool {
+	if deploy == nil {
+		return false
+	}
+	if ExtractDeploymentLocalQueueName(deploy) != "" {
+		return true
+	}
+	if (deploy.Labels != nil && deploy.Labels[KueueManagedLabel] == "true") ||
+		(deploy.Spec.Template.Labels != nil && deploy.Spec.Template.Labels[KueueManagedLabel] == "true") {
+		return true
+	}
+	return false
 }
 
 // IsKueueManagedPod returns true if the Pod is marked to be scheduled with Kueue.
@@ -917,9 +953,10 @@ func sanitizeInfraObjectMeta(meta *metav1.ObjectMeta, hasher SensitiveDataHasher
 }
 
 // SanitizeNode prepares a Node for infra.json, retaining only scheduling-relevant spec fields
-// (taints, unschedulable) and status fields (capacity, allocatable, conditions, phase), filtering
-// annotations, stripping cloud/cluster-identifying node labels, and hashing sensitive/--extra-hash-labels values via hasher.
-func SanitizeNode(node *corev1.Node, hasher SensitiveDataHasher) *corev1.Node {
+// (taints, unschedulable) and status fields (capacity, allocatable, conditions, phase), stripping
+// zero-valued nodeInfo and daemonEndpoints from status, filtering annotations, stripping
+// cloud/cluster-identifying node labels, and hashing sensitive/--extra-hash-labels values via hasher.
+func SanitizeNode(node *corev1.Node, hasher SensitiveDataHasher) map[string]any {
 	if node == nil {
 		return nil
 	}
@@ -938,7 +975,21 @@ func SanitizeNode(node *corev1.Node, hasher SensitiveDataHasher) *corev1.Node {
 		Conditions:  cp.Status.Conditions,
 		Phase:       cp.Status.Phase,
 	}
-	return cp
+	raw, err := json.Marshal(cp)
+	if err != nil {
+		log.Printf("WARN failed to marshal sanitized Node %q: %v", cp.Name, err)
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		log.Printf("WARN failed to unmarshal sanitized Node %q: %v", cp.Name, err)
+		return nil
+	}
+	if status, ok := m["status"].(map[string]any); ok {
+		delete(status, "nodeInfo")
+		delete(status, "daemonEndpoints")
+	}
+	return m
 }
 
 // SanitizeNamespace prepares a Namespace for infra.json (filtering annotations, hashing sensitive/--extra-hash-labels values via hasher, and omitting status).
@@ -1008,6 +1059,39 @@ func SanitizeTopology(topo *kueuev1beta2.Topology, hasher SensitiveDataHasher) m
 	cp := topo.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "Topology"}
 	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
+	return toMapWithoutStatus(cp)
+}
+
+// SanitizeWorkloadPriorityClass prepares a WorkloadPriorityClass for infra.json (filtering annotations,
+// hashing sensitive/--extra-hash-labels values via hasher, clearing free-form description, and omitting status).
+func SanitizeWorkloadPriorityClass(wpc *kueuev1beta2.WorkloadPriorityClass, hasher SensitiveDataHasher) map[string]any {
+	if wpc == nil {
+		return nil
+	}
+	cp := wpc.DeepCopy()
+	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "WorkloadPriorityClass"}
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
+	cp.Description = ""
+	return toMapWithoutStatus(cp)
+}
+
+// SanitizeRuntimeClass prepares a RuntimeClass for infra.json (filtering annotations, sanitizing
+// scheduling.nodeSelector and metadata.labels via hasher, and omitting status).
+func SanitizeRuntimeClass(rc *nodev1.RuntimeClass, hasher SensitiveDataHasher) map[string]any {
+	if rc == nil {
+		return nil
+	}
+	cp := rc.DeepCopy()
+	cp.TypeMeta = metav1.TypeMeta{APIVersion: nodev1.SchemeGroupVersion.String(), Kind: "RuntimeClass"}
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
+	if cp.Scheduling != nil {
+		// RuntimeClass scheduling.nodeSelector is a plain labels map (map[string]string) and does
+		// not support matchExpressions, so label map sanitization via SanitizeNodeLabels is sufficient.
+		cp.Scheduling.NodeSelector = SanitizeNodeLabels(cp.Scheduling.NodeSelector, hasher)
+		if len(cp.Scheduling.NodeSelector) == 0 && len(cp.Scheduling.Tolerations) == 0 {
+			cp.Scheduling = nil
+		}
+	}
 	return toMapWithoutStatus(cp)
 }
 

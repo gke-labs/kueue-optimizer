@@ -11,12 +11,12 @@ For the complete output format, event envelope, `workloadState` state machine, a
 ## Features
 
 - **Hybrid Periodic + Watch Recording**:
-  - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, and `Topology` objects, emitting events only when canonical object state changes.
-  - Watches `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, and Kueue `Workload`s in real time to capture exact creation, admission, scheduling, preemption, completion, and deletion timestamps.
+  - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, and `WorkloadPriorityClass`es, emitting events only when canonical object state changes.
+  - Watches `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, Kueue-managed `Deployment`s, `RayJob`s, `RayCluster`s, and Kueue `Workload`s in real time to capture exact creation, admission, scheduling, preemption, completion, and deletion timestamps.
   - Gracefully handles optional CRDs (`JobSet`, `LeaderWorkerSet`, `RayJob`, `RayCluster`, Kueue APIs) if they are not installed on the target cluster, retrying periodically without failing.
 - **Strict Data Sanitization** (see [`SCRAPER-SCHEMA.md`](SCRAPER-SCHEMA.md) for the full field-by-field specification):
-  - **Nodes (`infra.json`)**: Retains only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`), stripping node network/system metadata, cached images, attached volumes, cloud/cluster-identifying node labels, and disallowed annotations.
-  - **Queues, Cohorts & Topology (`infra.json`)**: `Namespace`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, and `Topology` records omit `.status`, `metadata.managedFields`, and disallowed/sensitive annotations.
+  - **Nodes (`infra.json`)**: Retains only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`), stripping node network/system metadata (`nodeInfo`, `daemonEndpoints`, `addresses`), cached images, attached volumes, cloud/cluster-identifying node labels, and disallowed annotations.
+  - **Queues, Cohorts, RuntimeClasses & Topology (`infra.json`)**: `Namespace`, `RuntimeClass`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, and `WorkloadPriorityClass` records omit `.status` (and free-form `WorkloadPriorityClass.description`), `metadata.managedFields`, and disallowed/sensitive annotations.
   - **Scheduled Pods (`infra.json`)**: Stores **only** node placement, effective resource requests, scheduling time, first notice time, and deletion time.
   - **Workflow Specs (`workflows.json`)**:
     - Replaces container and Ray sidecar images with a pause image (`registry.k8s.io/pause:3.10` by default) and clears commands, arguments, and environment variables (`env` / `envFrom`).
@@ -27,7 +27,7 @@ For the complete output format, event envelope, `workloadState` state machine, a
   - When enabled, uses a per-run 256-bit `HMAC-SHA256` key to deterministically hash:
     - **Resource names & references**: Workload, Pod, Job, JobSet, Deployment, LeaderWorkerSet, and Ray object names, along with `ownerReferences` and name-holding annotations.
     - **Label values (keys are never hashed)**: Values of built-in organizational/identity labels (e.g. `owner`, `team`, `customer`, `project`, `cost-center`), workload-referencing labels, and any additional keys or `<domain>/*` patterns passed via `--extra-hash-labels` across metadata, selectors, and affinities.
-  - Infrastructure object names (`Node`, `Namespace`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`) remain in plain text so cluster topology and queue hierarchy stay inspectable.
+  - Infrastructure object names (`Node`, `Namespace`, `RuntimeClass`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, `WorkloadPriorityClass`) remain in plain text so cluster topology and queue hierarchy stay inspectable.
 - **Streaming NDJSON Output**:
   - Appends and `fsync`s one compact JSON object per line with no outer array wrapper, enabling `O(1)`-memory streaming consumption.
 
@@ -123,8 +123,8 @@ Each run produces three append-only **JSON Lines (NDJSON)** files (one compact J
 
 | File | Recorded Resources & Events |
 | :--- | :--- |
-| `infra.json` | `"New"`, `"Update"`, and `"Deleted"` events for sanitized `Node`s (scheduling-relevant `.spec` + `.status`), `Namespace`s, `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects (without `.status`, with annotations filtered), and scheduled/running `Pod` placements and resource requests. |
-| `workflows.json` | Watch-driven `"New"`, `"Update"`, and `"Deleted"` events for `Job`, `JobSet`, `LeaderWorkerSet`, `Deployment`, `RayJob`, `RayCluster`, and standalone Kueue-managed `Pod` specs, annotated with top-level `workloadState` (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`). |
+| `infra.json` | `"New"`, `"Update"`, and `"Deleted"` events for sanitized `Node`s (scheduling-relevant `.spec` + `.status`), `Namespace`s, `RuntimeClass`es, `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es (without `.status`, with annotations filtered), and scheduled/running `Pod` placements and resource requests. |
+| `workflows.json` | Watch-driven `"New"`, `"Update"`, and `"Deleted"` events for `Job`, `JobSet`, `LeaderWorkerSet`, Kueue-managed `Deployment`, `RayJob`, `RayCluster`, and standalone Kueue-managed `Pod` specs, annotated with top-level `workloadState` (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`). |
 | `execution-time.json` | Watch-driven `"Admitted"`, `"PartialExecution"` (preempted), and `"FullExecution"` (completed without preemption) timing records for Kueue `Workload` objects. |
 
 ### Inspecting Traces with `jq`
@@ -161,6 +161,9 @@ rules:
   - apiGroups: [""]
     resources: ["nodes", "namespaces", "pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch"]
@@ -174,6 +177,7 @@ rules:
       - "localqueues"
       - "resourceflavors"
       - "topologies"
+      - "workloadpriorityclasses"
       - "workloads"
     verbs: ["get", "list", "watch"]
   - apiGroups: ["jobset.x-k8s.io"]
