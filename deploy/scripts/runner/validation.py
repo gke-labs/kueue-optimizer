@@ -359,6 +359,7 @@ def _inject_pod_execution_time_and_sanitize_workflow(
     compressed_duration_sec: float,
     pause_image_override: str | None = None,
     override_namespace: str | None = None,
+    extra_pod_annotations: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Prepare a workflow object for submission and inject pod execution duration into all pod templates.
 
@@ -382,6 +383,8 @@ def _inject_pod_execution_time_and_sanitize_workflow(
     ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = exec_str
     ann["kueue-optimizer.gke.io/real-duration-sec"] = f"{raw_duration_sec:.2f}"
     ann["kueue-optimizer.gke.io/compressed-duration-sec"] = f"{compressed_duration_sec:.3f}"
+    if extra_pod_annotations:
+        ann.update({str(k): str(v) for k, v in extra_pod_annotations.items()})
     meta["annotations"] = ann
     labels = dict(meta.get("labels") or {})
     labels["kueue-optimizer.gke.io/testrunner"] = "true"
@@ -422,6 +425,8 @@ def _inject_pod_execution_time_and_sanitize_workflow(
         t_meta = tpl.setdefault("metadata", {})
         t_ann = dict(t_meta.get("annotations") or {})
         t_ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = exec_str
+        if extra_pod_annotations:
+            t_ann.update({str(k): str(v) for k, v in extra_pod_annotations.items()})
         t_meta["annotations"] = t_ann
         t_labels = dict(t_meta.get("labels") or {})
         for r_lbl in RESERVED_POD_LABELS:
@@ -459,6 +464,8 @@ def _inject_pod_execution_time_and_sanitize_workflow(
         t_meta = tpl.setdefault("metadata", {})
         t_ann = dict(t_meta.get("annotations") or {})
         t_ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = exec_str
+        if extra_pod_annotations:
+            t_ann.update({str(k): str(v) for k, v in extra_pod_annotations.items()})
         t_meta["annotations"] = t_ann
         _patch_pod_spec(tpl.setdefault("spec", {}))
 

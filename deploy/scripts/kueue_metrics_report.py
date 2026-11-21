@@ -185,7 +185,7 @@ def main() -> int:
 
     for spec in KUEUE_METRICS_CATALOG:
         if spec.metric_type == MetricType.GAUGE:
-            res = report_gauge(range_by_name.get(spec.name, []), args.start_epoch)
+            res = report_gauge(range_by_name.get(spec.name, []), args.start_epoch, end=args.end_epoch)
             if not res:
                 unrecorded_metrics.append((spec.section, spec.name, spec.metric_type.value))
             for lbl_str, p50, p90, p99, avg in res:
@@ -255,7 +255,7 @@ def main() -> int:
             [[sec, name, mtype] for sec, name, mtype in unrecorded_metrics],
         )
 
-    quota_util_rows = report_aggregated_quota_utilization(range_by_name, args.start_epoch)
+    quota_util_rows = report_aggregated_quota_utilization(range_by_name, args.start_epoch, end=args.end_epoch)
     wait_time_prio_rows = report_aggregated_wait_time_by_priority(end_hist_by_name, start_hist_by_name)
     evict_summary_rows, evict_breakdown_rows = report_aggregated_evictions_and_reclaims(
         range_by_name,

@@ -1196,9 +1196,12 @@ def _build_initial_workloads_and_pods(
         if pc_name and prio_val is None:
             prio_val = 1000 - c_idx
 
-        base_wl_raw = (cand.exec_info.workload_name if cand.exec_info and cand.exec_info.workload_name else "") or (
-            f"pg-{cand.name}" if cand.name else f"pg-init-{c_idx}"
-        )
+        if cand.from_workflows_json and cand.raw_obj:
+            base_wl_raw = f"t0pg-{cand.name}" if cand.name else f"t0pg-init-{c_idx}"
+        else:
+            base_wl_raw = (cand.exec_info.workload_name if cand.exec_info and cand.exec_info.workload_name else "") or (
+                f"pg-{cand.name}" if cand.name else f"pg-init-{c_idx}"
+            )
 
         # Build dynamic resubmit item (`spec.suspend = True`) if parent workflow object is available from workflows.json.
         resubmit_item: ScheduledWorkflowItem | None = None
@@ -1219,6 +1222,7 @@ def _build_initial_workloads_and_pods(
                 compressed_duration_sec=comp_dur_full,
                 pause_image_override=pause_image_override,
                 override_namespace=override_workload_namespace,
+                extra_pod_annotations={"kueue-optimizer.gke.io/preempted-t0-resubmit": "true"},
             )
             resubmit_item = ScheduledWorkflowItem(
                 target_wall_offset_sec=0.0,

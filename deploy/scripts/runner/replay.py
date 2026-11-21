@@ -63,9 +63,15 @@ def apply_scenario_queues_and_wait(
             f"({wl_pod_total} pod(s)) before queue activation...",
             flush=True,
         )
-        mgr.apply_pre_admitted_workloads_parallel(
-            [(w.workload_manifest, w.workload_status) for w in initial_workloads]
-        )
+        bootstrap_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stamped_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for w in initial_workloads:
+            st_copy = json.loads(json.dumps(w.workload_status))
+            for cond in st_copy.get("conditions") or []:
+                if isinstance(cond, dict):
+                    cond["lastTransitionTime"] = bootstrap_iso
+            stamped_pairs.append((w.workload_manifest, st_copy))
+        mgr.apply_pre_admitted_workloads_parallel(stamped_pairs)
         for iwl in initial_workloads[:8]:
             tas_tag = " [TAS]" if iwl.is_tas else ""
             print(
@@ -205,6 +211,11 @@ def run_scenario_replay(
 
     initial_wl_by_key = {(w.namespace, w.workload_name): w for w in bundle.initial_workloads}
     initial_wl_keys = set(initial_wl_by_key.keys())
+    finite_initial_wl_keys = {
+        (w.namespace, w.workload_name)
+        for w in bundle.initial_workloads
+        if not all(p.is_infinite for p in w.pods)
+    }
     resubmitted_initial_wls: set[tuple[str, str]] = set()
 
     total_planned = len(bundle.scheduled_workflows)
@@ -223,7 +234,9 @@ def run_scenario_replay(
 
     start_epoch = time.time()
     t0_mono = time.monotonic()
+    poll_interval_sec = min(status_interval_sec, 0.5)
     next_status_mono = t0_mono
+    next_poll_mono = t0_mono
 
     def _check_and_resubmit_evicted_initial_workloads(
         snap: ClusterStatusSnapshot,
@@ -265,15 +278,21 @@ def run_scenario_replay(
             return max(finished_sched, snap.jobsets_completed + snap.jobsets_failed)
         return max(snap.workloads_finished, snap.jobsets_completed + snap.jobsets_failed)
 
-    def _emit_status(now_mono: float, note: str = "") -> ClusterStatusSnapshot:
+    def _finite_initial_wls_done(snap: ClusterStatusSnapshot) -> bool:
+        for wl_key in finite_initial_wl_keys:
+            if (
+                wl_key in snap.finished_workload_keys
+                or wl_key in resubmitted_initial_wls
+                or wl_key in snap.evicted_workload_keys
+                or (snap.workloads_query_ok and wl_key not in snap.present_workload_keys)
+            ):
+                continue
+            return False
+        return True
+
+    def _print_status_line(snap: ClusterStatusSnapshot, now_mono: float, note: str = "") -> None:
         wall_elapsed = now_mono - t0_mono
         sim_elapsed = wall_elapsed * speedup
-        snap = query_cluster_status(
-            mgr,
-            workload_namespaces=bundle.workload_namespaces,
-            include_kueue_workloads=True,
-        )
-        _check_and_resubmit_evicted_initial_workloads(snap, wall_elapsed)
         if event_heap:
             next_in = max(0.0, event_heap[0].target_wall_offset_sec - wall_elapsed)
             next_str = f"next_in={next_in:.2f}s"
@@ -292,6 +311,20 @@ def run_scenario_replay(
             f"| cqs: {cqs_str}{note_str}",
             flush=True,
         )
+
+    def _poll_cluster(now_mono: float) -> ClusterStatusSnapshot:
+        wall_elapsed = now_mono - t0_mono
+        snap = query_cluster_status(
+            mgr,
+            workload_namespaces=bundle.workload_namespaces,
+            include_kueue_workloads=True,
+        )
+        _check_and_resubmit_evicted_initial_workloads(snap, wall_elapsed)
+        return snap
+
+    def _emit_status(now_mono: float, note: str = "") -> ClusterStatusSnapshot:
+        snap = _poll_cluster(now_mono)
+        _print_status_line(snap, now_mono, note=note)
         return snap
 
     try:
@@ -346,26 +379,48 @@ def run_scenario_replay(
                 continue
 
             now_mono = time.monotonic()
-            if now_mono >= next_status_mono:
-                snap = _emit_status(now_mono)
-                while next_status_mono <= now_mono:
-                    next_status_mono += status_interval_sec
+            due_status = now_mono >= next_status_mono
+            need_fast_poll = (not event_heap) or bool(initial_wl_keys)
+            due_poll = need_fast_poll and now_mono >= next_poll_mono
+            if due_status or due_poll:
+                snap = _poll_cluster(now_mono)
+                status_printed = False
+                if due_status:
+                    _print_status_line(snap, now_mono)
+                    status_printed = True
+                    while next_status_mono <= now_mono:
+                        next_status_mono += status_interval_sec
+                while next_poll_mono <= now_mono:
+                    next_poll_mono += poll_interval_sec
 
                 if not event_heap:
                     if not wait_for_completion:
+                        if not status_printed:
+                            _print_status_line(snap, now_mono)
                         print("==> All scenario workflows submitted (--no-wait-for-completion).", flush=True)
                         break
                     done_count = _scheduled_done_count(snap)
-                    if submitted_count > 0 and done_count >= submitted_count:
+                    init_done = _finite_initial_wls_done(snap)
+                    if submitted_count > 0 and done_count >= submitted_count and init_done:
+                        if not status_printed:
+                            _print_status_line(snap, now_mono)
                         print(f"==> All {submitted_count} submitted scenario workflows completed!", flush=True)
                         break
-                    if submitted_count == 0 and snap.pods_running == 0 and snap.workloads_admitted == 0:
-                        print("==> No pending workflows or running initial pods remaining.", flush=True)
+                    if (
+                        submitted_count == 0
+                        and init_done
+                        and (finite_initial_wl_keys or (snap.pods_running == 0 and snap.workloads_admitted == 0))
+                    ):
+                        if not status_printed:
+                            _print_status_line(snap, now_mono)
+                        print("==> No pending workflows or running finite initial workloads remaining.", flush=True)
                         break
 
             now_mono = time.monotonic()
             wall_elapsed = now_mono - t0_mono
             wake_candidates = [next_status_mono - now_mono]
+            if (not event_heap) or initial_wl_keys:
+                wake_candidates.append(next_poll_mono - now_mono)
             if event_heap:
                 wake_candidates.append(event_heap[0].target_wall_offset_sec - wall_elapsed)
             if max_run_seconds is not None and max_run_seconds > 0:

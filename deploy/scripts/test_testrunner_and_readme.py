@@ -1481,6 +1481,125 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
         finally:
             mgr.close()
 
+    def test_finite_vs_infinite_initial_t0_workload_completion_gating_and_self_test_sync(self) -> None:
+        """Finite t0 PodGroup workloads hold replay open until finished, while infinite t0 PodGroups do not block."""
+        import subprocess
+        import sys
+        from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot
+
+        repo_root = REPO_ROOT
+        chk = subprocess.run(
+            [sys.executable, str(repo_root / "testscenarios/self-tests/generate_self_test_suite.py"), "--check"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(chk.returncode, 0, msg=f"Self-test suite out of sync:\n{chk.stdout}\n{chk.stderr}")
+
+        # Verify st37 loader output uses t0pg- prefix and injects preempted-t0-resubmit annotation on resubmit_item
+        st37_bundle = testrunner.load_scenario_bundle(
+            scenario_dir=repo_root / "testscenarios/self-tests/st37-t0-preempt-within-cq-lower-priority-resubmit",
+            skip_initial_offset=False,
+        )
+        self.assertEqual(len(st37_bundle.initial_workloads), 8)
+        for iwl in st37_bundle.initial_workloads:
+            self.assertTrue(iwl.workload_name.startswith("t0pg-"), iwl.workload_name)
+            self.assertIsNotNone(iwl.resubmit_item)
+            self.assertEqual(
+                iwl.resubmit_item.manifest["metadata"]["annotations"].get("kueue-optimizer.gke.io/preempted-t0-resubmit"),
+                "true",
+            )
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-t0-gate", apiserver_port=16498)
+        try:
+            finite_pod = testrunner.InitialPodSpec(
+                name="fin-p0",
+                namespace="ai-lab",
+                placement="node-0",
+                resource_request={"cpu": "4"},
+                remaining_duration_sec=10.0,
+                is_infinite=False,
+                manifest={},
+            )
+            inf_pod = testrunner.InitialPodSpec(
+                name="inf-p0",
+                namespace="ai-lab",
+                placement="node-1",
+                resource_request={"cpu": "4"},
+                remaining_duration_sec=864000.0,
+                is_infinite=True,
+                manifest={},
+            )
+            iwl_fin = testrunner.InitialWorkloadPodGroup(
+                workload_name="t0pg-fin-0",
+                namespace="ai-lab",
+                local_queue_name="lq-a",
+                cluster_queue_name="cq-a",
+                owner_kind="JobSet",
+                owner_name="fin-0",
+                priority_class_name="",
+                priority=0,
+                is_tas=False,
+                pods=[finite_pod],
+                workload_manifest={},
+                workload_status={},
+            )
+            iwl_inf = testrunner.InitialWorkloadPodGroup(
+                workload_name="t0pg-inf-0",
+                namespace="ai-lab",
+                local_queue_name="lq-a",
+                cluster_queue_name="cq-a",
+                owner_kind="Deployment",
+                owner_name="inf-0",
+                priority_class_name="",
+                priority=0,
+                is_tas=False,
+                pods=[inf_pod],
+                workload_manifest={},
+                workload_status={},
+            )
+            bundle = testrunner.load_scenario_bundle(scenario_dir=repo_root / "testscenarios/demo")
+            bundle.initial_workloads = [iwl_fin, iwl_inf]
+            bundle.initial_pods = []
+            bundle.scheduled_workflows = []
+            snaps = [
+                # Poll #1: finite t0pg-fin-0 still running -> must NOT exit yet!
+                ClusterStatusSnapshot(
+                    workloads_admitted=2,
+                    workloads_finished=0,
+                    workloads_query_ok=True,
+                    present_workload_keys={("ai-lab", "t0pg-fin-0"), ("ai-lab", "t0pg-inf-0")},
+                    finished_workload_keys=set(),
+                    pods_running=2,
+                ),
+                # Poll #2: t0pg-fin-0 finished while infinite t0pg-inf-0 stays running -> MUST exit cleanly now!
+                ClusterStatusSnapshot(
+                    workloads_admitted=1,
+                    workloads_finished=1,
+                    workloads_query_ok=True,
+                    present_workload_keys={("ai-lab", "t0pg-fin-0"), ("ai-lab", "t0pg-inf-0")},
+                    finished_workload_keys={("ai-lab", "t0pg-fin-0")},
+                    pods_running=1,
+                ),
+            ]
+            with (
+                mock.patch("runner.replay.query_cluster_status", side_effect=snaps) as m_qcs,
+                mock.patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                testrunner.run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle,
+                    speedup=1.0,
+                    max_run_seconds=10.0,
+                    status_interval_sec=0.02,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+            self.assertEqual(m_qcs.call_count, 2)
+        finally:
+            mgr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,20 @@ Always include the updated `README.md` file(s) alongside your scenario or script
 
 ---
 
+## Keep the 45-Scenario Self-Test Suite (`testscenarios/self-tests/`) Synchronized & Cross-Examined
+
+All 45 scenarios in `testscenarios/self-tests/` (`st01`–`st45`, covering baseline calibration, queueing & TAS, intra-CQ preemption, Cohort borrowing/reclaim, Fair Sharing, resource/admission edge cases, and `t0` initial-workload bootstrap, preemption, Fair Sharing, and Cohort reclaims), their per-scenario `AGENTS.md` guides, the suite-level `testscenarios/self-tests/AGENTS.md`, and `testscenarios/self-tests/README.md` are auto-generated from `testscenarios/self-tests/generate_self_test_suite.py`.
+
+1. **Always pair and cross-examine runs in separate isolated chambers**: Follow `testscenarios/self-tests/AGENTS.md` and each scenario's local `AGENTS.md` — execute each test side-by-side with its designated paired counterpart(s) in **separate isolated `kueue-optimizer` chambers** (`--namespace kueue-optimizer-chamber-stXX --port 164XX` per scenario, up to 7 parallel chambers; never reuse a single chamber across scenarios with `--skip-chamber-deploy`) and cross-check the expected directional and numerical shifts across Sections `5.1`–`5.4`.
+2. **Never allow drift**: Whenever `generate_self_test_suite.py`, any scenario definition, or any pairing rule is modified (or suspected of drift), run the full synchronization and check pipeline:
+   ```bash
+   python3 testscenarios/self-tests/generate_self_test_suite.py
+   python3 deploy/scripts/generate_scenario_readme.py --all
+   python3 testscenarios/self-tests/generate_self_test_suite.py --check
+   ```
+
+---
+
 ## Use "`kueue-optimizer` Chambers" (Never "KWOK Chambers") & Enforce Per-Run Isolation
 
 **Mandatory rule:** Across all documentation, reports, commit messages, code comments, and agent responses, always refer to the isolated evaluation environments as **`kueue-optimizer` chambers** (or **`kueue-optimizer` evaluation chambers**, e.g. `--namespace kueue-optimizer-chamber-<id>`) — **never** refer to them as `"KWOK chambers"` or `"KWOK + Kueue + JobSet chambers"`.

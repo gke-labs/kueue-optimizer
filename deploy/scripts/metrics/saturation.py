@@ -471,6 +471,19 @@ def _accumulate_kueue_workloads(
         # Case 3: Interrupted by preemption/reclaim/eviction/failure vs never-admitted (Pending)
         has_admission_record = bool((st.get("admission") or {}).get("clusterQueue"))
         has_started_pods = any(ph in ("Running", "Succeeded", "Failed") for ph in pod_phases)
+        is_resubmitted_t0_preemption = str(
+            (meta.get("annotations") or {}).get("kueue-optimizer.gke.io/preempted-t0-resubmit") or ""
+        ).lower() == "true" or any(
+            isinstance(ps, dict)
+            and str(
+                (((ps.get("template") or {}).get("metadata") or {}).get("annotations") or {}).get(
+                    "kueue-optimizer.gke.io/preempted-t0-resubmit"
+                )
+                or ""
+            ).lower()
+            == "true"
+            for ps in ((wl.get("spec") or {}).get("podSets") or [])
+        )
         was_ever_admitted_or_evicted = (
             is_admitted_true
             or has_admission_record
@@ -480,6 +493,7 @@ def _accumulate_kueue_workloads(
             or is_failed_finish
             or has_failed_pods
             or requeue_cnt > 0
+            or is_resubmitted_t0_preemption
         )
         if was_ever_admitted_or_evicted:
             acc.cnt_excluded_interrupted += 1
