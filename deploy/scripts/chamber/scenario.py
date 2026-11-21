@@ -195,6 +195,69 @@ def index_execution_times(
     return idx
 
 
+def _container_requests(container: dict[str, Any], include_ephemeral_storage: bool) -> dict[str, float]:
+    """Return the requests of a container, defaulting each missing request to its limit as a Pod does."""
+    res_block = container.get("resources") or {}
+    eff_reqs = {**(res_block.get("limits") or {}), **(res_block.get("requests") or {})}
+    return {
+        rk: parse_k8s_quantity(rv, rk)
+        for rk, rv in eff_reqs.items()
+        if include_ephemeral_storage or rk != "ephemeral-storage"
+    }
+
+
+def _aggregate_container_requests(p_spec: dict[str, Any], include_ephemeral_storage: bool) -> dict[str, float]:
+    """Return the requests of the containers and init containers together.
+
+    Sidecars (init containers with restartPolicy Always) keep running next to the containers.
+    Every other init container runs before them, next to the sidecars listed before it.
+    """
+    total: dict[str, float] = {}
+    for c in p_spec.get("containers") or []:
+        if isinstance(c, dict):
+            for rk, rv in _container_requests(c, include_ephemeral_storage).items():
+                total[rk] = total.get(rk, 0.0) + rv
+
+    sidecars: dict[str, float] = {}
+    init_peak: dict[str, float] = {}
+    for ic in p_spec.get("initContainers") or []:
+        if not isinstance(ic, dict):
+            continue
+        reqs = _container_requests(ic, include_ephemeral_storage)
+        if ic.get("restartPolicy") == "Always":
+            for rk, rv in reqs.items():
+                total[rk] = total.get(rk, 0.0) + rv
+                sidecars[rk] = sidecars.get(rk, 0.0) + rv
+            init_use = sidecars
+        else:
+            init_use = {rk: reqs.get(rk, 0.0) + sidecars.get(rk, 0.0) for rk in reqs.keys() | sidecars.keys()}
+        for rk, rv in init_use.items():
+            init_peak[rk] = max(init_peak.get(rk, 0.0), rv)
+
+    for rk, rv in init_peak.items():
+        total[rk] = max(total.get(rk, 0.0), rv)
+    return total
+
+
+def _pod_level_requests(p_spec: dict[str, Any], container_reqs: dict[str, float]) -> dict[str, float]:
+    """Return the pod-level requests that replace container_reqs in a Pod created from p_spec.
+
+    Only cpu, memory and hugepages count at pod level. A pod-level limit without a request
+    becomes the request, unless the containers already request that cpu or memory.
+    """
+    pod_res = p_spec.get("resources") or {}
+    pod_reqs = dict(pod_res.get("requests") or {})
+    for rk, rv in (pod_res.get("limits") or {}).items():
+        # For a cpu or memory the containers request, the API server uses container_reqs: no change.
+        if rk not in pod_reqs and not (rk in ("cpu", "memory") and rk in container_reqs):
+            pod_reqs[rk] = rv
+    return {
+        rk: parse_k8s_quantity(rv, rk)
+        for rk, rv in pod_reqs.items()
+        if rk in ("cpu", "memory") or rk.startswith("hugepages-")
+    }
+
+
 def extract_pod_spec_resources(
     p_spec: dict[str, Any] | None,
     *,
@@ -202,33 +265,16 @@ def extract_pod_spec_resources(
 ) -> dict[str, float]:
     """Compute effective per-pod resource requests from a Kubernetes PodSpec.
 
-    Follows exact Kubernetes / Kueue resource semantics:
+    Follows resource.PodRequests from k8s.io/component-helpers for a Pod created from the spec:
       - Each container resource defaults to limits[rk] when omitted from requests[rk] ({**limits, **requests}).
-      - Regular containers are summed across the pod; each initContainer takes max(current, init_req).
+      - Containers and sidecars are summed; each other initContainer counts with the sidecars listed before it.
+      - Pod-level spec.resources replace the result for cpu, memory and hugepages.
       - Pod overhead (spec.overhead), if present, is added once per pod.
     """
     if not isinstance(p_spec, dict):
         return {}
-    per_pod: dict[str, float] = {}
-    for c in p_spec.get("containers") or []:
-        if not isinstance(c, dict):
-            continue
-        res_block = c.get("resources") or {}
-        eff_reqs = {**(res_block.get("limits") or {}), **(res_block.get("requests") or {})}
-        for rk, rv in eff_reqs.items():
-            if not include_ephemeral_storage and rk == "ephemeral-storage":
-                continue
-            per_pod[rk] = per_pod.get(rk, 0.0) + parse_k8s_quantity(rv, rk)
-
-    for ic in p_spec.get("initContainers") or []:
-        if not isinstance(ic, dict):
-            continue
-        res_block = ic.get("resources") or {}
-        eff_reqs = {**(res_block.get("limits") or {}), **(res_block.get("requests") or {})}
-        for rk, rv in eff_reqs.items():
-            if not include_ephemeral_storage and rk == "ephemeral-storage":
-                continue
-            per_pod[rk] = max(per_pod.get(rk, 0.0), parse_k8s_quantity(rv, rk))
+    per_pod = _aggregate_container_requests(p_spec, include_ephemeral_storage)
+    per_pod.update(_pod_level_requests(p_spec, per_pod))
 
     overhead = p_spec.get("overhead") or {}
     if isinstance(overhead, dict):
