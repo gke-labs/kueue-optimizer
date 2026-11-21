@@ -32,20 +32,26 @@ Every **`kueue-optimizer` chamber** runs a complete, isolated virtual cluster co
 ├── README.md                                      # Architecture overview, directory map & quick-start guide
 ├── TESTRUNNER.md                                  # Reference guide for testrunner.py & kueue_metrics_report.py (Sections 5.1–5.4)
 ├── Makefile                                       # Chamber deployment, scenario replay, demo & test targets
+├── pyproject.toml                                 # Ruff lint & Python 3.12+ configuration
 ├── deploy/                                        # Chamber Kustomize manifests & Python orchestration tooling
 │   ├── kustomization.yaml                         # Default entrypoint (namespace: kueue-optimizer-chamber-01 + sample queues)
 │   ├── base/                                      # Core per-chamber control-plane manifests, configs & bootstrap CRDs
 │   ├── overlays/with-sample-queues/               # Sample Namespace, ResourceFlavor, ClusterQueue & LocalQueue
 │   └── scripts/
-│       ├── chamber_common.py                      # ChamberManager, auto-PKI/kubeconfig, registry plumbing & SSA helpers
+│       ├── chamber/                               # Shared chamber package (constants, parsers, YAML, PKI, manifests, k8s client, registry, lifecycle, CLI)
+│       ├── metrics/                               # Prometheus client, catalog, table formatting, Sections 5.1–5.3 aggregations & Section 5.4 saturation
+│       ├── runner/                                # Scenario validation, loader, terminal outline & timed replay engine
+│       ├── scenario_readme/                       # Scenario analysis, histograms & Markdown README section renderers
+│       ├── chamber_common.py                      # CLI entrypoint & backwards-compatible re-export facade for chamber/
 │       ├── chamber_registry.py                    # Per-chamber in-memory OCI registry CLI (status/push/build-kueue/delete/gc)
-│       ├── testrunner.py                          # End-to-end scenario replay & evaluation engine
-│       ├── kueue_metrics_report.py                # Aggregated Prometheus & physical saturation reporter (Sections 5.1–5.4)
+│       ├── testrunner.py                          # End-to-end scenario replay & evaluation CLI entrypoint
+│       ├── kueue_metrics_report.py                # Aggregated Prometheus & physical saturation reporter CLI (Sections 5.1–5.4)
 │       ├── demo.py                                # Synthetic 10-node, 20-JobSet smoke test & demo runner
 │       ├── generate_scenario_readme.py            # Auto-generates per-scenario README.md summaries (--all or single dir)
 │       ├── generate.sh                            # Regenerates embedded manifests from ./kwok, ./kueue, and ./jobset
 │       ├── test_chamber_registry.py               # Unit tests for per-chamber OCI registry & NodePort allocation
 │       ├── test_kueue_metrics_report.py           # Unit tests for Sections 5.1–5.4 metrics & saturation accounting
+│       ├── test_refactor_packages.py              # Unit tests for chamber, metrics, runner & scenario_readme package boundaries
 │       └── test_testrunner_and_readme.py          # Unit tests for testrunner, generate_scenario_readme & shared helpers
 ├── testscenarios/
 │   └── demo/                                      # Baseline 3-file scenario bundle (infra.json, workflows.json, execution-time.json)

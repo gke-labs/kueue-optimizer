@@ -51,6 +51,7 @@ from chamber_common import (
     env_int,
     env_str,
     format_kwok_pod_duration,
+    managed_chamber,
     normalize_queueing_strategy,
     parse_duration_seconds,
     query_cluster_status,
@@ -590,11 +591,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     should_cleanup_chamber = not args.no_cleanup
-    run_succeeded = False
-    try:
-        if not args.skip_chamber_deploy:
-            mgr.deploy_chamber(initial_nodes=node_docs)
-
+    with managed_chamber(
+        mgr,
+        skip_deploy=args.skip_chamber_deploy,
+        should_cleanup=should_cleanup_chamber,
+        initial_nodes=node_docs,
+    ):
         print(
             f"==> Connecting to the chamber's KWOK kube-apiserver on localhost:{args.port}...",
             flush=True,
@@ -666,23 +668,6 @@ def main(argv: list[str] | None = None) -> int:
             total_pods=total_workload_pods,
             wait_for_scrape=True,
         )
-        run_succeeded = True
-    finally:
-        if should_cleanup_chamber and run_succeeded:
-            print("", flush=True)
-            mgr.cleanup_chamber()
-        elif should_cleanup_chamber and mgr.created_namespace_in_this_run:
-            print("", flush=True)
-            try:
-                mgr.cleanup_chamber()
-            except Exception as cleanup_exc:
-                print(
-                    f"WARNING: Chamber cleanup after error failed for '{args.namespace}': {cleanup_exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        else:
-            mgr.close()
 
     if should_cleanup_chamber:
         return 0

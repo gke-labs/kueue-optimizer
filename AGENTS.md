@@ -8,7 +8,7 @@ Every test scenario directory under `testscenarios/` (any directory containing `
 
 1. **Direct test scenario edits:** You create, edit, or regenerate `infra.json`, `workflows.json`, or `execution-time.json` in any scenario directory.
 2. **Generator script runs/changes:** You modify or run any script that generates or mutates scenario JSON files (for example `deploy/scripts/demo.py` or a scenario's `generate_scenario.py`).
-3. **Summary script changes:** You modify `deploy/scripts/generate_scenario_readme.py` itself (in this case, always re-run with `--all` so all scenario `README.md` files stay consistent).
+3. **Summary script changes:** You modify `deploy/scripts/generate_scenario_readme.py` or its implementation package `deploy/scripts/scenario_readme/` (in this case, always re-run with `--all` so all scenario `README.md` files stay consistent).
 4. **New scenarios or drift detected:** You add a new scenario directory, notice a missing `README.md`, or have any reason to suspect a scenario's `README.md` is out of sync with its JSON inputs.
 
 ### How to Regenerate
@@ -17,12 +17,12 @@ Every test scenario directory under `testscenarios/` (any directory containing `
   ```bash
   python3 deploy/scripts/generate_scenario_readme.py testscenarios/<path/to/scenario>
   ```
-- **All scenario directories across the repository** (when multiple scenarios or `deploy/scripts/generate_scenario_readme.py` changed):
+- **All scenario directories across the repository** (when multiple scenarios, `deploy/scripts/generate_scenario_readme.py`, or `deploy/scripts/scenario_readme/` changed):
   ```bash
   python3 deploy/scripts/generate_scenario_readme.py --all
   ```
 
-Always include the updated `README.md` file(s) alongside your scenario or script changes (and in the same commit when committing). Never hand-edit the auto-generated sections of a scenario `README.md` without updating `deploy/scripts/generate_scenario_readme.py` and re-running it.
+Always include the updated `README.md` file(s) alongside your scenario or script changes (and in the same commit when committing). Never hand-edit the auto-generated sections of a scenario `README.md` without updating the generator (`deploy/scripts/generate_scenario_readme.py` and `deploy/scripts/scenario_readme/`) and re-running it.
 
 ---
 
@@ -79,10 +79,10 @@ Every isolated evaluation chamber (`--namespace kueue-optimizer-chamber-<id>`) r
 
 **Mandatory rule:** Whenever you make significant changes to chamber orchestration, scenario schemas, scenario generation/README tooling, or metrics evaluation, you MUST review and update both `skills/chamber-evaluation/SKILL.md` and `skills/generate-testscenario/SKILL.md` in the same change/commit so all repository skills stay 100% accurate and current:
 
-1. **Testrunner or Chamber Manager changes:** CLI flags, time-compression/duration logic, port-forwarding rules, prerequisite CR synthesis (`RuntimeClass`, `Topology`, `ResourceFlavor`, `Cohort`, `WorkloadPriorityClass`), or `infra-pods` handling in `deploy/scripts/testrunner.py` or `deploy/scripts/chamber_common.py`.
+1. **Testrunner or Chamber Manager changes:** CLI flags, time-compression/duration logic, port-forwarding rules, prerequisite CR synthesis (`RuntimeClass`, `Topology`, `ResourceFlavor`, `Cohort`, `WorkloadPriorityClass`), or `infra-pods` handling in `deploy/scripts/testrunner.py`, `deploy/scripts/runner/`, `deploy/scripts/chamber_common.py`, or `deploy/scripts/chamber/`.
 2. **Chamber deployment or manifest changes:** Control-plane topology, component versions, KWOK stage rules, or bootstrap manifests in `deploy/base/`, `deploy/overlays/`, or `deploy/scripts/generate.sh`.
-3. **Metrics report changes:** Formulas, columns, sections (`5.1`–`5.4`), subtitles, or workload classification rules in `deploy/scripts/kueue_metrics_report.py`.
-4. **Scenario schema, generator, or methodology changes:** `scraper/SCRAPER-SCHEMA.md`, `deploy/scripts/generate_scenario_readme.py`, scenario directory conventions, or per-scenario `AGENTS.md` requirements.
+3. **Metrics report changes:** Formulas, columns, sections (`5.1`–`5.4`), subtitles, or workload classification rules in `deploy/scripts/kueue_metrics_report.py` or `deploy/scripts/metrics/`.
+4. **Scenario schema, generator, or methodology changes:** `scraper/SCRAPER-SCHEMA.md`, `deploy/scripts/generate_scenario_readme.py`, `deploy/scripts/scenario_readme/`, scenario directory conventions, or per-scenario `AGENTS.md` requirements.
 
 ---
 

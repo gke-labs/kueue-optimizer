@@ -351,7 +351,7 @@ class ChamberLifecycleAndManifestSafetyTests(unittest.TestCase):
                 captured_patterns.append(cmd[-1])
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
-            with mock.patch("chamber_common.subprocess.run", side_effect=fake_run):
+            with mock.patch("chamber.k8s_client.subprocess.run", side_effect=fake_run):
                 mgr._pkill_chamber_port_forward("kwok-kube-apiserver", "16443:6443")
 
             self.assertEqual(len(captured_patterns), 1)
