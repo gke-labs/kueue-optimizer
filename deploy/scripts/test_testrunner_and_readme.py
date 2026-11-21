@@ -37,6 +37,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from chamber_common import (
     ChamberManager,
     build_cluster_queue_manifest,
+    extract_pod_spec_resources,
     extract_workflow_pods_and_requests,
     format_pod_execution_seconds,
     index_execution_times,
@@ -141,6 +142,64 @@ class SharedHelpersAndFormattingTests(unittest.TestCase):
         self.assertAlmostEqual(total_reqs["memory"], 50.0)
         # 6 pods * 4 TPUs (from limits) = 24 TPUs
         self.assertAlmostEqual(total_reqs["google.com/tpu"], 24.0)
+
+    def test_extract_pod_spec_resources_matches_kubernetes_pod_requests(self) -> None:
+        def ctr(**reqs: str) -> dict:
+            return {"resources": {"requests": reqs}}
+
+        def sidecar(**reqs: str) -> dict:
+            return {**ctr(**reqs), "restartPolicy": "Always"}
+
+        cases = [
+            (
+                "a sidecar listed after an init container does not run with it",
+                {"initContainers": [ctr(cpu="10"), sidecar(cpu="2")], "containers": [ctr(cpu="1")]},
+                {"cpu": 10.0},
+            ),
+            (
+                "a sidecar listed before an init container runs with it",
+                {"initContainers": [sidecar(cpu="2"), ctr(cpu="10")], "containers": [ctr(cpu="1")]},
+                {"cpu": 12.0},
+            ),
+            (
+                "a sidecar runs with the containers",
+                {"initContainers": [sidecar(cpu="1")], "containers": [ctr(cpu="1")]},
+                {"cpu": 2.0},
+            ),
+            (
+                "pod-level requests replace the container sum",
+                {"resources": {"requests": {"cpu": "4"}}, "containers": [ctr(cpu="1", memory="1Gi")]},
+                {"cpu": 4.0, "memory": 1.0},
+            ),
+            (
+                "a pod-level limit sets the request when no container requests it",
+                {"resources": {"limits": {"cpu": "4"}}, "containers": [ctr(memory="1Gi")]},
+                {"cpu": 4.0, "memory": 1.0},
+            ),
+            (
+                "a pod-level limit leaves a cpu request at the container sum",
+                {"resources": {"limits": {"cpu": "4"}}, "containers": [ctr(cpu="1")]},
+                {"cpu": 1.0},
+            ),
+            (
+                "a pod-level hugepages limit sets the request even when containers request hugepages",
+                {"resources": {"limits": {"hugepages-2Mi": "4Mi"}}, "containers": [ctr(**{"hugepages-2Mi": "2Mi"})]},
+                {"hugepages-2Mi": 4.0 * 1024**2},
+            ),
+            (
+                "pod-level resources other than cpu, memory and hugepages are ignored",
+                {"resources": {"requests": {"ephemeral-storage": "8Gi"}}, "containers": [ctr(cpu="1")]},
+                {"cpu": 1.0},
+            ),
+            (
+                "overhead is added to pod-level requests",
+                {"resources": {"requests": {"cpu": "4"}}, "overhead": {"cpu": "500m"}, "containers": [ctr(cpu="1")]},
+                {"cpu": 4.5},
+            ),
+        ]
+        for name, spec, want in cases:
+            with self.subTest(name):
+                self.assertEqual(extract_pod_spec_resources(spec, include_ephemeral_storage=True), want)
 
     def test_execution_time_index_preserves_namespace_and_annotation_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
