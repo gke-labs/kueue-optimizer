@@ -32,6 +32,7 @@ import (
 	nodev1 "k8s.io/api/node/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	resourcehelper "k8s.io/component-helpers/resource"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 	kueuev1beta2 "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
@@ -832,63 +833,21 @@ func IsScheduledAndRunningPod(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodRunning
 }
 
-// ComputePodResourceRequest calculates the effective pod resource requests:
-// max(pod.Spec.Resources.Requests, max(initContainer.Requests), sum(container.Requests)) + pod.Spec.Overhead.
+// ComputePodResourceRequest returns the effective resource requests of the pod spec,
+// computed with resource.PodRequests, the helper kube-scheduler uses. Because a sidecar
+// (an init container with restartPolicy Always) keeps running once started, it adds to
+// the containers and to the init containers listed after it, but not to those before it.
 func ComputePodResourceRequest(pod *corev1.Pod) corev1.ResourceList {
-	reqs := corev1.ResourceList{}
 	if pod == nil {
-		return reqs
+		return corev1.ResourceList{}
 	}
+	reqs := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{ExcludeOverhead: true})
 
-	// Sum regular container requests.
-	for _, c := range pod.Spec.Containers {
-		for rName, qty := range c.Resources.Requests {
-			cur := reqs[rName]
-			cur.Add(qty)
-			reqs[rName] = cur
-		}
-	}
-
-	// Account for init containers (sidecar init containers with RestartPolicy=Always add to running requests;
-	// standard init containers take the max per resource).
-	var sidecarReqs corev1.ResourceList
-	for _, ic := range pod.Spec.InitContainers {
-		if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
-			if sidecarReqs == nil {
-				sidecarReqs = corev1.ResourceList{}
-			}
-			for rName, qty := range ic.Resources.Requests {
-				cur := sidecarReqs[rName]
-				cur.Add(qty)
-				sidecarReqs[rName] = cur
-			}
-		} else {
-			for rName, qty := range ic.Resources.Requests {
-				if cur, ok := reqs[rName]; !ok || qty.Cmp(cur) > 0 {
-					reqs[rName] = qty.DeepCopy()
-				}
-			}
-		}
-	}
-	for rName, qty := range sidecarReqs {
-		cur := reqs[rName]
-		cur.Add(qty)
-		reqs[rName] = cur
-	}
-
-	// If pod-level resources are specified, take the max with container sum.
-	if pod.Spec.Resources != nil {
-		for rName, qty := range pod.Spec.Resources.Requests {
-			if cur, ok := reqs[rName]; !ok || qty.Cmp(cur) > 0 {
-				reqs[rName] = qty.DeepCopy()
-			}
-		}
-	}
-
-	// Add Pod Overhead if present.
+	// Add the overhead here so zero entries are skipped. reqs may hold the pod's own
+	// pod-level quantities, so add to a copy rather than to them.
 	for rName, qty := range pod.Spec.Overhead {
 		if !qty.IsZero() {
-			cur := reqs[rName]
+			cur := reqs[rName].DeepCopy()
 			cur.Add(qty)
 			reqs[rName] = cur
 		}
@@ -897,8 +856,7 @@ func ComputePodResourceRequest(pod *corev1.Pod) corev1.ResourceList {
 	// Normalize quantities to clean canonical string representations.
 	normalized := make(corev1.ResourceList, len(reqs))
 	for rName, qty := range reqs {
-		parsed := resource.MustParse(qty.String())
-		normalized[rName] = parsed
+		normalized[rName] = resource.MustParse(qty.String())
 	}
 	return normalized
 }

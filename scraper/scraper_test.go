@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1145,6 +1146,99 @@ func TestPodSpecProbesLifecycleAndIdentitySanitization(t *testing.T) {
 	}
 	if gotCPU := spec.Containers[0].Resources.Requests[corev1.ResourceCPU]; !gotCPU.Equal(resource.MustParse("1")) {
 		t.Errorf("expected container CPU request to be preserved, got %v", gotCPU)
+	}
+}
+
+func TestComputePodResourceRequest(t *testing.T) {
+	container := func(name string, requests corev1.ResourceList) corev1.Container {
+		return corev1.Container{Name: name, Resources: corev1.ResourceRequirements{Requests: requests}}
+	}
+	sidecar := func(name string, requests corev1.ResourceList) corev1.Container {
+		c := container(name, requests)
+		c.RestartPolicy = new(corev1.ContainerRestartPolicyAlways)
+		return c
+	}
+	cpu := func(v string) corev1.ResourceList {
+		return corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(v)}
+	}
+	cpuMem := func(c, m string) corev1.ResourceList {
+		return corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(c), corev1.ResourceMemory: resource.MustParse(m)}
+	}
+
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want corev1.ResourceList
+	}{
+		{
+			name: "nil pod has no requests",
+			pod:  nil,
+			want: corev1.ResourceList{},
+		},
+		{
+			name: "sidecar listed after an init container does not add to its peak",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{container("init", cpuMem("4", "1Gi")), sidecar("sidecar", cpuMem("1", "2Gi"))},
+				Containers:     []corev1.Container{container("main", cpuMem("1", "1Gi"))},
+			}},
+			want: cpuMem("4", "3Gi"),
+		},
+		{
+			name: "sidecar listed before an init container adds to its peak",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{sidecar("sidecar", cpu("1")), container("init", cpu("4"))},
+				Containers:     []corev1.Container{container("main", cpu("1"))},
+			}},
+			want: cpu("5"),
+		},
+		{
+			name: "sidecar adds to the regular containers",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{sidecar("sidecar", cpu("2"))},
+				Containers:     []corev1.Container{container("main", cpu("1"))},
+			}},
+			want: cpu("3"),
+		},
+		{
+			name: "pod overhead is added",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{container("main", cpu("1"))},
+				Overhead:   cpu("250m"),
+			}},
+			want: cpu("1250m"),
+		},
+		{
+			name: "zero overhead entry adds no resource",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{container("main", cpu("1"))},
+				Overhead:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("0")},
+			}},
+			want: cpu("1"),
+		},
+		{
+			name: "pod-level request sets its resource",
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{container("main", cpuMem("1", "1Gi"))},
+				Resources:  &corev1.ResourceRequirements{Requests: cpu("4")},
+			}},
+			want: cpuMem("4", "1Gi"),
+		},
+	}
+
+	asStrings := func(l corev1.ResourceList) map[corev1.ResourceName]string {
+		out := make(map[corev1.ResourceName]string, len(l))
+		for rName, qty := range l {
+			out[rName] = qty.String()
+		}
+		return out
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, want := asStrings(ComputePodResourceRequest(tc.pod)), asStrings(tc.want)
+			if !maps.Equal(got, want) {
+				t.Errorf("ComputePodResourceRequest() = %v, want %v", got, want)
+			}
+		})
 	}
 }
 
