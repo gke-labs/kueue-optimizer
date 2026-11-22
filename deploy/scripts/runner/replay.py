@@ -234,7 +234,8 @@ def run_scenario_replay(
 
     start_epoch = time.time()
     t0_mono = time.monotonic()
-    poll_interval_sec = min(status_interval_sec, 0.5)
+    fast_poll_floor = 1.5 if (total_planned + len(initial_wl_keys)) > 200 else 0.5
+    poll_interval_sec = min(status_interval_sec, fast_poll_floor)
     next_status_mono = t0_mono
     next_poll_mono = t0_mono
 
@@ -344,11 +345,11 @@ def run_scenario_replay(
             due_batch: list[ScheduledWorkflowItem] = []
             while event_heap and event_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
                 due_batch.append(heapq.heappop(event_heap))
-                if len(due_batch) >= 100:
+                if len(due_batch) >= 200:
                     break
 
             if due_batch:
-                mgr.apply_manifests_parallel([item.manifest for item in due_batch], max_workers=12)
+                mgr.apply_manifests_parallel([item.manifest for item in due_batch], max_workers=24)
                 now_off = time.monotonic() - t0_mono
                 for item in due_batch:
                     submitted_count += 1

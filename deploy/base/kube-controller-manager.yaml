@@ -47,6 +47,7 @@ spec:
         - --service-account-private-key-file=/etc/kubernetes/pki/admin.key
         - --kube-api-qps=5000
         - --kube-api-burst=10000
+        - --concurrent-job-syncs=32
         ports:
         - name: https
           containerPort: 10257

@@ -187,32 +187,44 @@ func NewScraper(
 // executes an initial scrape immediately, starts real-time watch loops resuming from the
 // captured ResourceVersions, and then scrapes periodically every cfg.Interval until ctx is canceled.
 func (s *Scraper) Run(ctx context.Context) error {
+	// Capture a single unified t0 timestamp across the entire synchronous startup List()
+	// barrier and initial ScrapeOnce so all t0 infrastructure, pod, workflow, and
+	// execution-time events share identical t0 alignment even on large (>1,000-workload) clusters.
+	startupTime := time.Now().UTC()
+
 	// 1. Synchronously index existing Kueue Workloads first so ownerStates, ownerToWorkload,
 	// workloadToOwner, workloadIsTAS, and Admitted records exist before workflow and pod events.
-	workloadsRV := s.syncInitialWorkloads(ctx)
+	workloadsRV := s.syncInitialWorkloads(ctx, startupTime)
 
 	// 2. Synchronously index top-level parent workflows (JobSets, RayJobs) so child Jobs/RayClusters
 	// and Pods inherit LocalQueue and parent owner mappings deterministically.
-	jobSetsRV := s.syncInitialJobSets(ctx)
+	jobSetsRV := s.syncInitialJobSets(ctx, startupTime)
 	var rayJobsRV, lwsRV, rayClustersRV string
 	if s.dynamicClient != nil {
-		rayJobsRV = s.syncInitialDynamicResource(ctx, rayJobGVR, "RayJob", s.handleRayJobUnstructured)
+		rayJobsRV = s.syncInitialDynamicResource(ctx, rayJobGVR, "RayJob", func(et watch.EventType, u *unstructured.Unstructured) {
+			s.handleRayJobUnstructuredAt(et, u, startupTime, true)
+		})
 	}
 
 	// 3. Synchronously index single-tier and child workflows (Jobs, Deployments, ReplicaSets, LWS, RayClusters).
-	jobsRV := s.syncInitialJobs(ctx)
-	deploymentsRV := s.syncInitialDeployments(ctx)
+	jobsRV := s.syncInitialJobs(ctx, startupTime)
+	deploymentsRV := s.syncInitialDeployments(ctx, startupTime)
 	replicaSetsRV := s.syncInitialReplicaSets(ctx)
 	if s.dynamicClient != nil {
-		lwsRV = s.syncInitialDynamicResource(ctx, lwsGVR, "LeaderWorkerSet", s.handleLeaderWorkerSetUnstructured)
-		rayClustersRV = s.syncInitialDynamicResource(ctx, rayClusterGVR, "RayCluster", s.handleRayClusterUnstructured)
+		lwsRV = s.syncInitialDynamicResource(ctx, lwsGVR, "LeaderWorkerSet", func(et watch.EventType, u *unstructured.Unstructured) {
+			s.handleLeaderWorkerSetUnstructuredAt(et, u, startupTime, true)
+		})
+		rayClustersRV = s.syncInitialDynamicResource(ctx, rayClusterGVR, "RayCluster", func(et watch.EventType, u *unstructured.Unstructured) {
+			s.handleRayClusterUnstructuredAt(et, u, startupTime, true)
+		})
 	}
 
 	// 4. Synchronously index existing Pods after all Workload and workflow ownership maps are warm.
-	podsRV := s.syncInitialPods(ctx)
+	podsRV, initialPods := s.syncInitialPods(ctx, startupTime)
 
-	// 5. Run initial periodic infrastructure & scheduled-pod scrape immediately with full linkage.
-	s.ScrapeOnce(ctx)
+	// 5. Run initial periodic infrastructure & scheduled-pod scrape immediately at startupTime,
+	// reusing initialPods to avoid a redundant cluster-wide Pod List() at startup.
+	s.scrapeOnceAt(ctx, startupTime, initialPods)
 
 	var wg sync.WaitGroup
 	startWatcher := func(fn func(context.Context)) {
@@ -253,6 +265,7 @@ func (s *Scraper) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			wg.Wait()
+			s.syncLogs()
 			return nil
 		case <-ticker.C:
 			s.ScrapeOnce(ctx)
@@ -260,11 +273,26 @@ func (s *Scraper) Run(ctx context.Context) error {
 	}
 }
 
+func (s *Scraper) syncLogs() {
+	if s.infraLog != nil {
+		_ = s.infraLog.Sync()
+	}
+	if s.workflowsLog != nil {
+		_ = s.workflowsLog.Sync()
+	}
+	if s.execTimeLog != nil {
+		_ = s.execTimeLog.Sync()
+	}
+}
+
 // ScrapeOnce executes a single periodic scrape of Nodes, Namespaces, RuntimeClasses,
 // ClusterQueues, Cohorts, LocalQueues, ResourceFlavors, Topologies, WorkloadPriorityClasses,
 // and Scheduled/Running Pods.
 func (s *Scraper) ScrapeOnce(ctx context.Context) {
-	now := time.Now().UTC()
+	s.scrapeOnceAt(ctx, time.Now().UTC(), nil)
+}
+
+func (s *Scraper) scrapeOnceAt(ctx context.Context, now time.Time, prelistedPods []corev1.Pod) {
 	s.scrapeNodes(ctx, now)
 	s.scrapeNamespaces(ctx, now)
 	s.scrapeRuntimeClasses(ctx, now)
@@ -276,7 +304,8 @@ func (s *Scraper) ScrapeOnce(ctx context.Context) {
 		s.scrapeTopologies(ctx, now)
 		s.scrapeWorkloadPriorityClasses(ctx, now)
 	}
-	s.scrapeScheduledAndRunningPods(ctx, now)
+	s.scrapeScheduledAndRunningPodsWithList(ctx, now, prelistedPods)
+	s.syncLogs()
 }
 
 func canonicalDigest(payload any) string {
@@ -557,29 +586,45 @@ func (s *Scraper) scrapeRuntimeClasses(ctx context.Context, now time.Time) {
 }
 
 func (s *Scraper) scrapeScheduledAndRunningPods(ctx context.Context, now time.Time) {
-	if s.kubeClient == nil {
+	s.scrapeScheduledAndRunningPodsWithList(ctx, now, nil)
+}
+
+func (s *Scraper) scrapeScheduledAndRunningPodsWithList(ctx context.Context, now time.Time, prelistedPods []corev1.Pod) {
+	if s.kubeClient == nil && prelistedPods == nil {
 		return
 	}
-	list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.Printf("WARN failed to list Pods: %v", err)
-		return
+	var items []corev1.Pod
+	if prelistedPods != nil {
+		items = prelistedPods
+	} else {
+		list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+		if err != nil {
+			log.Printf("WARN failed to list Pods: %v", err)
+			return
+		}
+		items = list.Items
 	}
 
 	var events []InfraEvent
+	presentActive := make(map[string]bool, len(items))
+	terminalPods := make(map[string]*corev1.Pod)
+
 	s.mu.Lock()
-	for i := range list.Items {
-		pod := &list.Items[i]
-		if !IsScheduledAndRunningPod(pod) {
-			continue
-		}
-		ev := s.observeScheduledRunningPodLocked(pod, now)
-		if ev != nil {
-			events = append(events, *ev)
+	for i := range items {
+		pod := &items[i]
+		key := pod.Namespace + "/" + pod.Name
+		if IsScheduledAndRunningPod(pod) {
+			presentActive[key] = true
+			ev := s.observeScheduledRunningPodLocked(pod, now)
+			if ev != nil {
+				events = append(events, *ev)
+			}
+		} else if IsTerminalPod(pod) || (pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero()) {
+			terminalPods[key] = pod
 		}
 	}
-	// Also emit "new" for any pods that were observed scheduled & running by the watch
-	// between periodic scrape intervals and completed before this scrape tick.
+	// Emit "new" for any pods observed scheduled & running by the watch before completing,
+	// and emit "deleted" for any previously emitted pods that terminated or disappeared across watch reconnects.
 	podKeys := make([]string, 0, len(s.podStates))
 	for k := range s.podStates {
 		podKeys = append(podKeys, k)
@@ -587,13 +632,43 @@ func (s *Scraper) scrapeScheduledAndRunningPods(ctx context.Context, now time.Ti
 	sort.Strings(podKeys)
 	for _, k := range podKeys {
 		st := s.podStates[k]
-		if !st.deleted && !st.emittedNew && st.lastPayload.Placement != "" {
+		if st.deleted {
+			continue
+		}
+		if !st.emittedNew && st.lastPayload.Placement != "" {
 			st.emittedNew = true
 			st.lastDigest = canonicalDigest(st.lastPayload)
 			events = append(events, InfraEvent{
 				Timestamp: now,
 				EventType: EventNew,
 				Payload:   st.lastPayload,
+			})
+		}
+		if st.emittedNew && !presentActive[k] {
+			endTime := now
+			var delPayload ScrapedPodPayload
+			if termPod, ok := terminalPods[k]; ok {
+				endTime = ExtractPodEndTime(termPod, now)
+				linkage := s.resolvePodWorkloadLinkageLocked(termPod)
+				delPayload = BuildScrapedPodPayloadWithLinkage(termPod, st.firstNoticeTime, &endTime, linkage, s.hasher)
+				if delPayload.Placement == "" && st.lastPayload.Placement != "" {
+					delPayload.Placement = st.lastPayload.Placement
+				}
+				if delPayload.SchedulingTime == nil && st.lastPayload.SchedulingTime != nil {
+					delPayload.SchedulingTime = st.lastPayload.SchedulingTime
+				}
+				mergePreservedPodLinkage(&delPayload, st.lastPayload)
+			} else {
+				delPayload = st.lastPayload
+				t := metav1.NewTime(endTime.UTC())
+				delPayload.DeletionTime = &t
+			}
+			st.deleted = true
+			st.lastPayload = ScrapedPodPayload{}
+			events = append(events, InfraEvent{
+				Timestamp: now,
+				EventType: EventDeleted,
+				Payload:   delPayload,
 			})
 		}
 	}
@@ -849,14 +924,17 @@ func (s *Scraper) observeScheduledRunningPodLocked(pod *corev1.Pod, now time.Tim
 }
 
 func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod) {
+	s.handlePodWatchEventAt(eventType, pod, time.Now().UTC(), false)
+}
+
+func (s *Scraper) handlePodWatchEventAt(eventType watch.EventType, pod *corev1.Pod, now time.Time, isInitialSync bool) {
 	if pod == nil {
 		return
 	}
-	now := time.Now().UTC()
 
 	// 1. If this Pod is a standalone Kueue-managed Pod (not owned by Job/JobSet/LWS/Deployment/Ray),
-	// record it in workflows.json.
-	if IsStandaloneKueuePod(pod) {
+	// record it in workflows.json (skipping pre-t0 historical Succeeded/Failed tombstones during initial sync).
+	if IsStandaloneKueuePod(pod) && !(isInitialSync && IsTerminalPod(pod)) {
 		var hasAdmissionGate, hasTopologyGate bool
 		for _, g := range pod.Spec.SchedulingGates {
 			if g.Name == KueueAdmissionGateName {
@@ -882,45 +960,80 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 		)
 	}
 
-	// 2. Track scheduled/running Pod lifecycle and deletion time for infra.json.
+	// 2. Track scheduled/running Pod lifecycle and completion/deletion time for infra.json.
 	key := pod.Namespace + "/" + pod.Name
 	var infraEvents []InfraEvent
 
 	s.mu.Lock()
 	switch eventType {
 	case watch.Added, watch.Modified:
-		if pod.Spec.NodeName != "" {
-			if _, ok := s.podStates[key]; !ok {
-				s.podStates[key] = &trackedPodState{
+		if IsScheduledAndRunningPod(pod) {
+			st, ok := s.podStates[key]
+			if !ok {
+				st = &trackedPodState{
 					firstNoticeTime: now,
 				}
+				s.podStates[key] = st
 			}
-		}
-		if IsScheduledAndRunningPod(pod) {
-			st := s.podStates[key]
-			// Keep lastPayload fresh so if the pod is deleted or finishes before the next
-			// periodic scrape we still have its exact placement, resource request, and initial scheduling time.
-			prev := st.lastPayload
-			linkage := s.resolvePodWorkloadLinkageLocked(pod)
-			st.lastPayload = BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, nil, linkage, s.hasher)
-			if prev.SchedulingTime != nil {
-				st.lastPayload.SchedulingTime = prev.SchedulingTime
+			if !st.deleted {
+				// Keep lastPayload fresh so if the pod is deleted or finishes before the next
+				// periodic scrape we still have its exact placement, resource request, and initial scheduling time.
+				prev := st.lastPayload
+				linkage := s.resolvePodWorkloadLinkageLocked(pod)
+				st.lastPayload = BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, nil, linkage, s.hasher)
+				if prev.SchedulingTime != nil {
+					st.lastPayload.SchedulingTime = prev.SchedulingTime
+				}
+				mergePreservedPodLinkage(&st.lastPayload, prev)
 			}
-			mergePreservedPodLinkage(&st.lastPayload, prev)
+		} else if !isInitialSync && (IsTerminalPod(pod) || (pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero())) {
+			// In both vanilla Kubernetes and chambers, Job/JobSet/PodGroup pods transition to
+			// Succeeded/Failed when done while remaining in etcd; emit EventDeleted immediately
+			// when a tracked running pod releases its node resources.
+			st, ok := s.podStates[key]
+			if ok && !st.deleted && (st.emittedNew || st.lastPayload.Placement != "") {
+				endTime := ExtractPodEndTime(pod, now)
+				linkage := s.resolvePodWorkloadLinkageLocked(pod)
+				if !st.emittedNew {
+					newPayload := st.lastPayload
+					if newPayload.Name == "" {
+						newPayload = BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, nil, linkage, s.hasher)
+					}
+					st.emittedNew = true
+					st.lastPayload = newPayload
+					infraEvents = append(infraEvents, InfraEvent{
+						Timestamp: st.firstNoticeTime,
+						EventType: EventNew,
+						Payload:   newPayload,
+					})
+				}
+				delPayload := BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, &endTime, linkage, s.hasher)
+				if delPayload.Placement == "" && st.lastPayload.Placement != "" {
+					delPayload.Placement = st.lastPayload.Placement
+				}
+				if delPayload.SchedulingTime == nil && st.lastPayload.SchedulingTime != nil {
+					delPayload.SchedulingTime = st.lastPayload.SchedulingTime
+				}
+				mergePreservedPodLinkage(&delPayload, st.lastPayload)
+				st.deleted = true
+				st.lastPayload = ScrapedPodPayload{}
+				infraEvents = append(infraEvents, InfraEvent{
+					Timestamp: now,
+					EventType: EventDeleted,
+					Payload:   delPayload,
+				})
+			}
 		}
 	case watch.Deleted:
 		st, ok := s.podStates[key]
-		if !ok && pod.Spec.NodeName != "" {
+		if !ok && pod.Spec.NodeName != "" && !IsTerminalPod(pod) {
 			st = &trackedPodState{
 				firstNoticeTime: now,
 			}
 			s.podStates[key] = st
 		}
 		if st != nil && !st.deleted && (st.emittedNew || pod.Spec.NodeName != "" || st.lastPayload.Placement != "") {
-			delTime := now
-			if pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero() {
-				delTime = pod.DeletionTimestamp.Time.UTC()
-			}
+			delTime := ExtractPodEndTime(pod, now)
 			linkage := s.resolvePodWorkloadLinkageLocked(pod)
 			// If the pod ran and was deleted between periodic scrapes, emit its "New" event first
 			// so its creation/placement is also present in infra.json.
@@ -952,8 +1065,8 @@ func (s *Scraper) handlePodWatchEvent(eventType watch.EventType, pod *corev1.Pod
 				EventType: EventDeleted,
 				Payload:   delPayload,
 			})
-			delete(s.podStates, key)
 		}
+		delete(s.podStates, key)
 	}
 	s.mu.Unlock()
 
@@ -1111,11 +1224,47 @@ func (s *Scraper) recordWorkflowEvent(
 	}
 }
 
+func isTerminalBatchJob(job *batchv1.Job) bool {
+	if job == nil {
+		return false
+	}
+	for _, c := range job.Status.Conditions {
+		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func isTerminalJobSet(js *jobsetv1alpha2.JobSet) bool {
+	if js == nil {
+		return false
+	}
+	for _, c := range js.Status.Conditions {
+		if (c.Type == string(jobsetv1alpha2.JobSetCompleted) || c.Type == string(jobsetv1alpha2.JobSetFailed)) &&
+			c.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func isTerminalRayJob(rj *rayv1.RayJob) bool {
+	if rj == nil {
+		return false
+	}
+	return rj.Status.JobDeploymentStatus == rayv1.JobDeploymentStatusComplete ||
+		rj.Status.JobDeploymentStatus == rayv1.JobDeploymentStatusFailed
+}
+
 func (s *Scraper) handleJobWatchEvent(eventType watch.EventType, job *batchv1.Job) {
+	s.handleJobWatchEventAt(eventType, job, time.Now().UTC(), false)
+}
+
+func (s *Scraper) handleJobWatchEventAt(eventType watch.EventType, job *batchv1.Job, now time.Time, isInitialSync bool) {
 	if job == nil {
 		return
 	}
-	now := time.Now().UTC()
 	lq := ExtractLocalQueueName(job)
 	var parentJobSet string
 	for _, ref := range job.OwnerReferences {
@@ -1137,6 +1286,10 @@ func (s *Scraper) handleJobWatchEvent(eventType watch.EventType, job *batchv1.Jo
 			s.jobToJobSet[job.Namespace+"/"+job.Name] = parentJobSet
 		}
 	}
+	if isInitialSync && isTerminalBatchJob(job) {
+		s.mu.Unlock()
+		return
+	}
 	if lq == "" && parentJobSet != "" {
 		if q, ok := s.jobSetQueues[job.Namespace+"/"+parentJobSet]; ok {
 			lq = q
@@ -1150,16 +1303,23 @@ func (s *Scraper) handleJobWatchEvent(eventType watch.EventType, job *batchv1.Jo
 }
 
 func (s *Scraper) handleJobSetWatchEvent(eventType watch.EventType, js *jobsetv1alpha2.JobSet) {
+	s.handleJobSetWatchEventAt(eventType, js, time.Now().UTC(), false)
+}
+
+func (s *Scraper) handleJobSetWatchEventAt(eventType watch.EventType, js *jobsetv1alpha2.JobSet, now time.Time, isInitialSync bool) {
 	if js == nil {
 		return
 	}
-	now := time.Now().UTC()
 	lq := ExtractLocalQueueName(js)
 	suspended := js.Spec.Suspend != nil && *js.Spec.Suspend
 
 	s.mu.Lock()
 	if lq != "" {
 		s.jobSetQueues[js.Namespace+"/"+js.Name] = lq
+	}
+	if isInitialSync && isTerminalJobSet(js) {
+		s.mu.Unlock()
+		return
 	}
 	wlState := s.determineSuspendableWorkloadStateLocked("JobSet", js.Namespace, js.Name, suspended, "")
 	s.mu.Unlock()
@@ -1179,10 +1339,13 @@ func (s *Scraper) shouldSkipDeployment(deploy *appsv1.Deployment) bool {
 }
 
 func (s *Scraper) handleDeploymentWatchEvent(eventType watch.EventType, deploy *appsv1.Deployment) {
+	s.handleDeploymentWatchEventAt(eventType, deploy, time.Now().UTC())
+}
+
+func (s *Scraper) handleDeploymentWatchEventAt(eventType watch.EventType, deploy *appsv1.Deployment, now time.Time) {
 	if deploy == nil || s.shouldSkipDeployment(deploy) {
 		return
 	}
-	now := time.Now().UTC()
 	lq := ExtractDeploymentLocalQueueName(deploy)
 	s.mu.Lock()
 	wlState := s.determineGroupWorkloadStateLocked("Deployment", deploy.Namespace, deploy.Name, deploy.Status.ReadyReplicas, deploy.Status.Replicas)
@@ -1193,10 +1356,13 @@ func (s *Scraper) handleDeploymentWatchEvent(eventType watch.EventType, deploy *
 }
 
 func (s *Scraper) handleLeaderWorkerSetWatchEvent(eventType watch.EventType, lws *leaderworkersetv1.LeaderWorkerSet) {
+	s.handleLeaderWorkerSetWatchEventAt(eventType, lws, time.Now().UTC())
+}
+
+func (s *Scraper) handleLeaderWorkerSetWatchEventAt(eventType watch.EventType, lws *leaderworkersetv1.LeaderWorkerSet, now time.Time) {
 	if lws == nil {
 		return
 	}
-	now := time.Now().UTC()
 	lq := ExtractLocalQueueName(lws)
 	if lq == "" && lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Labels != nil {
 		lq = lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Labels[KueueQueueLabel]
@@ -1210,10 +1376,13 @@ func (s *Scraper) handleLeaderWorkerSetWatchEvent(eventType watch.EventType, lws
 }
 
 func (s *Scraper) handleRayJobWatchEvent(eventType watch.EventType, rj *rayv1.RayJob) {
-	if rj == nil {
+	s.handleRayJobWatchEventAt(eventType, rj, time.Now().UTC(), false)
+}
+
+func (s *Scraper) handleRayJobWatchEventAt(eventType watch.EventType, rj *rayv1.RayJob, now time.Time, isInitialSync bool) {
+	if rj == nil || (isInitialSync && isTerminalRayJob(rj)) {
 		return
 	}
-	now := time.Now().UTC()
 	lq := ExtractLocalQueueName(rj)
 	s.mu.Lock()
 	wlState := s.determineSuspendableWorkloadStateLocked("RayJob", rj.Namespace, rj.Name, rj.Spec.Suspend, "")
@@ -1251,10 +1420,13 @@ func (s *Scraper) handleReplicaSetWatchEvent(eventType watch.EventType, rs *apps
 }
 
 func (s *Scraper) handleRayClusterWatchEvent(eventType watch.EventType, rc *rayv1.RayCluster) {
+	s.handleRayClusterWatchEventAt(eventType, rc, time.Now().UTC())
+}
+
+func (s *Scraper) handleRayClusterWatchEventAt(eventType watch.EventType, rc *rayv1.RayCluster, now time.Time) {
 	if rc == nil {
 		return
 	}
-	now := time.Now().UTC()
 	lq := ExtractLocalQueueName(rc)
 	var parentRayJob string
 	for _, ref := range rc.OwnerReferences {
@@ -1280,6 +1452,10 @@ func (s *Scraper) handleRayClusterWatchEvent(eventType watch.EventType, rc *rayv
 }
 
 func (s *Scraper) handleLeaderWorkerSetUnstructured(eventType watch.EventType, u *unstructured.Unstructured) {
+	s.handleLeaderWorkerSetUnstructuredAt(eventType, u, time.Now().UTC(), false)
+}
+
+func (s *Scraper) handleLeaderWorkerSetUnstructuredAt(eventType watch.EventType, u *unstructured.Unstructured, now time.Time, _ bool) {
 	if u == nil {
 		return
 	}
@@ -1288,10 +1464,14 @@ func (s *Scraper) handleLeaderWorkerSetUnstructured(eventType watch.EventType, u
 		log.Printf("WARN failed to convert unstructured LeaderWorkerSet %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 		return
 	}
-	s.handleLeaderWorkerSetWatchEvent(eventType, &lws)
+	s.handleLeaderWorkerSetWatchEventAt(eventType, &lws, now)
 }
 
 func (s *Scraper) handleRayJobUnstructured(eventType watch.EventType, u *unstructured.Unstructured) {
+	s.handleRayJobUnstructuredAt(eventType, u, time.Now().UTC(), false)
+}
+
+func (s *Scraper) handleRayJobUnstructuredAt(eventType watch.EventType, u *unstructured.Unstructured, now time.Time, isInitialSync bool) {
 	if u == nil {
 		return
 	}
@@ -1300,10 +1480,14 @@ func (s *Scraper) handleRayJobUnstructured(eventType watch.EventType, u *unstruc
 		log.Printf("WARN failed to convert unstructured RayJob %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 		return
 	}
-	s.handleRayJobWatchEvent(eventType, &rj)
+	s.handleRayJobWatchEventAt(eventType, &rj, now, isInitialSync)
 }
 
 func (s *Scraper) handleRayClusterUnstructured(eventType watch.EventType, u *unstructured.Unstructured) {
+	s.handleRayClusterUnstructuredAt(eventType, u, time.Now().UTC(), false)
+}
+
+func (s *Scraper) handleRayClusterUnstructuredAt(eventType watch.EventType, u *unstructured.Unstructured, now time.Time, _ bool) {
 	if u == nil {
 		return
 	}
@@ -1312,7 +1496,7 @@ func (s *Scraper) handleRayClusterUnstructured(eventType watch.EventType, u *uns
 		log.Printf("WARN failed to convert unstructured RayCluster %s/%s: %v", u.GetNamespace(), u.GetName(), err)
 		return
 	}
-	s.handleRayClusterWatchEvent(eventType, &rc)
+	s.handleRayClusterWatchEventAt(eventType, &rc, now)
 }
 
 func resolveWorkloadOwner(wl *kueuev1beta2.Workload, hasher SensitiveDataHasher) (ownerKind, ownerName, ownerAPIVersion string) {
@@ -1382,6 +1566,10 @@ func workloadUsesTAS(wl *kueuev1beta2.Workload) bool {
 // PartialExecution (when preempted), and FullExecution (when finished without preemption,
 // or when clean completion wins a race against in-flight preemption) records into execution-time.json.
 func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev1beta2.Workload) {
+	s.handleWorkloadWatchEventAt(eventType, wl, time.Now().UTC())
+}
+
+func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueuev1beta2.Workload, now time.Time) {
 	if wl == nil {
 		return
 	}
@@ -1394,7 +1582,6 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 		s.mu.Unlock()
 		return
 	}
-	now := time.Now().UTC()
 
 	rawOwnerKind, rawOwnerName, _ := resolveWorkloadOwner(wl, NoopHasher{})
 	if rawOwnerKind == "" || rawOwnerName == "" {
@@ -1716,7 +1903,7 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 	}
 }
 
-func (s *Scraper) syncInitialWorkloads(ctx context.Context) string {
+func (s *Scraper) syncInitialWorkloads(ctx context.Context, now time.Time) string {
 	if s.kueueClient == nil || ctx.Err() != nil {
 		return ""
 	}
@@ -1728,7 +1915,7 @@ func (s *Scraper) syncInitialWorkloads(ctx context.Context) string {
 		return ""
 	}
 	for i := range list.Items {
-		s.handleWorkloadWatchEvent(watch.Added, &list.Items[i])
+		s.handleWorkloadWatchEventAt(watch.Added, &list.Items[i], now)
 	}
 	if list.ResourceVersion != "" {
 		return list.ResourceVersion
@@ -1736,7 +1923,7 @@ func (s *Scraper) syncInitialWorkloads(ctx context.Context) string {
 	return "0"
 }
 
-func (s *Scraper) syncInitialJobSets(ctx context.Context) string {
+func (s *Scraper) syncInitialJobSets(ctx context.Context, now time.Time) string {
 	if s.jobsetClient == nil || ctx.Err() != nil {
 		return ""
 	}
@@ -1748,7 +1935,7 @@ func (s *Scraper) syncInitialJobSets(ctx context.Context) string {
 		return ""
 	}
 	for i := range list.Items {
-		s.handleJobSetWatchEvent(watch.Added, &list.Items[i])
+		s.handleJobSetWatchEventAt(watch.Added, &list.Items[i], now, true)
 	}
 	if list.ResourceVersion != "" {
 		return list.ResourceVersion
@@ -1756,7 +1943,7 @@ func (s *Scraper) syncInitialJobSets(ctx context.Context) string {
 	return "0"
 }
 
-func (s *Scraper) syncInitialJobs(ctx context.Context) string {
+func (s *Scraper) syncInitialJobs(ctx context.Context, now time.Time) string {
 	if s.kubeClient == nil || ctx.Err() != nil {
 		return ""
 	}
@@ -1766,7 +1953,7 @@ func (s *Scraper) syncInitialJobs(ctx context.Context) string {
 		return ""
 	}
 	for i := range list.Items {
-		s.handleJobWatchEvent(watch.Added, &list.Items[i])
+		s.handleJobWatchEventAt(watch.Added, &list.Items[i], now, true)
 	}
 	if list.ResourceVersion != "" {
 		return list.ResourceVersion
@@ -1774,7 +1961,7 @@ func (s *Scraper) syncInitialJobs(ctx context.Context) string {
 	return "0"
 }
 
-func (s *Scraper) syncInitialDeployments(ctx context.Context) string {
+func (s *Scraper) syncInitialDeployments(ctx context.Context, now time.Time) string {
 	if s.kubeClient == nil || ctx.Err() != nil {
 		return ""
 	}
@@ -1784,7 +1971,7 @@ func (s *Scraper) syncInitialDeployments(ctx context.Context) string {
 		return ""
 	}
 	for i := range list.Items {
-		s.handleDeploymentWatchEvent(watch.Added, &list.Items[i])
+		s.handleDeploymentWatchEventAt(watch.Added, &list.Items[i], now)
 	}
 	if list.ResourceVersion != "" {
 		return list.ResourceVersion
@@ -1810,22 +1997,22 @@ func (s *Scraper) syncInitialReplicaSets(ctx context.Context) string {
 	return "0"
 }
 
-func (s *Scraper) syncInitialPods(ctx context.Context) string {
+func (s *Scraper) syncInitialPods(ctx context.Context, now time.Time) (string, []corev1.Pod) {
 	if s.kubeClient == nil || ctx.Err() != nil {
-		return ""
+		return "", nil
 	}
 	list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("WARN failed to list Pods at startup: %v", err)
-		return ""
+		return "", nil
 	}
 	for i := range list.Items {
-		s.handlePodWatchEvent(watch.Added, &list.Items[i])
+		s.handlePodWatchEventAt(watch.Added, &list.Items[i], now, true)
 	}
 	if list.ResourceVersion != "" {
-		return list.ResourceVersion
+		return list.ResourceVersion, list.Items
 	}
-	return "0"
+	return "0", list.Items
 }
 
 func (s *Scraper) syncInitialDynamicResource(

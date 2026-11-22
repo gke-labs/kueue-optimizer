@@ -28,8 +28,8 @@ For the complete output format, event envelope, `workloadState` state machine, a
     - **Resource names & references**: Workload, Pod, Job, JobSet, Deployment, LeaderWorkerSet, and Ray object names, along with `ownerReferences` and name-holding annotations.
     - **Label values (keys are never hashed)**: Values of built-in organizational/identity labels (e.g. `owner`, `team`, `customer`, `project`, `cost-center`), workload-referencing labels, and any additional keys or `<domain>/*` patterns passed via `--extra-hash-labels` across metadata, selectors, and affinities.
   - Infrastructure object names (`Node`, `Namespace`, `RuntimeClass`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, `WorkloadPriorityClass`) remain in plain text so cluster topology and queue hierarchy stay inspectable.
-- **Streaming NDJSON Output**:
-  - Appends and `fsync`s one compact JSON object per line with no outer array wrapper, enabling `O(1)`-memory streaming consumption.
+- **Streaming NDJSON Output & Unified `t0` Startup Barrier**:
+  - Executes all initial `List()` barriers (`Workload`s, `JobSet`s, `Job`s, `Deployment`s, dynamic CRDs, `Pod`s, `Node`s, and Kueue queues/topologies) against a single unified `t0` timestamp (skipping pre-`t0` already-terminal historical tombstones while capturing bound non-terminal pods in both `Running` and `Pending`/`ContainerCreating` phases, and emitting `Deleted` events when pods reach `Succeeded`/`Failed` or are deleted), flushing via `fsync` at each barrier/reconciliation tick and on shutdown.
 
 ---
 

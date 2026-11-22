@@ -1600,6 +1600,119 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
         finally:
             mgr.close()
 
+    def test_podgroup_roundtrip_coalescing_partial_tas_synthesis_and_latched_preempted_finish(self) -> None:
+        """Verify PodGroup round-trip coalescing (no phantom Tier 4 pods), partial vanilla-K8s t0 TAS synthesis,
+        query_cluster_status latched Preempted=True handling, and 60-scenario scale invariants."""
+        from chamber.lifecycle import ChamberManager, query_cluster_status
+        from scenario_readme import analyze_scenario
+
+        repo_root = REPO_ROOT
+
+        # 1. Verify st50 (vanilla PodGroups + multi-API + infra-pods) coalesces 16 2-pod PodGroups without doubling
+        st50_dir = repo_root / "testscenarios/self-tests/st50-scale-quota-mixed-apis-infra-128n-1064w"
+        st50_bundle = testrunner.load_scenario_bundle(scenario_dir=st50_dir, skip_initial_offset=False)
+        self.assertEqual(len(st50_bundle.nodes), 128)
+        self.assertEqual(len(st50_bundle.initial_workloads), 64)
+        self.assertEqual(st50_bundle.initial_workload_pods_count, 80)
+        self.assertEqual(len(st50_bundle.initial_pods), 16)
+        self.assertEqual(len(st50_bundle.scheduled_workflows), 1000)
+        st50_analysis = analyze_scenario(st50_dir)
+        self.assertEqual(len(st50_analysis.admitted_at_start_wfs), 64)
+        self.assertEqual(len(st50_analysis.unadmitted_wfs), 1000)
+
+        # 2. Verify st54 partial vanilla-K8s t0 TAS binding synthesizes exact 24 missing pods onto TAS node pairs
+        st54_dir = repo_root / "testscenarios/self-tests/st54-scale-tas-preferred-and-partial-t0-144n-1104w"
+        st54_bundle = testrunner.load_scenario_bundle(scenario_dir=st54_dir, skip_initial_offset=False)
+        self.assertEqual(len(st54_bundle.nodes), 144)
+        self.assertEqual(len(st54_bundle.initial_workloads), 48)
+        self.assertEqual(st54_bundle.initial_workload_pods_count, 96)
+        for idx, iwl in enumerate(st54_bundle.initial_workloads):
+            self.assertEqual(len(iwl.pods), 2)
+            self.assertTrue(iwl.is_tas)
+            expected_pair = {f"st-node-{2 * idx:03d}", f"st-node-{2 * idx + 1:03d}"}
+            self.assertEqual({p.placement for p in iwl.pods}, expected_pair)
+
+        # 3. Verify scale scenarios st46..st60 counts (5 quota-only without TAS, 10 with TAS, all >100 nodes & >1000 wls)
+        suite_dir = repo_root / "testscenarios/self-tests"
+        scale_dirs = sorted(p for p in suite_dir.iterdir() if p.is_dir() and p.name.startswith("st") and int(p.name[2:4]) >= 46)
+        self.assertEqual(len(scale_dirs), 15)
+        no_tas = 0
+        with_tas = 0
+        for sd in scale_dirs:
+            sb = testrunner.load_scenario_bundle(scenario_dir=sd, skip_initial_offset=False)
+            self.assertGreater(len(sb.nodes), 100, sd.name)
+            self.assertGreater(len(sb.initial_workloads) + len(sb.scheduled_workflows), 1000, sd.name)
+            self.assertGreater(len(sb.initial_workloads), 0, sd.name)
+            if any(doc.get("kind") == "Topology" for doc in sb.prereq_and_queue_docs):
+                with_tas += 1
+            else:
+                no_tas += 1
+        self.assertEqual((no_tas, with_tas), (5, 10))
+
+        # 4. Verify query_cluster_status handles latched Preempted=True on finished regular Jobs vs PodGroups
+        fake_wl_list = {
+            "items": [
+                # Regular Job workload that was preempted on attempt 1, re-admitted, and finished cleanly:
+                {
+                    "metadata": {"name": "job-arr-0-abcde", "namespace": "st-workloads"},
+                    "status": {
+                        "conditions": [
+                            {"type": "Preempted", "status": "True", "reason": "InClusterQueue"},
+                            {"type": "Evicted", "status": "False", "reason": "InactiveWorkload"},
+                            {"type": "Finished", "status": "True", "reason": "Succeeded"},
+                        ]
+                    },
+                },
+                # t0 PodGroup workload whose pod succeeded in a race against preemption:
+                {
+                    "metadata": {
+                        "name": "t0pg-race-winner",
+                        "namespace": "st-workloads",
+                        "annotations": {"kueue.x-k8s.io/is-group-workload": "true"},
+                    },
+                    "status": {
+                        "conditions": [
+                            {"type": "Preempted", "status": "True", "reason": "InClusterQueue"},
+                            {"type": "Evicted", "status": "True", "reason": "Preempted"},
+                            {"type": "Finished", "status": "True", "reason": "Succeeded"},
+                        ]
+                    },
+                },
+                # t0 PodGroup workload genuinely killed by preemption (Finished=True with PodsFailed):
+                {
+                    "metadata": {
+                        "name": "t0pg-evicted-victim",
+                        "namespace": "st-workloads",
+                        "annotations": {"kueue.x-k8s.io/is-group-workload": "true"},
+                    },
+                    "status": {
+                        "conditions": [
+                            {"type": "Preempted", "status": "True", "reason": "InClusterQueue"},
+                            {"type": "Evicted", "status": "True", "reason": "Preempted"},
+                            {"type": "Finished", "status": "True", "reason": "PodsFailed"},
+                        ]
+                    },
+                },
+            ]
+        }
+
+        def fake_api_request(method: str, path: str, **_kwargs: object) -> tuple[int, bytes]:
+            if path == "/apis/kueue.x-k8s.io/v1beta2/workloads":
+                return 200, json.dumps(fake_wl_list).encode("utf-8")
+            return 200, b'{"items":[]}'
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-qcs-test", apiserver_port=16499)
+        try:
+            with mock.patch.object(mgr, "api_request", side_effect=fake_api_request):
+                snap = query_cluster_status(mgr, workload_namespaces=["st-workloads"], include_kueue_workloads=True)
+            self.assertIn(("st-workloads", "job-arr-0-abcde"), snap.finished_workload_keys)
+            self.assertIn(("st-workloads", "t0pg-race-winner"), snap.finished_workload_keys)
+            self.assertNotIn(("st-workloads", "t0pg-race-winner"), snap.evicted_workload_keys)
+            self.assertIn(("st-workloads", "t0pg-evicted-victim"), snap.evicted_workload_keys)
+            self.assertNotIn(("st-workloads", "t0pg-evicted-victim"), snap.finished_workload_keys)
+        finally:
+            mgr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

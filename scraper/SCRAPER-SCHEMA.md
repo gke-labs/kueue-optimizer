@@ -151,9 +151,9 @@ On disk (single line in `infra.json` for `Cohort`):
 
 ---
 
-### 3.5 Scheduled & Running `Pod` Payload (`ScrapedPodPayload`, `payload.kind == "Pod"`)
+### 3.5 Scheduled & Active `Pod` Payload (`ScrapedPodPayload`, `payload.kind == "Pod"`)
 
-Only pods that have been scheduled onto a node (`spec.nodeName != ""`) and reached `status.phase == "Running"` are recorded in `infra.json`.
+Pods that have been scheduled onto a node (`spec.nodeName != ""`), have not yet terminated (`status.phase` in `"Running"` or `"Pending"`, e.g. `ContainerCreating` at $t_0$ in vanilla Kubernetes), and have no `metadata.deletionTimestamp` emit `"New"`/`"Update"` events in `infra.json`. When a tracked pod transitions to a terminal phase (`"Succeeded"` or `"Failed"`) or is deleted (`watch.Deleted` / missing on reconciliation), `cluster-scraper` emits at-most-once `"Deleted"` with `deletionTime` set to the maximum container `terminated.finishedAt` timestamp (falling back to `metadata.deletionTimestamp` or observation time).
 
 To guarantee strict data hygiene, **no other pod fields are ever written to `infra.json`**. Specifically, container specs, container statuses, images, execution arguments, commands, environment variables, secrets, volumes, annotations, and labels are completely omitted.
 

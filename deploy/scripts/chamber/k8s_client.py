@@ -385,13 +385,13 @@ class ChamberK8sClientMixin:
 
     def _get_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=12)
+            self._executor = ThreadPoolExecutor(max_workers=24)
         return self._executor
 
     def apply_manifests_parallel(
         self,
         docs: list[dict[str, Any]],
-        max_workers: int = 12,
+        max_workers: int = 24,
     ) -> None:
         """Apply manifests concurrently over persistent keep-alive TLS sockets."""
         if not docs:

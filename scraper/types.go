@@ -213,6 +213,16 @@ func (l *JSONEventLog) Append(event any) error {
 		return fmt.Errorf("append event to %s: %w", l.path, err)
 	}
 	l.count++
+	return nil
+}
+
+// Sync flushes buffered kernel file data to stable storage.
+func (l *JSONEventLog) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
 	return l.file.Sync()
 }
 
@@ -230,6 +240,7 @@ func (l *JSONEventLog) Close() error {
 	if l.file == nil {
 		return nil
 	}
+	_ = l.file.Sync()
 	err := l.file.Close()
 	l.file = nil
 	return err

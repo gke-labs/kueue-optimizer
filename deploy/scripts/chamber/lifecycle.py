@@ -719,18 +719,22 @@ def query_cluster_status(
                         parent_js = (meta.get("labels") or {}).get("jobset.sigs.k8s.io/jobset-name")
                         if parent_js and (ns, str(parent_js)) in js_wl_owners:
                             continue
-                    conds = {
-                        c.get("type"): c.get("status")
-                        for c in ((it.get("status") or {}).get("conditions") or [])
-                    }
+                    raw_conds = (it.get("status") or {}).get("conditions") or []
+                    conds = {c.get("type"): c.get("status") for c in raw_conds}
+                    fin_cond = next((c for c in raw_conds if c.get("type") == "Finished"), None)
+                    fin_true = bool(fin_cond and fin_cond.get("status") == "True")
+                    fin_succeeded = bool(fin_true and str(fin_cond.get("reason") or "") == "Succeeded")
+                    is_group_wl = (
+                        str((meta.get("annotations") or {}).get("kueue.x-k8s.io/is-group-workload") or "") == "true"
+                    )
                     is_evicted_or_preempted = (
                         conds.get("Evicted") == "True" or conds.get("Preempted") == "True"
                     )
-                    if is_evicted_or_preempted and wl_key[1]:
+                    if is_evicted_or_preempted and wl_key[1] and not fin_succeeded:
                         snap.evicted_workload_keys.add(wl_key)
-                    if conds.get("Finished") == "True":
+                    if fin_true:
                         finished_cnt += 1
-                        if wl_key[1] and not is_evicted_or_preempted:
+                        if wl_key[1] and (fin_succeeded or not (is_group_wl and is_evicted_or_preempted)):
                             snap.finished_workload_keys.add(wl_key)
                     elif is_evicted_or_preempted:
                         evicted_cnt += 1

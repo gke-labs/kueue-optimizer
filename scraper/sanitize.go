@@ -831,13 +831,61 @@ func IsStandaloneKueuePod(pod *corev1.Pod) bool {
 	return true
 }
 
-// IsScheduledAndRunningPod returns true if the pod has been scheduled onto a node
-// and is in Running (or scheduled active) state.
+// IsTerminalPod returns true if the Pod has reached a terminal phase (Succeeded or Failed).
+func IsTerminalPod(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+}
+
+// IsScheduledAndRunningPod returns true if the pod has been bound onto a node and has not
+// terminated or begun deletion. Including bound PodPending pods (e.g. ContainerCreating while
+// pulling images in vanilla Kubernetes) ensures t0 node occupancy and Kueue quota sync match
+// kube-scheduler's actual node allocation.
 func IsScheduledAndRunningPod(pod *corev1.Pod) bool {
 	if pod == nil || pod.Spec.NodeName == "" {
 		return false
 	}
-	return pod.Status.Phase == corev1.PodRunning
+	if pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero() {
+		return false
+	}
+	if IsTerminalPod(pod) {
+		return false
+	}
+	return pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending || pod.Status.Phase == ""
+}
+
+// ExtractPodEndTime extracts the timestamp when a Pod released its node resources (latest container
+// Terminated.FinishedAt for Succeeded/Failed pods, or DeletionTimestamp when deleted), falling back to fallback.
+func ExtractPodEndTime(pod *corev1.Pod, fallback time.Time) time.Time {
+	if pod == nil {
+		return fallback.UTC()
+	}
+	var latest time.Time
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero() {
+			t := cs.State.Terminated.FinishedAt.Time.UTC()
+			if t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero() {
+			t := cs.State.Terminated.FinishedAt.Time.UTC()
+			if t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	if !latest.IsZero() {
+		return latest
+	}
+	if pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero() {
+		return pod.DeletionTimestamp.Time.UTC()
+	}
+	return fallback.UTC()
 }
 
 // ComputePodResourceRequest returns the effective resource requests of the pod spec,

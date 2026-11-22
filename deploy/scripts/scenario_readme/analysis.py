@@ -521,6 +521,7 @@ def _parse_workflows(
     admitted_at_start_wfs: list[ParsedWorkload] = []
     unadmitted_wfs: list[ParsedWorkload] = []
     seen_top_workflows: set[tuple[str, str, str]] = set()
+    podgroups_by_key: dict[tuple[str, str], ParsedWorkload] = {}
 
     for ev in workflow_events:
         ev_type = str(ev.get("eventType") or "")
@@ -549,6 +550,7 @@ def _parse_workflows(
 
         labels = dict(meta.get("labels") or {})
         annotations = dict(meta.get("annotations") or {})
+        pg_name = str(labels.get("kueue.x-k8s.io/pod-group-name") or "").strip() if kind == "Pod" else ""
 
         arr_ep = (
             parse_rfc3339_epoch(ev.get("timestamp"))
@@ -598,6 +600,49 @@ def _parse_workflows(
             "kueue-optimizer.gke.io/real-duration-sec",
         )
         fallback_dur = ann_dur if ann_dur is not None else 10.0
+
+        if pg_name:
+            pg_key = (wf_ns, pg_name)
+            existing_pg = podgroups_by_key.get(pg_key)
+            if existing_pg is not None:
+                existing_pg.total_pods += total_pods
+                for rk, rv in total_reqs.items():
+                    existing_pg.total_requests[rk] = existing_pg.total_requests.get(rk, 0.0) + rv
+                if arr_ep < existing_pg.arrival_epoch:
+                    existing_pg.arrival_epoch = arr_ep
+                continue
+
+            dur_sec, found_in_idx = exec_index.resolve_duration_sec(
+                namespace=wf_ns,
+                object_kind="PodGroup",
+                name=pg_name,
+                fallback_sec=fallback_dur,
+            )
+            found_dur = found_in_idx or (ann_dur is not None)
+            parsed_pg = ParsedWorkload(
+                name=pg_name,
+                namespace=wf_ns,
+                kind="PodGroup",
+                workload_state=wl_state,
+                arrival_epoch=arr_ep,
+                local_queue=lq_name,
+                priority_class=pc_name,
+                priority_value=pc_val,
+                total_pods=total_pods,
+                total_requests=dict(total_reqs),
+                per_pod_requests=dict(per_pod_reqs),
+                duration_sec=dur_sec,
+                found_duration=found_dur,
+                annotations=annotations,
+                labels=labels,
+            )
+            podgroups_by_key[pg_key] = parsed_pg
+            if wl_state == "Admitted":
+                admitted_at_start_wfs.append(parsed_pg)
+            else:
+                unadmitted_wfs.append(parsed_pg)
+            continue
+
         dur_sec, found_in_idx = exec_index.resolve_duration_sec(
             namespace=wf_ns,
             object_kind=kind,

@@ -26,17 +26,17 @@ leaderElection:
   resourceName: c1f6bfd2.kueue.x-k8s.io
 controller:
   groupKindConcurrency:
-    Job.batch: 5
-    Pod: 5
-    Workload.kueue.x-k8s.io: 10
+    Job.batch: 20
+    Pod: 20
+    Workload.kueue.x-k8s.io: 20
     LocalQueue.kueue.x-k8s.io: 5
     Cohort.kueue.x-k8s.io: 1
     ClusterQueue.kueue.x-k8s.io: 5
     ResourceFlavor.kueue.x-k8s.io: 1
-    JobSet.jobset.x-k8s.io: 5
+    JobSet.jobset.x-k8s.io: 20
 clientConnection:
-  qps: 300
-  burst: 500
+  qps: 1000
+  burst: 2000
 managedJobsNamespaceSelector:
   matchExpressions:
   - key: kubernetes.io/metadata.name

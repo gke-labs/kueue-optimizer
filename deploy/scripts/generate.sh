@@ -409,6 +409,20 @@ spec:
 STAGE_EOF
 } > "${MANIFESTS_DIR}/kwok-stages.yaml"
 cp "${KWOK_REPO}/kustomize/kwok/kwok.yaml" "${CONFIG_DIR}/kwok.yaml"
+python3 - "${CONFIG_DIR}/kwok.yaml" <<'PYEOF'
+import sys
+import yaml
+
+p = sys.argv[1]
+with open(p, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+opts = cfg.setdefault("options", {})
+opts["nodeLeaseParallelism"] = 32
+opts["podPlayStageParallelism"] = 64
+opts["nodePlayStageParallelism"] = 32
+with open(p, "w", encoding="utf-8") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False)
+PYEOF
 
 # Generate initial simulated KWOK Nodes
 {
@@ -508,7 +522,12 @@ for doc in docs:
             "LessThanOrEqualToFinalShare",
             "LessThanInitialShare",
         ]
-        cfg_obj.setdefault("controller", {}).setdefault("groupKindConcurrency", {})["JobSet.jobset.x-k8s.io"] = 5
+        gk_conc = cfg_obj.setdefault("controller", {}).setdefault("groupKindConcurrency", {})
+        gk_conc["Job.batch"] = 20
+        gk_conc["Pod"] = 20
+        gk_conc["Workload.kueue.x-k8s.io"] = 20
+        gk_conc["JobSet.jobset.x-k8s.io"] = 20
+        cfg_obj["clientConnection"] = {"qps": 1000, "burst": 2000}
         manager_config_str = yaml.safe_dump(cfg_obj, sort_keys=False)
         continue
 
@@ -638,7 +657,7 @@ for doc in docs:
         cfg_obj.setdefault("webhook", {})["port"] = 9443
         cfg_obj.setdefault("leaderElection", {})["leaderElect"] = False
         cfg_obj["leaderElection"].setdefault("resourceName", "6d4f6a47.jobset.x-k8s.io")
-        cfg_obj.setdefault("clientConnection", {"qps": 500, "burst": 500})
+        cfg_obj["clientConnection"] = {"qps": 1000, "burst": 2000}
         cfg_obj.setdefault("internalCertManagement", {})["enable"] = False
         manager_config_str = yaml.safe_dump(cfg_obj, sort_keys=False)
         continue

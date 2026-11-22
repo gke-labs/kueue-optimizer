@@ -137,6 +137,7 @@ class _AdmittedInitialCandidate:
     exec_info: WorkloadExecutionInfo | None
     preempt_item: ScheduledWorkflowItem | None
     from_workflows_json: bool = True
+    member_objs: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -243,6 +244,7 @@ def _schedule_workflows(
     first_seen_orig_ns: dict[tuple[str, str, str], str] = {}
     scheduled_by_key: dict[tuple[str, str, str], ScheduledWorkflowItem] = {}
     latest_obj_by_key: dict[tuple[str, str, str], tuple[dict[str, Any], str]] = {}
+    podgroup_members_by_key: dict[tuple[str, str, str], dict[str, dict[str, Any]]] = {}
     skipped_child_count = 0
     seq = 0
 
@@ -276,6 +278,24 @@ def _schedule_workflows(
             suspend_val = (raw_obj.get("spec") or {}).get("suspend")
             wl_state = "NotAdmitted" if suspend_val is True else "Admitted"
 
+        pg_name = (
+            str(((raw_meta.get("labels") or {}).get("kueue.x-k8s.io/pod-group-name")) or "").strip()
+            if kind == "Pod"
+            else ""
+        )
+        if pg_name:
+            pg_key = (ns, "PodGroup", pg_name)
+            if (pg_key in first_seen_state and first_seen_state[pg_key] != "NotAdmitted") or (
+                pg_key not in first_seen_state and wl_state != "NotAdmitted"
+            ):
+                prev_pg_lq = latest_obj_by_key.get(pg_key, ({}, ""))[1]
+                latest_obj_by_key[pg_key] = (raw_obj, lq_name or prev_pg_lq)
+                podgroup_members_by_key.setdefault(pg_key, {})[name] = raw_obj
+                if pg_key not in first_seen_state:
+                    first_seen_state[pg_key] = wl_state
+                    first_seen_orig_ns[pg_key] = orig_ns
+                continue
+
         key = (ns, kind, name)
         prev_lq = latest_obj_by_key.get(key, ({}, ""))[1]
         latest_obj_by_key[key] = (raw_obj, lq_name or prev_lq)
@@ -294,13 +314,23 @@ def _schedule_workflows(
                 else "preempted_after_initial_admission"
             )
             fallback_dur = _extract_existing_pod_exec_seconds(raw_obj) or default_exec_sec
-            raw_dur, found_in_idx = exec_index.resolve_duration_sec(
-                namespace=orig_ns,
-                object_kind=kind,
-                name=name,
-                fallback_sec=fallback_dur,
-                parent_jobset_name=parent_js,
-            )
+            found_in_idx = False
+            raw_dur = fallback_dur
+            if pg_name:
+                raw_dur, found_in_idx = exec_index.resolve_duration_sec(
+                    namespace=orig_ns,
+                    object_kind="PodGroup",
+                    name=pg_name,
+                    fallback_sec=fallback_dur,
+                )
+            if not found_in_idx:
+                raw_dur, found_in_idx = exec_index.resolve_duration_sec(
+                    namespace=orig_ns,
+                    object_kind=kind,
+                    name=name,
+                    fallback_sec=fallback_dur,
+                    parent_jobset_name=parent_js,
+                )
             comp_dur = max(min_pod_duration_sec, raw_dur / speedup)
             exec_str = format_pod_execution_seconds(comp_dur, min_seconds=min_pod_duration_sec)
             manifest, pod_cnt = _inject_pod_execution_time_and_sanitize_workflow(
@@ -340,6 +370,8 @@ def _schedule_workflows(
         if key in scheduled_by_key or initial_st == "NotAdmitted":
             continue
         ns, kind, name = key
+        if kind == "PodGroup":
+            continue
         orig_ns = first_seen_orig_ns.get(key, ns)
         info = exec_index.lookup(orig_ns, kind, name)
         if info and info.preempted_epochs and key in latest_obj_by_key:
@@ -399,6 +431,7 @@ def _schedule_workflows(
                 exec_info=info,
                 preempt_item=scheduled_by_key.get(key),
                 from_workflows_json=True,
+                member_objs=list((podgroup_members_by_key.get(key) or {}).values()),
             )
         )
 
@@ -1073,10 +1106,42 @@ def _build_initial_workloads_and_pods(
         lq_name, cq_name = _resolve_cq_and_lq_for_candidate(cand, parsed_infra)
         cand_pods = list(matched_pods_by_cand.get(c_idx) or [])
 
-        # Tier 4: Synthesize pods when a synthetic scenario specifies an Admitted workflow in workflows.json
-        # with a valid ClusterQueue and omitted individual Pod events in infra.json.
-        if not cand_pods and cand.from_workflows_json and cand.raw_obj and lq_name and cq_name:
-            ps_groups = _extract_workflow_podset_templates(cand.raw_obj, cand.kind)
+        # Tier 4: Synthesize missing pods when a scenario or vanilla-K8s t0 scrape specifies an Admitted
+        # workflow in workflows.json with fewer bound Pod events in infra.json than expected (0 or partial binding).
+        if cand.from_workflows_json and lq_name and cq_name:
+            if cand.kind == "PodGroup":
+                ps_groups_raw: dict[tuple[str, tuple[tuple[str, float], ...]], tuple[str, int, dict[str, str], bool]] = {}
+                for m_obj in cand.member_objs:
+                    for m_ps, m_cnt, m_reqs, m_tas in _extract_workflow_podset_templates(m_obj, "Pod"):
+                        gk_m = (m_ps, _canonical_resource_profile(m_reqs))
+                        if gk_m in ps_groups_raw:
+                            prev_ps, prev_cnt, prev_reqs, prev_tas = ps_groups_raw[gk_m]
+                            ps_groups_raw[gk_m] = (prev_ps, prev_cnt + m_cnt, prev_reqs, prev_tas or m_tas)
+                        else:
+                            ps_groups_raw[gk_m] = (m_ps, m_cnt, m_reqs, m_tas)
+                ps_groups = list(ps_groups_raw.values())
+                if len(ps_groups) == 1 and cand.member_objs:
+                    pg_tot_str = str(
+                        (((cand.member_objs[0].get("metadata") or {}).get("labels") or {}).get(
+                            "kueue.x-k8s.io/pod-group-total-count"
+                        ))
+                        or ""
+                    )
+                    try:
+                        pg_tot = int(pg_tot_str)
+                    except ValueError:
+                        pg_tot = 0
+                    if pg_tot > ps_groups[0][1]:
+                        ps_groups = [(ps_groups[0][0], pg_tot, ps_groups[0][2], ps_groups[0][3])]
+            elif cand.raw_obj:
+                ps_groups = _extract_workflow_podset_templates(cand.raw_obj, cand.kind)
+            else:
+                ps_groups = []
+        else:
+            ps_groups = []
+
+        expected_total_pods = sum(cnt for (_n, cnt, _r, _t) in ps_groups)
+        if ps_groups and len(cand_pods) < expected_total_pods:
             cq_doc_tmp = parsed_infra.cqs_by_name[cq_name]
             cq_flvs = [
                 str(f.get("name") or "")
@@ -1085,6 +1150,28 @@ def _build_initial_workloads_and_pods(
                 if isinstance(f, dict) and f.get("name")
             ]
             flv_doc_tmp = parsed_infra.flavors_by_name.get(cq_flvs[0]) if cq_flvs else None
+
+            allowed_ta_domains: dict[str, set[str]] = {}
+            for s_psa in (cand.exec_info.pod_set_assignments if cand.exec_info else []):
+                ta_obj = s_psa.get("topologyAssignment") if isinstance(s_psa, dict) else None
+                if not isinstance(ta_obj, dict):
+                    continue
+                ta_levels = [str(x) for x in (ta_obj.get("levels") or [])]
+                for sl_obj in ta_obj.get("slices") or []:
+                    if not isinstance(sl_obj, dict):
+                        continue
+                    for l_idx, lv_obj in enumerate(sl_obj.get("valuesPerLevel") or []):
+                        if l_idx >= len(ta_levels) or not isinstance(lv_obj, dict):
+                            continue
+                        lvl_key = ta_levels[l_idx]
+                        if lv_obj.get("universal") is not None:
+                            allowed_ta_domains.setdefault(lvl_key, set()).add(str(lv_obj["universal"]))
+                        indiv = lv_obj.get("individual")
+                        if isinstance(indiv, dict):
+                            pfx = str(indiv.get("prefix") or "")
+                            sfx = str(indiv.get("suffix") or "")
+                            for rt in indiv.get("roots") or []:
+                                allowed_ta_domains.setdefault(lvl_key, set()).add(f"{pfx}{rt}{sfx}")
 
             raw_dur_cand = default_exec_sec
             has_finite_end = False
@@ -1098,29 +1185,56 @@ def _build_initial_workloads_and_pods(
                     if rem > 0:
                         raw_dur_cand = rem
                         has_finite_end = True
-            existing_ann_dur = _extract_existing_pod_exec_seconds(cand.raw_obj)
+            existing_ann_dur = _extract_existing_pod_exec_seconds(cand.raw_obj) if cand.raw_obj else None
             if not has_finite_end and existing_ann_dur is not None and existing_ann_dur > 0:
                 raw_dur_cand = existing_ann_dur
                 has_finite_end = True
 
             synth_del_ep = (effective_start_epoch + raw_dur_cand) if has_finite_end else None
-            synth_idx = 0
+            have_by_prof: dict[tuple[tuple[str, float], ...], int] = {}
+            for pt_existing in cand_pods:
+                prof_ex = _canonical_resource_profile(pt_existing[3].get("resourceRequest") or {})
+                have_by_prof[prof_ex] = have_by_prof.get(prof_ex, 0) + 1
+
+            synth_idx = len(cand_pods)
             for ps_name, cnt, reqs, is_tas in ps_groups:
-                for _ in range(cnt):
+                prof_grp = _canonical_resource_profile(reqs)
+                already_have = min(cnt, have_by_prof.get(prof_grp, 0))
+                have_by_prof[prof_grp] = max(0, have_by_prof.get(prof_grp, 0) - already_have)
+                missing_cnt = cnt - already_have
+                for _ in range(missing_cnt):
+                    used_cand_nodes = {str(pt_c[3].get("placement") or "") for pt_c in cand_pods}
+                    search_passes = (
+                        [(True, True), (True, False), (False, False)]
+                        if allowed_ta_domains
+                        else [(False, True), (False, False)]
+                    )
                     chosen_node = ""
-                    for n_name, n_doc in parsed_infra.nodes_by_name.items():
-                        if not _node_Matches_flavor(n_doc, flv_doc_tmp):
-                            continue
-                        fits = all(
-                            rem_node_alloc.get(n_name, {}).get(rk, 0.0) + 1e-6 >= parse_k8s_quantity(rv, rk)
-                            for rk, rv in reqs.items()
-                            if rk in rem_node_alloc.get(n_name, {})
-                        )
-                        if fits:
-                            chosen_node = n_name
-                            for rk, rv in reqs.items():
-                                if rk in rem_node_alloc[n_name]:
-                                    rem_node_alloc[n_name][rk] -= parse_k8s_quantity(rv, rk)
+                    for require_ta, prefer_unused in search_passes:
+                        for n_name, n_doc in parsed_infra.nodes_by_name.items():
+                            if prefer_unused and n_name in used_cand_nodes:
+                                continue
+                            if not _node_Matches_flavor(n_doc, flv_doc_tmp):
+                                continue
+                            if require_ta:
+                                n_lbls = ((n_doc.get("metadata") or {}).get("labels")) or {}
+                                if not all(
+                                    str(n_lbls.get(lk) or "") in allowed_vals
+                                    for lk, allowed_vals in allowed_ta_domains.items()
+                                ):
+                                    continue
+                            fits = all(
+                                rem_node_alloc.get(n_name, {}).get(rk, 0.0) + 1e-6 >= parse_k8s_quantity(rv, rk)
+                                for rk, rv in reqs.items()
+                                if rk in rem_node_alloc.get(n_name, {})
+                            )
+                            if fits:
+                                chosen_node = n_name
+                                for rk, rv in reqs.items():
+                                    if rk in rem_node_alloc[n_name]:
+                                        rem_node_alloc[n_name][rk] -= parse_k8s_quantity(rv, rk)
+                                break
+                        if chosen_node:
                             break
                     if not chosen_node and parsed_infra.nodes_by_name:
                         chosen_node = next(iter(parsed_infra.nodes_by_name.keys()))
@@ -1196,7 +1310,11 @@ def _build_initial_workloads_and_pods(
         if pc_name and prio_val is None:
             prio_val = 1000 - c_idx
 
-        if cand.from_workflows_json and cand.raw_obj:
+        if cand.kind == "PodGroup":
+            base_wl_raw = (cand.exec_info.workload_name if cand.exec_info and cand.exec_info.workload_name else "") or (
+                cand.name if cand.name else f"pg-init-{c_idx}"
+            )
+        elif cand.from_workflows_json and cand.raw_obj:
             base_wl_raw = f"t0pg-{cand.name}" if cand.name else f"t0pg-init-{c_idx}"
         else:
             base_wl_raw = (cand.exec_info.workload_name if cand.exec_info and cand.exec_info.workload_name else "") or (
@@ -1205,7 +1323,7 @@ def _build_initial_workloads_and_pods(
 
         # Build dynamic resubmit item (`spec.suspend = True`) if parent workflow object is available from workflows.json.
         resubmit_item: ScheduledWorkflowItem | None = None
-        if cand.from_workflows_json and cand.raw_obj:
+        if cand.from_workflows_json and cand.raw_obj and cand.kind != "PodGroup":
             fallback_dur = _extract_existing_pod_exec_seconds(cand.raw_obj) or default_exec_sec
             raw_dur_full, found_idx = exec_index.resolve_duration_sec(
                 namespace=cand.orig_namespace,

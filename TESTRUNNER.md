@@ -78,6 +78,10 @@ flowchart TD
 | `--skip-chamber-deploy` / `--reuse-chamber` | `False` | Reuses an already-deployed chamber in `--namespace` instead of deploying from scratch, and preserves the reused chamber after completion unless `--cleanup-after` is passed. |
 | `--cleanup-after` | `False` | Explicitly tears down a reused chamber (`--skip-chamber-deploy`) when the run completes. |
 | `--dry-run` | `False` | Prints the full scenario outline and generated YAML manifests without touching any cluster (always takes precedence over `--cleanup` / `--cleanup-workloads`). |
+| `--scrape-output-dir` | `""` | Attaches `scraper/cluster-scraper` at exact chamber `t0` (right after queues and initial `t0` workloads/pods are active) and flushes live `infra.json`, `workflows.json`, and `execution-time.json` cleanly when replay finishes. |
+| `--scrape-interval-sec` | `30s` | Periodic infrastructure reconciliation interval passed to `cluster-scraper --interval` when `--scrape-output-dir` is set. |
+| `--scrape-hash-names` | `False` | Passes `--hash-names` to `cluster-scraper` when `--scrape-output-dir` is set. |
+| `--scraper-bin` | `scraper/cluster-scraper` | Path to compiled `cluster-scraper` binary used when `--scrape-output-dir` is set. |
 | `--cleanup-workloads` | `False` | Deletes only scenario workloads/queues/namespaces inside `kwok-kube-apiserver` while keeping the chamber running. |
 | `--cleanup` | `False` | Tears down the host chamber namespace (verified strictly via `kueue-optimizer.gke.io/chamber=true`) and local kubeconfig. |
 
