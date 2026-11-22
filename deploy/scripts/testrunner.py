@@ -87,6 +87,7 @@ from runner.loader import (
     InitialWorkloadPodGroup,
     ScenarioBundle,
     ScheduledInfraEvent,
+    ScheduledWorkflowDeletion,
     ScheduledWorkflowItem,
     load_scenario_bundle,
 )
@@ -122,6 +123,7 @@ __all__ = [
     "SYSTEM_NAMESPACES",
     "ScenarioBundle",
     "ScheduledInfraEvent",
+    "ScheduledWorkflowDeletion",
     "ScheduledWorkflowItem",
     "WaitForPodsReadyConfig",
     "apply_scenario_queues_and_wait",
@@ -215,6 +217,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             f"Fallback pod execution time in seconds for workloads without an entry in execution-time.json "
             f"(default: {DEFAULT_FALLBACK_EXEC_SEC})"
+        ),
+    )
+    parser.add_argument(
+        "--missing-duration-policy",
+        choices=("impute", "fallback", "error"),
+        default="impute",
+        help=(
+            "How to handle never-admitted/unindexed workflows missing from execution-time.json: "
+            "'impute' (default: peer median from same queue/shape with warning), "
+            "'fallback' (use --default-exec-seconds with warning), or 'error' (fail fast)"
         ),
     )
     parser.add_argument(
@@ -512,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
             infra_pods_namespace=infra_pods_ns,
             interrupted_duration_multiplier=args.interrupted_duration_multiplier,
             interrupted_duration_override=args.interrupted_duration_override,
+            missing_duration_policy=args.missing_duration_policy,
         )
     except ValueError as exc:
         parser.error(str(exc))

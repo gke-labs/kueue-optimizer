@@ -613,10 +613,14 @@ def _print_workflows_section(bundle: ScenarioBundle, queue_load: _QueueLoadSumma
     )
     print(f"      By Resource Kind      : {kinds_str}")
     print(f"      By Trigger Reason     : {reasons_str}")
+    if bundle.scheduled_workflow_deletions:
+        print(f"      Scheduled Deletions   : {len(bundle.scheduled_workflow_deletions)} workflow deletion event(s)")
     print(
         f"      Skipped Workflows     : {len(bundle.skipped_already_admitted_workflows)} already-admitted at t0, "
         f"{bundle.skipped_child_workflows} controller-managed child object(s)"
     )
+    for w_msg in bundle.missing_duration_warnings:
+        print(f"      WARNING (Durations)   : {w_msg}")
     print("========================================================================================", flush=True)
 
 

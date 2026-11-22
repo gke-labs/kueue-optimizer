@@ -22,6 +22,8 @@ from runner.loader import (
     InitialPodSpec,
     InitialWorkloadPodGroup,
     ScenarioBundle,
+    ScheduledInfraEvent,
+    ScheduledWorkflowDeletion,
     ScheduledWorkflowItem,
     load_scenario_bundle,
 )
@@ -53,6 +55,8 @@ __all__ = [
     "SERVER_METADATA_FIELDS",
     "SYSTEM_NAMESPACES",
     "ScenarioBundle",
+    "ScheduledInfraEvent",
+    "ScheduledWorkflowDeletion",
     "ScheduledWorkflowItem",
     "apply_scenario_queues_and_wait",
     "cleanup_scenario_workloads",

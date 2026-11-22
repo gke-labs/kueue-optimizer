@@ -30,6 +30,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	resourcehelper "k8s.io/component-helpers/resource"
@@ -1191,6 +1192,19 @@ func SanitizeWorkloadPriorityClass(wpc *kueuev1beta2.WorkloadPriorityClass, hash
 	}
 	cp := wpc.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: kueuev1beta2.SchemeGroupVersion.String(), Kind: "WorkloadPriorityClass"}
+	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
+	cp.Description = ""
+	return toMapWithoutStatus(cp)
+}
+
+// SanitizePriorityClass prepares a Kubernetes scheduling.k8s.io/v1 PriorityClass for infra.json
+// (filtering annotations, hashing sensitive/--extra-hash-labels values via hasher, clearing description, and omitting status).
+func SanitizePriorityClass(pc *schedulingv1.PriorityClass, hasher SensitiveDataHasher) map[string]any {
+	if pc == nil {
+		return nil
+	}
+	cp := pc.DeepCopy()
+	cp.TypeMeta = metav1.TypeMeta{APIVersion: schedulingv1.SchemeGroupVersion.String(), Kind: "PriorityClass"}
 	sanitizeInfraObjectMeta(&cp.ObjectMeta, hasher)
 	cp.Description = ""
 	return toMapWithoutStatus(cp)

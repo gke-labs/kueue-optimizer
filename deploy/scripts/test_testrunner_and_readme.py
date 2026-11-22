@@ -2210,5 +2210,835 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
         self.assertIn("cannot be combined with --skip-chamber-deploy", buf.getvalue())
 
 
+class FidelityReviewRegressionTests(unittest.TestCase):
+    """Regression suite covering Findings #1-#13 (Experiments A-L) from the scraper/chamber fidelity review."""
+
+    @staticmethod
+    def _base_infra_events(t0: str = "2026-11-22T10:00:00Z") -> list[dict]:
+        return [
+            {
+                "timestamp": t0,
+                "eventType": "New",
+                "payload": {
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {
+                        "name": "node-0",
+                        "labels": {"cloud.google.com/gke-tpu-accelerator": "tpu-v7x"},
+                    },
+                    "status": {
+                        "allocatable": {
+                            "cpu": "64",
+                            "memory": "128Gi",
+                            "pods": "110",
+                            "hugepages-1Gi": "0",
+                            "hugepages-2Mi": "0",
+                            "nvidia.com/gpu": "8",
+                            "google.com/tpu": "4",
+                        },
+                        "capacity": {
+                            "cpu": "64",
+                            "memory": "128Gi",
+                            "pods": "110",
+                            "hugepages-1Gi": "0",
+                            "hugepages-2Mi": "0",
+                            "nvidia.com/gpu": "8",
+                            "google.com/tpu": "4",
+                        },
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                    },
+                },
+            },
+            {
+                "timestamp": t0,
+                "eventType": "New",
+                "payload": {
+                    "apiVersion": "kueue.x-k8s.io/v1beta2",
+                    "kind": "ResourceFlavor",
+                    "metadata": {"name": "rf-main"},
+                    "spec": {},
+                },
+            },
+            {
+                "timestamp": t0,
+                "eventType": "New",
+                "payload": {
+                    "apiVersion": "kueue.x-k8s.io/v1beta2",
+                    "kind": "ClusterQueue",
+                    "metadata": {"name": "cq-main"},
+                    "spec": {
+                        "admissionChecks": ["prov-check-1"],
+                        "admissionCheckStrategy": {"admissionChecks": [{"name": "prov-check-2"}]},
+                        "resourceGroups": [
+                            {
+                                "coveredResources": ["cpu", "memory", "google.com/tpu", "nvidia.com/gpu"],
+                                "flavors": [
+                                    {
+                                        "name": "rf-main",
+                                        "resources": [
+                                            {"name": "cpu", "nominalQuota": "64"},
+                                            {"name": "memory", "nominalQuota": "128Gi"},
+                                            {"name": "google.com/tpu", "nominalQuota": "4"},
+                                            {"name": "nvidia.com/gpu", "nominalQuota": "8"},
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            },
+            {
+                "timestamp": t0,
+                "eventType": "New",
+                "payload": {
+                    "apiVersion": "kueue.x-k8s.io/v1beta2",
+                    "kind": "LocalQueue",
+                    "metadata": {"name": "lq-main", "namespace": "ai-lab"},
+                    "spec": {"clusterQueue": "cq-main"},
+                },
+            },
+        ]
+
+    @staticmethod
+    def _mk_job_event(
+        ts: str,
+        ev_type: str,
+        state: str,
+        name: str,
+        *,
+        ns: str = "ai-lab",
+        lq: str = "lq-main",
+        creation_time: str | None = None,
+        parallelism: int = 1,
+        completions: int = 1,
+        priority_class_k8s: str = "",
+        scheduler_name: str = "",
+    ) -> dict:
+        p_spec: dict = {
+            "restartPolicy": "Never",
+            "containers": [
+                {
+                    "name": "c",
+                    "image": "registry.k8s.io/pause:3.10",
+                    "resources": {"requests": {"cpu": "2", "memory": "4Gi", "google.com/tpu": "1"}},
+                }
+            ],
+        }
+        if priority_class_k8s:
+            p_spec["priorityClassName"] = priority_class_k8s
+            p_spec["priority"] = 99999
+        if scheduler_name:
+            p_spec["schedulerName"] = scheduler_name
+        lbls = {"kueue.x-k8s.io/queue-name": lq} if lq else {}
+        return {
+            "timestamp": ts,
+            "eventType": ev_type,
+            "workloadState": state,
+            "payload": {
+                "objectKind": "Job",
+                "name": name,
+                "namespace": ns,
+                "creationTime": creation_time or ts,
+                "localQueueName": lq,
+                "object": {
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "metadata": {"name": name, "namespace": ns, "labels": lbls},
+                    "spec": {
+                        "suspend": state == "NotAdmitted",
+                        "parallelism": parallelism,
+                        "completions": completions,
+                        "template": {"spec": p_spec},
+                    },
+                },
+            },
+        }
+
+    def test_experiments_A_B_D_workflow_cancellation_running_deletion_and_same_name_recreate(self) -> None:
+        t0 = "2026-11-22T10:00:00Z"
+        with tempfile.TemporaryDirectory() as td:
+            sc = Path(td)
+            infra = self._base_infra_events(t0)
+            wf = [
+                # Exp A: cancelled while pending at +15s
+                self._mk_job_event("2026-11-22T10:00:05Z", "New", "NotAdmitted", "job-cancel"),
+                self._mk_job_event("2026-11-22T10:00:15Z", "Deleted", "NotAdmitted", "job-cancel"),
+                # Exp B: running job deleted at +25s + terminal Failed job at +125s (must NOT multiply by 1.5x)
+                self._mk_job_event("2026-11-22T10:00:05Z", "New", "NotAdmitted", "job-kill"),
+                self._mk_job_event("2026-11-22T10:00:25Z", "Deleted", "Admitted", "job-kill"),
+                self._mk_job_event("2026-11-22T10:00:05Z", "New", "NotAdmitted", "job-crash"),
+                # Exp D: same-name delete & re-create ("train": 30s first run, deleted at +50s, re-created at +60s for 100s)
+                self._mk_job_event("2026-11-22T10:00:10Z", "New", "NotAdmitted", "train", creation_time="2026-11-22T10:00:10Z"),
+                self._mk_job_event("2026-11-22T10:00:50Z", "Deleted", "Admitted", "train", creation_time="2026-11-22T10:00:10Z"),
+                self._mk_job_event("2026-11-22T10:01:00Z", "New", "NotAdmitted", "train", creation_time="2026-11-22T10:01:00Z"),
+            ]
+            ex = [
+                {
+                    "timestamp": "2026-11-22T10:00:25Z",
+                    "eventType": "PartialExecution",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "executionType": "Partial",
+                        "workloadName": "job-job-kill-111",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "job-kill",
+                        "localQueueName": "lq-main",
+                        "creationTime": "2026-11-22T10:00:05Z",
+                        "admittedTime": "2026-11-22T10:00:05Z",
+                        "endTime": "2026-11-22T10:00:25Z",
+                        "executionDurationSeconds": 20.0,
+                        "interruptionReason": "Deleted",
+                        "preempted": False,
+                    },
+                },
+                {
+                    "timestamp": "2026-11-22T10:02:05Z",
+                    "eventType": "PartialExecution",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "executionType": "Partial",
+                        "workloadName": "job-job-crash-222",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "job-crash",
+                        "localQueueName": "lq-main",
+                        "creationTime": "2026-11-22T10:00:05Z",
+                        "admittedTime": "2026-11-22T10:00:05Z",
+                        "endTime": "2026-11-22T10:02:05Z",
+                        "executionDurationSeconds": 120.0,
+                        "interruptionReason": "Failed",
+                        "preempted": False,
+                    },
+                },
+                {
+                    "timestamp": "2026-11-22T10:00:40Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "job-train-inc1",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "train",
+                        "localQueueName": "lq-main",
+                        "creationTime": "2026-11-22T10:00:10Z",
+                        "admittedTime": "2026-11-22T10:00:10Z",
+                        "endTime": "2026-11-22T10:00:40Z",
+                        "executionDurationSeconds": 30.0,
+                        "preempted": False,
+                    },
+                },
+                {
+                    "timestamp": "2026-11-22T10:02:40Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "job-train-inc2",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "train",
+                        "localQueueName": "lq-main",
+                        "creationTime": "2026-11-22T10:01:00Z",
+                        "admittedTime": "2026-11-22T10:01:00Z",
+                        "endTime": "2026-11-22T10:02:40Z",
+                        "executionDurationSeconds": 100.0,
+                        "preempted": False,
+                    },
+                },
+            ]
+            (sc / "infra.json").write_text("\n".join(json.dumps(x) for x in infra) + "\n", encoding="utf-8")
+            (sc / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf) + "\n", encoding="utf-8")
+            (sc / "execution-time.json").write_text("\n".join(json.dumps(x) for x in ex) + "\n", encoding="utf-8")
+
+            bundle = testrunner.load_scenario_bundle(sc, skip_initial_offset=False)
+            by_name_inc = {(w.name, w.incarnation_index): w for w in bundle.scheduled_workflows}
+            # Failed and Deleted PartialExecution stay at 1.0x (120.0s and 20.0s), NOT 1.5x!
+            self.assertEqual(by_name_inc[("job-kill", 0)].execution_duration_sec, 20.0)
+            self.assertEqual(by_name_inc[("job-crash", 0)].execution_duration_sec, 120.0)
+            # Both incarnations of 'train' are scheduled separately with 30.0s and 100.0s!
+            self.assertEqual(by_name_inc[("train", 0)].execution_duration_sec, 30.0)
+            self.assertEqual(by_name_inc[("train", 0)].raw_offset_from_t0_sec, 10.0)
+            self.assertEqual(by_name_inc[("train", 1)].execution_duration_sec, 100.0)
+            self.assertEqual(by_name_inc[("train", 1)].raw_offset_from_t0_sec, 60.0)
+
+            del_reasons = {(d.name, round(d.raw_offset_from_t0_sec, 1)): d.delete_reason for d in bundle.scheduled_workflow_deletions}
+            self.assertEqual(del_reasons[("job-cancel", 15.0)], "cancelled")
+            self.assertEqual(del_reasons[("job-kill", 25.0)], "cancelled")
+            self.assertEqual(del_reasons[("train", 50.0)], "before_recreate")
+
+    def test_experiments_C_I_J_post_t0_fast_admitted_non_kueue_jobs_and_dynamic_cq_quota(self) -> None:
+        t0 = "2026-11-22T10:00:00Z"
+        with tempfile.TemporaryDirectory() as td:
+            sc = Path(td)
+            infra = self._base_infra_events(t0)
+            # Post-t0 ClusterQueue quota expansion at +30s & post-t0 non-Kueue Pod at +20s
+            cq_upd = json.loads(json.dumps(infra[2]))
+            cq_upd["timestamp"] = "2026-11-22T10:00:30Z"
+            cq_upd["eventType"] = "Update"
+            cq_upd["payload"]["spec"]["resourceGroups"][0]["flavors"][0]["resources"][2]["nominalQuota"] = "16"
+            infra.append(cq_upd)
+            infra.append(
+                {
+                    "timestamp": "2026-11-22T10:00:20Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "daemon-agent-xyz",
+                        "namespace": "kube-system",
+                        "placement": "node-0",
+                        "resourceRequest": {"cpu": "2", "memory": "4Gi"},
+                        "deletionTime": "2026-11-22T10:00:50Z",
+                    },
+                }
+            )
+            wf = [
+                # Non-Kueue system job and unqueued user job -> must NOT become t0 workloads or invent <cq>-init-lq!
+                self._mk_job_event(t0, "New", "Admitted", "cert-rotator", ns="kube-system", lq=""),
+                self._mk_job_event(t0, "New", "Admitted", "cron-backup", ns="batch-ops", lq=""),
+                # Fast-admitting Kueue job created at +45s (first seen Admitted) -> scheduled at +45s, NOT t0!
+                self._mk_job_event("2026-11-22T10:00:45Z", "New", "Admitted", "late-fast-job"),
+            ]
+            ex = [
+                {
+                    "timestamp": "2026-11-22T10:01:05Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "job-late-fast-1",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "late-fast-job",
+                        "localQueueName": "lq-main",
+                        "creationTime": "2026-11-22T10:00:45Z",
+                        "admittedTime": "2026-11-22T10:00:45Z",
+                        "endTime": "2026-11-22T10:01:05Z",
+                        "executionDurationSeconds": 20.0,
+                        "preempted": False,
+                    },
+                }
+            ]
+            (sc / "infra.json").write_text("\n".join(json.dumps(x) for x in infra) + "\n", encoding="utf-8")
+            (sc / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf) + "\n", encoding="utf-8")
+            (sc / "execution-time.json").write_text("\n".join(json.dumps(x) for x in ex) + "\n", encoding="utf-8")
+
+            bundle = testrunner.load_scenario_bundle(sc, skip_initial_offset=False)
+            self.assertEqual(len(bundle.initial_workloads), 0)
+            lq_names = [d["metadata"]["name"] for d in bundle.prereq_and_queue_docs if d.get("kind") == "LocalQueue"]
+            self.assertEqual(lq_names, ["lq-main"])
+            self.assertEqual(len(bundle.scheduled_workflows), 1)
+            self.assertEqual(bundle.scheduled_workflows[0].name, "late-fast-job")
+            self.assertEqual(bundle.scheduled_workflows[0].raw_offset_from_t0_sec, 45.0)
+            self.assertEqual(bundle.scheduled_workflows[0].trigger_reason, "post_t0_fast_admitted")
+
+            infra_kinds = [(ie.object_kind, ie.event_type, round(ie.raw_offset_from_t0_sec, 1)) for ie in bundle.scheduled_infra_events]
+            self.assertIn(("Pod", "New", 20.0), infra_kinds)
+            self.assertIn(("ClusterQueue", "Update", 30.0), infra_kinds)
+
+    def test_experiments_E_F_G_H_fifo_backlog_t0_preempt_full_waves_and_imputation(self) -> None:
+        t0 = "2026-11-22T10:00:00Z"
+        with tempfile.TemporaryDirectory() as td:
+            sc = Path(td)
+            infra = self._base_infra_events(t0)
+            # Exp F: t0 pod preempted at +100s in trace, then re-admitted and finished FullExecution=800s at +1000s.
+            infra.append(
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "t0-preempt-full-0",
+                        "namespace": "ai-lab",
+                        "placement": "node-0",
+                        "workloadName": "wl-t0-preempt-full",
+                        "ownerKind": "Job",
+                        "ownerName": "t0-preempt-full",
+                        "resourceRequest": {"cpu": "2", "memory": "4Gi", "google.com/tpu": "1"},
+                        "deletionTime": "2026-11-22T10:01:40Z",  # +100s preemption
+                    },
+                }
+            )
+            infra.append(
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "t0-scrape-end-0",
+                        "namespace": "ai-lab",
+                        "placement": "node-0",
+                        "workloadName": "wl-t0-scrape-end",
+                        "ownerKind": "Job",
+                        "ownerName": "t0-scrape-end",
+                        "resourceRequest": {"cpu": "2", "memory": "4Gi", "google.com/tpu": "1"},
+                    },
+                }
+            )
+            wf = [
+                self._mk_job_event(t0, "New", "Admitted", "t0-preempt-full", creation_time="2026-11-22T09:50:00Z"),
+                self._mk_job_event(t0, "New", "Admitted", "t0-scrape-end", creation_time="2026-11-22T09:58:00Z"),
+                # Exp E: listed alphabetically (alpha, mid, zeta), created zeta (-300s), mid (-200s), alpha (-100s)
+                self._mk_job_event(t0, "New", "NotAdmitted", "alpha", creation_time="2026-11-22T09:58:20Z"),
+                self._mk_job_event(t0, "New", "NotAdmitted", "mid", creation_time="2026-11-22T09:56:40Z"),
+                self._mk_job_event(t0, "New", "NotAdmitted", "zeta", creation_time="2026-11-22T09:55:00Z"),
+                # Exp G: completions=10, parallelism=2 (5 waves) with 100s FullExecution -> 20s per pod!
+                self._mk_job_event(
+                    "2026-11-22T10:00:10Z",
+                    "New",
+                    "NotAdmitted",
+                    "wave-job",
+                    parallelism=2,
+                    completions=10,
+                ),
+                # Exp H: starved job with no execution-time.json entry -> imputed from 80s peer median!
+                self._mk_job_event("2026-11-22T10:00:20Z", "New", "NotAdmitted", "starved-job"),
+            ]
+            ex = [
+                {
+                    "timestamp": t0,
+                    "eventType": "Admitted",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "workloadName": "wl-t0-preempt-full",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "t0-preempt-full",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "creationTime": "2026-11-22T09:50:00Z",
+                        "admittedTime": t0,
+                    },
+                },
+                {
+                    "timestamp": "2026-11-22T10:01:40Z",
+                    "eventType": "PartialExecution",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "executionType": "Partial",
+                        "workloadName": "wl-t0-preempt-full",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "t0-preempt-full",
+                        "localQueueName": "lq-main",
+                        "admittedTime": t0,
+                        "endTime": "2026-11-22T10:01:40Z",
+                        "executionDurationSeconds": 100.0,
+                        "interruptionReason": "Preempted",
+                        "preempted": True,
+                    },
+                },
+                {
+                    "timestamp": "2026-11-22T10:16:40Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "wl-t0-preempt-full",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "t0-preempt-full",
+                        "localQueueName": "lq-main",
+                        "admittedTime": "2026-11-22T10:03:20Z",
+                        "endTime": "2026-11-22T10:16:40Z",
+                        "executionDurationSeconds": 800.0,
+                        "preempted": False,
+                    },
+                },
+                {
+                    "timestamp": "2026-11-22T10:00:40Z",
+                    "eventType": "PartialExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Partial",
+                        "workloadName": "wl-t0-scrape-end",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "t0-scrape-end",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "creationTime": "2026-11-22T09:58:00Z",
+                        "admittedTime": t0,
+                        "endTime": "2026-11-22T10:00:40Z",
+                        "executionDurationSeconds": 40.0,
+                        "interruptionReason": "ScrapeEnded",
+                        "preempted": False,
+                    },
+                },
+                *[
+                    {
+                        "timestamp": "2026-11-22T10:01:20Z",
+                        "eventType": "FullExecution",
+                        "workloadState": "Admitted",
+                        "payload": {
+                            "executionType": "Full",
+                            "workloadName": f"wl-{nm}",
+                            "namespace": "ai-lab",
+                            "ownerKind": "Job",
+                            "ownerName": nm,
+                            "localQueueName": "lq-main",
+                            "admittedTime": t0,
+                            "endTime": "2026-11-22T10:01:20Z",
+                            "executionDurationSeconds": 80.0,
+                            "preempted": False,
+                        },
+                    }
+                    for nm in ("alpha", "mid", "zeta")
+                ],
+                {
+                    "timestamp": "2026-11-22T10:01:50Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "wl-wave-job",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "wave-job",
+                        "localQueueName": "lq-main",
+                        "admittedTime": "2026-11-22T10:00:10Z",
+                        "endTime": "2026-11-22T10:01:50Z",
+                        "executionDurationSeconds": 100.0,
+                        "preempted": False,
+                    },
+                },
+            ]
+            (sc / "infra.json").write_text("\n".join(json.dumps(x) for x in infra) + "\n", encoding="utf-8")
+            (sc / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf) + "\n", encoding="utf-8")
+            (sc / "execution-time.json").write_text("\n".join(json.dumps(x) for x in ex) + "\n", encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                testrunner.load_scenario_bundle(sc, skip_initial_offset=False, missing_duration_policy="error")
+
+            bundle = testrunner.load_scenario_bundle(sc, skip_initial_offset=False, missing_duration_policy="impute")
+            t0_backlog_names = [w.name for w in bundle.scheduled_workflows if w.target_wall_offset_sec == 0.0]
+            self.assertEqual(t0_backlog_names, ["zeta", "mid", "alpha"])
+
+            iwl_by_owner = {w.owner_name: w for w in bundle.initial_workloads}
+            # Exp F: uninterrupted 800s (NOT truncated 100s), and ScrapeEnded gets 1.5x * 40s = 60s (NOT 10 days)!
+            self.assertAlmostEqual(iwl_by_owner["t0-preempt-full"].pods[0].remaining_duration_sec, 800.0)
+            self.assertFalse(iwl_by_owner["t0-scrape-end"].pods[0].is_infinite)
+            self.assertAlmostEqual(iwl_by_owner["t0-scrape-end"].pods[0].remaining_duration_sec, 60.0)
+            # Seniority order: t0-preempt-full (09:50) comes before t0-scrape-end (09:58)
+            self.assertEqual([w.owner_name for w in bundle.initial_workloads], ["t0-preempt-full", "t0-scrape-end"])
+
+            sw_by_name = {w.name: w for w in bundle.scheduled_workflows}
+            # Exp G: 100s / ceil(10 / 2) = 20s per pod!
+            wave_pod_ann = sw_by_name["wave-job"].manifest["spec"]["template"]["metadata"]["annotations"][
+                "kueue-optimizer.gke.io/pod-execution-time-seconds"
+            ]
+            self.assertEqual(wave_pod_ann, "20")
+            # Exp H: starved-job imputed from 1-pod lq-main peers (80.0s), NOT 10.0s fallback!
+            self.assertEqual(sw_by_name["starved-job"].execution_duration_sec, 80.0)
+            self.assertEqual(bundle.imputed_duration_count, 1)
+            self.assertTrue(bundle.missing_duration_warnings)
+
+    def test_experiments_K_L_and_compat_lws_ray_priorityclass_scheduler_admissionchecks_noexecute(self) -> None:
+        from runner.replay import _fail_pods_bound_to_node
+
+        t0 = "2026-11-22T10:00:00Z"
+        with tempfile.TemporaryDirectory() as td:
+            sc = Path(td)
+            infra = self._base_infra_events(t0)
+            # Add a NotReady node at t0 (Experiment K)
+            infra.append(
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "node-down-t0"},
+                        "status": {
+                            "allocatable": {"cpu": "64", "memory": "128Gi", "pods": "110"},
+                            "capacity": {"cpu": "64", "memory": "128Gi", "pods": "110"},
+                            "conditions": [{"type": "Ready", "status": "False"}],
+                        },
+                    },
+                }
+            )
+            wf = [
+                self._mk_job_event(
+                    t0,
+                    "New",
+                    "NotAdmitted",
+                    "job-custom",
+                    priority_class_k8s="prod-tier-1",
+                    scheduler_name="volcano-custom-sched",
+                ),
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "LeaderWorkerSet",
+                        "name": "lws-infer",
+                        "namespace": "ai-lab",
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "leaderworkerset.x-k8s.io/v1",
+                            "kind": "LeaderWorkerSet",
+                            "metadata": {
+                                "name": "lws-infer",
+                                "namespace": "ai-lab",
+                                "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                            },
+                            "spec": {
+                                "replicas": 1,
+                                "leaderWorkerTemplate": {
+                                    "size": 4,
+                                    "leaderTemplate": {
+                                        "spec": {
+                                            "containers": [
+                                                {
+                                                    "name": "leader",
+                                                    "resources": {"requests": {"cpu": "2", "memory": "4Gi"}},
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    "workerTemplate": {
+                                        "spec": {
+                                            "containers": [
+                                                {
+                                                    "name": "worker",
+                                                    "resources": {"requests": {"cpu": "2", "memory": "4Gi"}},
+                                                }
+                                            ]
+                                        }
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "RayJob",
+                        "name": "ray-train",
+                        "namespace": "ai-lab",
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "ray.io/v1",
+                            "kind": "RayJob",
+                            "metadata": {
+                                "name": "ray-train",
+                                "namespace": "ai-lab",
+                                "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                            },
+                            "spec": {
+                                "suspend": True,
+                                "rayClusterSpec": {
+                                    "headGroupSpec": {
+                                        "template": {
+                                            "spec": {
+                                                "containers": [
+                                                    {
+                                                        "name": "head",
+                                                        "resources": {"requests": {"cpu": "2", "memory": "4Gi"}},
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    },
+                                    "workerGroupSpecs": [
+                                        {
+                                            "groupName": "gpu-workers",
+                                            "replicas": 2,
+                                            "template": {
+                                                "spec": {
+                                                    "containers": [
+                                                        {
+                                                            "name": "worker",
+                                                            "resources": {"requests": {"cpu": "4", "memory": "8Gi"}},
+                                                        }
+                                                    ]
+                                                }
+                                            },
+                                        }
+                                    ],
+                                },
+                            },
+                        },
+                    },
+                },
+            ]
+            (sc / "infra.json").write_text("\n".join(json.dumps(x) for x in infra) + "\n", encoding="utf-8")
+            (sc / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf) + "\n", encoding="utf-8")
+            (sc / "execution-time.json").write_text("", encoding="utf-8")
+
+            bundle = testrunner.load_scenario_bundle(sc, skip_initial_offset=False)
+
+            # Exp L: hugepages-1Gi=0 skipped -> real accelerator selected!
+            node0 = next(n for n in bundle.nodes if n["metadata"]["name"] == "node-0")
+            self.assertIn(
+                node0["metadata"]["annotations"]["kueue-optimizer.gke.io/node-accel-resource"],
+                ("google.com/tpu", "nvidia.com/gpu"),
+            )
+
+            # ClusterQueue admissionChecks stripped & recorded in annotation
+            cq_doc = next(d for d in bundle.prereq_and_queue_docs if d.get("kind") == "ClusterQueue")
+            self.assertNotIn("admissionChecks", cq_doc["spec"])
+            self.assertNotIn("admissionCheckStrategy", cq_doc["spec"])
+            self.assertEqual(
+                cq_doc["metadata"]["annotations"]["kueue-optimizer.gke.io/stripped-admission-checks"],
+                "prov-check-1,prov-check-2",
+            )
+
+            # PodSpec priorityClassName synthesized as scheduling.k8s.io/v1 PriorityClass, custom schedulerName stripped
+            k8s_pcs = [d for d in bundle.prereq_and_queue_docs if d.get("kind") == "PriorityClass"]
+            self.assertEqual([d["metadata"]["name"] for d in k8s_pcs], ["prod-tier-1"])
+            sw_by_name = {w.name: w for w in bundle.scheduled_workflows}
+            jc_pspec = sw_by_name["job-custom"].manifest["spec"]["template"]["spec"]
+            self.assertNotIn("schedulerName", jc_pspec)
+            self.assertNotIn("priority", jc_pspec)
+            self.assertEqual(jc_pspec["containers"][0]["resources"]["limits"]["google.com/tpu"], "1")
+
+            # LWS & RayJob translated to runnable JobSets with exact pod counts (4 and 3)
+            self.assertEqual(sw_by_name["lws-infer"].manifest["kind"], "JobSet")
+            self.assertEqual(sw_by_name["lws-infer"].pod_count, 4)
+            self.assertEqual(sw_by_name["ray-train"].manifest["kind"], "JobSet")
+            self.assertEqual(sw_by_name["ray-train"].pod_count, 3)
+
+            # Exp K: sync_kwok_nodes succeeds immediately when node-down-t0 is NotReady at t0
+            mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-fidk", apiserver_port=16499)
+            try:
+                patched_statuses: list[tuple[str, dict]] = []
+
+                def fake_node_api(method: str, path: str, **kw: object) -> tuple[int, bytes]:
+                    if method == "PATCH" and path.endswith("/status"):
+                        patched_statuses.append((path, json.loads(kw["body"].decode("utf-8"))))
+                        return 200, b"{}"
+                    if method == "GET" and path == "/api/v1/nodes":
+                        return 200, json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "metadata": {"name": "node-0", "labels": {"type": "kwok"}},
+                                        "status": {
+                                            "conditions": [{"type": "Ready", "status": "True"}],
+                                            "allocatable": node0["status"]["allocatable"],
+                                        },
+                                    },
+                                    {
+                                        "metadata": {"name": "node-down-t0", "labels": {"type": "kwok"}},
+                                        "status": {
+                                            "conditions": [{"type": "Ready", "status": "False"}],
+                                            "allocatable": {"cpu": "64", "memory": "128Gi", "pods": "110"},
+                                        },
+                                    },
+                                ]
+                            }
+                        ).encode("utf-8")
+                    if method == "GET" and path.startswith("/api/v1/pods?fieldSelector="):
+                        return 200, json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "metadata": {"name": "tol-pod", "namespace": "ai-lab"},
+                                        "spec": {
+                                            "tolerations": [
+                                                {"key": "maint", "operator": "Equal", "value": "true", "effect": "NoExecute"}
+                                            ],
+                                            "containers": [{"name": "c"}],
+                                        },
+                                        "status": {"phase": "Running"},
+                                    },
+                                    {
+                                        "metadata": {"name": "untol-pod", "namespace": "ai-lab"},
+                                        "spec": {"tolerations": [], "containers": [{"name": "c"}]},
+                                        "status": {"phase": "Running"},
+                                    },
+                                ]
+                            }
+                        ).encode("utf-8")
+                    return 200, b"{}"
+
+                with (
+                    mock.patch.object(mgr, "apply_manifests_parallel"),
+                    mock.patch.object(mgr, "api_request", side_effect=fake_node_api),
+                ):
+                    mgr.sync_kwok_nodes(bundle.nodes, timeout_sec=2.0)
+                    self.assertTrue(any("node-down-t0/status" in p for p, _ in patched_statuses))
+
+                    failed_cnt = _fail_pods_bound_to_node(
+                        mgr,
+                        {"ai-lab"},
+                        "node-0",
+                        reason="TaintManagerEviction",
+                        message="NoExecute taint",
+                        no_execute_taints=[{"key": "maint", "value": "true", "effect": "NoExecute"}],
+                    )
+                    # Only untol-pod fails; tol-pod tolerates the NoExecute taint!
+                    self.assertEqual(failed_cnt, 1)
+            finally:
+                mgr.close()
+
+    def test_same_creation_epoch_batch_dispatches_in_parallel(self) -> None:
+        from runner.loader import load_scenario_bundle
+        from runner.replay import run_scenario_replay
+
+        sc_dir = REPO_ROOT / "testscenarios" / "self-tests" / "st08-single-priority-deep-backlog-waves"
+        bundle = load_scenario_bundle(
+            scenario_dir=sc_dir,
+            infra_path=None,
+            workflows_path=None,
+            execution_time_path=None,
+            speedup=1.0,
+            min_pod_duration_sec=0.1,
+            infinite_pod_duration_sec=86400.0,
+            default_exec_sec=35.0,
+            initial_window_sec=1.0,
+            skip_initial_offset=True,
+            pause_image_override="",
+            override_workload_namespace=None,
+            override_queueing_strategy=None,
+            override_cq_fair_sharing_preemption=None,
+        )
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-ut-st08", workload_namespace="st-workloads")
+        calls: list[tuple[int, int]] = []
+        try:
+            def rec_parallel(docs, max_workers=24):
+                calls.append((len(docs), max_workers))
+
+            with (
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=rec_parallel),
+                mock.patch("runner.replay.query_cluster_status") as q_mock,
+            ):
+                q_mock.return_value = ClusterStatusSnapshot(
+                    workloads_admitted=0,
+                    workloads_pending=0,
+                    workloads_finished=16,
+                    pods_running=0,
+                    pods_pending=0,
+                    pods_succeeded=32,
+                    pods_failed=0,
+                    jobsets_completed=16,
+                    jobsets_failed=0,
+                    cq_summary=[],
+                    workloads_query_ok=True,
+                )
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle,
+                    speedup=1.0,
+                    max_run_seconds=None,
+                    status_interval_sec=3.0,
+                    wait_for_completion=False,
+                    initial_state_already_bootstrapped=True,
+                )
+            self.assertEqual(calls, [(16, 24)])
+        finally:
+            mgr.close()
+
+
 if __name__ == "__main__":
     unittest.main()

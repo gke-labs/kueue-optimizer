@@ -10,9 +10,9 @@ This document specifies the exact JSON Lines (NDJSON) file format, event envelop
 
 | File | Default Flag | Purpose |
 | :--- | :--- | :--- |
-| `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, Kueue controller `Configuration` (`ConfigMap/kueue-manager-config`), `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
-| `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of `Job`s, `JobSet`s, `LeaderWorkerSet`s, Kueue-managed `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s, with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
-| `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), preempted runs (`PartialExecution`), and non-preempted completions (`FullExecution`), with top-level `workloadState` metadata. |
+| `infra.json` | `--infra-file` | Periodic state & real-time watch changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, `PriorityClass`es (`scheduling.k8s.io/v1`), Kueue controller `Configuration` (`ConfigMap/kueue-manager-config` + `Deployment/kueue-controller-manager` `--feature-gates` CLI overrides), `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es, and scheduled/running `Pod` placements, resource requests, and real-time lifecycle timestamps. |
+| `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of Kueue-managed `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s (sorted by `creationTime` at `t0` and retaining watch `ResourceVersion`s across reconnects), with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
+| `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), interrupted/deleted runs (`PartialExecution`), and non-interrupted completions (`FullExecution`), with top-level `workloadState` metadata. |
 
 ### On-Disk File Format (One Event Per Line / JSON Lines)
 Each output file is written in **JSON Lines (NDJSON)** format:
@@ -111,6 +111,7 @@ Every `payload` object in `infra.json` contains top-level `"apiVersion"` and `"k
 | `"Node"` | `"v1"` | **Yes** (scheduling-only: `capacity`, `allocatable`, `conditions`, `phase`) | **No** (plain name) |
 | `"Namespace"` | `"v1"` | **No** (status omitted) | **No** (plain name) |
 | `"RuntimeClass"` | `"node.k8s.io/v1"` | **No** (status omitted) | **No** (plain name) |
+| `"PriorityClass"` | `"scheduling.k8s.io/v1"` | **No** (status & description omitted) | **No** (plain name) |
 | `"ClusterQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"Cohort"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"LocalQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
@@ -322,9 +323,9 @@ stateDiagram-v2
 | `endTime` | `string` (RFC3339 UTC) | On `PartialExecution` / `FullExecution` | Interruption/cutoff timestamp (for `PartialExecution`) or completion timestamp (for `FullExecution`). Omitted on `Admitted` events. |
 | `executionDurationSeconds` | `number` (`float64`) | On `PartialExecution` / `FullExecution` | Elapsed execution time in seconds (`endTime - admittedTime`). Omitted on `Admitted` events. |
 | `executionDuration` | `string` | On `PartialExecution` / `FullExecution` | Human-readable Go duration string (e.g., `"11s"`, `"1m30s"`). Omitted on `Admitted` events. |
-| `preempted` | `boolean` | **Yes** | `true` strictly when interrupted by preemption (`interruptionReason == "Preempted"`); `false` on `Admitted`, `FullExecution`, and non-preemption `PartialExecution` events (`NodeFailure`, `PodsReadyTimeout`, `Evicted`, `Failed`, `ScrapeEnded`). |
+| `preempted` | `boolean` | **Yes** | `true` strictly when interrupted by preemption (`interruptionReason == "Preempted"`); `false` on `Admitted`, `FullExecution`, and non-preemption `PartialExecution` events (`NodeFailure`, `PodsReadyTimeout`, `Evicted`, `Failed`, `Deleted`, `ScrapeEnded`). |
 | `preemptionCount` | `integer` | Optional | Cumulative number of times this workload has been preempted so far (omitted when `0`). |
-| `interruptionReason` | `string` | On `PartialExecution` | Categorized interruption cause: `"Preempted"`, `"NodeFailure"`, `"PodsReadyTimeout"`, `"Evicted"`, `"Failed"`, or `"ScrapeEnded"`. |
+| `interruptionReason` | `string` | On `PartialExecution` | Categorized interruption cause: `"Preempted"`, `"NodeFailure"`, `"PodsReadyTimeout"`, `"Evicted"`, `"Failed"`, `"Deleted"`, or `"ScrapeEnded"`. |
 | `interruptionCount` | `integer` | Optional | Cumulative number of interrupted execution slices observed for this workload (omitted when `0`). |
 | `trueDurationSeconds` | `number` (`float64`) | Optional | Explicit true uninterrupted execution duration in seconds (populated from `kueue-optimizer.gke.io/true-execution-time-seconds` or trace post-processing). Used by `testrunner.py` when replaying workloads that only recorded `PartialExecution` (`trueDurationSeconds > observed partial duration`). |
 | `missingDurationMultiplier` | `number` (`float64`) | Optional | Per-workload multiplier (`> 1.0`, populated from `kueue-optimizer.gke.io/missing-duration-multiplier` or trace post-processing) applied to `max(partial_durations_sec)` when `FullExecution` and `trueDurationSeconds` are absent. |
@@ -339,7 +340,7 @@ When a workload was scraped from admission until preemption, node failure, `Pods
 2. **Schema / Annotation True Length (`trueDurationSeconds` or `kueue-optimizer.gke.io/true-execution-time-seconds`)**: Explicit true uninterrupted length (`> observed_partial`).
 3. **CLI Multiplier (`--interrupted-duration-multiplier <M>`, `M > 1.0`)**: `max(partial_durations_sec) * M`.
 4. **Schema / Annotation Multiplier (`missingDurationMultiplier` or `kueue-optimizer.gke.io/missing-duration-multiplier`, `> 1.0`)**: `max(partial_durations_sec) * missingDurationMultiplier`.
-5. **Default Interrupted Multiplier (`1.5x`)**: `max(partial_durations_sec) * 1.5`.
+5. **Default Interrupted Multiplier (`1.5x` for external interruptions; `1.0x` for `Failed` / `Deleted`)**: `max(partial_durations_sec) * 1.5` for external cluster interruptions (`Preempted`, `NodeFailure`, `PodsReadyTimeout`, `Evicted`, `ScrapeEnded`), or `1.0x` (`max(partial_durations_sec)`) when the workload exited on its own (`Failed`) or was explicitly deleted (`Deleted`) without an explicit multiplier/override.
 
 Workloads that recorded a `FullExecution` always use `FullExecution` (`full_duration_sec`) and are unaffected by interrupted-workload multipliers or overrides.
 

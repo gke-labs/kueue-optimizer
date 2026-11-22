@@ -32,9 +32,77 @@ from runner.loader import (
     InitialWorkloadPodGroup,
     ScenarioBundle,
     ScheduledInfraEvent,
+    ScheduledWorkflowDeletion,
     ScheduledWorkflowItem,
 )
 from runner.validation import SYSTEM_NAMESPACES
+
+
+def _pod_tolerates_taint(pod_spec: dict[str, Any] | None, taint: dict[str, Any]) -> bool:
+    """Return True if pod_spec's tolerations tolerate the given taint indefinitely (or with positive tolerationSeconds)."""
+    if not isinstance(pod_spec, dict) or not isinstance(taint, dict):
+        return False
+    t_key = str(taint.get("key") or "")
+    t_val = str(taint.get("value") or "")
+    t_eff = str(taint.get("effect") or "")
+    for tol in pod_spec.get("tolerations") or []:
+        if not isinstance(tol, dict):
+            continue
+        tol_eff = str(tol.get("effect") or "")
+        if tol_eff and tol_eff != t_eff:
+            continue
+        tol_op = str(tol.get("operator") or "Equal")
+        tol_key = str(tol.get("key") or "")
+        tol_val = str(tol.get("value") or "")
+        key_val_ok = False
+        if tol_op == "Exists":
+            key_val_ok = (tol_key == "") or (tol_key == t_key)
+        elif tol_op in ("", "Equal"):
+            key_val_ok = (tol_key == t_key) and (tol_val == t_val)
+        if not key_val_ok:
+            continue
+        tol_sec = tol.get("tolerationSeconds")
+        if tol_sec is not None:
+            try:
+                if float(tol_sec) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        return True
+    return False
+
+
+def _pod_tolerates_all_no_execute_taints(
+    pod_spec: dict[str, Any] | None,
+    no_execute_taints: list[dict[str, Any]],
+) -> bool:
+    return all(_pod_tolerates_taint(pod_spec, t) for t in no_execute_taints)
+
+
+def _delete_rest_path(api_version: str, kind: str, namespace: str, name: str) -> str:
+    plural_map = {
+        "Node": ("v1", "nodes", True),
+        "Namespace": ("v1", "namespaces", True),
+        "Pod": ("v1", "pods", False),
+        "Job": ("batch/v1", "jobs", False),
+        "Deployment": ("apps/v1", "deployments", False),
+        "JobSet": ("jobset.x-k8s.io/v1alpha2", "jobsets", False),
+        "Workload": ("kueue.x-k8s.io/v1beta2", "workloads", False),
+        "ClusterQueue": ("kueue.x-k8s.io/v1beta2", "clusterqueues", True),
+        "Cohort": ("kueue.x-k8s.io/v1beta2", "cohorts", True),
+        "LocalQueue": ("kueue.x-k8s.io/v1beta2", "localqueues", False),
+        "ResourceFlavor": ("kueue.x-k8s.io/v1beta2", "resourceflavors", True),
+        "Topology": ("kueue.x-k8s.io/v1beta2", "topologies", True),
+        "WorkloadPriorityClass": ("kueue.x-k8s.io/v1beta2", "workloadpriorityclasses", True),
+        "PriorityClass": ("scheduling.k8s.io/v1", "priorityclasses", True),
+        "RuntimeClass": ("node.k8s.io/v1", "runtimeclasses", True),
+    }
+    default_api, plural, cluster_scoped = plural_map.get(kind, (api_version or "v1", f"{kind.lower()}s", False))
+    eff_api = api_version or default_api
+    prefix = "/api/v1" if eff_api == "v1" else f"/apis/{eff_api}"
+    if cluster_scoped or not namespace:
+        return f"{prefix}/{plural}/{name}"
+    return f"{prefix}/namespaces/{namespace}/{plural}/{name}"
 
 
 def _fail_pods_bound_to_node(
@@ -43,6 +111,8 @@ def _fail_pods_bound_to_node(
     node_name: str,
     reason: str,
     message: str,
+    *,
+    no_execute_taints: list[dict[str, Any]] | None = None,
 ) -> int:
     """Transition active non-terminal Pods bound to `node_name` to phase=Failed so Job/JobSet & Kueue TAS react immediately."""
     q_sel = urllib.parse.quote(f"spec.nodeName={node_name}", safe="=")
@@ -63,7 +133,10 @@ def _fail_pods_bound_to_node(
         p_status = pod.get("status") or {}
         if str(p_status.get("phase") or "") in ("Succeeded", "Failed"):
             continue
-        containers = ((pod.get("spec") or {}).get("containers")) or []
+        p_spec = pod.get("spec") or {}
+        if no_execute_taints and _pod_tolerates_all_no_execute_taints(p_spec, no_execute_taints):
+            continue
+        containers = p_spec.get("containers") or []
         c_statuses = []
         for c in containers:
             if not isinstance(c, dict):
@@ -152,9 +225,30 @@ def _execute_scheduled_infra_event(
     ie: ScheduledInfraEvent,
     wall_elapsed: float,
 ) -> None:
-    """Apply a scheduled post-t0 Node failure, taint, recovery, addition, or deletion."""
+    """Apply a scheduled post-t0 Node, Queue/Quota, PriorityClass, RuntimeClass, Namespace, or non-Kueue Pod event."""
     if ie.object_kind != "Node":
+        target_label = f"{ie.namespace}/{ie.name}" if ie.namespace else ie.name
+        if ie.event_type == "Deleted":
+            if ie.object_kind == "Namespace":
+                # Keep workload namespaces intact so Kueue Workload history and end-of-run metrics remain readable.
+                return
+            del_path = _delete_rest_path("", ie.object_kind, ie.namespace, ie.name)
+            mgr.api_delete(del_path, ignore_not_found=True)
+            print(
+                f"  - [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
+                f"Deleted {ie.object_kind} '{target_label}'",
+                flush=True,
+            )
+            return
+        if ie.manifest:
+            mgr.ssa_apply_doc(ie.manifest)
+            print(
+                f"  * [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
+                f"Applied {ie.event_type} {ie.object_kind} '{target_label}'",
+                flush=True,
+            )
         return
+
     allowed_ns = set(bundle.workload_namespaces) | {bundle.infra_pods_namespace}
     if ie.event_type == "Deleted":
         failed_pods = _fail_pods_bound_to_node(
@@ -229,12 +323,18 @@ def _execute_scheduled_infra_event(
                 reason="KubeletNotReady",
                 message="Simulated node failure during scenario replay",
             )
+        no_exec_filter = (
+            [t for t in taints_list if str(t.get("effect") or "") == "NoExecute"]
+            if (not ie.is_not_ready and ie.has_no_execute_taint)
+            else None
+        )
         failed_pods = _fail_pods_bound_to_node(
             mgr,
             allowed_ns,
             ie.name,
-            reason="NodeFailure",
-            message=f"Simulated node failure on '{ie.name}'",
+            reason="NodeFailure" if ie.is_not_ready else "TaintManagerEviction",
+            message=f"Simulated node {'failure' if ie.is_not_ready else 'NoExecute taint eviction'} on '{ie.name}'",
+            no_execute_taints=no_exec_filter,
         )
         print(
             f"  ! [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
@@ -303,13 +403,19 @@ def apply_scenario_queues_and_wait(
             f"({wl_pod_total} pod(s)) before queue activation...",
             flush=True,
         )
-        bootstrap_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_dt = datetime.now(timezone.utc)
         stamped_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        for w in initial_workloads:
+        for idx_w, w in enumerate(initial_workloads):
+            age_offset = max(0.0, float(getattr(w, "original_age_sec", 0.0) or 0.0))
+            if age_offset == 0.0 and len(initial_workloads) > 1:
+                age_offset = float(len(initial_workloads) - idx_w)
+            wl_ts = datetime.fromtimestamp(now_dt.timestamp() - age_offset, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
             st_copy = json.loads(json.dumps(w.workload_status))
             for cond in st_copy.get("conditions") or []:
                 if isinstance(cond, dict):
-                    cond["lastTransitionTime"] = bootstrap_iso
+                    cond["lastTransitionTime"] = wl_ts
             stamped_pairs.append((w.workload_manifest, st_copy))
         mgr.apply_pre_admitted_workloads_parallel(stamped_pairs)
         for iwl in initial_workloads[:8]:
@@ -450,6 +556,8 @@ def run_scenario_replay(
     heapq.heapify(event_heap)
     infra_heap: list[ScheduledInfraEvent] = list(bundle.scheduled_infra_events)
     heapq.heapify(infra_heap)
+    delete_heap: list[ScheduledWorkflowDeletion] = list(bundle.scheduled_workflow_deletions)
+    heapq.heapify(delete_heap)
 
     initial_wl_by_key = {(w.namespace, w.workload_name): w for w in bundle.initial_workloads}
     initial_wl_keys = set(initial_wl_by_key.keys())
@@ -459,6 +567,12 @@ def run_scenario_replay(
         if not all(p.is_infinite for p in w.pods)
     }
     resubmitted_initial_wls: set[tuple[str, str]] = set()
+    ever_finished_sched_wl_keys: set[tuple[str, str]] = set()
+    cancelled_workflow_count = 0
+    cancelled_unsubmitted_keys: set[tuple[str, str, str]] = set()
+    recreated_names: set[tuple[str, str]] = {
+        (d.namespace, d.applied_name) for d in bundle.scheduled_workflow_deletions if d.delete_reason == "before_recreate"
+    }
 
     total_planned = len(bundle.scheduled_workflows)
     submitted_count = 0
@@ -516,10 +630,13 @@ def run_scenario_replay(
             )
 
     def _scheduled_done_count(snap: ClusterStatusSnapshot) -> int:
+        ever_finished_sched_wl_keys.update(snap.finished_workload_keys - initial_wl_keys)
+        wl_done = len(ever_finished_sched_wl_keys) + cancelled_workflow_count
+        if recreated_names:
+            return wl_done
         if initial_wl_keys:
-            finished_sched = len(snap.finished_workload_keys - initial_wl_keys)
-            return max(finished_sched, snap.jobsets_completed + snap.jobsets_failed)
-        return max(snap.workloads_finished, snap.jobsets_completed + snap.jobsets_failed)
+            return max(wl_done, snap.jobsets_completed + snap.jobsets_failed + cancelled_workflow_count)
+        return max(wl_done, snap.workloads_finished + cancelled_workflow_count, snap.jobsets_completed + snap.jobsets_failed + cancelled_workflow_count)
 
     def _finite_initial_wls_done(snap: ClusterStatusSnapshot) -> bool:
         for wl_key in finite_initial_wl_keys:
@@ -533,12 +650,115 @@ def run_scenario_replay(
             return False
         return True
 
+    def _delete_workflow_and_children(del_ev: ScheduledWorkflowDeletion, wait_gone: bool) -> None:
+        del_path = _delete_rest_path(
+            del_ev.manifest_api_version,
+            del_ev.manifest_kind,
+            del_ev.namespace,
+            del_ev.applied_name,
+        )
+        del_opts = json.dumps({"apiVersion": "meta/v1", "kind": "DeleteOptions", "propagationPolicy": "Foreground"}).encode("utf-8")
+        mgr.api_request(
+            "DELETE",
+            del_path,
+            body=del_opts,
+            headers={"Content-Type": "application/json"},
+        )
+        # Also remove pods & child Jobs in namespace belonging to this workflow so KWOK pods release nodes immediately.
+        st_p, raw_p = mgr.api_request("GET", f"/api/v1/namespaces/{del_ev.namespace}/pods")
+        if st_p == 200 and raw_p:
+            pfx = f"{del_ev.applied_name}-"
+            for p_it in json.loads(raw_p.decode("utf-8")).get("items") or []:
+                pm = p_it.get("metadata") or {}
+                pn = str(pm.get("name") or "")
+                plbls = pm.get("labels") or {}
+                owned = (
+                    pn == del_ev.applied_name
+                    or pn.startswith(pfx)
+                    or plbls.get("job-name") == del_ev.applied_name
+                    or plbls.get("jobset.sigs.k8s.io/jobset-name") == del_ev.applied_name
+                )
+                if owned and pn:
+                    mgr.api_request(
+                        "DELETE",
+                        f"/api/v1/namespaces/{del_ev.namespace}/pods/{pn}?gracePeriodSeconds=0",
+                    )
+        if wait_gone:
+            wait_deadline = time.monotonic() + 5.0
+            while time.monotonic() < wait_deadline:
+                st_chk, _ = mgr.api_request("GET", del_path)
+                if st_chk == 404:
+                    break
+                time.sleep(0.1)
+
+    def _execute_workflow_deletion(del_ev: ScheduledWorkflowDeletion, wall_elapsed: float) -> None:
+        nonlocal cancelled_workflow_count, total_planned
+        if del_ev.initial_workload_name:
+            wl_key = (del_ev.namespace, del_ev.initial_workload_name)
+            resubmitted_initial_wls.add(wl_key)
+            iwl = initial_wl_by_key.get(wl_key)
+            if iwl is not None:
+                for p_spec in iwl.pods:
+                    pm_name = str((p_spec.manifest.get("metadata") or {}).get("name") or p_spec.name)
+                    mgr.api_request(
+                        "DELETE",
+                        f"/api/v1/namespaces/{del_ev.namespace}/pods/{pm_name}?gracePeriodSeconds=0",
+                    )
+            mgr.api_delete(
+                f"/apis/kueue.x-k8s.io/v1beta2/namespaces/{del_ev.namespace}/workloads/{del_ev.initial_workload_name}",
+                ignore_not_found=True,
+            )
+            print(
+                f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "
+                f"Deleted t0 initial Workload '{del_ev.namespace}/{del_ev.initial_workload_name}'",
+                flush=True,
+            )
+            return
+
+        # Snapshot finished workload keys BEFORE deleting an object that is about to be re-created with the same name.
+        pre_snap = query_cluster_status(
+            mgr,
+            workload_namespaces=bundle.workload_namespaces,
+            include_kueue_workloads=True,
+        )
+        ever_finished_sched_wl_keys.update(pre_snap.finished_workload_keys - initial_wl_keys)
+
+        unsubmitted_match = any(
+            w.namespace == del_ev.namespace and w.object_kind == del_ev.object_kind and w.name == del_ev.name
+            for w in event_heap
+        )
+        if unsubmitted_match and del_ev.delete_reason == "cancelled":
+            cancelled_unsubmitted_keys.add((del_ev.namespace, del_ev.object_kind, del_ev.name))
+            total_planned = max(0, total_planned - 1)
+            print(
+                f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "
+                f"Cancelled pending unsubmitted {del_ev.object_kind} '{del_ev.namespace}/{del_ev.name}'",
+                flush=True,
+            )
+            return
+
+        has_future_same_name = any(
+            w.namespace == del_ev.namespace
+            and str((w.manifest.get("metadata") or {}).get("name") or w.name) == del_ev.applied_name
+            for w in event_heap
+        )
+        _delete_workflow_and_children(del_ev, wait_gone=(del_ev.delete_reason == "before_recreate" or has_future_same_name))
+        if del_ev.delete_reason == "cancelled":
+            cancelled_workflow_count += 1
+        print(
+            f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "
+            f"Deleted {del_ev.object_kind} '{del_ev.namespace}/{del_ev.name}' (reason={del_ev.delete_reason})",
+            flush=True,
+        )
+
     def _print_status_line(snap: ClusterStatusSnapshot, now_mono: float, note: str = "") -> None:
         wall_elapsed = now_mono - t0_mono
         sim_elapsed = wall_elapsed * speedup
         next_candidates: list[float] = []
         if event_heap:
             next_candidates.append(max(0.0, event_heap[0].target_wall_offset_sec - wall_elapsed))
+        if delete_heap:
+            next_candidates.append(max(0.0, delete_heap[0].target_wall_offset_sec - wall_elapsed))
         if infra_heap:
             next_candidates.append(max(0.0, infra_heap[0].target_wall_offset_sec - wall_elapsed))
         if next_candidates:
@@ -566,6 +786,7 @@ def run_scenario_replay(
             workload_namespaces=bundle.workload_namespaces,
             include_kueue_workloads=True,
         )
+        ever_finished_sched_wl_keys.update(snap.finished_workload_keys - initial_wl_keys)
         _check_and_resubmit_evicted_initial_workloads(snap, wall_elapsed)
         return snap
 
@@ -597,14 +818,62 @@ def run_scenario_replay(
                     _execute_scheduled_infra_event(mgr, bundle, ie, time.monotonic() - t0_mono)
                 continue
 
+            # Execute due workflow deletions BEFORE same-timestamp creations so delete-and-recreate works cleanly.
+            due_deletes: list[ScheduledWorkflowDeletion] = []
+            while delete_heap and delete_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
+                due_deletes.append(heapq.heappop(delete_heap))
+
+            if due_deletes:
+                for del_ev in due_deletes:
+                    _execute_workflow_deletion(del_ev, time.monotonic() - t0_mono)
+                continue
+
             due_batch: list[ScheduledWorkflowItem] = []
             while event_heap and event_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
-                due_batch.append(heapq.heappop(event_heap))
+                cand_it = heapq.heappop(event_heap)
+                c_key = (cand_it.namespace, cand_it.object_kind, cand_it.name)
+                if c_key in cancelled_unsubmitted_keys:
+                    cancelled_unsubmitted_keys.discard(c_key)
+                    continue
+                due_batch.append(cand_it)
                 if len(due_batch) >= 200:
                     break
 
             if due_batch:
-                mgr.apply_manifests_parallel([item.manifest for item in due_batch], max_workers=24)
+                # Preserve exact creationTime FIFO order across small batches: group by creation_epoch
+                # and space distinct creation_epoch tiers across whole RFC3339 seconds when small (<= 12).
+                due_batch.sort(key=lambda x: (round(x.target_wall_offset_sec, 6), x.creation_epoch, x.seq))
+                distinct_c_epochs: list[float] = []
+                for x in due_batch:
+                    c_sec = round(float(x.creation_epoch), 3)
+                    if not distinct_c_epochs or abs(c_sec - distinct_c_epochs[-1]) > 1e-3:
+                        distinct_c_epochs.append(c_sec)
+
+                can_space_fifo = (
+                    1 < len(distinct_c_epochs) <= 12
+                    and len(due_batch) <= 24
+                    and (max_run_seconds is None or max_run_seconds >= len(distinct_c_epochs) * 2.5)
+                )
+                if can_space_fifo:
+                    groups: list[list[ScheduledWorkflowItem]] = []
+                    for x in due_batch:
+                        if not groups or abs(float(x.creation_epoch) - float(groups[-1][0].creation_epoch)) > 1e-3:
+                            groups.append([x])
+                        else:
+                            groups[-1].append(x)
+                    for g_idx, grp in enumerate(groups):
+                        mgr.apply_manifests_parallel(
+                            [it_g.manifest for it_g in grp],
+                            max_workers=min(24, max(1, len(grp))),
+                        )
+                        if g_idx + 1 < len(groups):
+                            rem_sec = max(0.05, 1.02 - (time.time() % 1.0))
+                            time.sleep(rem_sec)
+                elif len(distinct_c_epochs) > 1 and len(due_batch) <= 24:
+                    mgr.apply_manifests_parallel([item.manifest for item in due_batch], max_workers=1)
+                else:
+                    mgr.apply_manifests_parallel([item.manifest for item in due_batch], max_workers=24)
+
                 now_off = time.monotonic() - t0_mono
                 for item in due_batch:
                     submitted_count += 1
@@ -612,7 +881,7 @@ def run_scenario_replay(
 
                 if len(due_batch) == 1:
                     it = due_batch[0]
-                    src_tag = "exec-time.json" if it.indexed_from_execution_time else "fallback"
+                    src_tag = "exec-time.json" if it.indexed_from_execution_time else "fallback/imputed"
                     print(
                         f"  + [t={now_off:.2f}s wall / +{it.raw_offset_sec:.2f}s from start (t0+{it.raw_offset_from_t0_sec:.2f}s)] "
                         f"Created {it.object_kind} '{it.namespace}/{it.name}' "
@@ -636,7 +905,7 @@ def run_scenario_replay(
 
             now_mono = time.monotonic()
             due_status = now_mono >= next_status_mono
-            need_fast_poll = (not event_heap and not infra_heap) or bool(initial_wl_keys)
+            need_fast_poll = (not event_heap and not delete_heap) or bool(initial_wl_keys)
             due_poll = need_fast_poll and now_mono >= next_poll_mono
             if due_status or due_poll:
                 snap = _poll_cluster(now_mono)
@@ -649,7 +918,7 @@ def run_scenario_replay(
                 while next_poll_mono <= now_mono:
                     next_poll_mono += poll_interval_sec
 
-                if not event_heap and not infra_heap:
+                if not event_heap and not delete_heap:
                     if not wait_for_completion:
                         if not status_printed:
                             _print_status_line(snap, now_mono)
@@ -665,7 +934,10 @@ def run_scenario_replay(
                     if (
                         submitted_count == 0
                         and init_done
-                        and (finite_initial_wl_keys or (snap.pods_running == 0 and snap.workloads_admitted == 0))
+                        and (
+                            finite_initial_wl_keys
+                            or (not infra_heap and snap.pods_running == 0 and snap.workloads_admitted == 0)
+                        )
                     ):
                         if not status_printed:
                             _print_status_line(snap, now_mono)
@@ -675,10 +947,12 @@ def run_scenario_replay(
             now_mono = time.monotonic()
             wall_elapsed = now_mono - t0_mono
             wake_candidates = [next_status_mono - now_mono]
-            if (not event_heap and not infra_heap) or initial_wl_keys:
+            if (not event_heap and not delete_heap) or initial_wl_keys:
                 wake_candidates.append(next_poll_mono - now_mono)
             if event_heap:
                 wake_candidates.append(event_heap[0].target_wall_offset_sec - wall_elapsed)
+            if delete_heap:
+                wake_candidates.append(delete_heap[0].target_wall_offset_sec - wall_elapsed)
             if infra_heap:
                 wake_candidates.append(infra_heap[0].target_wall_offset_sec - wall_elapsed)
             if max_run_seconds is not None and max_run_seconds > 0:

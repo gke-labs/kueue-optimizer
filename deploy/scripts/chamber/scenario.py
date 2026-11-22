@@ -161,6 +161,13 @@ class WorkloadExecutionInfo:
         """True when the workload recorded PartialExecution(s) without completing FullExecution."""
         return (self.full_duration_sec is None or self.full_duration_sec <= 0) and bool(self.partial_durations_sec)
 
+    @property
+    def has_external_interruption(self) -> bool:
+        """True when at least one PartialExecution is not a self-terminal Failed/Deleted exit."""
+        if not self.interruption_reasons:
+            return True
+        return any(r not in ("Failed", "Deleted") for r in self.interruption_reasons)
+
     def resolved_duration_sec(
         self,
         default_sec: float = DEFAULT_FALLBACK_EXEC_SEC,
@@ -178,8 +185,9 @@ class WorkloadExecutionInfo:
           2. Schema/annotation trueDurationSeconds (true_duration_sec / workflow_true_duration_sec),
           3. Explicit CLI multiplier (--interrupted-duration-multiplier, > 1.0),
           4. Schema/annotation missingDurationMultiplier (> 1.0),
-          5. DEFAULT_INTERRUPTED_DURATION_MULTIPLIER (1.5x),
-        guaranteeing the replay duration is strictly longer than the interrupted recording.
+          5. DEFAULT_INTERRUPTED_DURATION_MULTIPLIER (1.5x) for external cluster interruptions
+             (Preempted, NodeFailure, PodsReadyTimeout, Evicted, ScrapeEnded), or 1.0x for
+             self-terminal Failed / user-Deleted exits unless explicitly overridden.
         """
         if self.full_duration_sec is not None and self.full_duration_sec > 0:
             return self.full_duration_sec
@@ -229,11 +237,40 @@ class WorkloadExecutionInfo:
                 eff_mult = float(workflow_missing_multiplier)
             elif self.missing_duration_multiplier is not None and self.missing_duration_multiplier > 1.0:
                 eff_mult = float(self.missing_duration_multiplier)
-            else:
+            elif self.has_external_interruption:
                 eff_mult = DEFAULT_INTERRUPTED_DURATION_MULTIPLIER
+            else:
+                eff_mult = 1.0
 
             return base_partial * eff_mult
         return default_sec
+
+
+def _select_incarnation(
+    candidates: list[WorkloadExecutionInfo] | None,
+    creation_epoch: float | None = None,
+    incarnation_index: int | None = None,
+) -> WorkloadExecutionInfo | None:
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    if creation_epoch is not None:
+        scored: list[tuple[int, float, int]] = []
+        for idx, cand in enumerate(candidates):
+            ref_ep = cand.creation_epoch
+            if ref_ep is None and cand.admitted_epochs:
+                ref_ep = min(cand.admitted_epochs)
+            if ref_ep is not None:
+                # Prefer workloads created at or right after the workflow's creationTime (within 2s clock skew).
+                before_penalty = 0 if ref_ep >= creation_epoch - 2.0 else 1
+                scored.append((before_penalty, abs(ref_ep - creation_epoch), idx))
+        if scored:
+            scored.sort()
+            return candidates[scored[0][2]]
+    if incarnation_index is not None and 0 <= incarnation_index < len(candidates):
+        return candidates[incarnation_index]
+    return candidates[0]
 
 
 @dataclass
@@ -243,6 +280,9 @@ class ExecutionTimeIndex:
     by_owner_kind_name: dict[tuple[str, str, str], WorkloadExecutionInfo] = field(default_factory=dict)
     by_owner_name: dict[tuple[str, str], WorkloadExecutionInfo] = field(default_factory=dict)
     by_workload_name: dict[tuple[str, str], WorkloadExecutionInfo] = field(default_factory=dict)
+    by_owner_kind_name_list: dict[tuple[str, str, str], list[WorkloadExecutionInfo]] = field(default_factory=dict)
+    by_owner_name_list: dict[tuple[str, str], list[WorkloadExecutionInfo]] = field(default_factory=dict)
+    all_workloads: list[WorkloadExecutionInfo] = field(default_factory=list)
     total_events: int = 0
     admitted_events: int = 0
     partial_events: int = 0
@@ -256,11 +296,20 @@ class ExecutionTimeIndex:
         object_kind: str,
         name: str,
         parent_jobset_name: str | None = None,
+        *,
+        creation_epoch: float | None = None,
+        incarnation_index: int | None = None,
     ) -> WorkloadExecutionInfo | None:
         """Look up execution info for a workflow object by (namespace, kind, name) or workload name."""
+        cands = self.by_owner_kind_name_list.get((namespace, object_kind, name))
+        if cands:
+            return _select_incarnation(cands, creation_epoch=creation_epoch, incarnation_index=incarnation_index)
         info = self.by_owner_kind_name.get((namespace, object_kind, name))
         if info is not None:
             return info
+        cands = self.by_owner_name_list.get((namespace, name))
+        if cands:
+            return _select_incarnation(cands, creation_epoch=creation_epoch, incarnation_index=incarnation_index)
         info = self.by_owner_name.get((namespace, name))
         if info is not None:
             return info
@@ -268,9 +317,15 @@ class ExecutionTimeIndex:
         if info is not None:
             return info
         if parent_jobset_name:
+            cands = self.by_owner_kind_name_list.get((namespace, "JobSet", parent_jobset_name))
+            if cands:
+                return _select_incarnation(cands, creation_epoch=creation_epoch, incarnation_index=incarnation_index)
             info = self.by_owner_kind_name.get((namespace, "JobSet", parent_jobset_name))
             if info is not None:
                 return info
+            cands = self.by_owner_name_list.get((namespace, parent_jobset_name))
+            if cands:
+                return _select_incarnation(cands, creation_epoch=creation_epoch, incarnation_index=incarnation_index)
             info = self.by_owner_name.get((namespace, parent_jobset_name))
             if info is not None:
                 return info
@@ -288,9 +343,18 @@ class ExecutionTimeIndex:
         interrupted_duration_override: InterruptedDurationOverride | None = None,
         workflow_true_duration_sec: float | None = None,
         workflow_missing_multiplier: float | None = None,
+        creation_epoch: float | None = None,
+        incarnation_index: int | None = None,
     ) -> tuple[float, bool]:
         """Return (duration_seconds, found_in_index) for the given workload."""
-        info = self.lookup(namespace, object_kind, name, parent_jobset_name=parent_jobset_name)
+        info = self.lookup(
+            namespace,
+            object_kind,
+            name,
+            parent_jobset_name=parent_jobset_name,
+            creation_epoch=creation_epoch,
+            incarnation_index=incarnation_index,
+        )
         if info is not None:
             if (info.full_duration_sec is not None and info.full_duration_sec > 0) or info.partial_durations_sec:
                 return (
@@ -337,12 +401,16 @@ def index_execution_times(
         cq_name = str(pl.get("clusterQueueName") or "")
 
         key_wl = (ns, wl_name)
-        info = idx.by_workload_name.get(key_wl)
+        info = idx.by_workload_name.get(key_wl) if wl_name else None
         if info is None and owner_name:
-            info = idx.by_owner_kind_name.get((ns, owner_kind, owner_name)) or idx.by_owner_name.get(
+            cand = idx.by_owner_kind_name.get((ns, owner_kind, owner_name)) or idx.by_owner_name.get(
                 (ns, owner_name)
             )
+            if cand is not None and (not wl_name or not cand.workload_name or cand.workload_name == wl_name):
+                info = cand
+        is_new_info = False
         if info is None:
+            is_new_info = True
             info = WorkloadExecutionInfo(
                 workload_name=wl_name,
                 namespace=ns,
@@ -351,6 +419,8 @@ def index_execution_times(
                 local_queue_name=lq_name,
                 cluster_queue_name=cq_name,
             )
+        elif wl_name and not info.workload_name:
+            info.workload_name = wl_name
 
         if lq_name and not info.local_queue_name:
             info.local_queue_name = lq_name
@@ -401,12 +471,16 @@ def index_execution_times(
             except ValueError:
                 dur_val = None
 
+        adm_ts_any = parse_rfc3339_epoch(pl.get("admittedTime"), strict=strict_timestamps)
         if ev_type == "Admitted":
             idx.admitted_events += 1
-            adm_ts = parse_rfc3339_epoch(pl.get("admittedTime"), strict=strict_timestamps) or ev_ts
-            if adm_ts is not None:
+            adm_ts = adm_ts_any or ev_ts
+            if adm_ts is not None and adm_ts not in info.admitted_epochs:
                 info.admitted_epochs.append(adm_ts)
-        elif ev_type == "PartialExecution":
+        elif adm_ts_any is not None and adm_ts_any not in info.admitted_epochs:
+            info.admitted_epochs.append(adm_ts_any)
+
+        if ev_type == "PartialExecution":
             idx.partial_events += 1
             if dur_val is not None and dur_val >= 0:
                 info.partial_durations_sec.append(dur_val)
@@ -429,12 +503,18 @@ def index_execution_times(
             if end_ts is not None:
                 info.full_end_epoch = end_ts
 
+        if is_new_info:
+            idx.all_workloads.append(info)
+            if owner_name:
+                idx.by_owner_name_list.setdefault((ns, owner_name), []).append(info)
+                if owner_kind:
+                    idx.by_owner_kind_name_list.setdefault((ns, owner_kind, owner_name), []).append(info)
         if wl_name:
             idx.by_workload_name[(ns, wl_name)] = info
         if owner_name:
-            idx.by_owner_name[(ns, owner_name)] = info
+            idx.by_owner_name.setdefault((ns, owner_name), info)
             if owner_kind:
-                idx.by_owner_kind_name[(ns, owner_kind, owner_name)] = info
+                idx.by_owner_kind_name.setdefault((ns, owner_kind, owner_name), info)
 
     return idx
 

@@ -396,11 +396,12 @@ class ChamberK8sClientMixin:
         docs: list[dict[str, Any]],
         max_workers: int = 24,
     ) -> None:
-        """Apply manifests concurrently over persistent keep-alive TLS sockets."""
+        """Apply manifests concurrently over persistent keep-alive TLS sockets (or sequentially when max_workers <= 1)."""
         if not docs:
             return
-        if len(docs) == 1:
-            self.ssa_apply_doc(docs[0])
+        if len(docs) == 1 or max_workers <= 1:
+            for d in docs:
+                self.ssa_apply_doc(d)
             return
 
         pool = self._get_executor()
@@ -676,13 +677,66 @@ class ChamberK8sClientMixin:
         remove_stale: bool = True,
         timeout_sec: float = 180.0,
     ) -> None:
-        """Apply simulated KWOK nodes concurrently, remove stale nodes, and wait until Ready."""
-        nodes_by_name = {n["metadata"]["name"]: n for n in nodes}
+        """Apply simulated KWOK nodes concurrently, remove stale nodes, and wait until healthy nodes are Ready."""
+        nodes_by_name: dict[str, dict[str, Any]] = {}
+        unhealthy_t0_names: set[str] = set()
+        prepared_nodes: list[dict[str, Any]] = []
+        for raw_nd in nodes:
+            nd = json.loads(json.dumps(raw_nd))
+            nname = nd["metadata"]["name"]
+            ann = (nd.get("metadata") or {}).get("annotations") or {}
+            if str(ann.get("kueue-optimizer.gke.io/node-failed") or "").lower() == "true":
+                unhealthy_t0_names.add(nname)
+                spec_blk = nd.setdefault("spec", {})
+                taints = list(spec_blk.get("taints") or [])
+                if not any(isinstance(t, dict) and t.get("key") == "node.kubernetes.io/not-ready" for t in taints):
+                    taints.append({"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"})
+                spec_blk["taints"] = taints
+            nodes_by_name[nname] = nd
+            prepared_nodes.append(nd)
+
+        healthy_t0_names = set(nodes_by_name.keys()) - unhealthy_t0_names
+
         t_start = time.monotonic()
-        self.apply_manifests_parallel(nodes, max_workers=24)
+        self.apply_manifests_parallel(prepared_nodes, max_workers=24)
         elapsed = time.monotonic() - t_start
-        if len(nodes) > 20:
-            print(f"    Applied {len(nodes)} KWOK nodes in {elapsed:.1f}s. Waiting for nodes Ready...", flush=True)
+        if len(prepared_nodes) > 20:
+            print(
+                f"    Applied {len(prepared_nodes)} KWOK nodes in {elapsed:.1f}s "
+                f"({len(healthy_t0_names)} healthy, {len(unhealthy_t0_names)} NotReady at t0). Waiting for nodes...",
+                flush=True,
+            )
+
+        # Immediately stamp Ready=False + full allocatable/capacity onto t0 NotReady nodes (skipped by node-initialize).
+        if unhealthy_t0_names:
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            for u_name in sorted(unhealthy_t0_names):
+                u_doc = nodes_by_name[u_name]
+                u_st = u_doc.get("status") or {}
+                status_patch = {
+                    "status": {
+                        "allocatable": u_st.get("allocatable") or {},
+                        "capacity": u_st.get("capacity") or u_st.get("allocatable") or {},
+                        "nodeInfo": u_st.get("nodeInfo") or {},
+                        "phase": "Running",
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "False",
+                                "reason": "KubeletNotReady",
+                                "message": "Node was NotReady at scenario start (t0)",
+                                "lastHeartbeatTime": now_iso,
+                                "lastTransitionTime": now_iso,
+                            }
+                        ],
+                    }
+                }
+                self.api_request(
+                    "PATCH",
+                    f"/api/v1/nodes/{u_name}/status",
+                    body=json.dumps(status_patch).encode("utf-8"),
+                    headers={"Content-Type": "application/merge-patch+json"},
+                )
 
         stale_deleted = not remove_stale
         deadline = time.monotonic() + timeout_sec
@@ -703,7 +757,8 @@ class ChamberK8sClientMixin:
                         self.api_delete(f"/api/v1/nodes/{sname}", obj=s_it)
                     stale_deleted = True
 
-                ready_count = 0
+                ready_healthy_count = 0
+                present_unhealthy_count = 0
                 nodes_needing_status_patch.clear()
                 for it in items:
                     nname = it.get("metadata", {}).get("name", "")
@@ -711,18 +766,27 @@ class ChamberK8sClientMixin:
                         continue
                     st_obj = it.get("status", {}) or {}
                     conds = {c.get("type"): c.get("status") for c in (st_obj.get("conditions") or [])}
-                    if conds.get("Ready") == "True":
-                        ready_count += 1
+                    if nname in unhealthy_t0_names:
+                        present_unhealthy_count += 1
+                        alloc = st_obj.get("allocatable") or {}
+                        expected_alloc = nodes_by_name[nname]["status"]["allocatable"]
+                        if any(str(alloc.get(k)) != str(v) for k, v in expected_alloc.items()):
+                            nodes_needing_status_patch.append(nodes_by_name[nname])
+                    elif conds.get("Ready") == "True":
+                        ready_healthy_count += 1
                         alloc = st_obj.get("allocatable") or {}
                         expected_alloc = nodes_by_name[nname]["status"]["allocatable"]
                         if any(str(alloc.get(k)) != str(v) for k, v in expected_alloc.items()):
                             nodes_needing_status_patch.append(nodes_by_name[nname])
 
-                if ready_count >= len(nodes_by_name):
+                if ready_healthy_count >= len(healthy_t0_names) and present_unhealthy_count >= len(unhealthy_t0_names):
                     break
             time.sleep(0.5)
         else:
-            raise RuntimeError(f"Timed out waiting for {len(nodes_by_name)} KWOK nodes to become Ready")
+            raise RuntimeError(
+                f"Timed out waiting for {len(healthy_t0_names)} healthy KWOK node(s) to become Ready "
+                f"(and {len(unhealthy_t0_names)} t0-NotReady node(s) to sync)"
+            )
 
         if nodes_needing_status_patch:
             pool = self._get_executor()

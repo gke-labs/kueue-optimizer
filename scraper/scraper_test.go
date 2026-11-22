@@ -36,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -4173,5 +4174,305 @@ fairSharing:
 	}
 	if _, hasFS := updMap["fairSharing"]; hasFS {
 		t.Errorf("expected Update payload to omit fairSharing when disabled globally, got %+v", updMap)
+	}
+}
+
+func TestDeletedAdmittedWorkloadEmitsDeletedPartialAndClearsScrapeEnded(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+
+	wl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-deleted-running",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "batch/v1",
+					Kind:       "Job",
+					Name:       "job-deleted-running",
+					Controller: ptr.To(true),
+				},
+			},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Admitted",
+					LastTransitionTime: metav1.NewTime(t0.Add(10 * time.Second)),
+				},
+			},
+		},
+	}
+
+	// Admitted at t0+10s, deleted at t0+60s, scraper stops 2 hours later (t0+7200s).
+	scraper.handleWorkloadWatchEventAt(watch.Added, wl, t0.Add(10*time.Second))
+	scraper.handleWorkloadWatchEventAt(watch.Deleted, wl, t0.Add(60*time.Second))
+	scraper.flushInFlightWorkloadsAsPartial(t0.Add(7200 * time.Second))
+	_ = scraper.execTimeLog.Sync()
+
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	evs := readJSONLines[ExecutionTimeEvent](t, rawExec)
+	if len(evs) != 2 {
+		t.Fatalf("expected strictly 2 events [Admitted, PartialExecution(Deleted)], got %d:\n%s", len(evs), string(rawExec))
+	}
+	if evs[1].EventType != ExecutionEventPartial || evs[1].Payload.InterruptionReason != InterruptionReasonDeleted {
+		t.Fatalf("expected PartialExecution with InterruptionReason=%q, got %+v", InterruptionReasonDeleted, evs[1])
+	}
+	if evs[1].Payload.ExecutionDurationSeconds == nil || *evs[1].Payload.ExecutionDurationSeconds != 50.0 {
+		t.Errorf("expected 50s deleted partial duration (not 7190s ScrapeEnded), got %v", evs[1].Payload.ExecutionDurationSeconds)
+	}
+}
+
+func TestNeverAdmittedEvictedWorkloadEmitsZeroPartialExecution(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)
+
+	ownerRef := []metav1.OwnerReference{
+		{
+			APIVersion: "batch/v1",
+			Kind:       "Job",
+			Name:       "job-never-admitted",
+			Controller: ptr.To(true),
+		},
+	}
+	// 1. Workload evicted by AdmissionCheck 30m after creation without ever being admitted.
+	wlPendingEvicted := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-ac-evicted",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			OwnerReferences:   ownerRef,
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionFalse,
+					Reason:             "UnsatisfiedChecks",
+					LastTransitionTime: metav1.NewTime(t0),
+				},
+				{
+					Type:               kueuev1beta2.WorkloadEvicted,
+					Status:             metav1.ConditionTrue,
+					Reason:             "AdmissionCheck",
+					Message:            "ProvisioningRequest timed out",
+					LastTransitionTime: metav1.NewTime(t0.Add(1800 * time.Second)),
+				},
+			},
+		},
+	}
+	scraper.handleWorkloadWatchEventAt(watch.Added, wlPendingEvicted, t0.Add(1800*time.Second))
+
+	// 2. Startup-pending workload with latched historical Preempted=True and zero observed admission / past seconds.
+	wlLatchedPreemptPending := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-latched-pending",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0.Add(-3600 * time.Second)),
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "batch/v1", Kind: "Job", Name: "job-latched", Controller: ptr.To(true)},
+			},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionFalse,
+					Reason:             kueuev1beta2.WorkloadAdmittedReasonNoReservation,
+					LastTransitionTime: metav1.NewTime(t0.Add(-600 * time.Second)),
+				},
+				{
+					Type:               kueuev1beta2.WorkloadPreempted,
+					Status:             metav1.ConditionTrue,
+					Reason:             kueuev1beta2.InClusterQueueReason,
+					LastTransitionTime: metav1.NewTime(t0.Add(-600 * time.Second)),
+				},
+			},
+		},
+	}
+	scraper.handleWorkloadWatchEventAt(watch.Added, wlLatchedPreemptPending, t0)
+	_ = scraper.execTimeLog.Sync()
+
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	evs := readJSONLines[ExecutionTimeEvent](t, rawExec)
+	if len(evs) != 0 {
+		t.Fatalf("expected 0 PartialExecution events for never-admitted / unmeasured pre-scrape pending workloads, got %d:\n%s", len(evs), string(rawExec))
+	}
+}
+
+func TestNonKueueFilteringWatchRelistAndStalePodListProtection(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 11, 22, 11, 0, 0, 0, time.UTC)
+
+	mkJob := func(ns, name, lq string, complete bool) *batchv1.Job {
+		var labels map[string]string
+		if lq != "" {
+			labels = map[string]string{KueueQueueLabel: lq}
+		}
+		var conds []batchv1.JobCondition
+		if complete {
+			conds = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+		}
+		return &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         ns,
+				CreationTimestamp: metav1.NewTime(t0),
+				Labels:            labels,
+			},
+			Spec: batchv1.JobSpec{
+				Suspend: ptr.To(lq != ""),
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						RestartPolicy: corev1.RestartPolicyNever,
+						Containers:    []corev1.Container{{Name: "c", Image: "busybox"}},
+					},
+				},
+			},
+			Status: batchv1.JobStatus{Conditions: conds},
+		}
+	}
+
+	// 1. Non-Kueue kube-system Job and unqueued user Job are ignored; queued Job is recorded.
+	scraper.handleJobWatchEventAt(watch.Added, mkJob("kube-system", "sys-cron", "", false), t0, false)
+	scraper.handleJobWatchEventAt(watch.Added, mkJob("ai-lab", "plain-k8s-job", "", false), t0, false)
+	scraper.handleJobWatchEventAt(watch.Added, mkJob("ai-lab", "kueue-job-1", "lq-main", false), t0, false)
+
+	// 2. Simulated 410-Gone re-list: historical completed untracked job is skipped (isInitialSync=true),
+	// and kueue-job-1 missing from present set emits Deleted.
+	scraper.handleJobWatchEventAt(watch.Added, mkJob("ai-lab", "old-finished-job", "lq-main", true), t0.Add(5*time.Second), true)
+	scraper.reconcileWorkflowDeletionsOnRelist("Job", map[string]bool{}, t0.Add(5*time.Second))
+	_ = scraper.workflowsLog.Sync()
+
+	rawWf, err := os.ReadFile(scraper.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	wfEvs := readJSONLines[WorkflowEvent](t, rawWf)
+	if len(wfEvs) != 2 || wfEvs[0].EventType != EventNew || wfEvs[0].Payload.Name != "kueue-job-1" ||
+		wfEvs[1].EventType != EventDeleted || wfEvs[1].Payload.Name != "kueue-job-1" {
+		t.Fatalf("expected strictly [New(kueue-job-1), Deleted(kueue-job-1)], got %+v", wfEvs)
+	}
+
+	// 3. Real-time Pod watch emits New immediately, and a stale periodic Pods().List() snapshot taken
+	// BEFORE the pod bound does NOT emit a false Deleted event!
+	boundPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "rt-pod-1",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0.Add(10 * time.Second)),
+			Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-1",
+			Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	scraper.handlePodWatchEventAt(watch.Added, boundPod, t0.Add(12*time.Second), false)
+	// Simulate scrapeScheduledAndRunningPods where listStartedAt would be before firstNoticeTime:
+	// pass empty prelistedPods with now == t0+11s (< firstNoticeTime t0+12s).
+	scraper.scrapeScheduledAndRunningPodsWithList(context.Background(), t0.Add(11*time.Second), []corev1.Pod{})
+	_ = scraper.infraLog.Sync()
+
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read infra.json: %v", err)
+	}
+	infEvs := readJSONLines[InfraEvent](t, rawInfra)
+	if len(infEvs) != 1 || infEvs[0].EventType != EventNew {
+		t.Fatalf("expected real-time Pod New with zero false Deleted from stale list, got %+v", infEvs)
+	}
+}
+
+func TestScrapePriorityClassesDeploymentFeatureGatesAndInfraWatch(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	// Custom ConfigMap name discovered from Deployment --config volume + --feature-gates CLI override.
+	customCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "custom-kueue-cfg", Namespace: DefaultKueueNamespace},
+		Data: map[string]string{
+			"config.yaml": "apiVersion: config.kueue.x-k8s.io/v1beta2\nkind: Configuration\nmanageJobsWithoutQueueName: true\n",
+		},
+	}
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "kueue-controller-manager", Namespace: DefaultKueueNamespace},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{
+						{
+							Name:         "cfg-vol",
+							VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "custom-kueue-cfg"}}},
+						},
+					},
+					Containers: []corev1.Container{
+						{
+							Name:         "manager",
+							Args:         []string{"--config=/etc/custom/config.yaml", "--feature-gates=TopologyAwareScheduling=true,MultiKueue=false"},
+							VolumeMounts: []corev1.VolumeMount{{Name: "cfg-vol", MountPath: "/etc/custom"}},
+						},
+					},
+				},
+			},
+		},
+	}
+	_, _ = scraper.kubeClient.CoreV1().ConfigMaps(DefaultKueueNamespace).Create(context.Background(), customCM, metav1.CreateOptions{})
+	_, _ = scraper.kubeClient.AppsV1().Deployments(DefaultKueueNamespace).Create(context.Background(), deploy, metav1.CreateOptions{})
+
+	// System PriorityClass is skipped; user PriorityClass is recorded.
+	_, _ = scraper.kubeClient.SchedulingV1().PriorityClasses().Create(context.Background(), &schedulingv1.PriorityClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "system-node-critical"},
+		Value:      2000001000,
+	}, metav1.CreateOptions{})
+	_, _ = scraper.kubeClient.SchedulingV1().PriorityClasses().Create(context.Background(), &schedulingv1.PriorityClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-high-prio"},
+		Value:      5000,
+	}, metav1.CreateOptions{})
+
+	scraper.scrapeKueueConfiguration(context.Background(), t0)
+	scraper.scrapePriorityClasses(context.Background(), t0)
+
+	// Real-time ClusterQueue watch update when nominalQuota changes.
+	cq1 := &kueuev1beta2.ClusterQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "cq-dyn"},
+		Spec:       kueuev1beta2.ClusterQueueSpec{CohortName: "main-cohort"},
+	}
+	cq2 := cq1.DeepCopy()
+	cq2.Spec.CohortName = "expanded-cohort"
+	scraper.handleInfraObjectWatchEventAt(watch.Added, "ClusterQueue", "cq-dyn", "cq-dyn", "", SanitizeClusterQueue(cq1, scraper.hasher), t0.Add(1*time.Second))
+	scraper.handleInfraObjectWatchEventAt(watch.Modified, "ClusterQueue", "cq-dyn", "cq-dyn", "", SanitizeClusterQueue(cq1, scraper.hasher), t0.Add(2*time.Second))
+	scraper.handleInfraObjectWatchEventAt(watch.Modified, "ClusterQueue", "cq-dyn", "cq-dyn", "", SanitizeClusterQueue(cq2, scraper.hasher), t0.Add(3*time.Second))
+	_ = scraper.infraLog.Sync()
+
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read infra.json: %v", err)
+	}
+	evs := readJSONLines[InfraEvent](t, rawInfra)
+	if len(evs) != 4 {
+		t.Fatalf("expected 4 infra events [Configuration(New), PriorityClass(New), ClusterQueue(New), ClusterQueue(Update)], got %d:\n%s", len(evs), string(rawInfra))
+	}
+	cfgMap, _ := evs[0].Payload.(map[string]any)
+	fgMap, _ := cfgMap["featureGates"].(map[string]any)
+	if fgMap["TopologyAwareScheduling"] != true || fgMap["MultiKueue"] != false || cfgMap["manageJobsWithoutQueueName"] != true {
+		t.Errorf("unexpected merged Configuration payload: %+v", cfgMap)
+	}
+	if evs[3].EventType != EventUpdate {
+		t.Errorf("expected ClusterQueue Update event, got %+v", evs[3])
 	}
 }

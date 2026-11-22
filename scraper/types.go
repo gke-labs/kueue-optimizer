@@ -156,6 +156,7 @@ const (
 	InterruptionReasonPodsReadyTimeout = "PodsReadyTimeout"
 	InterruptionReasonEvicted          = "Evicted"
 	InterruptionReasonFailed           = "Failed"
+	InterruptionReasonDeleted          = "Deleted"
 	InterruptionReasonScrapeEnded      = "ScrapeEnded"
 )
 
