@@ -31,10 +31,12 @@ from chamber.constants import (
     validate_dns_label,
 )
 from chamber.manifests import (
+    KueueScenarioConfiguration,
     build_cohort_manifest,
     build_local_queue_manifest,
     build_namespace_manifest,
     build_priority_class_manifest,
+    parse_kueue_configuration_payload,
 )
 from chamber.parsers import (
     format_pod_execution_seconds,
@@ -199,6 +201,7 @@ class ScenarioBundle:
     scheduled_infra_events: list[ScheduledInfraEvent] = field(default_factory=list)
     interrupted_duration_multiplier: float | None = None
     interrupted_duration_override: InterruptedDurationOverride | None = None
+    kueue_configuration: KueueScenarioConfiguration | None = None
 
     @property
     def initial_workload_pods_count(self) -> int:
@@ -219,6 +222,7 @@ class _ParsedInfra:
     pod_new_events: dict[tuple[str, str], tuple[float, dict[str, Any]]]
     pod_delete_epochs: dict[tuple[str, str], float]
     scheduled_infra_events: list[ScheduledInfraEvent] = field(default_factory=list)
+    kueue_configuration: KueueScenarioConfiguration | None = None
 
 
 def _compute_timeline_bounds(
@@ -519,6 +523,7 @@ def _parse_infra_resources(
     lqs_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     pod_new_events: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
     pod_delete_epochs: dict[tuple[str, str], float] = {}
+    kueue_configuration: KueueScenarioConfiguration | None = None
 
     for idx_inf, ev in enumerate(infra_events):
         ev_type = str(ev.get("eventType") or "")
@@ -584,6 +589,15 @@ def _parse_infra_resources(
             )
             if ev_type != "Deleted" and rc_name not in runtime_classes_by_name:
                 runtime_classes_by_name[rc_name] = _prepare_kueue_or_ns_doc(pl)
+
+        elif kind == "Configuration":
+            if ev_type == "Deleted":
+                kueue_configuration = None
+            else:
+                kueue_configuration = parse_kueue_configuration_payload(
+                    pl,
+                    source_desc=f"{inf_file} event #{idx_inf} Configuration",
+                )
 
         elif kind == "Topology":
             t_name = validate_dns_label(
@@ -670,6 +684,7 @@ def _parse_infra_resources(
         pod_new_events=pod_new_events,
         pod_delete_epochs=pod_delete_epochs,
         scheduled_infra_events=scheduled_infra_events,
+        kueue_configuration=kueue_configuration,
     )
 
 
@@ -2176,6 +2191,17 @@ def load_scenario_bundle(
             detected_strategy = str(st_val)
             break
 
+    kueue_cfg = parsed_infra.kueue_configuration
+    if kueue_cfg is None:
+        standalone_cfg_json = resolved_dir / "kueue-config.json"
+        if standalone_cfg_json.is_file():
+            import json as _json
+
+            kueue_cfg = parse_kueue_configuration_payload(
+                _json.loads(standalone_cfg_json.read_text(encoding="utf-8")),
+                source_desc=str(standalone_cfg_json),
+            )
+
     return ScenarioBundle(
         scenario_dir=resolved_dir,
         infra_path=inf_file,
@@ -2209,4 +2235,5 @@ def load_scenario_bundle(
         scheduled_infra_events=parsed_infra.scheduled_infra_events,
         interrupted_duration_multiplier=interrupted_duration_multiplier,
         interrupted_duration_override=parsed_override,
+        kueue_configuration=kueue_cfg,
     )

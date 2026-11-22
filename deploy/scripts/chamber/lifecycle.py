@@ -46,9 +46,13 @@ from chamber.constants import (
 )
 from chamber.k8s_client import ChamberK8sClientMixin
 from chamber.manifests import (
+    AdmissionFairSharingConfig,
     WaitForPodsReadyConfig,
     match_yaml_section_field,
+    parse_fair_sharing_strategies,
     parse_feature_gates_arg,
+    patch_kueue_admission_fair_sharing_config,
+    patch_kueue_extra_configuration_fields,
     patch_kueue_fair_sharing_config,
     patch_kueue_feature_gates_config,
     patch_kueue_wait_for_pods_ready_config,
@@ -74,8 +78,10 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
     _replace_yaml_section_field = staticmethod(replace_yaml_section_field)
     _patch_registry_manifest = staticmethod(patch_registry_manifest)
     _patch_kueue_fair_sharing_config = staticmethod(patch_kueue_fair_sharing_config)
+    _patch_kueue_admission_fair_sharing_config = staticmethod(patch_kueue_admission_fair_sharing_config)
     _patch_kueue_wait_for_pods_ready_config = staticmethod(patch_kueue_wait_for_pods_ready_config)
     _patch_kueue_feature_gates_config = staticmethod(patch_kueue_feature_gates_config)
+    _patch_kueue_extra_configuration_fields = staticmethod(patch_kueue_extra_configuration_fields)
     _patch_kustomize_kueue_image = staticmethod(patch_kustomize_kueue_image)
 
     def __init__(
@@ -91,8 +97,12 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         kueue_image: str | None = None,
         kueue_build_dir: Path | str | None = None,
         enable_fair_sharing: bool = True,
+        fair_sharing_strategies: tuple[str, ...] | list[str] | str | None = None,
+        admission_fair_sharing: AdmissionFairSharingConfig | None = None,
         wait_for_pods_ready: WaitForPodsReadyConfig | None = None,
         kueue_feature_gates: dict[str, bool] | str | None = None,
+        kueue_resources_config: dict[str, Any] | None = None,
+        manage_jobs_without_queue_name: bool | None = None,
     ) -> None:
         self.chamber_namespace = validate_dns_label(chamber_namespace, "chamber namespace")
         self.workload_namespace = validate_dns_label(workload_namespace, "workload namespace")
@@ -105,8 +115,13 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         self.kueue_build_dir = Path(kueue_build_dir).resolve() if kueue_build_dir else None
         self._resolved_kueue_image: str | None = None
         self.enable_fair_sharing = bool(enable_fair_sharing)
+        self.fair_sharing_strategies = parse_fair_sharing_strategies(fair_sharing_strategies)
+        self.admission_fair_sharing = admission_fair_sharing
         self.wait_for_pods_ready = wait_for_pods_ready
         self.kueue_feature_gates = parse_feature_gates_arg(kueue_feature_gates)
+        self.kueue_resources_config = dict(kueue_resources_config) if kueue_resources_config else None
+        self.manage_jobs_without_queue_name = manage_jobs_without_queue_name
+        self._rendered_controller_manager_config_yaml: str | None = None
         self.scrape_interval = normalize_scrape_interval(scrape_interval)
         self.kubeconfig_path = resolve_kubeconfig_path(self.chamber_namespace, kubeconfig_out)
         self._created_namespace_in_this_run: bool = False
@@ -166,8 +181,8 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             )
         return True
 
-    def detect_live_fair_sharing_enabled(self) -> bool | None:
-        """Read ConfigMap/kueue-manager-config in the chamber namespace to detect whether fairSharing is active."""
+    def read_live_kueue_config_yaml(self) -> str | None:
+        """Read ConfigMap/kueue-manager-config data['controller_manager_config.yaml'] from the host chamber namespace."""
         proc = self.host_kubectl(
             ["-n", self.chamber_namespace, "get", "configmap", "kueue-manager-config", "-o", "json"],
             check=False,
@@ -180,9 +195,63 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         except json.JSONDecodeError:
             return None
         cfg_yaml = str(((cm_obj.get("data") or {}).get("controller_manager_config.yaml")) or "")
-        if not cfg_yaml.strip():
+        return cfg_yaml if cfg_yaml.strip() else None
+
+    def detect_live_fair_sharing_enabled(self) -> bool | None:
+        """Read ConfigMap/kueue-manager-config in the chamber namespace to detect whether fairSharing is active."""
+        cfg_yaml = self.read_live_kueue_config_yaml()
+        if not cfg_yaml:
             return None
         return bool(re.search(r"^fairSharing\s*:", cfg_yaml, flags=re.MULTILINE))
+
+    def sync_kueue_configuration_to_kwok_apiserver(self) -> None:
+        """Mirror active ConfigMap/kueue-manager-config into `kueue-system` inside the chamber KWOK apiserver.
+
+        Allows `cluster-scraper` connected to the chamber kubeconfig to discover and record the active
+        `config.kueue.x-k8s.io/v1beta2` `Configuration` into `infra.json` identically to a vanilla cluster.
+        """
+        cfg_yaml = self._rendered_controller_manager_config_yaml or self.read_live_kueue_config_yaml()
+        if not cfg_yaml:
+            return
+        ns_doc = {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "kueue-system"}}
+        st_ns, _ = self.api_request("GET", "/api/v1/namespaces/kueue-system")
+        if st_ns == 404:
+            self.api_request(
+                "POST",
+                "/api/v1/namespaces",
+                body=json.dumps(ns_doc).encode("utf-8"),
+                content_type="application/json",
+            )
+        cm_doc = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "kueue-manager-config", "namespace": "kueue-system"},
+            "data": {"controller_manager_config.yaml": cfg_yaml},
+        }
+        body = json.dumps(cm_doc).encode("utf-8")
+        st_get, raw_get = self.api_request("GET", "/api/v1/namespaces/kueue-system/configmaps/kueue-manager-config")
+        if st_get == 200 and raw_get:
+            try:
+                existing = json.loads(raw_get.decode("utf-8"))
+                rv = (existing.get("metadata") or {}).get("resourceVersion")
+                if rv:
+                    cm_doc["metadata"]["resourceVersion"] = rv
+                    body = json.dumps(cm_doc).encode("utf-8")
+            except Exception:
+                pass
+            self.api_request(
+                "PUT",
+                "/api/v1/namespaces/kueue-system/configmaps/kueue-manager-config",
+                body=body,
+                content_type="application/json",
+            )
+        else:
+            self.api_request(
+                "POST",
+                "/api/v1/namespaces/kueue-system/configmaps",
+                body=body,
+                content_type="application/json",
+            )
 
     def ensure_pki(self, prefer_cluster: bool = True) -> Path:
         """Obtain PKI from Secret/kwok-pki in the cluster if present, or generate ad-hoc."""
@@ -288,9 +357,18 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         kust_yaml.write_text(kust_text, encoding="utf-8")
 
         self._patch_registry_manifest(base_dst, self.registry_port, self.registry_memory_limit)
-        self._patch_kueue_fair_sharing_config(base_dst, self.enable_fair_sharing)
+        self._patch_kueue_fair_sharing_config(base_dst, self.enable_fair_sharing, self.fair_sharing_strategies)
+        self._patch_kueue_admission_fair_sharing_config(base_dst, self.admission_fair_sharing)
         self._patch_kueue_wait_for_pods_ready_config(base_dst, self.wait_for_pods_ready)
         self._patch_kueue_feature_gates_config(base_dst, self.kueue_feature_gates)
+        self._patch_kueue_extra_configuration_fields(
+            base_dst,
+            resources_block=self.kueue_resources_config,
+            manage_jobs_without_queue_name=self.manage_jobs_without_queue_name,
+        )
+        cfg_file = base_dst / "config" / "controller_manager_config.yaml"
+        if cfg_file.is_file():
+            self._rendered_controller_manager_config_yaml = cfg_file.read_text(encoding="utf-8")
 
         active_kueue_img = self._resolved_kueue_image or self.kueue_image
         if active_kueue_img:
@@ -332,7 +410,16 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         base_dst = self.prepare_tmp_deploy_dir(initial_nodes=initial_nodes, check_cluster_ports=False)
         pki_note = "cluster Secret/kwok-pki" if self._pki_source == "cluster" else "ad-hoc generated PKI"
         kueue_img_note = self._resolved_kueue_image or DEFAULT_KUEUE_IMAGE
-        fs_note = "enabled" if self.enable_fair_sharing else "disabled"
+        fs_note = (
+            f"enabled [{', '.join(self.fair_sharing_strategies)}]"
+            if self.enable_fair_sharing
+            else "disabled"
+        )
+        afs_note = (
+            f", AdmissionFairSharing: [{self.admission_fair_sharing.summary_str()}]"
+            if self.admission_fair_sharing and self.admission_fair_sharing.enabled
+            else ""
+        )
         wfpr_note = (
             f", WaitForPodsReady: [{self.wait_for_pods_ready.summary_str()}]"
             if self.wait_for_pods_ready and self.wait_for_pods_ready.enabled
@@ -346,7 +433,7 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         print(
             f"==> Preparing & deploying chamber into host cluster namespace '{self.chamber_namespace}' "
             f"(PKI: {pki_note}, Registry: localhost:{self.registry_port} [RAM {self.registry_memory_limit}], "
-            f"Kueue: {kueue_img_note}, FairSharing: {fs_note}{wfpr_note}{fg_note}, Prometheus scrape: {self.scrape_interval})...",
+            f"Kueue: {kueue_img_note}, FairSharing: {fs_note}{afs_note}{wfpr_note}{fg_note}, Prometheus scrape: {self.scrape_interval})...",
             flush=True,
         )
         self._ensure_namespace_safe_for_apply(record_creation=True)

@@ -11,7 +11,7 @@ For the complete output format, event envelope, `workloadState` state machine, a
 ## Features
 
 - **Hybrid Periodic + Watch Recording**:
-  - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, and `WorkloadPriorityClass`es, emitting events only when canonical object state changes (ignoring volatile `metadata.resourceVersion`, `metadata.generation`, and `status.conditions[].lastHeartbeatTime`).
+  - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, Kueue controller `Configuration` (`ConfigMap/kueue-manager-config` in `--kueue-namespace`), and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, and `WorkloadPriorityClass`es, emitting events only when canonical object state changes (ignoring volatile `metadata.resourceVersion`, `metadata.generation`, and `status.conditions[].lastHeartbeatTime`).
   - Watches `Node`s, `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, Kueue-managed `Deployment`s, `RayJob`s, `RayCluster`s, and Kueue `Workload`s in real time to capture exact mid-run node failures/recoveries/additions/deletions, workload creation, admission, scheduling, interruptions (`PartialExecution` across `Preempted`, `NodeFailure`, `PodsReadyTimeout`, `Evicted`, `Failed`, and shutdown `ScrapeEnded`), `unhealthyNodes` TAS hot-swaps, completion (`FullExecution`), and deletion timestamps.
   - Gracefully handles optional CRDs (`JobSet`, `LeaderWorkerSet`, `RayJob`, `RayCluster`, Kueue APIs) if they are not installed on the target cluster, retrying periodically without failing.
 - **Strict Data Sanitization** (see [`SCRAPER-SCHEMA.md`](SCRAPER-SCHEMA.md) for the full field-by-field specification):
@@ -111,6 +111,8 @@ go run . -n 15s --duration 10m --output-dir /tmp/kueue-trace
 | `--execution-time-file` | — | `execution-time.json` | Filename (relative to `--output-dir`) or absolute path for Kueue `Workload` admission and partial/full execution events. |
 | `--hash-names` | `--sha256-names` | `false` | Replace names of `Workload`s, `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, and `RayCluster`s, and also enable hashing of sensitive, workload-referencing, and `--extra-hash-labels` label values across scraped objects and selectors using per-run HMAC-SHA256 digests. |
 | `--pause-image` | — | `registry.k8s.io/pause:3.10` | Pause container image substituted into all sanitized workflow container specs. |
+| `--kueue-namespace` | — | `kueue-system` | Namespace containing the Kueue controller `ConfigMap` (`""` disables `Configuration` scraping). |
+| `--kueue-configmap` | — | `kueue-manager-config` | Name of the Kueue controller `ConfigMap` holding `controller_manager_config.yaml` (`""` disables `Configuration` scraping). |
 | `--extra-hash-labels` | — | `""` | Comma-separated additional list of label keys or `<domain>/*` patterns (matched case-insensitively; flag may also be repeated) to deterministically hash across scraped objects and selectors in addition to the built-in sensitive label list (requires `--hash-names`). |
 | `--qps` | — | `200` | Kubernetes API client QPS rate limit. |
 | `--burst` | — | `400` | Kubernetes API client burst limit. |
@@ -161,6 +163,10 @@ rules:
   - apiGroups: [""]
     resources: ["nodes", "namespaces", "pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["kueue-manager-config"]
+    verbs: ["get"]
   - apiGroups: ["node.k8s.io"]
     resources: ["runtimeclasses"]
     verbs: ["get", "list", "watch"]

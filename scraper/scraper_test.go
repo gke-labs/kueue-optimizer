@@ -4043,3 +4043,135 @@ func TestPartialExecutionNodeFailurePodsReadyTimeoutFailedAndScrapeEndedFlush(t 
 		t.Fatalf("wl-inflight expected [Admitted, PartialExecution(20s, ScrapeEnded, state=Admitted)], got %+v", ifEvs)
 	}
 }
+
+func TestScrapeAndSanitizeKueueConfiguration(t *testing.T) {
+	rawYAML := `apiVersion: config.kueue.x-k8s.io/v1beta2
+kind: Configuration
+namespace: ` + testSecretValue + `
+health:
+  healthProbeBindAddress: :8081
+metrics:
+  bindAddress: :8443
+  enableClusterQueueResources: true
+webhook:
+  port: 9443
+leaderElection:
+  leaderElect: true
+  resourceName: ` + testSecretValue + `
+internalCertManagement:
+  enable: true
+  webhookSecretName: ` + testSecretValue + `
+clientConnection:
+  qps: 50
+  burst: 100
+manageJobsWithoutQueueName: true
+fairSharing:
+  preemptionStrategies:
+  - LessThanOrEqualToFinalShare
+admissionFairSharing:
+  usageHalfLifeTime: 20s
+  usageSamplingInterval: 1s
+  resourceWeights:
+    google.com/tpu: 1
+    cpu: 0
+waitForPodsReady:
+  timeout: 30s
+  blockAdmission: true
+featureGates:
+  TASReplaceMultipleFailedNodes: true
+`
+	sanitized, ok := SanitizeKueueConfigurationYAML(rawYAML)
+	if !ok {
+		t.Fatalf("expected SanitizeKueueConfigurationYAML to accept valid Configuration YAML")
+	}
+	encoded, err := json.Marshal(sanitized)
+	if err != nil {
+		t.Fatalf("marshal sanitized Configuration: %v", err)
+	}
+	for _, secret := range testForbiddenSubstrings {
+		if strings.Contains(string(encoded), secret) {
+			t.Errorf("sanitized Configuration leaked %q: %s", secret, string(encoded))
+		}
+	}
+	for _, forbiddenKey := range []string{"namespace", "health", "metrics", "webhook", "leaderElection", "internalCertManagement", "clientConnection"} {
+		if _, exists := sanitized[forbiddenKey]; exists {
+			t.Errorf("expected internal field %q to be stripped from sanitized Configuration: %s", forbiddenKey, string(encoded))
+		}
+	}
+	for _, wantKey := range []string{"fairSharing", "admissionFairSharing", "waitForPodsReady", "featureGates", "manageJobsWithoutQueueName"} {
+		if _, exists := sanitized[wantKey]; !exists {
+			t.Errorf("expected scheduling policy field %q to be retained in sanitized Configuration: %s", wantKey, string(encoded))
+		}
+	}
+
+	// Legacy v1beta1 fairSharing.enable: false must normalize to fairSharing omitted.
+	legacyDisabledYAML := `apiVersion: config.kueue.x-k8s.io/v1beta1
+kind: Configuration
+fairSharing:
+  enable: false
+  preemptionStrategies:
+  - LessThanOrEqualToFinalShare
+`
+	legacySanitized, ok := SanitizeKueueConfigurationYAML(legacyDisabledYAML)
+	if !ok {
+		t.Fatalf("expected legacy v1beta1 Configuration to parse")
+	}
+	if _, hasFS := legacySanitized["fairSharing"]; hasFS {
+		t.Errorf("expected legacy fairSharing.enable=false to omit fairSharing, got %+v", legacySanitized)
+	}
+
+	// Integration test: missing ConfigMap is a graceful no-op; adding/updating/deleting emits New -> suppressed -> Update -> Deleted.
+	t0 := time.Date(2026, 11, 22, 3, 0, 0, 0, time.UTC)
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	scraper.scrapeKueueConfiguration(context.Background(), t0)
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      DefaultKueueConfigMapName,
+			Namespace: DefaultKueueNamespace,
+		},
+		Data: map[string]string{
+			"controller_manager_config.yaml": rawYAML,
+		},
+	}
+	if _, err := scraper.kubeClient.CoreV1().ConfigMaps(DefaultKueueNamespace).Create(context.Background(), cm, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create kueue-manager-config: %v", err)
+	}
+	scraper.scrapeKueueConfiguration(context.Background(), t0.Add(5*time.Second))
+	// Identical tick must not emit a duplicate event.
+	scraper.scrapeKueueConfiguration(context.Background(), t0.Add(10*time.Second))
+
+	// Update ConfigMap to globally disable FairSharing and AdmissionFairSharing.
+	cmDisabled := cm.DeepCopy()
+	cmDisabled.Data["controller_manager_config.yaml"] = "apiVersion: config.kueue.x-k8s.io/v1beta2\nkind: Configuration\nmetrics:\n  bindAddress: :8443\n"
+	if _, err := scraper.kubeClient.CoreV1().ConfigMaps(DefaultKueueNamespace).Update(context.Background(), cmDisabled, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update kueue-manager-config: %v", err)
+	}
+	scraper.scrapeKueueConfiguration(context.Background(), t0.Add(15*time.Second))
+
+	// Delete ConfigMap -> emits Deleted.
+	if err := scraper.kubeClient.CoreV1().ConfigMaps(DefaultKueueNamespace).Delete(context.Background(), DefaultKueueConfigMapName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete kueue-manager-config: %v", err)
+	}
+	scraper.scrapeKueueConfiguration(context.Background(), t0.Add(20*time.Second))
+	_ = scraper.infraLog.Sync()
+
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read infra.json: %v", err)
+	}
+	evs := readJSONLines[InfraEvent](t, rawInfra)
+	if len(evs) != 3 {
+		t.Fatalf("expected [New, Update, Deleted] Configuration events, got %d:\n%s", len(evs), string(rawInfra))
+	}
+	if evs[0].EventType != EventNew || evs[1].EventType != EventUpdate || evs[2].EventType != EventDeleted {
+		t.Errorf("unexpected Configuration event sequence: %+v", evs)
+	}
+	updMap, ok := evs[1].Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("expected Update payload map, got %T", evs[1].Payload)
+	}
+	if _, hasFS := updMap["fairSharing"]; hasFS {
+		t.Errorf("expected Update payload to omit fairSharing when disabled globally, got %+v", updMap)
+	}
+}

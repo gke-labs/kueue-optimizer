@@ -19,7 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from chamber.manifests import WaitForPodsReadyConfig
+from chamber.constants import DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+from chamber.manifests import AdmissionFairSharingConfig, WaitForPodsReadyConfig
 from chamber.parsers import calc_summary_stats, format_duration_hms, parse_k8s_quantity
 from chamber.scenario import DEFAULT_INTERRUPTED_DURATION_MULTIPLIER, extract_workflow_pods_and_requests
 from runner.loader import InitialPodSpec, ScenarioBundle, ScheduledWorkflowItem
@@ -236,6 +237,9 @@ def _print_timeline_and_index(
     enable_fair_sharing: bool | None,
     reused_chamber: bool,
     wait_for_pods_ready: WaitForPodsReadyConfig | None = None,
+    fair_sharing_strategies: tuple[str, ...] | None = None,
+    admission_fair_sharing: AdmissionFairSharingConfig | None = None,
+    config_from_scenario: bool = False,
 ) -> None:
     idx = bundle.exec_index
     durations = [
@@ -289,13 +293,24 @@ def _print_timeline_and_index(
     if enable_fair_sharing is None:
         fs_mode_desc = "inherited from running chamber (--skip-chamber-deploy)"
     else:
+        strats_str = ", ".join(fair_sharing_strategies or DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES)
         base_fs_desc = (
-            "enabled (LessThanOrEqualToFinalShare, LessThanInitialShare)"
+            f"enabled ({strats_str})"
             if enable_fair_sharing
             else "disabled (Classical Preemption)"
         )
-        fs_mode_desc = f"{base_fs_desc} [detected from live chamber]" if reused_chamber else base_fs_desc
+        if reused_chamber:
+            fs_mode_desc = f"{base_fs_desc} [detected from live chamber]"
+        elif config_from_scenario:
+            fs_mode_desc = f"{base_fs_desc} [from scenario Configuration]"
+        else:
+            fs_mode_desc = base_fs_desc
     print(f"  Kueue FairSharing Config  : {fs_mode_desc}")
+    if admission_fair_sharing and admission_fair_sharing.enabled:
+        afs_src = " [from scenario Configuration]" if config_from_scenario else ""
+        print(f"  AdmissionFairSharing      : {admission_fair_sharing.summary_str()}{afs_src}")
+    elif config_from_scenario:
+        print("  AdmissionFairSharing      : disabled [from scenario Configuration]")
     if wait_for_pods_ready and wait_for_pods_ready.enabled:
         print(f"  WaitForPodsReady Config   : {wait_for_pods_ready.summary_str()}")
     print("")
@@ -612,6 +627,9 @@ def print_scenario_outline(
     *,
     reused_chamber: bool = False,
     wait_for_pods_ready: WaitForPodsReadyConfig | None = None,
+    fair_sharing_strategies: tuple[str, ...] | None = None,
+    admission_fair_sharing: AdmissionFairSharingConfig | None = None,
+    config_from_scenario: bool = False,
 ) -> None:
     """Print a detailed description of the test case: length, execution-time index, nodes & initial usage, queues, and workflows."""
     cq_docs = [d for d in bundle.prereq_and_queue_docs if d.get("kind") == "ClusterQueue"]
@@ -631,6 +649,9 @@ def print_scenario_outline(
         enable_fair_sharing,
         reused_chamber,
         wait_for_pods_ready=wait_for_pods_ready,
+        fair_sharing_strategies=fair_sharing_strategies,
+        admission_fair_sharing=admission_fair_sharing,
+        config_from_scenario=config_from_scenario,
     )
     _print_nodes_and_initial_usage(bundle, node_summary, init_usage)
     _print_queues_section(cq_docs, lq_docs, rf_docs, topo_docs, cohort_docs, queue_load)

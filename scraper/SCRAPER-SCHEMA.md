@@ -10,7 +10,7 @@ This document specifies the exact JSON Lines (NDJSON) file format, event envelop
 
 | File | Default Flag | Purpose |
 | :--- | :--- | :--- |
-| `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
+| `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, Kueue controller `Configuration` (`ConfigMap/kueue-manager-config`), `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
 | `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of `Job`s, `JobSet`s, `LeaderWorkerSet`s, Kueue-managed `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s, with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
 | `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), preempted runs (`PartialExecution`), and non-preempted completions (`FullExecution`), with top-level `workloadState` metadata. |
 
@@ -117,6 +117,7 @@ Every `payload` object in `infra.json` contains top-level `"apiVersion"` and `"k
 | `"ResourceFlavor"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"Topology"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"WorkloadPriorityClass"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status & description omitted) | **No** (plain name) |
+| `"Configuration"` | `"config.kueue.x-k8s.io/v1beta2"` (or `"v1beta1"`) | **No** (sanitized scheduling policy fields only) | **No** (cluster-singleton policy) |
 | `"Pod"` | `"v1"` | **No** (`ScrapedPodPayload` only) | **Yes** (SHA-256 hex when `--hash-names` is set) |
 
 ---
@@ -147,6 +148,11 @@ On disk (single line in `infra.json` for `ClusterQueue`):
 On disk (single line in `infra.json` for `Cohort`):
 ```json
 {"timestamp":"2026-10-30T12:05:53.450112904Z","eventType":"New","payload":{"apiVersion":"kueue.x-k8s.io/v1beta2","kind":"Cohort","metadata":{"creationTimestamp":"2026-10-30T12:05:14Z","generation":1,"name":"main-cohort","resourceVersion":"245","uid":"9f2b1b24-1b7d-4e54-8f31-18e62f9a3d10"},"spec":{"fairSharing":{"weight":"2"},"parentName":"root-cohort","resourceGroups":[{"coveredResources":["cpu"],"flavors":[{"name":"default-flavor","resources":[{"borrowingLimit":"8","lendingLimit":"4","name":"cpu","nominalQuota":"16"}]}]}]}}}
+```
+
+On disk (single line in `infra.json` for sanitized Kueue controller `Configuration`, scraped from `ConfigMap/kueue-manager-config` in `--kueue-namespace` `kueue-system` retaining strictly scheduling-policy fields `fairSharing`, `admissionFairSharing`, `waitForPodsReady`, `featureGates`, `resources`, and `manageJobsWithoutQueueName` while stripping all internal TLS/webhook/metrics/leaderElection/clientConnection fields; omitting `fairSharing` signifies global Fair Sharing disabled / Classical Preemption):
+```json
+{"timestamp":"2026-10-30T12:05:53.455000000Z","eventType":"New","payload":{"admissionFairSharing":{"resourceWeights":{"cpu":0,"google.com/tpu":1,"memory":0},"usageHalfLifeTime":"20s","usageSamplingInterval":"1s"},"apiVersion":"config.kueue.x-k8s.io/v1beta2","fairSharing":{"preemptionStrategies":["LessThanOrEqualToFinalShare","LessThanInitialShare"]},"kind":"Configuration"}}
 ```
 
 ---

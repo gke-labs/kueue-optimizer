@@ -60,18 +60,27 @@ const (
 // business-specific container commands and images from workflow specifications.
 const DefaultPauseImage = "registry.k8s.io/pause:3.10"
 
+// DefaultKueueNamespace and DefaultKueueConfigMapName identify the standard
+// ConfigMap holding Kueue's controller_manager_config.yaml Configuration document.
+const (
+	DefaultKueueNamespace     = "kueue-system"
+	DefaultKueueConfigMapName = "kueue-manager-config"
+)
+
 // Config holds runtime configuration for the Kubernetes and Kueue load test scraper.
 type Config struct {
-	Kubeconfig        string
-	Interval          time.Duration
-	Duration          time.Duration
-	HashNames         bool
-	PauseImage        string
-	ExtraHashLabels   []string
-	HashSalt          []byte
-	InfraFile         string
-	WorkflowsFile     string
-	ExecutionTimeFile string
+	Kubeconfig         string
+	Interval           time.Duration
+	Duration           time.Duration
+	HashNames          bool
+	PauseImage         string
+	ExtraHashLabels    []string
+	HashSalt           []byte
+	InfraFile          string
+	WorkflowsFile      string
+	ExecutionTimeFile  string
+	KueueNamespace     string
+	KueueConfigMapName string
 }
 
 // InfraEvent represents a single event stored in infra.json.

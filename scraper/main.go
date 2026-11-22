@@ -116,6 +116,8 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 		infraFile         string
 		workflowsFile     string
 		executionTimeFile string
+		kueueNamespace    string
+		kueueConfigMap    string
 		qps               float64
 		burst             int
 	)
@@ -139,6 +141,8 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 	fs.StringVar(&infraFile, "infra-file", "infra.json", "Path (or filename in --output-dir) for infrastructure & pod scrape events")
 	fs.StringVar(&workflowsFile, "workflows-file", "workflows.json", "Path (or filename in --output-dir) for workflow creation/update events")
 	fs.StringVar(&executionTimeFile, "execution-time-file", "execution-time.json", "Path (or filename in --output-dir) for workload execution time events")
+	fs.StringVar(&kueueNamespace, "kueue-namespace", DefaultKueueNamespace, "Namespace containing Kueue's controller ConfigMap (empty string disables ConfigMap scraping)")
+	fs.StringVar(&kueueConfigMap, "kueue-configmap", DefaultKueueConfigMapName, "ConfigMap name holding Kueue's controller_manager_config.yaml")
 	fs.Float64Var(&qps, "qps", 200.0, "Kubernetes API client QPS limit")
 	fs.IntVar(&burst, "burst", 400, "Kubernetes API client burst limit")
 
@@ -176,9 +180,11 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 		HashNames:         hashEnabled,
 		PauseImage:        pauseImage,
 		ExtraHashLabels:   []string(extraHashLabels),
-		InfraFile:         resolveOutputPath(outputDir, infraFile),
-		WorkflowsFile:     resolveOutputPath(outputDir, workflowsFile),
-		ExecutionTimeFile: resolveOutputPath(outputDir, executionTimeFile),
+		InfraFile:          resolveOutputPath(outputDir, infraFile),
+		WorkflowsFile:      resolveOutputPath(outputDir, workflowsFile),
+		ExecutionTimeFile:  resolveOutputPath(outputDir, executionTimeFile),
+		KueueNamespace:     strings.TrimSpace(kueueNamespace),
+		KueueConfigMapName: strings.TrimSpace(kueueConfigMap),
 	}
 	return cfg, qps, burst, nil
 }

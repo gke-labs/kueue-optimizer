@@ -47,6 +47,8 @@ ALLOWED_INFRA_GVKS: frozenset[tuple[str, str]] = frozenset(
         ("v1", "Namespace"),
         ("v1", "Pod"),
         ("node.k8s.io/v1", "RuntimeClass"),
+        ("config.kueue.x-k8s.io/v1beta2", "Configuration"),
+        ("config.kueue.x-k8s.io/v1beta1", "Configuration"),
         ("kueue.x-k8s.io/v1beta2", "ClusterQueue"),
         ("kueue.x-k8s.io/v1beta2", "LocalQueue"),
         ("kueue.x-k8s.io/v1beta2", "ResourceFlavor"),

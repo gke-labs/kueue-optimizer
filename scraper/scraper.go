@@ -44,6 +44,7 @@ import (
 	kueuev1beta2 "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	kueueclientset "sigs.k8s.io/kueue/client-go/clientset/versioned"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -167,6 +168,12 @@ func NewScraper(
 	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 60 * time.Second
+	}
+	if cfg.KueueNamespace == "" {
+		cfg.KueueNamespace = DefaultKueueNamespace
+	}
+	if cfg.KueueConfigMapName == "" {
+		cfg.KueueConfigMapName = DefaultKueueConfigMapName
 	}
 	var hasher SensitiveDataHasher = NoopHasher{}
 	if cfg.HashNames {
@@ -314,6 +321,7 @@ func (s *Scraper) scrapeOnceAt(ctx context.Context, now time.Time, prelistedPods
 	nodesRV := s.scrapeNodes(ctx, now)
 	s.scrapeNamespaces(ctx, now)
 	s.scrapeRuntimeClasses(ctx, now)
+	s.scrapeKueueConfiguration(ctx, now)
 	if s.kueueClient != nil {
 		s.scrapeClusterQueues(ctx, now)
 		s.scrapeCohorts(ctx, now)
@@ -534,6 +542,129 @@ func (s *Scraper) scrapeNamespaces(ctx context.Context, now time.Time) {
 		}
 	}
 	s.reconcileInfraKind("Namespace", now, current)
+}
+
+// SanitizeKueueConfigurationYAML parses a Kueue controller_manager_config.yaml document
+// and retains strictly scheduler/admission policy fields (fairSharing, admissionFairSharing,
+// waitForPodsReady, featureGates, resources, manageJobsWithoutQueueName), stripping all
+// cluster-internal networking, webhook, TLS, leader-election, and client-connection settings.
+func SanitizeKueueConfigurationYAML(rawYAML string) (map[string]any, bool) {
+	trimmed := strings.TrimSpace(rawYAML)
+	if trimmed == "" {
+		return nil, false
+	}
+	jsonBytes, err := yaml.YAMLToJSON([]byte(trimmed))
+	if err != nil {
+		return nil, false
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(jsonBytes, &raw); err != nil {
+		return nil, false
+	}
+	kind, _ := raw["kind"].(string)
+	apiVer, _ := raw["apiVersion"].(string)
+	if kind != "Configuration" || !strings.HasPrefix(apiVer, "config.kueue.x-k8s.io/") {
+		return nil, false
+	}
+
+	out := map[string]any{
+		"apiVersion": "config.kueue.x-k8s.io/v1beta2",
+		"kind":       "Configuration",
+	}
+
+	if fsVal, exists := raw["fairSharing"]; exists && fsVal != nil {
+		if fsMap, ok := fsVal.(map[string]any); ok {
+			enabled := true
+			if en, hasEn := fsMap["enable"].(bool); hasEn && !en {
+				enabled = false
+			}
+			if enabled {
+				cleanFS := map[string]any{}
+				if strats, ok := fsMap["preemptionStrategies"].([]any); ok && len(strats) > 0 {
+					cleanFS["preemptionStrategies"] = strats
+				} else {
+					cleanFS["preemptionStrategies"] = []any{
+						"LessThanOrEqualToFinalShare",
+						"LessThanInitialShare",
+					}
+				}
+				out["fairSharing"] = cleanFS
+			}
+		}
+	}
+
+	if afsVal, exists := raw["admissionFairSharing"]; exists && afsVal != nil {
+		if afsMap, ok := afsVal.(map[string]any); ok {
+			out["admissionFairSharing"] = afsMap
+		}
+	}
+
+	if wfprVal, exists := raw["waitForPodsReady"]; exists && wfprVal != nil {
+		if wfprMap, ok := wfprVal.(map[string]any); ok && len(wfprMap) > 0 {
+			out["waitForPodsReady"] = wfprMap
+		}
+	}
+
+	if fgVal, exists := raw["featureGates"]; exists && fgVal != nil {
+		if fgMap, ok := fgVal.(map[string]any); ok && len(fgMap) > 0 {
+			out["featureGates"] = fgMap
+		}
+	}
+
+	if resVal, exists := raw["resources"]; exists && resVal != nil {
+		if resMap, ok := resVal.(map[string]any); ok && len(resMap) > 0 {
+			out["resources"] = resMap
+		}
+	}
+
+	if mjwqn, ok := raw["manageJobsWithoutQueueName"].(bool); ok && mjwqn {
+		out["manageJobsWithoutQueueName"] = true
+	}
+
+	return out, true
+}
+
+func (s *Scraper) scrapeKueueConfiguration(ctx context.Context, now time.Time) {
+	if s.kubeClient == nil || s.cfg.KueueNamespace == "" || s.cfg.KueueConfigMapName == "" {
+		return
+	}
+	cm, err := s.kubeClient.CoreV1().ConfigMaps(s.cfg.KueueNamespace).Get(ctx, s.cfg.KueueConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			s.reconcileInfraKind("Configuration", now, nil)
+			return
+		}
+		if !apierrors.IsForbidden(err) {
+			log.Printf("WARN failed to get ConfigMap %s/%s: %v", s.cfg.KueueNamespace, s.cfg.KueueConfigMapName, err)
+		}
+		return
+	}
+	rawYAML := cm.Data["controller_manager_config.yaml"]
+	if strings.TrimSpace(rawYAML) == "" {
+		keys := make([]string, 0, len(cm.Data))
+		for k := range cm.Data {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if strings.HasSuffix(k, ".yaml") || strings.HasSuffix(k, ".yml") {
+				rawYAML = cm.Data[k]
+				break
+			}
+		}
+	}
+	payload, ok := SanitizeKueueConfigurationYAML(rawYAML)
+	if !ok {
+		return
+	}
+	current := map[string]cachedObject{
+		"kueue-configuration": {
+			name:    "kueue-configuration",
+			digest:  canonicalDigest(payload),
+			payload: payload,
+		},
+	}
+	s.reconcileInfraKind("Configuration", now, current)
 }
 
 func (s *Scraper) scrapeClusterQueues(ctx context.Context, now time.Time) {

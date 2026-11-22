@@ -276,6 +276,7 @@ class ScenarioAnalysis:
     cqs_by_name: dict[str, dict[str, Any]]
     lqs_by_key: dict[tuple[str, str], dict[str, Any]]
     namespaces_by_name: dict[str, dict[str, Any]]
+    kueue_configuration: dict[str, Any] | None
 
     all_nodes: list[dict[str, Any]]
     total_node_count: int
@@ -380,6 +381,7 @@ def _parse_infra_events(infra_events: list[dict[str, Any]]) -> dict[str, Any]:
     cqs_by_name: dict[str, dict[str, Any]] = {}
     lqs_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     namespaces_by_name: dict[str, dict[str, Any]] = {}
+    kueue_configuration: dict[str, Any] | None = None
     pod_new_events: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
     pod_delete_epochs: dict[tuple[str, str], float] = {}
     infra_timestamps: list[float] = []
@@ -421,6 +423,11 @@ def _parse_infra_events(infra_events: list[dict[str, Any]]) -> dict[str, Any]:
         elif kind == "Namespace" and ev_type in ("New", "Update"):
             if name:
                 namespaces_by_name[name] = pl
+        elif kind == "Configuration":
+            if ev_type == "Deleted":
+                kueue_configuration = None
+            elif ev_type in ("New", "Update", ""):
+                kueue_configuration = pl
         elif kind == "Pod":
             if ev_type == "New" and name and (ns, name) not in pod_new_events:
                 pod_new_events[(ns, name)] = (ep if ep is not None else 0.0, pl)
@@ -438,6 +445,7 @@ def _parse_infra_events(infra_events: list[dict[str, Any]]) -> dict[str, Any]:
         "cqs_by_name": cqs_by_name,
         "lqs_by_key": lqs_by_key,
         "namespaces_by_name": namespaces_by_name,
+        "kueue_configuration": kueue_configuration,
         "pod_new_events": pod_new_events,
         "pod_delete_epochs": pod_delete_epochs,
         "infra_timestamps": infra_timestamps,
@@ -839,6 +847,7 @@ def analyze_scenario(scenario_dir: Path) -> ScenarioAnalysis:
         cqs_by_name=infra["cqs_by_name"],
         lqs_by_key=infra["lqs_by_key"],
         namespaces_by_name=infra["namespaces_by_name"],
+        kueue_configuration=infra["kueue_configuration"],
         all_nodes=nodes_info["all_nodes"],
         total_node_count=nodes_info["total_node_count"],
         label_val_sets=nodes_info["label_val_sets"],

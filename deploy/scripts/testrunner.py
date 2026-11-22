@@ -52,13 +52,16 @@ import sys
 import time
 
 from chamber_common import (
+    AdmissionFairSharingConfig,
     ChamberManager,
+    DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES,
     DEFAULT_FALLBACK_EXEC_SEC,
     DEFAULT_INFRA_PODS_NAMESPACE,
     DEFAULT_INTERRUPTED_DURATION_MULTIPLIER,
     DEFAULT_PAUSE_IMAGE,
     DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC,
     InterruptedDurationOverride,
+    KueueScenarioConfiguration,
     ROOT_DIR,
     WaitForPodsReadyConfig,
     add_common_chamber_args,
@@ -69,8 +72,11 @@ from chamber_common import (
     managed_chamber,
     normalize_queueing_strategy,
     parse_duration_seconds,
+    parse_fair_sharing_strategies,
+    parse_feature_gates_arg,
     parse_interrupted_duration_override,
     query_cluster_status,
+    resolve_admission_fair_sharing_config,
     resolve_fair_sharing_arg,
     resolve_wait_for_pods_ready_config,
 )
@@ -104,11 +110,13 @@ __all__ = [
     "ALLOWED_INFRA_GVKS",
     "ALLOWED_WORKFLOW_GVKS",
     "ALLOWED_WORKFLOW_KINDS",
+    "AdmissionFairSharingConfig",
     "DEFAULT_INFINITE_POD_DURATION_SEC",
     "DEFAULT_SCENARIO_DIR",
     "InitialPodSpec",
     "InitialWorkloadPodGroup",
     "InterruptedDurationOverride",
+    "KueueScenarioConfiguration",
     "MAX_K8S_NAME_LEN",
     "SERVER_METADATA_FIELDS",
     "SYSTEM_NAMESPACES",
@@ -123,6 +131,7 @@ __all__ = [
     "main",
     "parse_interrupted_duration_override",
     "print_scenario_outline",
+    "resolve_admission_fair_sharing_config",
     "resolve_wait_for_pods_ready_config",
     "run_scenario_replay",
     "validate_workflow_events",
@@ -447,12 +456,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.speedup <= 0:
         parser.error("--speedup / --time-compression must be > 0")
 
-    enable_fair_sharing = resolve_fair_sharing_arg(
-        args.fair_sharing,
-        args.skip_chamber_deploy and not args.cleanup and not args.cleanup_workloads,
-        parser,
-    )
-
     if args.cleanup_after:
         args.no_cleanup = False
     elif args.skip_chamber_deploy:
@@ -484,36 +487,11 @@ def main(argv: list[str] | None = None) -> int:
             registry_memory_limit=args.registry_memory_limit,
             kueue_image=args.kueue_image,
             kueue_build_dir=args.kueue_build_dir,
-            enable_fair_sharing=enable_fair_sharing,
         )
         mgr.cleanup_chamber()
         return 0
 
     infra_pods_ns = args.infra_pods_namespace.strip() or DEFAULT_INFRA_PODS_NAMESPACE
-
-    try:
-        wfpr_cfg = resolve_wait_for_pods_ready_config(
-            enabled=args.wait_for_pods_ready,
-            raw_timeout=args.wait_for_pods_ready_timeout,
-            raw_recovery_timeout=args.wait_for_pods_ready_recovery_timeout,
-            block_admission=args.wait_for_pods_ready_block_admission,
-            requeuing_timestamp=args.wait_for_pods_ready_requeue_timestamp,
-            backoff_limit_count=args.wait_for_pods_ready_backoff_limit,
-            raw_backoff_base=args.wait_for_pods_ready_backoff_base,
-            raw_backoff_max=args.wait_for_pods_ready_backoff_max,
-            speedup=args.speedup,
-            max_run_seconds=max_run_seconds,
-            min_wall_timeout=args.wait_for_pods_ready_min_timeout,
-            cap_to_duration=args.wait_for_pods_ready_cap_to_duration,
-        )
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    if args.skip_chamber_deploy and not args.cleanup_workloads and (wfpr_cfg.enabled or args.kueue_feature_gates):
-        parser.error(
-            "--wait-for-pods-ready* and --kueue-feature-gates cannot be combined with --skip-chamber-deploy "
-            "because Kueue's controller configuration is only applied when deploying a chamber."
-        )
 
     try:
         bundle = load_scenario_bundle(
@@ -538,6 +516,113 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
+    sc_cfg = bundle.kueue_configuration
+    enable_fair_sharing = resolve_fair_sharing_arg(
+        args.fair_sharing,
+        args.skip_chamber_deploy and not args.cleanup_workloads,
+        parser,
+        scenario_default=sc_cfg.fair_sharing_enabled if sc_cfg is not None else None,
+    )
+
+    try:
+        if args.fair_sharing_strategies is not None:
+            fair_sharing_strategies = parse_fair_sharing_strategies(args.fair_sharing_strategies)
+        elif sc_cfg is not None:
+            fair_sharing_strategies = sc_cfg.fair_sharing_strategies
+        else:
+            fair_sharing_strategies = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+
+        afs_cfg = resolve_admission_fair_sharing_config(
+            enabled=args.admission_fair_sharing,
+            raw_usage_half_life=args.afs_usage_half_life,
+            raw_usage_sampling_interval=args.afs_sampling_interval,
+            resource_weights=args.afs_resource_weights,
+            scenario_afs=sc_cfg.afs_raw if sc_cfg is not None else None,
+            speedup=args.speedup,
+            max_run_seconds=max_run_seconds,
+        )
+
+        sc_wfpr = sc_cfg.wfpr_raw if sc_cfg is not None else None
+        sc_wfpr_req = (sc_wfpr.get("requeuingStrategy") or {}) if isinstance(sc_wfpr, dict) else {}
+        eff_wfpr_enabled = (
+            args.wait_for_pods_ready
+            if args.wait_for_pods_ready is not None
+            else (True if sc_wfpr is not None else None)
+        )
+        wfpr_cfg = resolve_wait_for_pods_ready_config(
+            enabled=eff_wfpr_enabled,
+            raw_timeout=(
+                args.wait_for_pods_ready_timeout
+                if args.wait_for_pods_ready_timeout is not None
+                else (sc_wfpr.get("timeout") if sc_wfpr else None)
+            ),
+            raw_recovery_timeout=(
+                args.wait_for_pods_ready_recovery_timeout
+                if args.wait_for_pods_ready_recovery_timeout is not None
+                else (sc_wfpr.get("recoveryTimeout") if sc_wfpr else None)
+            ),
+            block_admission=(
+                args.wait_for_pods_ready_block_admission
+                if args.wait_for_pods_ready_block_admission is not None
+                else (sc_wfpr.get("blockAdmission") if sc_wfpr else None)
+            ),
+            requeuing_timestamp=(
+                args.wait_for_pods_ready_requeue_timestamp
+                if args.wait_for_pods_ready_requeue_timestamp is not None
+                else sc_wfpr_req.get("timestamp")
+            ),
+            backoff_limit_count=(
+                args.wait_for_pods_ready_backoff_limit
+                if args.wait_for_pods_ready_backoff_limit is not None
+                else sc_wfpr_req.get("backoffLimitCount")
+            ),
+            raw_backoff_base=(
+                args.wait_for_pods_ready_backoff_base
+                if args.wait_for_pods_ready_backoff_base is not None
+                else sc_wfpr_req.get("backoffBaseSeconds")
+            ),
+            raw_backoff_max=(
+                args.wait_for_pods_ready_backoff_max
+                if args.wait_for_pods_ready_backoff_max is not None
+                else sc_wfpr_req.get("backoffMaxSeconds")
+            ),
+            speedup=args.speedup,
+            max_run_seconds=max_run_seconds,
+            min_wall_timeout=args.wait_for_pods_ready_min_timeout,
+            cap_to_duration=args.wait_for_pods_ready_cap_to_duration,
+        )
+        merged_feature_gates: dict[str, bool] = {}
+        if sc_cfg is not None and sc_cfg.feature_gates:
+            merged_feature_gates.update(sc_cfg.feature_gates)
+        merged_feature_gates.update(parse_feature_gates_arg(args.kueue_feature_gates))
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    has_cli_controller_override = any(
+        x is not None
+        for x in (
+            args.fair_sharing_strategies,
+            args.admission_fair_sharing,
+            args.afs_usage_half_life,
+            args.afs_sampling_interval,
+            args.afs_resource_weights,
+            args.wait_for_pods_ready,
+            args.wait_for_pods_ready_timeout,
+            args.wait_for_pods_ready_recovery_timeout,
+            args.wait_for_pods_ready_block_admission,
+            args.wait_for_pods_ready_backoff_limit,
+            args.wait_for_pods_ready_backoff_base,
+            args.wait_for_pods_ready_backoff_max,
+            args.kueue_feature_gates,
+        )
+    )
+    if args.skip_chamber_deploy and not args.cleanup_workloads and (has_cli_controller_override or sc_cfg is not None):
+        parser.error(
+            "Scenario Kueue Configuration statements and controller config CLI flags (--fair-sharing-strategies, "
+            "--admission-fair-sharing*, --wait-for-pods-ready*, --kueue-feature-gates) cannot be combined with "
+            "--skip-chamber-deploy because Kueue's controller configuration is only applied when deploying a chamber."
+        )
+
     mgr = ChamberManager(
         chamber_namespace=args.namespace,
         workload_namespace=bundle.primary_workload_namespace,
@@ -549,8 +634,12 @@ def main(argv: list[str] | None = None) -> int:
         kueue_image=args.kueue_image,
         kueue_build_dir=args.kueue_build_dir,
         enable_fair_sharing=enable_fair_sharing,
+        fair_sharing_strategies=fair_sharing_strategies,
+        admission_fair_sharing=afs_cfg,
         wait_for_pods_ready=wfpr_cfg,
-        kueue_feature_gates=args.kueue_feature_gates,
+        kueue_feature_gates=merged_feature_gates,
+        kueue_resources_config=sc_cfg.resources_block if sc_cfg is not None else None,
+        manage_jobs_without_queue_name=sc_cfg.manage_jobs_without_queue_name if sc_cfg is not None else None,
     )
 
     if args.cleanup_workloads:
@@ -575,11 +664,18 @@ def main(argv: list[str] | None = None) -> int:
             enable_fair_sharing=outline_fs,
             reused_chamber=args.skip_chamber_deploy,
             wait_for_pods_ready=wfpr_cfg,
+            fair_sharing_strategies=fair_sharing_strategies,
+            admission_fair_sharing=afs_cfg,
+            config_from_scenario=sc_cfg is not None,
         )
         limit = args.dry_run_limit
         sample_nodes = bundle.nodes[:limit] if limit > 0 else bundle.nodes
         sample_pods = bundle.initial_pods[:limit] if limit > 0 else bundle.initial_pods
         sample_wfs = bundle.scheduled_workflows[:limit] if limit > 0 else bundle.scheduled_workflows
+        if sc_cfg is not None:
+            print("# === Kueue Controller Configuration (from scenario infra.json) ===")
+            print(docs_to_pretty_yaml([sc_cfg.raw_doc]), end="")
+            print("---")
         print(f"# === KWOK Nodes (showing {len(sample_nodes)} of {len(bundle.nodes)}) ===")
         print(docs_to_pretty_yaml(sample_nodes), end="")
         print("---\n# === Namespaces, ResourceFlavors, Topologies, ClusterQueues, LocalQueues ===")
@@ -614,6 +710,9 @@ def main(argv: list[str] | None = None) -> int:
         enable_fair_sharing=banner_fs,
         reused_chamber=args.skip_chamber_deploy,
         wait_for_pods_ready=wfpr_cfg,
+        fair_sharing_strategies=fair_sharing_strategies,
+        admission_fair_sharing=afs_cfg,
+        config_from_scenario=sc_cfg is not None,
     )
 
     should_cleanup_chamber = not args.no_cleanup
@@ -645,6 +744,7 @@ def main(argv: list[str] | None = None) -> int:
         mgr.wait_for_crds()
         mgr.apply_kwok_stages()
         mgr.ensure_kueue_webhook_namespace_exclusions(excluded_namespaces=(bundle.infra_pods_namespace,))
+        mgr.sync_kueue_configuration_to_kwok_apiserver()
 
         for ns in bundle.workload_namespaces:
             mgr.workload_namespace = ns

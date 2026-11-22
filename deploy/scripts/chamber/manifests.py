@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Any
@@ -26,11 +26,20 @@ from chamber.constants import (
     DEFAULT_FLAVOR_NAME,
 )
 from chamber.parsers import parse_duration_seconds, parse_k8s_quantity
+from chamber.yaml_utils import to_clean_yaml
 
 
 DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC = 300.0
 DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC = 2.0
 DEFAULT_WAIT_FOR_PODS_READY_MAX_DURATION_FRACTION = 0.5
+DEFAULT_AFS_SAMPLING_INTERVAL_SEC = 300.0
+DEFAULT_AFS_MIN_SAMPLING_WALL_SEC = 0.5
+
+VALID_FAIR_SHARING_STRATEGY_SETS: tuple[tuple[str, ...], ...] = (
+    ("LessThanOrEqualToFinalShare",),
+    ("LessThanInitialShare",),
+    ("LessThanOrEqualToFinalShare", "LessThanInitialShare"),
+)
 
 
 def format_go_duration_seconds(seconds: float) -> str:
@@ -262,6 +271,281 @@ def parse_feature_gates_arg(raw: str | dict[str, bool] | None) -> dict[str, bool
         else:
             raise ValueError(f"Invalid boolean in --kueue-feature-gates entry {tok!r}: expected true|false")
     return out
+
+
+def parse_fair_sharing_strategies(
+    raw: str | list[str] | tuple[str, ...] | None,
+    *,
+    field_desc: str = "fairSharing.preemptionStrategies",
+) -> tuple[str, ...]:
+    """Validate and normalize Kueue FairSharing preemptionStrategies against Kueue's legal sets."""
+    if raw is None:
+        return DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+    if isinstance(raw, str):
+        items = tuple(tok.strip() for tok in raw.split(",") if tok.strip())
+    elif isinstance(raw, (list, tuple)):
+        items = tuple(str(tok).strip() for tok in raw if str(tok).strip())
+    else:
+        raise ValueError(f"Invalid {field_desc} {raw!r}: expected list of strategy names")
+    if not items:
+        raise ValueError(f"{field_desc}: must specify at least one PreemptionStrategy when fairSharing is enabled")
+    if items not in VALID_FAIR_SHARING_STRATEGY_SETS:
+        allowed_str = " | ".join("[" + ", ".join(s) + "]" for s in VALID_FAIR_SHARING_STRATEGY_SETS)
+        raise ValueError(f"Unsupported {field_desc} {list(items)!r}; Kueue only supports: {allowed_str}")
+    return items
+
+
+def parse_afs_resource_weights(
+    raw: str | dict[str, Any] | None,
+    *,
+    field_desc: str = "admissionFairSharing.resourceWeights",
+) -> dict[str, float]:
+    """Parse 'resA=1,resB=0' or dict[str, float] into validated non-negative resource weights."""
+    if raw is None:
+        return {}
+    out: dict[str, float] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            rk = str(k).strip()
+            if not rk:
+                continue
+            try:
+                val = float(v)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid numeric weight in {field_desc}[{rk!r}]={v!r}") from exc
+            if val < 0:
+                raise ValueError(f"Negative weight in {field_desc}[{rk!r}]={val}: must be >= 0")
+            out[rk] = val
+        return out
+    for tok in str(raw).split(","):
+        item = tok.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid {field_desc} entry {item!r}: expected <resource>=<non-negative-float>")
+        rk, rv = item.split("=", 1)
+        rk_clean = rk.strip()
+        try:
+            val = float(rv.strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid numeric weight in {field_desc} entry {item!r}") from exc
+        if val < 0:
+            raise ValueError(f"Negative weight in {field_desc} entry {item!r}: must be >= 0")
+        out[rk_clean] = val
+    return out
+
+
+@dataclass
+class AdmissionFairSharingConfig:
+    """Resolved Kueue admissionFairSharing configuration adjusted for --speedup and --duration."""
+
+    enabled: bool = False
+    raw_usage_half_life_sec: float = 0.0
+    effective_usage_half_life_sec: float = 0.0
+    raw_usage_sampling_interval_sec: float = DEFAULT_AFS_SAMPLING_INTERVAL_SEC
+    effective_usage_sampling_interval_sec: float = DEFAULT_AFS_SAMPLING_INTERVAL_SEC
+    resource_weights: dict[str, float] = field(default_factory=dict)
+
+    def summary_str(self) -> str:
+        if not self.enabled:
+            return "disabled"
+        parts = [
+            f"usageHalfLifeTime={format_go_duration_seconds(self.effective_usage_half_life_sec)} "
+            f"(raw {format_go_duration_seconds(self.raw_usage_half_life_sec)})",
+            f"usageSamplingInterval={format_go_duration_seconds(self.effective_usage_sampling_interval_sec)} "
+            f"(raw {format_go_duration_seconds(self.raw_usage_sampling_interval_sec)})",
+        ]
+        if self.resource_weights:
+            rw_str = ", ".join(f"{k}={v:g}" for k, v in sorted(self.resource_weights.items()))
+            parts.append(f"resourceWeights={{{rw_str}}}")
+        return ", ".join(parts)
+
+
+def resolve_admission_fair_sharing_config(
+    *,
+    enabled: bool | None = None,
+    raw_usage_half_life: str | float | None = None,
+    raw_usage_sampling_interval: str | float | None = None,
+    resource_weights: str | dict[str, Any] | None = None,
+    scenario_afs: dict[str, Any] | None = None,
+    speedup: float = 1.0,
+    max_run_seconds: float | None = None,
+) -> AdmissionFairSharingConfig:
+    """Resolve Kueue admissionFairSharing configuration (CLI overrides > scenario Configuration > disabled)."""
+    has_cli_subflag = any(
+        x is not None for x in (raw_usage_half_life, raw_usage_sampling_interval, resource_weights)
+    )
+    if enabled is not None:
+        eff_enabled = bool(enabled)
+    elif has_cli_subflag:
+        eff_enabled = True
+    elif scenario_afs is not None:
+        eff_enabled = True
+    else:
+        return AdmissionFairSharingConfig(enabled=False)
+
+    if not eff_enabled:
+        return AdmissionFairSharingConfig(enabled=False)
+
+    base_afs = scenario_afs or {}
+    hl_src = raw_usage_half_life if raw_usage_half_life is not None else base_afs.get("usageHalfLifeTime", "0s")
+    si_src = (
+        raw_usage_sampling_interval
+        if raw_usage_sampling_interval is not None
+        else base_afs.get("usageSamplingInterval", "5m")
+    )
+    rw_src = resource_weights if resource_weights is not None else base_afs.get("resourceWeights")
+
+    if isinstance(hl_src, (int, float)):
+        raw_hl = float(hl_src)
+    elif str(hl_src).strip() in ("0", "0s", "0ms", ""):
+        raw_hl = 0.0
+    else:
+        parsed_hl = parse_duration_seconds(str(hl_src))
+        if parsed_hl is None:
+            raise ValueError(f"Invalid admissionFairSharing.usageHalfLifeTime {hl_src!r}")
+        raw_hl = parsed_hl
+    if raw_hl < 0:
+        raise ValueError(f"admissionFairSharing.usageHalfLifeTime must be >= 0 (got {hl_src!r})")
+
+    if isinstance(si_src, (int, float)):
+        raw_si = float(si_src)
+    else:
+        parsed_si = parse_duration_seconds(str(si_src))
+        if parsed_si is None:
+            raise ValueError(f"Invalid admissionFairSharing.usageSamplingInterval {si_src!r}")
+        raw_si = parsed_si
+    if raw_si <= 0:
+        raise ValueError(f"admissionFairSharing.usageSamplingInterval must be > 0 (got {si_src!r})")
+
+    parsed_weights = parse_afs_resource_weights(rw_src)
+    eff_speedup = max(1e-6, float(speedup))
+    eff_hl = 0.0 if raw_hl == 0.0 else max(DEFAULT_AFS_MIN_SAMPLING_WALL_SEC, raw_hl / eff_speedup)
+    eff_si = max(DEFAULT_AFS_MIN_SAMPLING_WALL_SEC, raw_si / eff_speedup)
+    if max_run_seconds is not None and max_run_seconds > 0:
+        eff_si = min(eff_si, max(DEFAULT_AFS_MIN_SAMPLING_WALL_SEC, max_run_seconds * 0.25))
+
+    return AdmissionFairSharingConfig(
+        enabled=True,
+        raw_usage_half_life_sec=raw_hl,
+        effective_usage_half_life_sec=eff_hl,
+        raw_usage_sampling_interval_sec=raw_si,
+        effective_usage_sampling_interval_sec=eff_si,
+        resource_weights=parsed_weights,
+    )
+
+
+@dataclass
+class KueueScenarioConfiguration:
+    """Validated Kueue `Configuration` statement extracted from a test scenario (`infra.json` or `kueue-config.json`)."""
+
+    fair_sharing_enabled: bool = False
+    fair_sharing_strategies: tuple[str, ...] = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+    afs_raw: dict[str, Any] | None = None
+    wfpr_raw: dict[str, Any] | None = None
+    feature_gates: dict[str, bool] = field(default_factory=dict)
+    resources_block: dict[str, Any] | None = None
+    manage_jobs_without_queue_name: bool | None = None
+    raw_doc: dict[str, Any] = field(default_factory=dict)
+
+
+def parse_kueue_configuration_payload(
+    doc: dict[str, Any],
+    *,
+    source_desc: str = "Configuration",
+) -> KueueScenarioConfiguration:
+    """Validate and parse a Kueue `config.kueue.x-k8s.io/v1beta2` (or `v1beta1`) `Configuration` payload."""
+    if not isinstance(doc, dict):
+        raise ValueError(f"{source_desc}: expected object dict for Kueue Configuration")
+    api_ver = str(doc.get("apiVersion") or "")
+    kind = str(doc.get("kind") or "")
+    if kind != "Configuration" or api_ver not in (
+        "config.kueue.x-k8s.io/v1beta2",
+        "config.kueue.x-k8s.io/v1beta1",
+    ):
+        raise ValueError(
+            f"{source_desc}: expected apiVersion 'config.kueue.x-k8s.io/v1beta2' (or v1beta1) and kind 'Configuration', "
+            f"got ({api_ver!r}, {kind!r})"
+        )
+
+    fs_raw = doc.get("fairSharing")
+    if fs_raw is None:
+        fs_enabled = False
+        fs_strategies = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+    elif isinstance(fs_raw, dict):
+        if fs_raw.get("enable") is False:
+            fs_enabled = False
+            fs_strategies = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+        else:
+            fs_enabled = True
+            if "preemptionStrategies" in fs_raw:
+                fs_strategies = parse_fair_sharing_strategies(
+                    fs_raw["preemptionStrategies"],
+                    field_desc=f"{source_desc} fairSharing.preemptionStrategies",
+                )
+            else:
+                fs_strategies = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+    else:
+        raise ValueError(f"{source_desc}: fairSharing must be a mapping or null, got {type(fs_raw).__name__}")
+
+    afs_raw = doc.get("admissionFairSharing")
+    if afs_raw is not None:
+        if not isinstance(afs_raw, dict):
+            raise ValueError(
+                f"{source_desc}: admissionFairSharing must be a mapping or null, got {type(afs_raw).__name__}"
+            )
+        # Validate values immediately via resolve_admission_fair_sharing_config.
+        resolve_admission_fair_sharing_config(scenario_afs=afs_raw, speedup=1.0)
+
+    wfpr_raw = doc.get("waitForPodsReady")
+    if wfpr_raw is not None:
+        if not isinstance(wfpr_raw, dict):
+            raise ValueError(
+                f"{source_desc}: waitForPodsReady must be a mapping or null, got {type(wfpr_raw).__name__}"
+            )
+        req_strat = wfpr_raw.get("requeuingStrategy") or {}
+        if not isinstance(req_strat, dict):
+            raise ValueError(f"{source_desc}: waitForPodsReady.requeuingStrategy must be a mapping")
+        resolve_wait_for_pods_ready_config(
+            enabled=True,
+            raw_timeout=wfpr_raw.get("timeout"),
+            raw_recovery_timeout=wfpr_raw.get("recoveryTimeout"),
+            block_admission=wfpr_raw.get("blockAdmission"),
+            requeuing_timestamp=req_strat.get("timestamp"),
+            backoff_limit_count=req_strat.get("backoffLimitCount"),
+            raw_backoff_base=req_strat.get("backoffBaseSeconds"),
+            raw_backoff_max=req_strat.get("backoffMaxSeconds"),
+            speedup=1.0,
+        )
+
+    fg_raw = doc.get("featureGates")
+    fg_parsed: dict[str, bool] = {}
+    if fg_raw is not None:
+        if not isinstance(fg_raw, dict):
+            raise ValueError(f"{source_desc}: featureGates must be a mapping of bools")
+        for k, v in fg_raw.items():
+            if not isinstance(v, bool):
+                raise ValueError(f"{source_desc}: featureGates[{k!r}] must be a boolean, got {v!r}")
+            fg_parsed[str(k)] = v
+
+    res_raw = doc.get("resources")
+    if res_raw is not None and not isinstance(res_raw, dict):
+        raise ValueError(f"{source_desc}: resources must be a mapping or null")
+
+    mjwqn_raw = doc.get("manageJobsWithoutQueueName")
+    if mjwqn_raw is not None and not isinstance(mjwqn_raw, bool):
+        raise ValueError(f"{source_desc}: manageJobsWithoutQueueName must be a boolean")
+
+    return KueueScenarioConfiguration(
+        fair_sharing_enabled=fs_enabled,
+        fair_sharing_strategies=fs_strategies,
+        afs_raw=dict(afs_raw) if isinstance(afs_raw, dict) else None,
+        wfpr_raw=dict(wfpr_raw) if isinstance(wfpr_raw, dict) else None,
+        feature_gates=fg_parsed,
+        resources_block=dict(res_raw) if isinstance(res_raw, dict) and res_raw else None,
+        manage_jobs_without_queue_name=mjwqn_raw,
+        raw_doc=dict(doc),
+    )
 
 
 def build_kwok_node_manifest(
@@ -523,8 +807,12 @@ def _insert_top_level_kueue_config_block(cfg_text: str, block_lines: list[str]) 
     return cfg_text.rstrip("\n") + "\n" + block
 
 
-def patch_kueue_fair_sharing_config(base_dst: Path, enable_fair_sharing: bool) -> None:
-    """Enable or disable Preemption-Based Fair Sharing in controller_manager_config.yaml."""
+def patch_kueue_fair_sharing_config(
+    base_dst: Path,
+    enable_fair_sharing: bool,
+    strategies: tuple[str, ...] | list[str] | None = None,
+) -> None:
+    """Enable (with configurable preemptionStrategies) or disable global FairSharing in controller_manager_config.yaml."""
     cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
     if not cfg_yaml.exists():
         return
@@ -536,12 +824,77 @@ def patch_kueue_fair_sharing_config(base_dst: Path, enable_fair_sharing: bool) -
         flags=re.MULTILINE,
     )
     if enable_fair_sharing:
+        resolved_strats = parse_fair_sharing_strategies(strategies)
         fs_lines = [
             "fairSharing:",
             "  preemptionStrategies:",
-            *[f"  - {s}" for s in DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES],
+            *[f"  - {s}" for s in resolved_strats],
         ]
         cfg_text = _insert_top_level_kueue_config_block(cfg_text, fs_lines)
+    cfg_yaml.write_text(cfg_text, encoding="utf-8")
+
+
+def patch_kueue_admission_fair_sharing_config(
+    base_dst: Path,
+    afs_cfg: AdmissionFairSharingConfig | None,
+) -> None:
+    """Configure or remove admissionFairSharing in controller_manager_config.yaml."""
+    cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
+    if not cfg_yaml.exists():
+        return
+    cfg_text = cfg_yaml.read_text(encoding="utf-8")
+    cfg_text = re.sub(
+        r"^admissionFairSharing:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    if afs_cfg is not None and afs_cfg.enabled:
+        afs_lines = [
+            "admissionFairSharing:",
+            f"  usageHalfLifeTime: {format_go_duration_seconds(afs_cfg.effective_usage_half_life_sec)}",
+            f"  usageSamplingInterval: {format_go_duration_seconds(afs_cfg.effective_usage_sampling_interval_sec)}",
+        ]
+        if afs_cfg.resource_weights:
+            afs_lines.append("  resourceWeights:")
+            for rk, rv in sorted(afs_cfg.resource_weights.items()):
+                val_str = str(int(rv)) if abs(rv - round(rv)) < 1e-9 else f"{rv:g}"
+                afs_lines.append(f"    {rk}: {val_str}")
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, afs_lines)
+    cfg_yaml.write_text(cfg_text, encoding="utf-8")
+
+
+def patch_kueue_extra_configuration_fields(
+    base_dst: Path,
+    *,
+    resources_block: dict[str, Any] | None = None,
+    manage_jobs_without_queue_name: bool | None = None,
+) -> None:
+    """Apply optional `resources` and `manageJobsWithoutQueueName` fields into controller_manager_config.yaml."""
+    cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
+    if not cfg_yaml.exists():
+        return
+    cfg_text = cfg_yaml.read_text(encoding="utf-8")
+    cfg_text = re.sub(
+        r"^resources:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    cfg_text = re.sub(
+        r"^manageJobsWithoutQueueName:[ \t]*[^\n]*\n",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    if resources_block:
+        res_yaml = to_clean_yaml({"resources": resources_block})
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, res_yaml.splitlines())
+    if manage_jobs_without_queue_name is not None:
+        cfg_text = _insert_top_level_kueue_config_block(
+            cfg_text,
+            [f"manageJobsWithoutQueueName: {str(bool(manage_jobs_without_queue_name)).lower()}"],
+        )
     cfg_yaml.write_text(cfg_text, encoding="utf-8")
 
 

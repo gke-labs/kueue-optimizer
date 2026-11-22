@@ -2056,6 +2056,159 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
         finally:
             mgr.close()
 
+    def test_declarative_kueue_configuration_loading_patching_and_scenarios(self) -> None:
+        """Verify declarative Kueue Configuration parsing, controller_manager_config.yaml patching, CLI precedence, and st76-st80 scenarios."""
+        import contextlib
+        import shutil
+        from chamber.manifests import (
+            patch_kueue_admission_fair_sharing_config,
+            patch_kueue_fair_sharing_config,
+            parse_kueue_configuration_payload,
+        )
+        from chamber_common import resolve_admission_fair_sharing_config, resolve_fair_sharing_arg
+
+        # 1. Validate st76-st80 scenario bundles and README rendering
+        expected = {
+            "st76-config-fair-sharing-enabled-default": (
+                True,
+                ("LessThanOrEqualToFinalShare", "LessThanInitialShare"),
+                False,
+            ),
+            "st77-config-fair-sharing-disabled-globally": (
+                False,
+                ("LessThanOrEqualToFinalShare", "LessThanInitialShare"),
+                False,
+            ),
+            "st78-config-fair-sharing-final-share-rule-only": (
+                True,
+                ("LessThanOrEqualToFinalShare",),
+                False,
+            ),
+            "st79-config-admission-fair-sharing-enabled": (
+                True,
+                ("LessThanOrEqualToFinalShare", "LessThanInitialShare"),
+                True,
+            ),
+            "st80-config-admission-fair-sharing-disabled": (
+                True,
+                ("LessThanOrEqualToFinalShare", "LessThanInitialShare"),
+                False,
+            ),
+        }
+        for slug, (want_fs, want_strats, want_afs) in expected.items():
+            sc_dir = REPO_ROOT / "testscenarios" / "self-tests" / slug
+            bundle = testrunner.load_scenario_bundle(sc_dir)
+            self.assertIsNotNone(bundle.kueue_configuration, slug)
+            assert bundle.kueue_configuration is not None
+            self.assertEqual(bundle.kueue_configuration.fair_sharing_enabled, want_fs, slug)
+            self.assertEqual(bundle.kueue_configuration.fair_sharing_strategies, want_strats, slug)
+            self.assertEqual(bundle.kueue_configuration.afs_raw is not None, want_afs, slug)
+
+            analysis = generate_scenario_readme.analyze_scenario(sc_dir)
+            self.assertIsNotNone(analysis.kueue_configuration, slug)
+            md = generate_scenario_readme.generate_readme_for_scenario(sc_dir)
+            self.assertIn("Kueue Controller `Configuration`", md)
+            self.assertIn("### 5.0 Kueue Controller `Configuration` (`infra.json`)", md)
+
+        # 2. Validation rejects invalid preemptionStrategies and negative AFS weights
+        with self.assertRaises(ValueError):
+            parse_kueue_configuration_payload(
+                {
+                    "apiVersion": "config.kueue.x-k8s.io/v1beta2",
+                    "kind": "Configuration",
+                    "fairSharing": {"preemptionStrategies": []},
+                }
+            )
+        with self.assertRaises(ValueError):
+            parse_kueue_configuration_payload(
+                {
+                    "apiVersion": "config.kueue.x-k8s.io/v1beta2",
+                    "kind": "Configuration",
+                    "fairSharing": {"preemptionStrategies": ["LessThanInitialShare", "LessThanOrEqualToFinalShare"]},
+                }
+            )
+        with self.assertRaises(ValueError):
+            parse_kueue_configuration_payload(
+                {
+                    "apiVersion": "config.kueue.x-k8s.io/v1beta2",
+                    "kind": "Configuration",
+                    "admissionFairSharing": {"resourceWeights": {"cpu": -1.0}},
+                }
+            )
+
+        # 3. Legacy v1beta1 fairSharing.enable: false normalizes cleanly to fair_sharing_enabled=False
+        legacy = parse_kueue_configuration_payload(
+            {
+                "apiVersion": "config.kueue.x-k8s.io/v1beta1",
+                "kind": "Configuration",
+                "fairSharing": {"enable": False, "preemptionStrategies": ["LessThanOrEqualToFinalShare"]},
+            }
+        )
+        self.assertFalse(legacy.fair_sharing_enabled)
+
+        # 4. Speedup scaling & CLI precedence over scenario Configuration
+        b79 = testrunner.load_scenario_bundle(
+            REPO_ROOT / "testscenarios" / "self-tests" / "st79-config-admission-fair-sharing-enabled"
+        )
+        assert b79.kueue_configuration is not None
+        scaled_afs = resolve_admission_fair_sharing_config(
+            enabled=None,
+            raw_usage_half_life=None,
+            raw_usage_sampling_interval=None,
+            resource_weights=None,
+            scenario_afs=b79.kueue_configuration.afs_raw,
+            speedup=4.0,
+        )
+        self.assertTrue(scaled_afs.enabled)
+        self.assertAlmostEqual(scaled_afs.effective_usage_half_life_sec, 5.0)
+        # 1.0s / 4.0 = 0.25s is clamped at DEFAULT_AFS_MIN_SAMPLING_WALL_SEC (0.5s)
+        self.assertAlmostEqual(scaled_afs.effective_usage_sampling_interval_sec, 0.5)
+
+        # Explicit --no-admission-fair-sharing overrides scenario AFS
+        disabled_afs = resolve_admission_fair_sharing_config(
+            enabled=False,
+            raw_usage_half_life=None,
+            raw_usage_sampling_interval=None,
+            resource_weights=None,
+            scenario_afs=b79.kueue_configuration.afs_raw,
+            speedup=1.0,
+        )
+        self.assertFalse(disabled_afs.enabled)
+
+        # Explicit --fair-sharing overrides st77 scenario FairSharing=False
+        dummy_parser = testrunner.build_arg_parser()
+        self.assertFalse(resolve_fair_sharing_arg(None, False, dummy_parser, scenario_default=False))
+        self.assertTrue(resolve_fair_sharing_arg(True, False, dummy_parser, scenario_default=False))
+
+        # 5. Verify controller_manager_config.yaml patching for disabled FS, single-rule FS, and AFS
+        with tempfile.TemporaryDirectory() as td:
+            base_copy = Path(td) / "base"
+            shutil.copytree(REPO_ROOT / "deploy" / "base", base_copy)
+            cfg_file = base_copy / "config" / "controller_manager_config.yaml"
+
+            patch_kueue_fair_sharing_config(base_copy, False)
+            self.assertNotIn("fairSharing:", cfg_file.read_text(encoding="utf-8"))
+
+            patch_kueue_fair_sharing_config(base_copy, True, strategies=("LessThanOrEqualToFinalShare",))
+            text_rule = cfg_file.read_text(encoding="utf-8")
+            self.assertIn("  - LessThanOrEqualToFinalShare\n", text_rule)
+            self.assertNotIn("LessThanInitialShare", text_rule)
+
+            patch_kueue_admission_fair_sharing_config(base_copy, scaled_afs)
+            text_afs = cfg_file.read_text(encoding="utf-8")
+            self.assertIn("admissionFairSharing:", text_afs)
+            self.assertIn("usageHalfLifeTime: 5s", text_afs)
+            self.assertIn("google.com/tpu: 1", text_afs)
+
+        # 6. Reject --skip-chamber-deploy when scenario specifies declarative Configuration
+        sc77 = str(REPO_ROOT / "testscenarios" / "self-tests" / "st77-config-fair-sharing-disabled-globally")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as cm:
+                testrunner.main([sc77, "--skip-chamber-deploy"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("cannot be combined with --skip-chamber-deploy", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
