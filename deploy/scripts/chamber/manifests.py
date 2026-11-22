@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import re
 from typing import Any
@@ -24,7 +25,243 @@ from chamber.constants import (
     DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES,
     DEFAULT_FLAVOR_NAME,
 )
-from chamber.parsers import parse_k8s_quantity
+from chamber.parsers import parse_duration_seconds, parse_k8s_quantity
+
+
+DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC = 300.0
+DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC = 2.0
+DEFAULT_WAIT_FOR_PODS_READY_MAX_DURATION_FRACTION = 0.5
+
+
+def format_go_duration_seconds(seconds: float) -> str:
+    """Format a non-negative duration in seconds as a Go time.ParseDuration string ('0s', '10s', '2500ms')."""
+    if seconds <= 0:
+        return "0s"
+    if abs(seconds - round(seconds)) < 1e-3:
+        return f"{int(round(seconds))}s"
+    return f"{max(100, int(round(seconds * 1000)))}ms"
+
+
+@dataclass
+class WaitForPodsReadyConfig:
+    """Resolved Kueue waitForPodsReady configuration adjusted for --speedup and --duration."""
+
+    enabled: bool = False
+    raw_timeout_sec: float = DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC
+    effective_timeout_sec: float = DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC
+    clamped_timeout_to_duration: bool = False
+    floored_timeout_to_min: bool = False
+    raw_recovery_timeout_sec: float | None = None
+    effective_recovery_timeout_sec: float | None = None
+    clamped_recovery_to_duration: bool = False
+    block_admission: bool | None = None
+    requeuing_timestamp: str = "Eviction"
+    backoff_limit_count: int | None = None
+    raw_backoff_base_sec: float | None = None
+    effective_backoff_base_sec: int | None = None
+    raw_backoff_max_sec: float | None = None
+    effective_backoff_max_sec: int | None = None
+
+    def summary_str(self) -> str:
+        if not self.enabled:
+            return "disabled"
+        notes: list[str] = [f"timeout={format_go_duration_seconds(self.effective_timeout_sec)} (raw {format_go_duration_seconds(self.raw_timeout_sec)})"]
+        if self.clamped_timeout_to_duration:
+            notes.append("clamped-to-duration")
+        elif self.floored_timeout_to_min:
+            notes.append("floored-to-min")
+        if self.effective_recovery_timeout_sec is not None:
+            notes.append(
+                f"recoveryTimeout={format_go_duration_seconds(self.effective_recovery_timeout_sec)}"
+                + (
+                    f" (raw {format_go_duration_seconds(self.raw_recovery_timeout_sec)})"
+                    if self.raw_recovery_timeout_sec is not None
+                    else ""
+                )
+            )
+        if self.block_admission is not None:
+            notes.append(f"blockAdmission={str(self.block_admission).lower()}")
+        if self.effective_backoff_base_sec is not None:
+            notes.append(f"backoffBase={self.effective_backoff_base_sec}s")
+        if self.effective_backoff_max_sec is not None:
+            notes.append(f"backoffMax={self.effective_backoff_max_sec}s")
+        if self.backoff_limit_count is not None:
+            notes.append(f"backoffLimit={self.backoff_limit_count}")
+        return ", ".join(notes)
+
+
+def resolve_wait_for_pods_ready_config(
+    *,
+    enabled: bool | None = None,
+    raw_timeout: str | float | None = None,
+    raw_recovery_timeout: str | float | None = None,
+    block_admission: bool | None = None,
+    requeuing_timestamp: str | None = None,
+    backoff_limit_count: int | None = None,
+    raw_backoff_base: str | float | None = None,
+    raw_backoff_max: str | float | None = None,
+    speedup: float = 1.0,
+    max_run_seconds: float | None = None,
+    min_wall_timeout: str | float | None = DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC,
+    cap_to_duration: bool = True,
+    max_duration_fraction: float = DEFAULT_WAIT_FOR_PODS_READY_MAX_DURATION_FRACTION,
+) -> WaitForPodsReadyConfig:
+    """Adjust Kueue waitForPodsReady timeouts and backoffs to --speedup and --duration."""
+    has_explicit_subflag = any(
+        x is not None
+        for x in (
+            raw_timeout,
+            raw_recovery_timeout,
+            block_admission,
+            backoff_limit_count,
+            raw_backoff_base,
+            raw_backoff_max,
+        )
+    )
+    eff_enabled = bool(enabled) if enabled is not None else has_explicit_subflag
+    if not eff_enabled:
+        return WaitForPodsReadyConfig(enabled=False)
+
+    eff_speedup = max(1e-6, float(speedup))
+    min_floor = (
+        float(min_wall_timeout)
+        if isinstance(min_wall_timeout, (int, float))
+        else (parse_duration_seconds(str(min_wall_timeout)) or DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC)
+    )
+    min_floor = max(0.5, min_floor)
+
+    raw_t = (
+        float(raw_timeout)
+        if isinstance(raw_timeout, (int, float))
+        else (
+            parse_duration_seconds(str(raw_timeout))
+            if raw_timeout is not None and str(raw_timeout).strip()
+            else DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC
+        )
+    )
+    if raw_t is None or raw_t <= 0:
+        raise ValueError(f"--wait-for-pods-ready-timeout must be > 0 (got {raw_timeout!r})")
+
+    scaled_t = raw_t / eff_speedup
+    floored_t = False
+    if scaled_t < min_floor:
+        scaled_t = min_floor
+        floored_t = True
+
+    clamped_t = False
+    duration_cap: float | None = None
+    if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+        frac = max(0.1, min(0.9, float(max_duration_fraction)))
+        duration_cap = max(min(min_floor, max_run_seconds * 0.8), max_run_seconds * frac)
+        if scaled_t > duration_cap:
+            scaled_t = duration_cap
+            clamped_t = True
+            floored_t = False
+
+    raw_rec_sec: float | None = None
+    eff_rec_sec: float | None = None
+    clamped_rec = False
+    if raw_recovery_timeout is not None and str(raw_recovery_timeout).strip() != "":
+        raw_rec_sec = (
+            float(raw_recovery_timeout)
+            if isinstance(raw_recovery_timeout, (int, float))
+            else parse_duration_seconds(str(raw_recovery_timeout))
+        )
+        if raw_rec_sec is None or raw_rec_sec < 0:
+            raise ValueError(
+                f"--wait-for-pods-ready-recovery-timeout must be >= 0 (got {raw_recovery_timeout!r})"
+            )
+        if raw_rec_sec == 0:
+            eff_rec_sec = 0.0
+        else:
+            eff_rec_sec = max(min_floor, raw_rec_sec / eff_speedup)
+            if duration_cap is not None and eff_rec_sec > duration_cap:
+                eff_rec_sec = duration_cap
+                clamped_rec = True
+
+    raw_bb_sec: float | None = None
+    eff_bb_sec: int | None = None
+    if raw_backoff_base is not None and str(raw_backoff_base).strip() != "":
+        raw_bb_sec = (
+            float(raw_backoff_base)
+            if isinstance(raw_backoff_base, (int, float))
+            else parse_duration_seconds(str(raw_backoff_base))
+        )
+        if raw_bb_sec is not None and raw_bb_sec > 0:
+            scaled_bb = max(1, int(round(raw_bb_sec / eff_speedup)))
+            if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+                scaled_bb = min(scaled_bb, max(1, int(max_run_seconds * 0.25)))
+            eff_bb_sec = scaled_bb
+
+    raw_bm_sec: float | None = None
+    eff_bm_sec: int | None = None
+    if raw_backoff_max is not None and str(raw_backoff_max).strip() != "":
+        raw_bm_sec = (
+            float(raw_backoff_max)
+            if isinstance(raw_backoff_max, (int, float))
+            else parse_duration_seconds(str(raw_backoff_max))
+        )
+        if raw_bm_sec is not None and raw_bm_sec > 0:
+            scaled_bm = max(1, int(round(raw_bm_sec / eff_speedup)))
+            if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+                scaled_bm = min(scaled_bm, max(1, int(max_run_seconds * 0.5)))
+            if eff_bb_sec is not None and scaled_bm < eff_bb_sec:
+                scaled_bm = eff_bb_sec
+            eff_bm_sec = scaled_bm
+    elif eff_bb_sec is not None:
+        default_bm = max(eff_bb_sec, int(round(3600.0 / eff_speedup)))
+        if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+            default_bm = max(eff_bb_sec, min(default_bm, max(1, int(max_run_seconds * 0.5))))
+        eff_bm_sec = default_bm
+
+    req_ts = (requeuing_timestamp or "Eviction").strip()
+    if req_ts not in ("Eviction", "Creation"):
+        raise ValueError(
+            f"--wait-for-pods-ready-requeue-timestamp must be 'Eviction' or 'Creation' (got {requeuing_timestamp!r})"
+        )
+
+    return WaitForPodsReadyConfig(
+        enabled=True,
+        raw_timeout_sec=raw_t,
+        effective_timeout_sec=scaled_t,
+        clamped_timeout_to_duration=clamped_t,
+        floored_timeout_to_min=floored_t,
+        raw_recovery_timeout_sec=raw_rec_sec,
+        effective_recovery_timeout_sec=eff_rec_sec,
+        clamped_recovery_to_duration=clamped_rec,
+        block_admission=block_admission,
+        requeuing_timestamp=req_ts,
+        backoff_limit_count=backoff_limit_count,
+        raw_backoff_base_sec=raw_bb_sec,
+        effective_backoff_base_sec=eff_bb_sec,
+        raw_backoff_max_sec=raw_bm_sec,
+        effective_backoff_max_sec=eff_bm_sec,
+    )
+
+
+def parse_feature_gates_arg(raw: str | dict[str, bool] | None) -> dict[str, bool]:
+    """Parse comma-separated 'GateA=true,GateB=false' overrides into a dict[str, bool]."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): bool(v) for k, v in raw.items() if str(k).strip()}
+    out: dict[str, bool] = {}
+    for item in str(raw).split(","):
+        tok = item.strip()
+        if not tok:
+            continue
+        if "=" not in tok:
+            raise ValueError(f"Invalid --kueue-feature-gates entry {tok!r}: expected FeatureName=true|false")
+        k, v = tok.split("=", 1)
+        k_clean = k.strip()
+        v_clean = v.strip().lower()
+        if v_clean in ("true", "1", "yes"):
+            out[k_clean] = True
+        elif v_clean in ("false", "0", "no"):
+            out[k_clean] = False
+        else:
+            raise ValueError(f"Invalid boolean in --kueue-feature-gates entry {tok!r}: expected true|false")
+    return out
 
 
 def build_kwok_node_manifest(
@@ -273,13 +510,25 @@ def patch_registry_manifest(base_dst: Path, node_port: int, memory_limit: str) -
     reg_yaml.write_text(reg_text, encoding="utf-8")
 
 
+def _insert_top_level_kueue_config_block(cfg_text: str, block_lines: list[str]) -> str:
+    block = "\n".join(block_lines) + "\n"
+    if re.search(r"^internalCertManagement:", cfg_text, flags=re.MULTILINE):
+        return re.sub(
+            r"^internalCertManagement:",
+            f"{block}internalCertManagement:",
+            cfg_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    return cfg_text.rstrip("\n") + "\n" + block
+
+
 def patch_kueue_fair_sharing_config(base_dst: Path, enable_fair_sharing: bool) -> None:
     """Enable or disable Preemption-Based Fair Sharing in controller_manager_config.yaml."""
     cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
     if not cfg_yaml.exists():
         return
     cfg_text = cfg_yaml.read_text(encoding="utf-8")
-    # Strip any existing top-level fairSharing block cleanly
     cfg_text = re.sub(
         r"^fairSharing:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
         "",
@@ -292,17 +541,75 @@ def patch_kueue_fair_sharing_config(base_dst: Path, enable_fair_sharing: bool) -
             "  preemptionStrategies:",
             *[f"  - {s}" for s in DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES],
         ]
-        fs_block = "\n".join(fs_lines) + "\n"
-        if re.search(r"^internalCertManagement:", cfg_text, flags=re.MULTILINE):
-            cfg_text = re.sub(
-                r"^internalCertManagement:",
-                f"{fs_block}internalCertManagement:",
-                cfg_text,
-                count=1,
-                flags=re.MULTILINE,
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, fs_lines)
+    cfg_yaml.write_text(cfg_text, encoding="utf-8")
+
+
+def patch_kueue_wait_for_pods_ready_config(
+    base_dst: Path,
+    wfpr_cfg: WaitForPodsReadyConfig | None,
+) -> None:
+    """Configure or remove waitForPodsReady in controller_manager_config.yaml."""
+    cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
+    if not cfg_yaml.exists():
+        return
+    cfg_text = cfg_yaml.read_text(encoding="utf-8")
+    cfg_text = re.sub(
+        r"^waitForPodsReady:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    if wfpr_cfg is not None and wfpr_cfg.enabled:
+        lines = [
+            "waitForPodsReady:",
+            f"  timeout: {format_go_duration_seconds(wfpr_cfg.effective_timeout_sec)}",
+        ]
+        if wfpr_cfg.effective_recovery_timeout_sec is not None:
+            lines.append(
+                f"  recoveryTimeout: {format_go_duration_seconds(wfpr_cfg.effective_recovery_timeout_sec)}"
             )
-        else:
-            cfg_text = cfg_text.rstrip("\n") + "\n" + fs_block
+        if wfpr_cfg.block_admission is not None:
+            lines.append(f"  blockAdmission: {str(bool(wfpr_cfg.block_admission)).lower()}")
+        has_req = (
+            wfpr_cfg.requeuing_timestamp != "Eviction"
+            or wfpr_cfg.backoff_limit_count is not None
+            or wfpr_cfg.effective_backoff_base_sec is not None
+            or wfpr_cfg.effective_backoff_max_sec is not None
+        )
+        if has_req:
+            lines.append("  requeuingStrategy:")
+            lines.append(f"    timestamp: {wfpr_cfg.requeuing_timestamp}")
+            if wfpr_cfg.backoff_limit_count is not None:
+                lines.append(f"    backoffLimitCount: {int(wfpr_cfg.backoff_limit_count)}")
+            if wfpr_cfg.effective_backoff_base_sec is not None:
+                lines.append(f"    backoffBaseSeconds: {int(wfpr_cfg.effective_backoff_base_sec)}")
+            if wfpr_cfg.effective_backoff_max_sec is not None:
+                lines.append(f"    backoffMaxSeconds: {int(wfpr_cfg.effective_backoff_max_sec)}")
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, lines)
+    cfg_yaml.write_text(cfg_text, encoding="utf-8")
+
+
+def patch_kueue_feature_gates_config(
+    base_dst: Path,
+    feature_gates: dict[str, bool] | None,
+) -> None:
+    """Configure or remove featureGates in controller_manager_config.yaml."""
+    cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
+    if not cfg_yaml.exists():
+        return
+    cfg_text = cfg_yaml.read_text(encoding="utf-8")
+    cfg_text = re.sub(
+        r"^featureGates:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    if feature_gates:
+        lines = ["featureGates:"]
+        for k in sorted(feature_gates):
+            lines.append(f"  {k}: {str(bool(feature_gates[k])).lower()}")
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, lines)
     cfg_yaml.write_text(cfg_text, encoding="utf-8")
 
 

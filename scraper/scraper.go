@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -90,14 +91,29 @@ type trackedWorkflowState struct {
 }
 
 type workloadExecState struct {
-	currentlyAdmitted        bool
-	currentAdmittedTime      time.Time
-	lastAdmittedTime         time.Time
-	lastRecordedAdmittedTime time.Time
-	preemptionCount          int
-	recordedPartialKeys      map[string]bool
-	recordedFull             bool
-	clusterQueueName         string
+	currentlyAdmitted         bool
+	currentAdmittedTime       time.Time
+	lastAdmittedTime          time.Time
+	lastRecordedAdmittedTime  time.Time
+	preemptionCount           int
+	interruptionCount         int
+	recordedPartialKeys       map[string]bool
+	recordedFull              bool
+	recordedTerminalFailure   bool
+	clusterQueueName          string
+	workloadName              string
+	namespace                 string
+	ownerKind                 string
+	ownerName                 string
+	ownerAPIVersion           string
+	localQueueName            string
+	priorityClassName         string
+	priority                  *int32
+	podSetAssignments         []kueuev1beta2.PodSetAssignment
+	unhealthyNodes            []string
+	creationTime              metav1.Time
+	trueDurationSeconds       *float64
+	missingDurationMultiplier *float64
 }
 
 type workloadOwnerRef struct {
@@ -224,7 +240,7 @@ func (s *Scraper) Run(ctx context.Context) error {
 
 	// 5. Run initial periodic infrastructure & scheduled-pod scrape immediately at startupTime,
 	// reusing initialPods to avoid a redundant cluster-wide Pod List() at startup.
-	s.scrapeOnceAt(ctx, startupTime, initialPods)
+	nodesRV := s.scrapeOnceAt(ctx, startupTime, initialPods)
 
 	var wg sync.WaitGroup
 	startWatcher := func(fn func(context.Context)) {
@@ -236,6 +252,7 @@ func (s *Scraper) Run(ctx context.Context) error {
 	}
 
 	// 6. Start real-time watchers resuming from the initial ResourceVersions captured above.
+	startWatcher(func(ctx context.Context) { s.watchNodesLoop(ctx, nodesRV) })
 	startWatcher(func(ctx context.Context) { s.watchPodsLoop(ctx, podsRV) })
 	startWatcher(func(ctx context.Context) { s.watchJobsLoop(ctx, jobsRV) })
 	startWatcher(func(ctx context.Context) { s.watchDeploymentsLoop(ctx, deploymentsRV) })
@@ -265,6 +282,7 @@ func (s *Scraper) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			wg.Wait()
+			s.flushInFlightWorkloadsAsPartial(time.Now().UTC())
 			s.syncLogs()
 			return nil
 		case <-ticker.C:
@@ -289,11 +307,11 @@ func (s *Scraper) syncLogs() {
 // ClusterQueues, Cohorts, LocalQueues, ResourceFlavors, Topologies, WorkloadPriorityClasses,
 // and Scheduled/Running Pods.
 func (s *Scraper) ScrapeOnce(ctx context.Context) {
-	s.scrapeOnceAt(ctx, time.Now().UTC(), nil)
+	_ = s.scrapeOnceAt(ctx, time.Now().UTC(), nil)
 }
 
-func (s *Scraper) scrapeOnceAt(ctx context.Context, now time.Time, prelistedPods []corev1.Pod) {
-	s.scrapeNodes(ctx, now)
+func (s *Scraper) scrapeOnceAt(ctx context.Context, now time.Time, prelistedPods []corev1.Pod) string {
+	nodesRV := s.scrapeNodes(ctx, now)
 	s.scrapeNamespaces(ctx, now)
 	s.scrapeRuntimeClasses(ctx, now)
 	if s.kueueClient != nil {
@@ -306,10 +324,12 @@ func (s *Scraper) scrapeOnceAt(ctx context.Context, now time.Time, prelistedPods
 	}
 	s.scrapeScheduledAndRunningPodsWithList(ctx, now, prelistedPods)
 	s.syncLogs()
+	return nodesRV
 }
 
 func canonicalDigest(payload any) string {
-	// Normalize payload to map and drop volatile resourceVersion before hashing for diff detection.
+	// Normalize payload to map and drop volatile resourceVersion / generation / condition heartbeat timestamps
+	// before hashing for diff detection so periodic kubelet heartbeats do not emit spurious Node Update events.
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return ""
@@ -318,6 +338,16 @@ func canonicalDigest(payload any) string {
 	if err := json.Unmarshal(raw, &m); err == nil {
 		if meta, ok := m["metadata"].(map[string]any); ok {
 			delete(meta, "resourceVersion")
+			delete(meta, "generation")
+		}
+		if st, ok := m["status"].(map[string]any); ok {
+			if conds, ok := st["conditions"].([]any); ok {
+				for _, item := range conds {
+					if cm, ok := item.(map[string]any); ok {
+						delete(cm, "lastHeartbeatTime")
+					}
+				}
+			}
 		}
 		if norm, err := json.Marshal(m); err == nil {
 			raw = norm
@@ -389,14 +419,14 @@ func (s *Scraper) reconcileInfraKind(kind string, now time.Time, current map[str
 	}
 }
 
-func (s *Scraper) scrapeNodes(ctx context.Context, now time.Time) {
+func (s *Scraper) scrapeNodes(ctx context.Context, now time.Time) string {
 	if s.kubeClient == nil {
-		return
+		return ""
 	}
 	list, err := s.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("WARN failed to list Nodes: %v", err)
-		return
+		return ""
 	}
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
@@ -409,6 +439,79 @@ func (s *Scraper) scrapeNodes(ctx context.Context, now time.Time) {
 		}
 	}
 	s.reconcileInfraKind("Node", now, current)
+	if list.ResourceVersion != "" {
+		return list.ResourceVersion
+	}
+	return "0"
+}
+
+func (s *Scraper) handleNodeWatchEvent(eventType watch.EventType, node *corev1.Node) {
+	s.handleNodeWatchEventAt(eventType, node, time.Now().UTC())
+}
+
+func (s *Scraper) handleNodeWatchEventAt(eventType watch.EventType, node *corev1.Node, now time.Time) {
+	if node == nil || node.Name == "" {
+		return
+	}
+	var ev *InfraEvent
+	s.mu.Lock()
+	nodeCache, ok := s.infraCache["Node"]
+	if !ok {
+		nodeCache = make(map[string]cachedObject)
+		s.infraCache["Node"] = nodeCache
+	}
+	switch eventType {
+	case watch.Added, watch.Modified:
+		payload := SanitizeNode(node, s.hasher)
+		digest := canonicalDigest(payload)
+		prev, existed := nodeCache[node.Name]
+		if !existed {
+			nodeCache[node.Name] = cachedObject{
+				name:    node.Name,
+				digest:  digest,
+				payload: payload,
+			}
+			ev = &InfraEvent{
+				Timestamp: now,
+				EventType: EventNew,
+				Payload:   payload,
+			}
+		} else if prev.digest != digest {
+			nodeCache[node.Name] = cachedObject{
+				name:    node.Name,
+				digest:  digest,
+				payload: payload,
+			}
+			ev = &InfraEvent{
+				Timestamp: now,
+				EventType: EventUpdate,
+				Payload:   payload,
+			}
+		}
+	case watch.Deleted:
+		if prev, existed := nodeCache[node.Name]; existed {
+			delete(nodeCache, node.Name)
+			ev = &InfraEvent{
+				Timestamp: now,
+				EventType: EventDeleted,
+				Payload:   prev.payload,
+			}
+		} else {
+			payload := SanitizeNode(node, s.hasher)
+			ev = &InfraEvent{
+				Timestamp: now,
+				EventType: EventDeleted,
+				Payload:   payload,
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	if ev != nil && s.infraLog != nil {
+		if err := s.infraLog.Append(*ev); err != nil {
+			log.Printf("ERROR writing Node watch event to %s: %v", s.cfg.InfraFile, err)
+		}
+	}
 }
 
 func (s *Scraper) scrapeNamespaces(ctx context.Context, now time.Time) {
@@ -1601,6 +1704,23 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	if wl.Status.Admission != nil && len(wl.Status.Admission.PodSetAssignments) > 0 {
 		podSetAssignments = SanitizePodSetAssignments(wl.Status.Admission.PodSetAssignments, s.hasher)
 	}
+	var unhealthyNodes []string
+	if len(wl.Status.UnhealthyNodes) > 0 {
+		unhealthyNodes = make([]string, 0, len(wl.Status.UnhealthyNodes))
+		for _, un := range wl.Status.UnhealthyNodes {
+			if un.Name == "" {
+				continue
+			}
+			nName := un.Name
+			if s.hasher.ShouldHashLabel("kubernetes.io/hostname") {
+				nName = s.hasher.HashName(nName)
+			}
+			unhealthyNodes = append(unhealthyNodes, nName)
+		}
+	}
+	trueDurSec := parsePositiveFloatAnnotation(wl.Annotations, "kueue-optimizer.gke.io/true-execution-time-seconds")
+	missingMult := parsePositiveFloatAnnotation(wl.Annotations, "kueue-optimizer.gke.io/missing-duration-multiplier")
+
 	usesTAS := workloadUsesTAS(wl)
 	var podSetNames []string
 	if len(wl.Spec.PodSets) > 0 {
@@ -1619,20 +1739,38 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	isAdmitted := admittedCond != nil && admittedCond.Status == metav1.ConditionTrue
 	isEvicted := evictedCond != nil && evictedCond.Status == metav1.ConditionTrue
 	isPreempted := false
-	var preemptTime time.Time
-	var preemptReason, preemptMsg string
+	var interruptTime time.Time
+	var interruptReason, interruptMsg, interruptionCategory string
 
 	if preemptedCond != nil && preemptedCond.Status == metav1.ConditionTrue {
 		isPreempted = true
-		preemptTime = preemptedCond.LastTransitionTime.Time.UTC()
-		preemptReason = preemptedCond.Reason
-		preemptMsg = preemptedCond.Message
+		interruptTime = preemptedCond.LastTransitionTime.Time.UTC()
+		interruptReason = preemptedCond.Reason
+		interruptMsg = preemptedCond.Message
+		interruptionCategory = InterruptionReasonPreempted
 	} else if isEvicted &&
 		(evictedCond.Reason == kueuev1beta2.WorkloadEvictedByPreemption || strings.Contains(evictedCond.Reason, "Preempt")) {
 		isPreempted = true
-		preemptTime = evictedCond.LastTransitionTime.Time.UTC()
-		preemptReason = evictedCond.Reason
-		preemptMsg = evictedCond.Message
+		interruptTime = evictedCond.LastTransitionTime.Time.UTC()
+		interruptReason = evictedCond.Reason
+		interruptMsg = evictedCond.Message
+		interruptionCategory = InterruptionReasonPreempted
+	} else if isEvicted {
+		interruptTime = evictedCond.LastTransitionTime.Time.UTC()
+		interruptReason = evictedCond.Reason
+		interruptMsg = evictedCond.Message
+		switch {
+		case evictedCond.Reason == kueuev1beta2.WorkloadEvictedDueToNodeFailures ||
+			strings.Contains(evictedCond.Reason, "NodeFailure") ||
+			strings.Contains(evictedCond.Reason, "FailedNode"):
+			interruptionCategory = InterruptionReasonNodeFailure
+		case evictedCond.Reason == kueuev1beta2.WorkloadEvictedByPodsReadyTimeout ||
+			strings.Contains(evictedCond.Reason, "PodsReadyTimeout") ||
+			strings.Contains(evictedCond.Reason, "RequeuingLimitExceeded"):
+			interruptionCategory = InterruptionReasonPodsReadyTimeout
+		default:
+			interruptionCategory = InterruptionReasonEvicted
+		}
 	}
 	isFinished := finishedCond != nil && finishedCond.Status == metav1.ConditionTrue
 
@@ -1651,8 +1789,16 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 		s.workloadPodSets[key] = podSetNames
 	}
 	ownerUnsuspended := isAdmitted
-	if wfSt, ok := s.workflowStates[ownerKey]; ok && wfSt.workloadState != WorkloadStateAdmitted {
-		ownerUnsuspended = false
+	if wfSt, ok := s.workflowStates[ownerKey]; ok {
+		if wfSt.workloadState != WorkloadStateAdmitted {
+			ownerUnsuspended = false
+		}
+		if trueDurSec == nil {
+			trueDurSec = extractPositiveFloatAnnotationFromPayload(wfSt.lastPayload, "kueue-optimizer.gke.io/true-execution-time-seconds")
+		}
+		if missingMult == nil {
+			missingMult = extractPositiveFloatAnnotationFromPayload(wfSt.lastPayload, "kueue-optimizer.gke.io/missing-duration-multiplier")
+		}
 	}
 	// Allow FullExecution when Finished=True transitioned cleanly (Reason == Succeeded, or Workload
 	// completed without pods/owner being suspended) even when Preempted=True remains latched on wl.Status.Conditions.
@@ -1665,7 +1811,7 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	switch {
 	case finishedCleanly:
 		s.ownerStates[ownerKey] = WorkloadStateAdmitted
-	case isPreempted || isEvicted:
+	case isPreempted || isEvicted || (isFinished && !finishedCleanly):
 		s.ownerStates[ownerKey] = WorkloadStateNotAdmitted
 	case isAdmitted:
 		s.ownerStates[ownerKey] = WorkloadStateAdmitted
@@ -1682,23 +1828,79 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 		}
 		s.workloadStates[key] = st
 	}
+	st.workloadName = workloadName
+	st.namespace = wl.Namespace
+	if ownerKind != "" {
+		st.ownerKind = ownerKind
+	}
+	if ownerName != "" {
+		st.ownerName = ownerName
+	}
+	if ownerAPIVersion != "" {
+		st.ownerAPIVersion = ownerAPIVersion
+	}
+	if localQueueName != "" {
+		st.localQueueName = localQueueName
+	}
+	if priorityClassName != "" {
+		st.priorityClassName = priorityClassName
+	}
+	if priorityCopy != nil {
+		st.priority = priorityCopy
+	}
+	if len(podSetAssignments) > 0 {
+		st.podSetAssignments = podSetAssignments
+	}
+	if len(unhealthyNodes) > 0 {
+		st.unhealthyNodes = unhealthyNodes
+	}
+	if !wl.CreationTimestamp.IsZero() {
+		st.creationTime = wl.CreationTimestamp
+	}
+	if trueDurSec != nil {
+		st.trueDurationSeconds = trueDurSec
+	}
+	if missingMult != nil {
+		st.missingDurationMultiplier = missingMult
+	}
 	if wl.Status.Admission != nil && wl.Status.Admission.ClusterQueue != "" {
 		st.clusterQueueName = string(wl.Status.Admission.ClusterQueue)
 	}
 	clusterQueueName := st.clusterQueueName
+	effectivePodSets := podSetAssignments
+	if len(effectivePodSets) == 0 {
+		effectivePodSets = st.podSetAssignments
+	}
+	effectiveUnhealthy := unhealthyNodes
+	if len(effectiveUnhealthy) == 0 {
+		effectiveUnhealthy = st.unhealthyNodes
+	}
+
+	wasEverAdmitted := isAdmitted ||
+		!st.currentAdmittedTime.IsZero() ||
+		!st.lastAdmittedTime.IsZero() ||
+		(admittedCond != nil && admittedCond.Status == metav1.ConditionTrue && !admittedCond.LastTransitionTime.IsZero()) ||
+		(wl.Status.AccumulatedPastExecutionTimeSeconds != nil && *wl.Status.AccumulatedPastExecutionTimeSeconds > 0)
+
+	if interruptionCategory == "" && isFinished && !finishedCleanly && wasEverAdmitted {
+		interruptionCategory = InterruptionReasonFailed
+		interruptTime = finishedCond.LastTransitionTime.Time.UTC()
+		interruptReason = finishedCond.Reason
+		interruptMsg = finishedCond.Message
+	}
 
 	// 1. Check if Workload is currently Admitted.
 	// During Kueue's two-phase eviction, Evicted=True / Preempted=True are set before pods
 	// terminate and before Admitted flips to False; skip emitting Admitted while eviction is active.
-	evictionActive := isPreempted || isEvicted
-	if isAdmitted && !evictionActive && !st.recordedFull {
+	evictionActive := isPreempted || isEvicted || (isFinished && !finishedCleanly)
+	if isAdmitted && !evictionActive && !st.recordedFull && !st.recordedTerminalFailure {
 		admittedAt := admittedCond.LastTransitionTime.Time.UTC()
 		if admittedAt.IsZero() {
 			admittedAt = now
 		}
 		alreadyRecorded := !st.lastRecordedAdmittedTime.IsZero() && admittedAt.Equal(st.lastRecordedAdmittedTime)
-		alreadyConsumedByPreemption := st.preemptionCount > 0 && !st.lastAdmittedTime.IsZero() && admittedAt.Equal(st.lastAdmittedTime)
-		if !alreadyRecorded && !alreadyConsumedByPreemption {
+		alreadyConsumedByInterruption := st.interruptionCount > 0 && !st.lastAdmittedTime.IsZero() && admittedAt.Equal(st.lastAdmittedTime)
+		if !alreadyRecorded && !alreadyConsumedByInterruption {
 			st.currentlyAdmitted = true
 			st.currentAdmittedTime = admittedAt
 			st.lastAdmittedTime = admittedAt
@@ -1708,71 +1910,84 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 				EventType:     ExecutionEventAdmitted,
 				WorkloadState: WorkloadStateAdmitted,
 				Payload: ExecutionTimePayload{
-					WorkloadName:      workloadName,
-					Namespace:         wl.Namespace,
-					OwnerKind:         ownerKind,
-					OwnerName:         ownerName,
-					OwnerAPIVersion:   ownerAPIVersion,
-					LocalQueueName:    localQueueName,
-					ClusterQueueName:  clusterQueueName,
-					PriorityClassName: priorityClassName,
-					Priority:          priorityCopy,
-					PodSetAssignments: podSetAssignments,
-					CreationTime:      wl.CreationTimestamp,
-					AdmittedTime:      metav1.NewTime(admittedAt),
-					Preempted:         false,
-					PreemptionCount:   st.preemptionCount,
-					Reason:            admittedCond.Reason,
-					Message:           admittedCond.Message,
+					WorkloadName:              workloadName,
+					Namespace:                 wl.Namespace,
+					OwnerKind:                 ownerKind,
+					OwnerName:                 ownerName,
+					OwnerAPIVersion:           ownerAPIVersion,
+					LocalQueueName:            localQueueName,
+					ClusterQueueName:          clusterQueueName,
+					PriorityClassName:         priorityClassName,
+					Priority:                  priorityCopy,
+					PodSetAssignments:         effectivePodSets,
+					UnhealthyNodes:            effectiveUnhealthy,
+					CreationTime:              wl.CreationTimestamp,
+					AdmittedTime:              metav1.NewTime(admittedAt),
+					Preempted:                 false,
+					PreemptionCount:           st.preemptionCount,
+					InterruptionCount:         st.interruptionCount,
+					TrueDurationSeconds:       st.trueDurationSeconds,
+					MissingDurationMultiplier: st.missingDurationMultiplier,
+					Reason:                    admittedCond.Reason,
+					Message:                   admittedCond.Message,
 				},
 			})
 		}
 	}
 
-	// 2. Check if Workload got Preempted -> record Partial Execution.
-	if isPreempted && !finishedCleanly && !st.recordedFull {
-		if preemptTime.IsZero() {
-			preemptTime = now
+	// 2. Check if Workload execution was interrupted (Preempted, NodeFailure, PodsReadyTimeout, Evicted, or Failed)
+	// -> record Partial Execution.
+	if interruptionCategory != "" && !finishedCleanly && !st.recordedFull && !st.recordedTerminalFailure {
+		if interruptTime.IsZero() {
+			interruptTime = now
 		}
-		partialKey := preemptTime.Format(time.RFC3339Nano) + "/" + preemptReason
+		partialKey := interruptTime.Format(time.RFC3339Nano) + "/" + interruptionCategory + "/" + interruptReason
 		if !st.recordedPartialKeys[partialKey] {
 			st.recordedPartialKeys[partialKey] = true
-			st.preemptionCount++
+			st.interruptionCount++
+			if isPreempted {
+				st.preemptionCount++
+			}
+			if isFinished && !finishedCleanly {
+				st.recordedTerminalFailure = true
+			}
 
 			admittedAt := st.currentAdmittedTime
 			observedAdmittedAt := !admittedAt.IsZero()
 			if !observedAdmittedAt && isAdmitted && !admittedCond.LastTransitionTime.IsZero() {
 				cand := admittedCond.LastTransitionTime.Time.UTC()
-				if st.preemptionCount == 1 || !cand.Equal(st.lastAdmittedTime) {
+				if st.interruptionCount == 1 || !cand.Equal(st.lastAdmittedTime) {
 					admittedAt = cand
 					st.lastAdmittedTime = cand
 					observedAdmittedAt = true
 				}
 			}
 			if !observedAdmittedAt {
-				if st.preemptionCount == 1 {
+				if st.interruptionCount == 1 {
 					if wl.Status.AccumulatedPastExecutionTimeSeconds != nil && *wl.Status.AccumulatedPastExecutionTimeSeconds > 0 {
-						admittedAt = preemptTime.Add(-time.Duration(*wl.Status.AccumulatedPastExecutionTimeSeconds) * time.Second)
+						admittedAt = interruptTime.Add(-time.Duration(*wl.Status.AccumulatedPastExecutionTimeSeconds) * time.Second)
+					} else if admittedCond != nil && admittedCond.Status == metav1.ConditionTrue && !admittedCond.LastTransitionTime.IsZero() && !admittedCond.LastTransitionTime.Time.After(interruptTime) {
+						admittedAt = admittedCond.LastTransitionTime.Time.UTC()
 					} else if !wl.CreationTimestamp.IsZero() {
 						admittedAt = wl.CreationTimestamp.Time.UTC()
 					} else {
-						admittedAt = preemptTime
+						admittedAt = interruptTime
 					}
 				} else {
-					admittedAt = preemptTime
+					admittedAt = interruptTime
 				}
 			}
 
-			durSec := preemptTime.Sub(admittedAt).Seconds()
+			durSec := interruptTime.Sub(admittedAt).Seconds()
 			if durSec < 0 {
 				durSec = 0
 			}
-			if durSec == 0 && !observedAdmittedAt && st.preemptionCount == 1 &&
+			if durSec == 0 && !observedAdmittedAt && st.interruptionCount == 1 &&
 				wl.Status.AccumulatedPastExecutionTimeSeconds != nil && *wl.Status.AccumulatedPastExecutionTimeSeconds > 0 {
 				durSec = float64(*wl.Status.AccumulatedPastExecutionTimeSeconds)
 			}
 			durStr := time.Duration(durSec * float64(time.Second)).Round(time.Millisecond).String()
-			endMetaTime := metav1.NewTime(preemptTime)
+			endMetaTime := metav1.NewTime(interruptTime)
 
 			st.currentlyAdmitted = isAdmitted
 			st.currentAdmittedTime = time.Time{}
@@ -1782,30 +1997,38 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 				EventType:     ExecutionEventPartial,
 				WorkloadState: WorkloadStateNotAdmitted,
 				Payload: ExecutionTimePayload{
-					ExecutionType:            "Partial",
-					WorkloadName:             workloadName,
-					Namespace:                wl.Namespace,
-					OwnerKind:                ownerKind,
-					OwnerName:                ownerName,
-					OwnerAPIVersion:          ownerAPIVersion,
-					LocalQueueName:           localQueueName,
-					ClusterQueueName:         clusterQueueName,
-					CreationTime:             wl.CreationTimestamp,
-					AdmittedTime:             metav1.NewTime(admittedAt),
-					EndTime:                  &endMetaTime,
-					ExecutionDurationSeconds: &durSec,
-					ExecutionDuration:        durStr,
-					Preempted:                true,
-					PreemptionCount:          st.preemptionCount,
-					Reason:                   preemptReason,
-					Message:                  preemptMsg,
+					ExecutionType:             "Partial",
+					WorkloadName:              workloadName,
+					Namespace:                 wl.Namespace,
+					OwnerKind:                 ownerKind,
+					OwnerName:                 ownerName,
+					OwnerAPIVersion:           ownerAPIVersion,
+					LocalQueueName:            localQueueName,
+					ClusterQueueName:          clusterQueueName,
+					PriorityClassName:         priorityClassName,
+					Priority:                  priorityCopy,
+					PodSetAssignments:         effectivePodSets,
+					UnhealthyNodes:            effectiveUnhealthy,
+					CreationTime:              wl.CreationTimestamp,
+					AdmittedTime:              metav1.NewTime(admittedAt),
+					EndTime:                   &endMetaTime,
+					ExecutionDurationSeconds:  &durSec,
+					ExecutionDuration:         durStr,
+					Preempted:                 isPreempted,
+					PreemptionCount:           st.preemptionCount,
+					InterruptionReason:        interruptionCategory,
+					InterruptionCount:         st.interruptionCount,
+					TrueDurationSeconds:       st.trueDurationSeconds,
+					MissingDurationMultiplier: st.missingDurationMultiplier,
+					Reason:                    interruptReason,
+					Message:                   interruptMsg,
 				},
 			})
 		}
 	}
 
-	// 3. Check if Workload Finished without preemption (or won a race with in-flight preemption) -> record Full Execution.
-	if isFinished && !st.recordedFull && (!isPreempted || finishedCleanly) {
+	// 3. Check if Workload Finished cleanly -> record Full Execution.
+	if isFinished && finishedCleanly && !st.recordedFull {
 		finishedAt := finishedCond.LastTransitionTime.Time.UTC()
 		if finishedAt.IsZero() {
 			finishedAt = now
@@ -1835,21 +2058,25 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 				EventType:     ExecutionEventAdmitted,
 				WorkloadState: WorkloadStateAdmitted,
 				Payload: ExecutionTimePayload{
-					WorkloadName:      workloadName,
-					Namespace:         wl.Namespace,
-					OwnerKind:         ownerKind,
-					OwnerName:         ownerName,
-					OwnerAPIVersion:   ownerAPIVersion,
-					LocalQueueName:    localQueueName,
-					ClusterQueueName:  clusterQueueName,
-					PriorityClassName: priorityClassName,
-					Priority:          priorityCopy,
-					PodSetAssignments: podSetAssignments,
-					CreationTime:      wl.CreationTimestamp,
-					AdmittedTime:      metav1.NewTime(admittedAt),
-					Preempted:         false,
-					PreemptionCount:   st.preemptionCount,
-					Reason:            "Admitted",
+					WorkloadName:              workloadName,
+					Namespace:                 wl.Namespace,
+					OwnerKind:                 ownerKind,
+					OwnerName:                 ownerName,
+					OwnerAPIVersion:           ownerAPIVersion,
+					LocalQueueName:            localQueueName,
+					ClusterQueueName:          clusterQueueName,
+					PriorityClassName:         priorityClassName,
+					Priority:                  priorityCopy,
+					PodSetAssignments:         effectivePodSets,
+					UnhealthyNodes:            effectiveUnhealthy,
+					CreationTime:              wl.CreationTimestamp,
+					AdmittedTime:              metav1.NewTime(admittedAt),
+					Preempted:                 false,
+					PreemptionCount:           st.preemptionCount,
+					InterruptionCount:         st.interruptionCount,
+					TrueDurationSeconds:       st.trueDurationSeconds,
+					MissingDurationMultiplier: st.missingDurationMultiplier,
+					Reason:                    "Admitted",
 				},
 			})
 		}
@@ -1869,23 +2096,30 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 			EventType:     ExecutionEventFull,
 			WorkloadState: WorkloadStateAdmitted,
 			Payload: ExecutionTimePayload{
-				ExecutionType:            "Full",
-				WorkloadName:             workloadName,
-				Namespace:                wl.Namespace,
-				OwnerKind:                ownerKind,
-				OwnerName:                ownerName,
-				OwnerAPIVersion:          ownerAPIVersion,
-				LocalQueueName:           localQueueName,
-				ClusterQueueName:         clusterQueueName,
-				CreationTime:             wl.CreationTimestamp,
-				AdmittedTime:             metav1.NewTime(admittedAt),
-				EndTime:                  &endMetaTime,
-				ExecutionDurationSeconds: &durSec,
-				ExecutionDuration:        durStr,
-				Preempted:                false,
-				PreemptionCount:          st.preemptionCount,
-				Reason:                   finishedCond.Reason,
-				Message:                  finishedCond.Message,
+				ExecutionType:             "Full",
+				WorkloadName:              workloadName,
+				Namespace:                 wl.Namespace,
+				OwnerKind:                 ownerKind,
+				OwnerName:                 ownerName,
+				OwnerAPIVersion:           ownerAPIVersion,
+				LocalQueueName:            localQueueName,
+				ClusterQueueName:          clusterQueueName,
+				PriorityClassName:         priorityClassName,
+				Priority:                  priorityCopy,
+				PodSetAssignments:         effectivePodSets,
+				UnhealthyNodes:            effectiveUnhealthy,
+				CreationTime:              wl.CreationTimestamp,
+				AdmittedTime:              metav1.NewTime(admittedAt),
+				EndTime:                   &endMetaTime,
+				ExecutionDurationSeconds:  &durSec,
+				ExecutionDuration:         durStr,
+				Preempted:                 false,
+				PreemptionCount:           st.preemptionCount,
+				InterruptionCount:         st.interruptionCount,
+				TrueDurationSeconds:       st.trueDurationSeconds,
+				MissingDurationMultiplier: st.missingDurationMultiplier,
+				Reason:                    finishedCond.Reason,
+				Message:                   finishedCond.Message,
 			},
 		})
 	}
@@ -1899,6 +2133,141 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	for _, ev := range events {
 		if err := s.execTimeLog.Append(ev); err != nil {
 			log.Printf("ERROR writing Workload execution event to %s: %v", s.cfg.ExecutionTimeFile, err)
+		}
+	}
+}
+
+func parsePositiveFloatAnnotation(ann map[string]string, key string) *float64 {
+	if len(ann) == 0 {
+		return nil
+	}
+	raw := strings.TrimSpace(ann[key])
+	if raw == "" {
+		return nil
+	}
+	raw = strings.TrimSuffix(raw, "s")
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v <= 0 {
+		return nil
+	}
+	return &v
+}
+
+func extractPositiveFloatAnnotationFromPayload(payload any, key string) *float64 {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return nil
+	}
+	meta, ok := m["metadata"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	ann, ok := meta["annotations"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	val, ok := ann[key]
+	if !ok || val == nil {
+		return nil
+	}
+	strVal, ok := val.(string)
+	if !ok {
+		return nil
+	}
+	strVal = strings.TrimSuffix(strings.TrimSpace(strVal), "s")
+	f, err := strconv.ParseFloat(strVal, 64)
+	if err != nil || f <= 0 {
+		return nil
+	}
+	return &f
+}
+
+// flushInFlightWorkloadsAsPartial emits PartialExecution (interruptionReason="ScrapeEnded")
+// for any Workload that was Admitted and still running when scraping terminated, so downstream
+// replay knows the observed elapsed duration up to scrape cutoff and can scale/override it.
+func (s *Scraper) flushInFlightWorkloadsAsPartial(shutdownTime time.Time) {
+	if s.execTimeLog == nil {
+		return
+	}
+	now := shutdownTime.UTC()
+	var events []ExecutionTimeEvent
+
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.workloadStates))
+	for k := range s.workloadStates {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		st := s.workloadStates[k]
+		if st == nil || st.recordedFull || st.recordedTerminalFailure || !st.currentlyAdmitted || st.currentAdmittedTime.IsZero() {
+			continue
+		}
+		partialKey := "ScrapeEnded/" + st.currentAdmittedTime.Format(time.RFC3339Nano)
+		if st.recordedPartialKeys[partialKey] {
+			continue
+		}
+		st.recordedPartialKeys[partialKey] = true
+		st.interruptionCount++
+
+		if ref, ok := s.workloadToOwner[k]; ok && ref.kind != "" && ref.name != "" {
+			ownerKey := ref.kind + "/" + st.namespace + "/" + ref.name
+			if wfSt, ok := s.workflowStates[ownerKey]; ok {
+				if st.trueDurationSeconds == nil {
+					st.trueDurationSeconds = extractPositiveFloatAnnotationFromPayload(wfSt.lastPayload, "kueue-optimizer.gke.io/true-execution-time-seconds")
+				}
+				if st.missingDurationMultiplier == nil {
+					st.missingDurationMultiplier = extractPositiveFloatAnnotationFromPayload(wfSt.lastPayload, "kueue-optimizer.gke.io/missing-duration-multiplier")
+				}
+			}
+		}
+
+		durSec := now.Sub(st.currentAdmittedTime).Seconds()
+		if durSec < 0 {
+			durSec = 0
+		}
+		durStr := time.Duration(durSec * float64(time.Second)).Round(time.Millisecond).String()
+		endMeta := metav1.NewTime(now)
+
+		events = append(events, ExecutionTimeEvent{
+			Timestamp:     now,
+			EventType:     ExecutionEventPartial,
+			WorkloadState: WorkloadStateAdmitted,
+			Payload: ExecutionTimePayload{
+				ExecutionType:             "Partial",
+				WorkloadName:              st.workloadName,
+				Namespace:                 st.namespace,
+				OwnerKind:                 st.ownerKind,
+				OwnerName:                 st.ownerName,
+				OwnerAPIVersion:           st.ownerAPIVersion,
+				LocalQueueName:            st.localQueueName,
+				ClusterQueueName:          st.clusterQueueName,
+				PriorityClassName:         st.priorityClassName,
+				Priority:                  st.priority,
+				PodSetAssignments:         st.podSetAssignments,
+				UnhealthyNodes:            st.unhealthyNodes,
+				CreationTime:              st.creationTime,
+				AdmittedTime:              metav1.NewTime(st.currentAdmittedTime),
+				EndTime:                   &endMeta,
+				ExecutionDurationSeconds:  &durSec,
+				ExecutionDuration:         durStr,
+				Preempted:                 false,
+				PreemptionCount:           st.preemptionCount,
+				InterruptionReason:        InterruptionReasonScrapeEnded,
+				InterruptionCount:         st.interruptionCount,
+				TrueDurationSeconds:       st.trueDurationSeconds,
+				MissingDurationMultiplier: st.missingDurationMultiplier,
+				Reason:                    InterruptionReasonScrapeEnded,
+				Message:                   "Workload was still admitted and executing when cluster-scraper stopped",
+			},
+		})
+	}
+	s.mu.Unlock()
+
+	for _, ev := range events {
+		if err := s.execTimeLog.Append(ev); err != nil {
+			log.Printf("ERROR writing ScrapeEnded partial execution event to %s: %v", s.cfg.ExecutionTimeFile, err)
 		}
 	}
 }
@@ -2045,6 +2414,58 @@ func watchOptionsFromSentinel(rv string) metav1.ListOptions {
 		return metav1.ListOptions{}
 	}
 	return metav1.ListOptions{ResourceVersion: rv}
+}
+
+func (s *Scraper) watchNodesLoop(ctx context.Context, initialRV string) {
+	if s.kubeClient == nil {
+		return
+	}
+	rv := initialRV
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if rv == "" {
+			rv = s.scrapeNodes(ctx, time.Now().UTC())
+			if rv == "" {
+				if ctx.Err() != nil {
+					return
+				}
+				sleepContext(ctx, 2*time.Second)
+				continue
+			}
+		}
+
+		watchOpts := watchOptionsFromSentinel(rv)
+		rv = ""
+		w, err := s.kubeClient.CoreV1().Nodes().Watch(ctx, watchOpts)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("WARN failed to start Node watch: %v", err)
+			sleepContext(ctx, 2*time.Second)
+			continue
+		}
+		s.consumeNodeWatch(ctx, w)
+	}
+}
+
+func (s *Scraper) consumeNodeWatch(ctx context.Context, w watch.Interface) {
+	defer w.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-w.ResultChan():
+			if !ok {
+				return
+			}
+			if node, ok := ev.Object.(*corev1.Node); ok {
+				s.handleNodeWatchEvent(ev.Type, node)
+			}
+		}
+	}
 }
 
 func (s *Scraper) watchPodsLoop(ctx context.Context, initialRV string) {

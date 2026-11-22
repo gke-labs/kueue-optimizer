@@ -2640,7 +2640,8 @@ func TestSuppressStaleAdmittedDuringActiveEvictionAndPreemption(t *testing.T) {
 	}
 	scraper.handleWorkloadWatchEvent(watch.Modified, wlReadmitted)
 
-	// 7. Non-preemption eviction (e.g. PodsReadyTimeout) while Admitted=True (tAdmit2) is still latched must NOT emit Admitted.
+	// 7. Non-preemption eviction (e.g. PodsReadyTimeout) while Admitted=True (tAdmit2) is still latched must NOT emit
+	// duplicate Admitted, and must record a deduplicated PartialExecution with interruptionReason=PodsReadyTimeout.
 	wlNonPreemptEvict := wlReadmitted.DeepCopy()
 	wlNonPreemptEvict.Status.Conditions = append(wlNonPreemptEvict.Status.Conditions, metav1.Condition{
 		Type:               kueuev1beta2.WorkloadEvicted,
@@ -2656,17 +2657,22 @@ func TestSuppressStaleAdmittedDuringActiveEvictionAndPreemption(t *testing.T) {
 		t.Fatalf("read execution-time.json: %v", err)
 	}
 	execEvents := readJSONLines[ExecutionTimeEvent](t, rawExec)
-	if len(execEvents) != 3 {
-		t.Fatalf("expected strictly 3 events (Admitted@tAdmit1, PartialExecution@tPreempt, Admitted@tAdmit2), got %d:\n%s", len(execEvents), string(rawExec))
+	if len(execEvents) != 4 {
+		t.Fatalf("expected strictly 4 events (Admitted@tAdmit1, PartialExecution@tPreempt, Admitted@tAdmit2, PartialExecution@PodsReadyTimeout), got %d:\n%s", len(execEvents), string(rawExec))
 	}
 	if execEvents[0].EventType != ExecutionEventAdmitted || !execEvents[0].Payload.AdmittedTime.Time.Equal(tAdmit1) {
 		t.Errorf("event[0] expected Admitted at %v, got %+v", tAdmit1, execEvents[0])
 	}
-	if execEvents[1].EventType != ExecutionEventPartial || *execEvents[1].Payload.ExecutionDurationSeconds != 15.0 {
-		t.Errorf("event[1] expected PartialExecution (15s), got %+v", execEvents[1])
+	if execEvents[1].EventType != ExecutionEventPartial || *execEvents[1].Payload.ExecutionDurationSeconds != 15.0 ||
+		execEvents[1].Payload.InterruptionReason != InterruptionReasonPreempted || !execEvents[1].Payload.Preempted {
+		t.Errorf("event[1] expected PartialExecution (15s, Preempted), got %+v", execEvents[1])
 	}
 	if execEvents[2].EventType != ExecutionEventAdmitted || !execEvents[2].Payload.AdmittedTime.Time.Equal(tAdmit2) || execEvents[2].Payload.PreemptionCount != 1 {
 		t.Errorf("event[2] expected Admitted at %v with preemptionCount=1, got %+v", tAdmit2, execEvents[2])
+	}
+	if execEvents[3].EventType != ExecutionEventPartial || *execEvents[3].Payload.ExecutionDurationSeconds != 10.0 ||
+		execEvents[3].Payload.InterruptionReason != InterruptionReasonPodsReadyTimeout || execEvents[3].Payload.Preempted {
+		t.Errorf("event[3] expected PartialExecution (10s, PodsReadyTimeout, preempted=false), got %+v", execEvents[3])
 	}
 }
 
@@ -3810,5 +3816,230 @@ func TestVanillaAndChamberT0ParityBoundPendingAndTerminalPodDeletion(t *testing.
 	delPl := watchEvs[0]["payload"].(map[string]any)
 	if delPl["deletionTime"] != tDone.Format(time.RFC3339) {
 		t.Errorf("expected deletionTime=%q from container Terminated.FinishedAt, got %v", tDone.Format(time.RFC3339), delPl["deletionTime"])
+	}
+}
+
+func TestNodeWatchRealTimeFailureRecoveryDeletionAndHeartbeatSuppression(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 11, 22, 1, 0, 0, 0, time.UTC)
+
+	makeNode := func(name string, ready corev1.ConditionStatus, hb time.Time, trans time.Time, taints []corev1.Taint) *corev1.Node {
+		return &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				ResourceVersion: hb.Format(time.RFC3339Nano),
+				Labels: map[string]string{
+					"kubernetes.io/hostname": name,
+				},
+			},
+			Spec: corev1.NodeSpec{
+				Taints: taints,
+			},
+			Status: corev1.NodeStatus{
+				Phase: corev1.NodeRunning,
+				Conditions: []corev1.NodeCondition{
+					{
+						Type:               corev1.NodeReady,
+						Status:             ready,
+						LastHeartbeatTime:  metav1.NewTime(hb),
+						LastTransitionTime: metav1.NewTime(trans),
+					},
+				},
+			},
+		}
+	}
+
+	// 1. Initial Added -> EventNew
+	n0 := makeNode("st-node-00", corev1.ConditionTrue, t0, t0, nil)
+	scraper.handleNodeWatchEventAt(watch.Added, n0, t0)
+
+	// 2. Pure heartbeat update (only LastHeartbeatTime and ResourceVersion changed) -> MUST NOT emit Update!
+	n0Heartbeat := makeNode("st-node-00", corev1.ConditionTrue, t0.Add(10*time.Second), t0, nil)
+	scraper.handleNodeWatchEventAt(watch.Modified, n0Heartbeat, t0.Add(10*time.Second))
+
+	// 3. Node failure (Ready=False + NoExecute taint) -> EventUpdate
+	n0Failed := makeNode("st-node-00", corev1.ConditionFalse, t0.Add(15*time.Second), t0.Add(15*time.Second), []corev1.Taint{
+		{Key: "node.kubernetes.io/unreachable", Effect: corev1.TaintEffectNoExecute},
+	})
+	scraper.handleNodeWatchEventAt(watch.Modified, n0Failed, t0.Add(15*time.Second))
+
+	// 4. Node recovery (Ready=True, taints cleared) -> EventUpdate
+	n0Recovered := makeNode("st-node-00", corev1.ConditionTrue, t0.Add(25*time.Second), t0.Add(25*time.Second), nil)
+	scraper.handleNodeWatchEventAt(watch.Modified, n0Recovered, t0.Add(25*time.Second))
+
+	// 5. Node deletion -> EventDeleted
+	scraper.handleNodeWatchEventAt(watch.Deleted, n0Recovered, t0.Add(35*time.Second))
+
+	_ = scraper.infraLog.Sync()
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read infra.json: %v", err)
+	}
+	evs := readJSONLines[InfraEvent](t, rawInfra)
+	wantTypes := []EventType{EventNew, EventUpdate, EventUpdate, EventDeleted}
+	if len(evs) != len(wantTypes) {
+		t.Fatalf("expected %d Node events (heartbeat suppressed), got %d:\n%s", len(wantTypes), len(evs), string(rawInfra))
+	}
+	for i, wt := range wantTypes {
+		if evs[i].EventType != wt {
+			t.Errorf("evs[%d].EventType = %q, want %q", i, evs[i].EventType, wt)
+		}
+	}
+}
+
+func TestPartialExecutionNodeFailurePodsReadyTimeoutFailedAndScrapeEndedFlush(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 11, 22, 2, 0, 0, 0, time.UTC)
+
+	ownerRef := func(name string) []metav1.OwnerReference {
+		return []metav1.OwnerReference{
+			{
+				APIVersion: "batch/v1",
+				Kind:       "Job",
+				Name:       name,
+				Controller: ptr.To(true),
+			},
+		}
+	}
+
+	// A. TAS Hot-Swap (unhealthyNodes populated transiently, then cleared by Kueue while staying Admitted -> FullExecution retains unhealthyNodes!)
+	wlHotSwap := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-hotswap",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			OwnerReferences:   ownerRef("job-hotswap"),
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+			Conditions: []metav1.Condition{
+				{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0)},
+			},
+		},
+	}
+	scraper.handleWorkloadWatchEventAt(watch.Added, wlHotSwap, t0)
+
+	wlHotSwapFault := wlHotSwap.DeepCopy()
+	wlHotSwapFault.Status.UnhealthyNodes = []kueuev1beta2.UnhealthyNode{{Name: "st-node-00"}}
+	scraper.handleWorkloadWatchEventAt(watch.Modified, wlHotSwapFault, t0.Add(5*time.Second))
+
+	wlHotSwapDone := wlHotSwap.DeepCopy()
+	wlHotSwapDone.Status.UnhealthyNodes = nil // Kueue clears unhealthyNodes after swapping
+	wlHotSwapDone.Status.Conditions = append(wlHotSwapDone.Status.Conditions, metav1.Condition{
+		Type: kueuev1beta2.WorkloadFinished, Status: metav1.ConditionTrue, Reason: kueuev1beta2.WorkloadFinishedReasonSucceeded,
+		LastTransitionTime: metav1.NewTime(t0.Add(16 * time.Second)),
+	})
+	scraper.handleWorkloadWatchEventAt(watch.Modified, wlHotSwapDone, t0.Add(16*time.Second))
+
+	// B. NodeFailure Eviction with trueDurationSeconds & missingDurationMultiplier annotations
+	wlNodeFail := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-nodefail",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			OwnerReferences:   ownerRef("job-nodefail"),
+			Annotations: map[string]string{
+				"kueue-optimizer.gke.io/true-execution-time-seconds": "42.5",
+				"kueue-optimizer.gke.io/missing-duration-multiplier": "2.5",
+			},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission:      &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+			UnhealthyNodes: []kueuev1beta2.UnhealthyNode{{Name: "st-node-01"}},
+			Conditions: []metav1.Condition{
+				{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0)},
+				{Type: kueuev1beta2.WorkloadEvicted, Status: metav1.ConditionTrue, Reason: kueuev1beta2.WorkloadEvictedDueToNodeFailures, LastTransitionTime: metav1.NewTime(t0.Add(7 * time.Second))},
+			},
+		},
+	}
+	scraper.handleWorkloadWatchEventAt(watch.Added, wlNodeFail, t0.Add(7*time.Second))
+
+	// C. Terminal Failed Workload (must emit PartialExecution with InterruptionReasonFailed, NEVER FullExecution!)
+	wlFailed := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-failed",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			OwnerReferences:   ownerRef("job-failed"),
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+			Conditions: []metav1.Condition{
+				{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0.Add(2 * time.Second))},
+			},
+		},
+	}
+	scraper.handleWorkloadWatchEventAt(watch.Added, wlFailed, t0.Add(2*time.Second))
+	wlFailedTerm := wlFailed.DeepCopy()
+	wlFailedTerm.Status.Conditions = append(wlFailedTerm.Status.Conditions, metav1.Condition{
+		Type: kueuev1beta2.WorkloadFinished, Status: metav1.ConditionTrue, Reason: kueuev1beta2.WorkloadFinishedReasonFailed,
+		LastTransitionTime: metav1.NewTime(t0.Add(11 * time.Second)),
+	})
+	scraper.handleWorkloadWatchEventAt(watch.Modified, wlFailedTerm, t0.Add(11*time.Second))
+
+	// D. In-Flight Admitted Workload flushed on Shutdown -> PartialExecution (InterruptionReasonScrapeEnded)
+	wlInFlight := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "wl-inflight",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0.Add(5 * time.Second)),
+			OwnerReferences:   ownerRef("job-inflight"),
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+			Conditions: []metav1.Condition{
+				{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0.Add(5 * time.Second))},
+			},
+		},
+	}
+	scraper.handleWorkloadWatchEventAt(watch.Added, wlInFlight, t0.Add(5*time.Second))
+	scraper.flushInFlightWorkloadsAsPartial(t0.Add(25 * time.Second))
+	_ = scraper.execTimeLog.Sync()
+
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	execEvs := readJSONLines[ExecutionTimeEvent](t, rawExec)
+
+	byWl := make(map[string][]ExecutionTimeEvent)
+	for _, ev := range execEvs {
+		byWl[ev.Payload.WorkloadName] = append(byWl[ev.Payload.WorkloadName], ev)
+	}
+
+	// Verify A (wl-hotswap): Admitted + FullExecution(16s) with unhealthyNodes=["st-node-00"] and 0 PartialExecution
+	hsEvs := byWl["wl-hotswap"]
+	if len(hsEvs) != 2 || hsEvs[0].EventType != ExecutionEventAdmitted || hsEvs[1].EventType != ExecutionEventFull {
+		t.Fatalf("wl-hotswap expected [Admitted, FullExecution], got %+v", hsEvs)
+	}
+	if len(hsEvs[1].Payload.UnhealthyNodes) != 1 || hsEvs[1].Payload.UnhealthyNodes[0] != "st-node-00" {
+		t.Errorf("wl-hotswap FullExecution expected unhealthyNodes=[st-node-00], got %+v", hsEvs[1].Payload.UnhealthyNodes)
+	}
+
+	// Verify B (wl-nodefail): PartialExecution(7s, NodeFailure, preempted=false, trueDuration=42.5, mult=2.5)
+	nfEvs := byWl["wl-nodefail"]
+	if len(nfEvs) != 1 || nfEvs[0].EventType != ExecutionEventPartial || nfEvs[0].Payload.InterruptionReason != InterruptionReasonNodeFailure || nfEvs[0].Payload.Preempted {
+		t.Fatalf("wl-nodefail expected [PartialExecution(NodeFailure, preempted=false)], got %+v", nfEvs)
+	}
+	if nfEvs[0].Payload.TrueDurationSeconds == nil || *nfEvs[0].Payload.TrueDurationSeconds != 42.5 ||
+		nfEvs[0].Payload.MissingDurationMultiplier == nil || *nfEvs[0].Payload.MissingDurationMultiplier != 2.5 {
+		t.Errorf("wl-nodefail missing trueDurationSeconds/missingDurationMultiplier: %+v", nfEvs[0].Payload)
+	}
+
+	// Verify C (wl-failed): Admitted + PartialExecution(9s, Failed), NO FullExecution
+	flEvs := byWl["wl-failed"]
+	if len(flEvs) != 2 || flEvs[1].EventType != ExecutionEventPartial || flEvs[1].Payload.InterruptionReason != InterruptionReasonFailed || *flEvs[1].Payload.ExecutionDurationSeconds != 9.0 {
+		t.Fatalf("wl-failed expected [Admitted, PartialExecution(9s, Failed)], got %+v", flEvs)
+	}
+
+	// Verify D (wl-inflight): Admitted + PartialExecution(20s, ScrapeEnded, workloadState=Admitted)
+	ifEvs := byWl["wl-inflight"]
+	if len(ifEvs) != 2 || ifEvs[1].EventType != ExecutionEventPartial || ifEvs[1].Payload.InterruptionReason != InterruptionReasonScrapeEnded ||
+		ifEvs[1].WorkloadState != WorkloadStateAdmitted || *ifEvs[1].Payload.ExecutionDurationSeconds != 20.0 {
+		t.Fatalf("wl-inflight expected [Admitted, PartialExecution(20s, ScrapeEnded, state=Admitted)], got %+v", ifEvs)
 	}
 }

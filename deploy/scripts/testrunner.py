@@ -55,8 +55,12 @@ from chamber_common import (
     ChamberManager,
     DEFAULT_FALLBACK_EXEC_SEC,
     DEFAULT_INFRA_PODS_NAMESPACE,
+    DEFAULT_INTERRUPTED_DURATION_MULTIPLIER,
     DEFAULT_PAUSE_IMAGE,
+    DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC,
+    InterruptedDurationOverride,
     ROOT_DIR,
+    WaitForPodsReadyConfig,
     add_common_chamber_args,
     docs_to_pretty_yaml,
     env_bool,
@@ -65,8 +69,10 @@ from chamber_common import (
     managed_chamber,
     normalize_queueing_strategy,
     parse_duration_seconds,
+    parse_interrupted_duration_override,
     query_cluster_status,
     resolve_fair_sharing_arg,
+    resolve_wait_for_pods_ready_config,
 )
 from runner.loader import (
     DEFAULT_INFINITE_POD_DURATION_SEC,
@@ -74,6 +80,7 @@ from runner.loader import (
     InitialPodSpec,
     InitialWorkloadPodGroup,
     ScenarioBundle,
+    ScheduledInfraEvent,
     ScheduledWorkflowItem,
     load_scenario_bundle,
 )
@@ -101,17 +108,22 @@ __all__ = [
     "DEFAULT_SCENARIO_DIR",
     "InitialPodSpec",
     "InitialWorkloadPodGroup",
+    "InterruptedDurationOverride",
     "MAX_K8S_NAME_LEN",
     "SERVER_METADATA_FIELDS",
     "SYSTEM_NAMESPACES",
     "ScenarioBundle",
+    "ScheduledInfraEvent",
     "ScheduledWorkflowItem",
+    "WaitForPodsReadyConfig",
     "apply_scenario_queues_and_wait",
     "build_arg_parser",
     "cleanup_scenario_workloads",
     "load_scenario_bundle",
     "main",
+    "parse_interrupted_duration_override",
     "print_scenario_outline",
+    "resolve_wait_for_pods_ready_config",
     "run_scenario_replay",
     "validate_workflow_events",
 ]
@@ -195,6 +207,93 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"Fallback pod execution time in seconds for workloads without an entry in execution-time.json "
             f"(default: {DEFAULT_FALLBACK_EXEC_SEC})"
         ),
+    )
+    parser.add_argument(
+        "--interrupted-duration-multiplier",
+        "--partial-duration-multiplier",
+        dest="interrupted_duration_multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Multiplier (> 1.0) applied to observed PartialExecution duration for workloads interrupted by "
+            "preemption, node failure, or scrape cutoff that lack a FullExecution entry "
+            f"(default when neither override nor schema multiplier is set: {DEFAULT_INTERRUPTED_DURATION_MULTIPLIER:g}x)"
+        ),
+    )
+    parser.add_argument(
+        "--interrupted-duration-override",
+        "--true-duration-override",
+        dest="interrupted_duration_override",
+        default=None,
+        help=(
+            "Explicit true uninterrupted execution duration (> observed partial duration) for PartialExecution-only "
+            "workloads: accepts a global duration (e.g. '45s'), 'name=duration' pairs ('job-a=40s,job-b=60s'), "
+            "or a JSON map file path ('@overrides.json')"
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready",
+        dest="wait_for_pods_ready",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable Kueue waitForPodsReady in controller_manager_config.yaml (auto-enabled when any "
+            "--wait-for-pods-ready-* timeout/backoff flag is passed; automatically scaled to --speedup and --duration)"
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-timeout",
+        default=None,
+        help="Raw trace waitForPodsReady.timeout (e.g. '30s', '5m'), scaled by 1/--speedup and clamped to --duration",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-recovery-timeout",
+        default=None,
+        help="Raw trace waitForPodsReady.recoveryTimeout after pod/node failure (e.g. '15s', '0s' to disable)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-block-admission",
+        dest="wait_for_pods_ready_block_admission",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Configure waitForPodsReady.blockAdmission in Kueue controller config",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-requeue-timestamp",
+        default="Eviction",
+        choices=["Eviction", "Creation"],
+        help="Configure waitForPodsReady.requeuingStrategy.timestamp ('Eviction' or 'Creation'; default: Eviction)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-backoff-limit",
+        type=int,
+        default=None,
+        help="Configure waitForPodsReady.requeuingStrategy.backoffLimitCount before workload deactivation",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-backoff-base",
+        default=None,
+        help="Raw trace waitForPodsReady.requeuingStrategy.backoffBaseSeconds (scaled by 1/--speedup)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-backoff-max",
+        default=None,
+        help="Raw trace waitForPodsReady.requeuingStrategy.backoffMaxSeconds (scaled by 1/--speedup)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-min-timeout",
+        default=f"{DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC:g}s",
+        help=(
+            "Minimum wall-clock waitForPodsReady timeout floor after --speedup scaling "
+            f"(default: {DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC:g}s)"
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-cap-to-duration",
+        dest="wait_for_pods_ready_cap_to_duration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clamp scaled waitForPodsReady timeout to <= 50%% of --duration when --duration is set (default: true)",
     )
     parser.add_argument(
         "--infinite-pod-duration",
@@ -392,23 +491,52 @@ def main(argv: list[str] | None = None) -> int:
 
     infra_pods_ns = args.infra_pods_namespace.strip() or DEFAULT_INFRA_PODS_NAMESPACE
 
-    bundle = load_scenario_bundle(
-        scenario_dir=args.scenario_dir,
-        infra_path=args.infra_file,
-        workflows_path=args.workflows_file,
-        execution_time_path=args.execution_time_file,
-        speedup=args.speedup,
-        min_pod_duration_sec=min_pod_duration_sec,
-        infinite_pod_duration_sec=infinite_pod_sec,
-        default_exec_sec=default_exec_sec,
-        initial_window_sec=initial_window_sec,
-        skip_initial_offset=args.skip_initial_offset,
-        pause_image_override=args.pause_image,
-        override_workload_namespace=override_wl_ns,
-        override_queueing_strategy=override_q_strategy,
-        override_cq_fair_sharing_preemption=args.cq_fair_sharing_preemption,
-        infra_pods_namespace=infra_pods_ns,
-    )
+    try:
+        wfpr_cfg = resolve_wait_for_pods_ready_config(
+            enabled=args.wait_for_pods_ready,
+            raw_timeout=args.wait_for_pods_ready_timeout,
+            raw_recovery_timeout=args.wait_for_pods_ready_recovery_timeout,
+            block_admission=args.wait_for_pods_ready_block_admission,
+            requeuing_timestamp=args.wait_for_pods_ready_requeue_timestamp,
+            backoff_limit_count=args.wait_for_pods_ready_backoff_limit,
+            raw_backoff_base=args.wait_for_pods_ready_backoff_base,
+            raw_backoff_max=args.wait_for_pods_ready_backoff_max,
+            speedup=args.speedup,
+            max_run_seconds=max_run_seconds,
+            min_wall_timeout=args.wait_for_pods_ready_min_timeout,
+            cap_to_duration=args.wait_for_pods_ready_cap_to_duration,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.skip_chamber_deploy and not args.cleanup_workloads and (wfpr_cfg.enabled or args.kueue_feature_gates):
+        parser.error(
+            "--wait-for-pods-ready* and --kueue-feature-gates cannot be combined with --skip-chamber-deploy "
+            "because Kueue's controller configuration is only applied when deploying a chamber."
+        )
+
+    try:
+        bundle = load_scenario_bundle(
+            scenario_dir=args.scenario_dir,
+            infra_path=args.infra_file,
+            workflows_path=args.workflows_file,
+            execution_time_path=args.execution_time_file,
+            speedup=args.speedup,
+            min_pod_duration_sec=min_pod_duration_sec,
+            infinite_pod_duration_sec=infinite_pod_sec,
+            default_exec_sec=default_exec_sec,
+            initial_window_sec=initial_window_sec,
+            skip_initial_offset=args.skip_initial_offset,
+            pause_image_override=args.pause_image,
+            override_workload_namespace=override_wl_ns,
+            override_queueing_strategy=override_q_strategy,
+            override_cq_fair_sharing_preemption=args.cq_fair_sharing_preemption,
+            infra_pods_namespace=infra_pods_ns,
+            interrupted_duration_multiplier=args.interrupted_duration_multiplier,
+            interrupted_duration_override=args.interrupted_duration_override,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     mgr = ChamberManager(
         chamber_namespace=args.namespace,
@@ -421,6 +549,8 @@ def main(argv: list[str] | None = None) -> int:
         kueue_image=args.kueue_image,
         kueue_build_dir=args.kueue_build_dir,
         enable_fair_sharing=enable_fair_sharing,
+        wait_for_pods_ready=wfpr_cfg,
+        kueue_feature_gates=args.kueue_feature_gates,
     )
 
     if args.cleanup_workloads:
@@ -444,6 +574,7 @@ def main(argv: list[str] | None = None) -> int:
             speedup=args.speedup,
             enable_fair_sharing=outline_fs,
             reused_chamber=args.skip_chamber_deploy,
+            wait_for_pods_ready=wfpr_cfg,
         )
         limit = args.dry_run_limit
         sample_nodes = bundle.nodes[:limit] if limit > 0 else bundle.nodes
@@ -482,6 +613,7 @@ def main(argv: list[str] | None = None) -> int:
         speedup=args.speedup,
         enable_fair_sharing=banner_fs,
         reused_chamber=args.skip_chamber_deploy,
+        wait_for_pods_ready=wfpr_cfg,
     )
 
     should_cleanup_chamber = not args.no_cleanup

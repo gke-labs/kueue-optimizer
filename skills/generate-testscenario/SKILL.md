@@ -51,7 +51,8 @@ Before writing code, map the user's description onto concrete quantities so expe
    - Only `(apiVersion, kind)` pairs in `SCRAPER-SCHEMA.md` are accepted (`v1/Node`, `v1/Namespace`, `v1/Pod`, `node.k8s.io/v1/RuntimeClass`, and `kueue.x-k8s.io/v1beta2` `ClusterQueue`/`LocalQueue`/`ResourceFlavor`/`Topology`/`Cohort`/`WorkloadPriorityClass` in `infra.json`; `batch/v1/Job`, `jobset.x-k8s.io/v1alpha2/JobSet`, `leaderworkerset.x-k8s.io/v1/LeaderWorkerSet`, `apps/v1/Deployment`, `ray.io/v1/RayJob`, `ray.io/v1/RayCluster`, and `v1/Pod` in `workflows.json`, with `payload.objectKind == payload.object.kind`).
 5. **Workload Arrivals & Durations (`workflows.json` + `execution-time.json`)**:
    - Design arrival timestamps and durations so the scenario runs cleanly within **`~1–5 minutes` of active wall-clock time** by default (either `35s–90s` native at `--speedup 1` for focused synthetic tests, or scaled cleanly via `--speedup <S>` with compressed pod durations staying `>= 8s–10s`).
-   - Every workload in `workflows.json` MUST have a matching entry in `execution-time.json` (keyed by `(namespace, objectKind, name)`) with `"eventType": "Admitted"` and `"eventType": "FullExecution"` (`"executionDurationSeconds": <dur>`) so `testrunner.py` indexes 100% of durations deterministically.
+   - Every workload in `workflows.json` MUST have a matching entry in `execution-time.json` (keyed by `(namespace, objectKind, name)`) with `"eventType": "Admitted"` and either `"eventType": "FullExecution"` (`"executionDurationSeconds": <dur>`) or `"eventType": "PartialExecution"` (`"interruptionReason": "Preempted" | "NodeFailure" | "PodsReadyTimeout" | "Evicted" | "Failed" | "ScrapeEnded"`, optionally paired with `"trueDurationSeconds"` or `"missingDurationMultiplier"`) so `testrunner.py` indexes 100% of durations deterministically.
+   - When simulating mid-scenario node failures, recoveries, deletions, or additions, emit post-`t0` (`timestamp > t0 + 1s`) `Node` `"Update"` (`Ready: "False"` + `kueue-optimizer.gke.io/node-failed: "true"` or `NoExecute` taint; `Ready: "True"` for recovery), `"Deleted"`, or `"New"` events in `infra.json` (and set `backoffLimit >= 4` on `Job`/`JobSet` specs expected to replace pods across hot-swapped nodes).
 
 ---
 
@@ -117,7 +118,7 @@ python3 deploy/scripts/generate_scenario_readme.py testscenarios/<scenario-slug>
 # 2. Verify full bundle parsing, execution-time indexing (100% hit rate), and resource totals offline:
 python3 deploy/scripts/testrunner.py testscenarios/<scenario-slug> --dry-run
 
-# 3. If modifying the 60-scenario self-test suite (testscenarios/self-tests/), verify zero drift:
+# 3. If modifying the 75-scenario self-test suite (testscenarios/self-tests/), verify zero drift:
 python3 testscenarios/self-tests/generate_self_test_suite.py --check
 
 # 4. Verify zero hardcoded machine- or user-specific absolute paths in tracked/new files:

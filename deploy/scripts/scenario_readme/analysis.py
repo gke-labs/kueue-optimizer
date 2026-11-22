@@ -398,7 +398,7 @@ def _parse_infra_events(infra_events: list[dict[str, Any]]) -> dict[str, Any]:
         ns = str(meta.get("namespace") or pl.get("namespace") or "default")
 
         if kind == "Node" and ev_type in ("New", "Update"):
-            if name:
+            if name and name not in nodes_by_name:
                 nodes_by_name[name] = pl
         elif kind == "Topology" and ev_type in ("New", "Update"):
             if name:
@@ -599,6 +599,19 @@ def _parse_workflows(
             "kueue-optimizer.gke.io/pod-execution-time-seconds",
             "kueue-optimizer.gke.io/real-duration-sec",
         )
+        wf_true_dur = parse_positive_duration_annotation(
+            annotations,
+            "kueue-optimizer.gke.io/true-execution-time-seconds",
+            "kueue-optimizer.gke.io/expected-execution-time-seconds",
+        )
+        wf_mult: float | None = None
+        if annotations.get("kueue-optimizer.gke.io/missing-duration-multiplier") is not None:
+            try:
+                cand_m = float(str(annotations["kueue-optimizer.gke.io/missing-duration-multiplier"]).strip())
+                if cand_m > 1.0:
+                    wf_mult = cand_m
+            except (TypeError, ValueError):
+                pass
         fallback_dur = ann_dur if ann_dur is not None else 10.0
 
         if pg_name:
@@ -617,6 +630,8 @@ def _parse_workflows(
                 object_kind="PodGroup",
                 name=pg_name,
                 fallback_sec=fallback_dur,
+                workflow_true_duration_sec=wf_true_dur,
+                workflow_missing_multiplier=wf_mult,
             )
             found_dur = found_in_idx or (ann_dur is not None)
             parsed_pg = ParsedWorkload(
@@ -649,6 +664,8 @@ def _parse_workflows(
             name=wf_name,
             fallback_sec=fallback_dur,
             parent_jobset_name=parent_js,
+            workflow_true_duration_sec=wf_true_dur,
+            workflow_missing_multiplier=wf_mult,
         )
         found_dur = found_in_idx or (ann_dur is not None)
 

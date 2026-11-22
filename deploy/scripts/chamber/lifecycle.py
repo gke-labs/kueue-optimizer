@@ -46,8 +46,12 @@ from chamber.constants import (
 )
 from chamber.k8s_client import ChamberK8sClientMixin
 from chamber.manifests import (
+    WaitForPodsReadyConfig,
     match_yaml_section_field,
+    parse_feature_gates_arg,
     patch_kueue_fair_sharing_config,
+    patch_kueue_feature_gates_config,
+    patch_kueue_wait_for_pods_ready_config,
     patch_kustomize_kueue_image,
     patch_registry_manifest,
     replace_yaml_section_field,
@@ -70,6 +74,8 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
     _replace_yaml_section_field = staticmethod(replace_yaml_section_field)
     _patch_registry_manifest = staticmethod(patch_registry_manifest)
     _patch_kueue_fair_sharing_config = staticmethod(patch_kueue_fair_sharing_config)
+    _patch_kueue_wait_for_pods_ready_config = staticmethod(patch_kueue_wait_for_pods_ready_config)
+    _patch_kueue_feature_gates_config = staticmethod(patch_kueue_feature_gates_config)
     _patch_kustomize_kueue_image = staticmethod(patch_kustomize_kueue_image)
 
     def __init__(
@@ -85,6 +91,8 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         kueue_image: str | None = None,
         kueue_build_dir: Path | str | None = None,
         enable_fair_sharing: bool = True,
+        wait_for_pods_ready: WaitForPodsReadyConfig | None = None,
+        kueue_feature_gates: dict[str, bool] | str | None = None,
     ) -> None:
         self.chamber_namespace = validate_dns_label(chamber_namespace, "chamber namespace")
         self.workload_namespace = validate_dns_label(workload_namespace, "workload namespace")
@@ -97,6 +105,8 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         self.kueue_build_dir = Path(kueue_build_dir).resolve() if kueue_build_dir else None
         self._resolved_kueue_image: str | None = None
         self.enable_fair_sharing = bool(enable_fair_sharing)
+        self.wait_for_pods_ready = wait_for_pods_ready
+        self.kueue_feature_gates = parse_feature_gates_arg(kueue_feature_gates)
         self.scrape_interval = normalize_scrape_interval(scrape_interval)
         self.kubeconfig_path = resolve_kubeconfig_path(self.chamber_namespace, kubeconfig_out)
         self._created_namespace_in_this_run: bool = False
@@ -279,6 +289,8 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
 
         self._patch_registry_manifest(base_dst, self.registry_port, self.registry_memory_limit)
         self._patch_kueue_fair_sharing_config(base_dst, self.enable_fair_sharing)
+        self._patch_kueue_wait_for_pods_ready_config(base_dst, self.wait_for_pods_ready)
+        self._patch_kueue_feature_gates_config(base_dst, self.kueue_feature_gates)
 
         active_kueue_img = self._resolved_kueue_image or self.kueue_image
         if active_kueue_img:
@@ -321,10 +333,20 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         pki_note = "cluster Secret/kwok-pki" if self._pki_source == "cluster" else "ad-hoc generated PKI"
         kueue_img_note = self._resolved_kueue_image or DEFAULT_KUEUE_IMAGE
         fs_note = "enabled" if self.enable_fair_sharing else "disabled"
+        wfpr_note = (
+            f", WaitForPodsReady: [{self.wait_for_pods_ready.summary_str()}]"
+            if self.wait_for_pods_ready and self.wait_for_pods_ready.enabled
+            else ""
+        )
+        fg_note = (
+            f", FeatureGates: {self.kueue_feature_gates}"
+            if self.kueue_feature_gates
+            else ""
+        )
         print(
             f"==> Preparing & deploying chamber into host cluster namespace '{self.chamber_namespace}' "
             f"(PKI: {pki_note}, Registry: localhost:{self.registry_port} [RAM {self.registry_memory_limit}], "
-            f"Kueue: {kueue_img_note}, FairSharing: {fs_note}, Prometheus scrape: {self.scrape_interval})...",
+            f"Kueue: {kueue_img_note}, FairSharing: {fs_note}{wfpr_note}{fg_note}, Prometheus scrape: {self.scrape_interval})...",
             flush=True,
         )
         self._ensure_namespace_safe_for_apply(record_creation=True)
@@ -724,6 +746,7 @@ def query_cluster_status(
                     fin_cond = next((c for c in raw_conds if c.get("type") == "Finished"), None)
                     fin_true = bool(fin_cond and fin_cond.get("status") == "True")
                     fin_succeeded = bool(fin_true and str(fin_cond.get("reason") or "") == "Succeeded")
+                    is_deactivated = (it.get("spec") or {}).get("active") is False and conds.get("Admitted") != "True"
                     is_group_wl = (
                         str((meta.get("annotations") or {}).get("kueue.x-k8s.io/is-group-workload") or "") == "true"
                     )
@@ -732,9 +755,9 @@ def query_cluster_status(
                     )
                     if is_evicted_or_preempted and wl_key[1] and not fin_succeeded:
                         snap.evicted_workload_keys.add(wl_key)
-                    if fin_true:
+                    if fin_true or is_deactivated:
                         finished_cnt += 1
-                        if wl_key[1] and (fin_succeeded or not (is_group_wl and is_evicted_or_preempted)):
+                        if wl_key[1] and (fin_succeeded or is_deactivated or not (is_group_wl and is_evicted_or_preempted)):
                             snap.finished_workload_keys.add(wl_key)
                     elif is_evicted_or_preempted:
                         evicted_cnt += 1

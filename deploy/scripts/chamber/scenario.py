@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,109 @@ from typing import Any
 from chamber.constants import DEFAULT_FALLBACK_EXEC_SEC
 from chamber.parsers import parse_duration_seconds, parse_k8s_quantity, parse_rfc3339_epoch
 from chamber.yaml_utils import load_jsonl_events
+
+
+DEFAULT_INTERRUPTED_DURATION_MULTIPLIER = 1.5
+
+
+@dataclass
+class InterruptedDurationOverride:
+    """Explicit true-length overrides for workloads that only recorded PartialExecution."""
+
+    global_duration_sec: float | None = None
+    by_key: dict[str, float] = field(default_factory=dict)
+
+    def lookup(
+        self,
+        *,
+        namespace: str,
+        owner_kind: str,
+        owner_name: str,
+        workload_name: str = "",
+    ) -> float | None:
+        candidates = []
+        if owner_kind and namespace and owner_name:
+            candidates.append(f"{owner_kind}/{namespace}/{owner_name}")
+        if namespace and owner_name:
+            candidates.append(f"{namespace}/{owner_name}")
+        if owner_name:
+            candidates.append(owner_name)
+        if namespace and workload_name:
+            candidates.append(f"{namespace}/{workload_name}")
+        if workload_name:
+            candidates.append(workload_name)
+        for cand in candidates:
+            if cand in self.by_key:
+                return self.by_key[cand]
+        if "*" in self.by_key:
+            return self.by_key["*"]
+        return self.global_duration_sec
+
+
+def parse_interrupted_duration_override(
+    raw: str | float | dict[str, Any] | InterruptedDurationOverride | None,
+) -> InterruptedDurationOverride | None:
+    """Parse --interrupted-duration-override from scalar duration, k=v pairs, or a JSON file/dict."""
+    if raw is None:
+        return None
+    if isinstance(raw, InterruptedDurationOverride):
+        return raw
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        if val <= 0:
+            raise ValueError(f"--interrupted-duration-override must be > 0 (got {raw!r})")
+        return InterruptedDurationOverride(global_duration_sec=val)
+    if isinstance(raw, dict):
+        parsed_map: dict[str, float] = {}
+        for k, v in raw.items():
+            dur = float(v) if isinstance(v, (int, float)) else parse_duration_seconds(str(v))
+            if dur is None or dur <= 0:
+                raise ValueError(f"Invalid duration override for {k!r}: {v!r}")
+            parsed_map[str(k).strip()] = dur
+        return InterruptedDurationOverride(by_key=parsed_map)
+
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    # JSON file (@path.json or existing file path)
+    cand_path = Path(text[1:].strip()) if text.startswith("@") else Path(text)
+    if text.startswith("@") or (cand_path.suffix.lower() == ".json" or cand_path.is_file()):
+        if not cand_path.is_file():
+            raise ValueError(f"Interrupted duration override file not found: {cand_path}")
+        loaded = json.loads(cand_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"Interrupted duration override JSON file {cand_path} must contain a JSON object")
+        return parse_interrupted_duration_override(loaded)
+
+    # Inline JSON object
+    if text.startswith("{"):
+        loaded = json.loads(text)
+        if not isinstance(loaded, dict):
+            raise ValueError("Inline --interrupted-duration-override JSON must be an object")
+        return parse_interrupted_duration_override(loaded)
+
+    # Inline key=dur,key2=dur2 pairs
+    if "=" in text:
+        parsed_pairs: dict[str, float] = {}
+        for part in text.split(","):
+            tok = part.strip()
+            if not tok:
+                continue
+            if "=" not in tok:
+                raise ValueError(f"Invalid key=duration entry in --interrupted-duration-override: {tok!r}")
+            k, v = tok.split("=", 1)
+            dur = parse_duration_seconds(v.strip())
+            if dur is None or dur <= 0:
+                raise ValueError(f"Invalid duration for {k.strip()!r} in --interrupted-duration-override: {v!r}")
+            parsed_pairs[k.strip()] = dur
+        return InterruptedDurationOverride(by_key=parsed_pairs)
+
+    # Scalar duration string (e.g. '45s' or '45')
+    scalar = parse_duration_seconds(text)
+    if scalar is None or scalar <= 0:
+        raise ValueError(f"Invalid --interrupted-duration-override value: {raw!r}")
+    return InterruptedDurationOverride(global_duration_sec=scalar)
 
 
 @dataclass
@@ -40,19 +144,95 @@ class WorkloadExecutionInfo:
     priority_class_name: str = ""
     priority: int | None = None
     pod_set_assignments: list[dict[str, Any]] = field(default_factory=list)
+    unhealthy_nodes: list[str] = field(default_factory=list)
     creation_epoch: float | None = None
     full_duration_sec: float | None = None
     full_end_epoch: float | None = None
     partial_durations_sec: list[float] = field(default_factory=list)
     admitted_epochs: list[float] = field(default_factory=list)
     preempted_epochs: list[float] = field(default_factory=list)
+    interrupted_epochs: list[float] = field(default_factory=list)
+    interruption_reasons: list[str] = field(default_factory=list)
+    true_duration_sec: float | None = None
+    missing_duration_multiplier: float | None = None
 
-    def resolved_duration_sec(self, default_sec: float = DEFAULT_FALLBACK_EXEC_SEC) -> float:
-        """Return the workload's execution duration in seconds (preferring FullExecution)."""
+    @property
+    def is_interrupted_only(self) -> bool:
+        """True when the workload recorded PartialExecution(s) without completing FullExecution."""
+        return (self.full_duration_sec is None or self.full_duration_sec <= 0) and bool(self.partial_durations_sec)
+
+    def resolved_duration_sec(
+        self,
+        default_sec: float = DEFAULT_FALLBACK_EXEC_SEC,
+        *,
+        interrupted_duration_multiplier: float | None = None,
+        interrupted_duration_override: InterruptedDurationOverride | None = None,
+        workflow_true_duration_sec: float | None = None,
+        workflow_missing_multiplier: float | None = None,
+    ) -> float:
+        """Return the workload's execution duration in seconds.
+
+        For workloads with FullExecution, returns full_duration_sec.
+        For interrupted-only workloads (PartialExecution without FullExecution), applies:
+          1. Explicit CLI true-length override (--interrupted-duration-override),
+          2. Schema/annotation trueDurationSeconds (true_duration_sec / workflow_true_duration_sec),
+          3. Explicit CLI multiplier (--interrupted-duration-multiplier, > 1.0),
+          4. Schema/annotation missingDurationMultiplier (> 1.0),
+          5. DEFAULT_INTERRUPTED_DURATION_MULTIPLIER (1.5x),
+        guaranteeing the replay duration is strictly longer than the interrupted recording.
+        """
         if self.full_duration_sec is not None and self.full_duration_sec > 0:
             return self.full_duration_sec
         if self.partial_durations_sec:
-            return max(self.partial_durations_sec)
+            observed_partial = max(self.partial_durations_sec)
+            base_partial = observed_partial if observed_partial > 0 else default_sec
+
+            if interrupted_duration_override is not None:
+                ov = interrupted_duration_override.lookup(
+                    namespace=self.namespace,
+                    owner_kind=self.owner_kind,
+                    owner_name=self.owner_name,
+                    workload_name=self.workload_name,
+                )
+                if ov is not None:
+                    if ov <= observed_partial:
+                        raise ValueError(
+                            f"Interrupted duration override ({ov:.2f}s) for workload "
+                            f"{self.namespace}/{self.owner_name or self.workload_name} must be strictly longer "
+                            f"than its interrupted recording ({observed_partial:.2f}s)."
+                        )
+                    return ov
+
+            cand_true = (
+                workflow_true_duration_sec
+                if workflow_true_duration_sec is not None and workflow_true_duration_sec > 0
+                else self.true_duration_sec
+            )
+            if cand_true is not None and cand_true > 0:
+                if cand_true <= observed_partial:
+                    raise ValueError(
+                        f"trueDurationSeconds ({cand_true:.2f}s) for workload "
+                        f"{self.namespace}/{self.owner_name or self.workload_name} must be strictly longer "
+                        f"than its interrupted recording ({observed_partial:.2f}s)."
+                    )
+                return cand_true
+
+            eff_mult: float
+            if interrupted_duration_multiplier is not None:
+                if interrupted_duration_multiplier <= 1.0:
+                    raise ValueError(
+                        f"--interrupted-duration-multiplier must be > 1.0 so interrupted workloads replay "
+                        f"longer than their interrupted recording (got {interrupted_duration_multiplier!r})."
+                    )
+                eff_mult = float(interrupted_duration_multiplier)
+            elif workflow_missing_multiplier is not None and workflow_missing_multiplier > 1.0:
+                eff_mult = float(workflow_missing_multiplier)
+            elif self.missing_duration_multiplier is not None and self.missing_duration_multiplier > 1.0:
+                eff_mult = float(self.missing_duration_multiplier)
+            else:
+                eff_mult = DEFAULT_INTERRUPTED_DURATION_MULTIPLIER
+
+            return base_partial * eff_mult
         return default_sec
 
 
@@ -103,14 +283,26 @@ class ExecutionTimeIndex:
         name: str,
         fallback_sec: float = DEFAULT_FALLBACK_EXEC_SEC,
         parent_jobset_name: str | None = None,
+        *,
+        interrupted_duration_multiplier: float | None = None,
+        interrupted_duration_override: InterruptedDurationOverride | None = None,
+        workflow_true_duration_sec: float | None = None,
+        workflow_missing_multiplier: float | None = None,
     ) -> tuple[float, bool]:
         """Return (duration_seconds, found_in_index) for the given workload."""
         info = self.lookup(namespace, object_kind, name, parent_jobset_name=parent_jobset_name)
         if info is not None:
-            if info.full_duration_sec is not None and info.full_duration_sec > 0:
-                return info.full_duration_sec, True
-            if info.partial_durations_sec:
-                return max(info.partial_durations_sec), True
+            if (info.full_duration_sec is not None and info.full_duration_sec > 0) or info.partial_durations_sec:
+                return (
+                    info.resolved_duration_sec(
+                        default_sec=fallback_sec,
+                        interrupted_duration_multiplier=interrupted_duration_multiplier,
+                        interrupted_duration_override=interrupted_duration_override,
+                        workflow_true_duration_sec=workflow_true_duration_sec,
+                        workflow_missing_multiplier=workflow_missing_multiplier,
+                    ),
+                    True,
+                )
         return fallback_sec, False
 
 
@@ -175,6 +367,32 @@ def index_execution_times(
         if info.creation_epoch is None and pl.get("creationTime"):
             info.creation_epoch = parse_rfc3339_epoch(pl.get("creationTime"), strict=strict_timestamps)
 
+        true_dur_raw = pl.get("trueDurationSeconds")
+        if true_dur_raw is not None:
+            try:
+                td = float(true_dur_raw)
+                if td > 0:
+                    info.true_duration_sec = td
+            except (TypeError, ValueError):
+                pass
+        mult_raw = pl.get("missingDurationMultiplier")
+        if mult_raw is not None:
+            try:
+                mm = float(mult_raw)
+                if mm > 1.0:
+                    info.missing_duration_multiplier = mm
+            except (TypeError, ValueError):
+                pass
+        unhealthy_raw = pl.get("unhealthyNodes")
+        if isinstance(unhealthy_raw, list):
+            for un in unhealthy_raw:
+                un_s = str(un or "").strip()
+                if un_s and un_s not in info.unhealthy_nodes:
+                    info.unhealthy_nodes.append(un_s)
+        psa_raw = pl.get("podSetAssignments")
+        if isinstance(psa_raw, list) and psa_raw:
+            info.pod_set_assignments = [dict(x) for x in psa_raw if isinstance(x, dict)]
+
         dur_raw = pl.get("executionDurationSeconds")
         dur_val = float(dur_raw) if dur_raw is not None else None
         if dur_val is None and pl.get("executionDuration"):
@@ -188,16 +406,21 @@ def index_execution_times(
             adm_ts = parse_rfc3339_epoch(pl.get("admittedTime"), strict=strict_timestamps) or ev_ts
             if adm_ts is not None:
                 info.admitted_epochs.append(adm_ts)
-            psa_raw = pl.get("podSetAssignments")
-            if isinstance(psa_raw, list) and psa_raw:
-                info.pod_set_assignments = [dict(x) for x in psa_raw if isinstance(x, dict)]
         elif ev_type == "PartialExecution":
             idx.partial_events += 1
-            if dur_val is not None and dur_val > 0:
+            if dur_val is not None and dur_val >= 0:
                 info.partial_durations_sec.append(dur_val)
+            int_reason = str(pl.get("interruptionReason") or "").strip()
+            preempted_flag = pl.get("preempted")
+            if not int_reason:
+                int_reason = "Preempted" if preempted_flag is not False else "Interrupted"
+            info.interruption_reasons.append(int_reason)
             end_ts = parse_rfc3339_epoch(pl.get("endTime"), strict=strict_timestamps) or ev_ts
             if end_ts is not None:
-                info.preempted_epochs.append(end_ts)
+                if int_reason != "ScrapeEnded":
+                    info.interrupted_epochs.append(end_ts)
+                if bool(preempted_flag) or int_reason == "Preempted":
+                    info.preempted_epochs.append(end_ts)
         elif ev_type == "FullExecution":
             idx.full_events += 1
             if dur_val is not None and dur_val > 0:

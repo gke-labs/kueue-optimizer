@@ -22,12 +22,252 @@ import json
 import signal
 import time
 from typing import Any
+import urllib.parse
 
 from chamber.constants import validate_dns_label
 from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot, query_cluster_status
 from chamber.parsers import format_duration_hms
-from runner.loader import InitialPodSpec, InitialWorkloadPodGroup, ScenarioBundle, ScheduledWorkflowItem
+from runner.loader import (
+    InitialPodSpec,
+    InitialWorkloadPodGroup,
+    ScenarioBundle,
+    ScheduledInfraEvent,
+    ScheduledWorkflowItem,
+)
 from runner.validation import SYSTEM_NAMESPACES
+
+
+def _fail_pods_bound_to_node(
+    mgr: ChamberManager,
+    allowed_namespaces: set[str],
+    node_name: str,
+    reason: str,
+    message: str,
+) -> int:
+    """Transition active non-terminal Pods bound to `node_name` to phase=Failed so Job/JobSet & Kueue TAS react immediately."""
+    q_sel = urllib.parse.quote(f"spec.nodeName={node_name}", safe="=")
+    st, raw = mgr.api_request("GET", f"/api/v1/pods?fieldSelector={q_sel}")
+    if st != 200 or not raw:
+        return 0
+    items = json.loads(raw.decode("utf-8")).get("items") or []
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    failed_count = 0
+    for pod in items:
+        meta = pod.get("metadata") or {}
+        ns = str(meta.get("namespace") or "default")
+        p_name = str(meta.get("name") or "")
+        if not p_name or (allowed_namespaces and ns not in allowed_namespaces):
+            continue
+        if meta.get("deletionTimestamp"):
+            continue
+        p_status = pod.get("status") or {}
+        if str(p_status.get("phase") or "") in ("Succeeded", "Failed"):
+            continue
+        containers = ((pod.get("spec") or {}).get("containers")) or []
+        c_statuses = []
+        for c in containers:
+            if not isinstance(c, dict):
+                continue
+            c_statuses.append(
+                {
+                    "name": str(c.get("name") or "pause"),
+                    "image": str(c.get("image") or "registry.k8s.io/pause:3.10"),
+                    "ready": False,
+                    "started": False,
+                    "restartCount": 0,
+                    "state": {
+                        "terminated": {
+                            "exitCode": 137,
+                            "reason": reason,
+                            "message": message,
+                            "startedAt": str(p_status.get("startTime") or now_iso),
+                            "finishedAt": now_iso,
+                        }
+                    },
+                }
+            )
+        status_patch = {
+            "status": {
+                "phase": "Failed",
+                "reason": reason,
+                "message": message,
+                "conditions": [
+                    {"type": "Initialized", "status": "True", "lastTransitionTime": now_iso},
+                    {"type": "PodScheduled", "status": "True", "lastTransitionTime": now_iso},
+                    {"type": "Ready", "status": "False", "reason": reason, "lastTransitionTime": now_iso},
+                    {"type": "ContainersReady", "status": "False", "reason": reason, "lastTransitionTime": now_iso},
+                ],
+                "containerStatuses": c_statuses,
+            }
+        }
+        p_st, _ = mgr.api_request(
+            "PATCH",
+            f"/api/v1/namespaces/{ns}/pods/{p_name}/status",
+            body=json.dumps(status_patch).encode("utf-8"),
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+        if p_st in (200, 201):
+            failed_count += 1
+    return failed_count
+
+
+def _patch_node_ready_condition(
+    mgr: ChamberManager,
+    node_name: str,
+    ready_status: str,
+    reason: str,
+    message: str,
+    extra_status: dict[str, Any] | None = None,
+) -> None:
+    """Patch Node /status Ready condition while preserving allocatable/capacity."""
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    status_body: dict[str, Any] = {
+        "conditions": [
+            {
+                "type": "Ready",
+                "status": ready_status,
+                "reason": reason,
+                "message": message,
+                "lastHeartbeatTime": now_iso,
+                "lastTransitionTime": now_iso,
+            }
+        ],
+        "phase": "Running",
+    }
+    if extra_status:
+        for k in ("allocatable", "capacity", "nodeInfo"):
+            if extra_status.get(k):
+                status_body[k] = extra_status[k]
+    mgr.api_request(
+        "PATCH",
+        f"/api/v1/nodes/{node_name}/status",
+        body=json.dumps({"status": status_body}).encode("utf-8"),
+        headers={"Content-Type": "application/merge-patch+json"},
+    )
+
+
+def _execute_scheduled_infra_event(
+    mgr: ChamberManager,
+    bundle: ScenarioBundle,
+    ie: ScheduledInfraEvent,
+    wall_elapsed: float,
+) -> None:
+    """Apply a scheduled post-t0 Node failure, taint, recovery, addition, or deletion."""
+    if ie.object_kind != "Node":
+        return
+    allowed_ns = set(bundle.workload_namespaces) | {bundle.infra_pods_namespace}
+    if ie.event_type == "Deleted":
+        failed_pods = _fail_pods_bound_to_node(
+            mgr,
+            allowed_ns,
+            ie.name,
+            reason="NodeDeleted",
+            message=f"Simulated Node '{ie.name}' deleted during scenario replay",
+        )
+        mgr.api_request("DELETE", f"/api/v1/nodes/{ie.name}")
+        print(
+            f"  ! [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
+            f"Deleted Node '{ie.name}' (failed {failed_pods} bound pod(s))",
+            flush=True,
+        )
+        return
+
+    if ie.event_type == "New":
+        mgr.ssa_apply_doc(ie.manifest)
+        st_blk = (ie.manifest.get("status") or {}) if isinstance(ie.manifest, dict) else {}
+        if ie.is_not_ready:
+            _patch_node_ready_condition(
+                mgr,
+                ie.name,
+                ready_status=ie.ready_status or "False",
+                reason="KubeletNotReady",
+                message="Node added in NotReady state",
+                extra_status=st_blk,
+            )
+        else:
+            _patch_node_ready_condition(
+                mgr,
+                ie.name,
+                ready_status="True",
+                reason="KubeletReady",
+                message="kubelet is posting ready status",
+                extra_status=st_blk,
+            )
+        print(
+            f"  * [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
+            f"Added Node '{ie.name}' (Ready={'False' if ie.is_not_ready else 'True'})",
+            flush=True,
+        )
+        return
+
+    # ie.event_type == "Update"
+    spec_in = dict((ie.manifest.get("spec") or {}) if isinstance(ie.manifest, dict) else {})
+    taints_list = [dict(t) for t in (spec_in.get("taints") or []) if isinstance(t, dict)]
+    if ie.is_not_ready or ie.has_no_execute_taint:
+        if ie.is_not_ready and not any(
+            t.get("key") == "node.kubernetes.io/not-ready" for t in taints_list
+        ):
+            taints_list.append({"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"})
+        patch_doc = {
+            "metadata": {"annotations": {"kueue-optimizer.gke.io/node-failed": "true"}},
+            "spec": {
+                "unschedulable": bool(spec_in.get("unschedulable", ie.is_not_ready)),
+                "taints": taints_list,
+            },
+        }
+        mgr.api_request(
+            "PATCH",
+            f"/api/v1/nodes/{ie.name}",
+            body=json.dumps(patch_doc).encode("utf-8"),
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+        if ie.is_not_ready:
+            _patch_node_ready_condition(
+                mgr,
+                ie.name,
+                ready_status=ie.ready_status or "False",
+                reason="KubeletNotReady",
+                message="Simulated node failure during scenario replay",
+            )
+        failed_pods = _fail_pods_bound_to_node(
+            mgr,
+            allowed_ns,
+            ie.name,
+            reason="NodeFailure",
+            message=f"Simulated node failure on '{ie.name}'",
+        )
+        print(
+            f"  ! [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
+            f"Node '{ie.name}' marked unhealthy (Ready={ie.ready_status or ('False' if ie.is_not_ready else 'True')}, "
+            f"noExecuteTaint={ie.has_no_execute_taint}, failed {failed_pods} bound pod(s))",
+            flush=True,
+        )
+    else:
+        patch_doc = {
+            "metadata": {"annotations": {"kueue-optimizer.gke.io/node-failed": None}},
+            "spec": {
+                "unschedulable": bool(spec_in.get("unschedulable", False)),
+                "taints": taints_list,
+            },
+        }
+        mgr.api_request(
+            "PATCH",
+            f"/api/v1/nodes/{ie.name}",
+            body=json.dumps(patch_doc).encode("utf-8"),
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+        _patch_node_ready_condition(
+            mgr,
+            ie.name,
+            ready_status="True",
+            reason="KubeletReady",
+            message="kubelet is posting ready status",
+        )
+        print(
+            f"  * [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
+            f"Node '{ie.name}' updated/recovered (Ready=True, unschedulable={bool(spec_in.get('unschedulable', False))})",
+            flush=True,
+        )
 
 
 def apply_scenario_queues_and_wait(
@@ -208,6 +448,8 @@ def run_scenario_replay(
 
     event_heap: list[ScheduledWorkflowItem] = list(bundle.scheduled_workflows)
     heapq.heapify(event_heap)
+    infra_heap: list[ScheduledInfraEvent] = list(bundle.scheduled_infra_events)
+    heapq.heapify(infra_heap)
 
     initial_wl_by_key = {(w.namespace, w.workload_name): w for w in bundle.initial_workloads}
     initial_wl_keys = set(initial_wl_by_key.keys())
@@ -294,9 +536,13 @@ def run_scenario_replay(
     def _print_status_line(snap: ClusterStatusSnapshot, now_mono: float, note: str = "") -> None:
         wall_elapsed = now_mono - t0_mono
         sim_elapsed = wall_elapsed * speedup
+        next_candidates: list[float] = []
         if event_heap:
-            next_in = max(0.0, event_heap[0].target_wall_offset_sec - wall_elapsed)
-            next_str = f"next_in={next_in:.2f}s"
+            next_candidates.append(max(0.0, event_heap[0].target_wall_offset_sec - wall_elapsed))
+        if infra_heap:
+            next_candidates.append(max(0.0, infra_heap[0].target_wall_offset_sec - wall_elapsed))
+        if next_candidates:
+            next_str = f"next_in={min(next_candidates):.2f}s"
         else:
             next_str = "next_in=none"
 
@@ -342,6 +588,15 @@ def run_scenario_replay(
                 )
                 break
 
+            due_infra: list[ScheduledInfraEvent] = []
+            while infra_heap and infra_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
+                due_infra.append(heapq.heappop(infra_heap))
+
+            if due_infra:
+                for ie in due_infra:
+                    _execute_scheduled_infra_event(mgr, bundle, ie, time.monotonic() - t0_mono)
+                continue
+
             due_batch: list[ScheduledWorkflowItem] = []
             while event_heap and event_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
                 due_batch.append(heapq.heappop(event_heap))
@@ -381,7 +636,7 @@ def run_scenario_replay(
 
             now_mono = time.monotonic()
             due_status = now_mono >= next_status_mono
-            need_fast_poll = (not event_heap) or bool(initial_wl_keys)
+            need_fast_poll = (not event_heap and not infra_heap) or bool(initial_wl_keys)
             due_poll = need_fast_poll and now_mono >= next_poll_mono
             if due_status or due_poll:
                 snap = _poll_cluster(now_mono)
@@ -394,7 +649,7 @@ def run_scenario_replay(
                 while next_poll_mono <= now_mono:
                     next_poll_mono += poll_interval_sec
 
-                if not event_heap:
+                if not event_heap and not infra_heap:
                     if not wait_for_completion:
                         if not status_printed:
                             _print_status_line(snap, now_mono)
@@ -420,10 +675,12 @@ def run_scenario_replay(
             now_mono = time.monotonic()
             wall_elapsed = now_mono - t0_mono
             wake_candidates = [next_status_mono - now_mono]
-            if (not event_heap) or initial_wl_keys:
+            if (not event_heap and not infra_heap) or initial_wl_keys:
                 wake_candidates.append(next_poll_mono - now_mono)
             if event_heap:
                 wake_candidates.append(event_heap[0].target_wall_offset_sec - wall_elapsed)
+            if infra_heap:
+                wake_candidates.append(infra_heap[0].target_wall_offset_sec - wall_elapsed)
             if max_run_seconds is not None and max_run_seconds > 0:
                 wake_candidates.append(max_run_seconds - wall_elapsed)
             sleep_sec = max(0.01, min(wake_candidates))

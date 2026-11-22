@@ -218,6 +218,10 @@ spec:
       operator: NotIn
       values:
       - "True"
+    - key: .metadata.annotations["kueue-optimizer.gke.io/node-failed"]
+      operator: NotIn
+      values:
+      - "true"
 NODE_INIT_EOF
   echo "---"
   kubectl --kubeconfig=/dev/null kustomize "${KWOK_REPO}/kustomize/stage/node/heartbeat-with-lease"
@@ -246,6 +250,15 @@ spec:
       operator: NotIn
       values:
       - "True"
+    - key: .metadata.annotations["kueue-optimizer.gke.io/pod-never-ready"]
+      operator: NotIn
+      values:
+      - "true"
+  delay:
+    durationMilliseconds: 0
+    durationFrom:
+      jq:
+        expression: '(.metadata.annotations["kueue-optimizer.gke.io/pod-startup-delay-seconds"] // "0") | tostring | if . == "" then "0s" elif test("[a-zA-Z]$") then . else . + "s" end'
   next:
     statusTemplate: |
       {{ $now := Now }}

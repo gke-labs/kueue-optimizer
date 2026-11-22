@@ -153,6 +153,14 @@ def add_common_chamber_args(
         ),
     )
     parser.add_argument(
+        "--kueue-feature-gates",
+        default=os.environ.get("KUEUE_FEATURE_GATES"),
+        help=(
+            "Optional comma-separated Kueue feature gate overrides rendered into controller_manager_config.yaml "
+            "(e.g. 'TASReplaceMultipleFailedNodes=true')"
+        ),
+    )
+    parser.add_argument(
         "--skip-chamber-deploy",
         "--reuse-chamber",
         action="store_true",

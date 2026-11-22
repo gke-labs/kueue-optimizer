@@ -44,6 +44,7 @@ from chamber.parsers import (
 )
 from chamber.scenario import (
     ExecutionTimeIndex,
+    InterruptedDurationOverride,
     WorkloadExecutionInfo,
     build_topology_assignment,
     collect_known_parent_workflows,
@@ -52,6 +53,7 @@ from chamber.scenario import (
     filter_initial_running_pods,
     index_execution_times,
     is_child_workflow_owned_by_tracked_parent,
+    parse_interrupted_duration_override,
 )
 from chamber.yaml_utils import load_jsonl_events
 from runner.validation import (
@@ -59,11 +61,14 @@ from runner.validation import (
     MAX_K8S_NAME_LEN,
     SYSTEM_NAMESPACES,
     _extract_existing_pod_exec_seconds,
+    _extract_workflow_true_duration_and_multiplier,
     _inject_pod_execution_time_and_sanitize_workflow,
     _parse_optional_event_epoch,
     _prepare_kueue_or_ns_doc,
     _prepare_node_manifest,
     _require_event_epoch,
+    extract_node_ready_status,
+    is_node_payload_unhealthy,
     validate_workflow_events,
 )
 
@@ -105,6 +110,24 @@ class ScheduledWorkflowItem:
     indexed_from_execution_time: bool = field(compare=False)
     pod_count: int = field(compare=False)
     manifest: dict[str, Any] = field(compare=False)
+
+
+@dataclass(order=True)
+class ScheduledInfraEvent:
+    """Post-t0 infrastructure lifecycle event (Node failure, recovery, addition, or deletion)."""
+
+    target_wall_offset_sec: float
+    seq: int
+    raw_offset_sec: float = field(compare=False)
+    raw_offset_from_t0_sec: float = field(compare=False)
+    event_timestamp: str = field(compare=False)
+    event_type: str = field(compare=False)  # "New" | "Update" | "Deleted"
+    object_kind: str = field(compare=False)  # "Node"
+    name: str = field(compare=False)
+    ready_status: str | None = field(compare=False, default=None)
+    is_not_ready: bool = field(compare=False, default=False)
+    has_no_execute_taint: bool = field(compare=False, default=False)
+    manifest: dict[str, Any] = field(compare=False, default_factory=dict)
 
 
 @dataclass
@@ -173,6 +196,9 @@ class ScenarioBundle:
     cluster_queue_names: list[str]
     queueing_strategy: str
     initial_workloads: list[InitialWorkloadPodGroup] = field(default_factory=list)
+    scheduled_infra_events: list[ScheduledInfraEvent] = field(default_factory=list)
+    interrupted_duration_multiplier: float | None = None
+    interrupted_duration_override: InterruptedDurationOverride | None = None
 
     @property
     def initial_workload_pods_count(self) -> int:
@@ -192,6 +218,7 @@ class _ParsedInfra:
     lqs_by_key: dict[tuple[str, str], dict[str, Any]]
     pod_new_events: dict[tuple[str, str], tuple[float, dict[str, Any]]]
     pod_delete_epochs: dict[tuple[str, str], float]
+    scheduled_infra_events: list[ScheduledInfraEvent] = field(default_factory=list)
 
 
 def _compute_timeline_bounds(
@@ -211,6 +238,7 @@ def _compute_timeline_bounds(
     for w_info in exec_index.by_workload_name.values():
         all_last_epochs.extend(w_info.admitted_epochs)
         all_last_epochs.extend(w_info.preempted_epochs)
+        all_last_epochs.extend(w_info.interrupted_epochs)
 
     t0_epoch = min(all_first_epochs) if all_first_epochs else time.time()
     t_end_epoch = max(all_last_epochs) if all_last_epochs else t0_epoch
@@ -233,6 +261,8 @@ def _schedule_workflows(
     default_exec_sec: float,
     pause_image_override: str | None,
     override_workload_namespace: str | None,
+    interrupted_duration_multiplier: float | None = None,
+    interrupted_duration_override: InterruptedDurationOverride | None = None,
 ) -> tuple[
     list[ScheduledWorkflowItem],
     list[_AdmittedInitialCandidate],
@@ -314,6 +344,7 @@ def _schedule_workflows(
                 else "preempted_after_initial_admission"
             )
             fallback_dur = _extract_existing_pod_exec_seconds(raw_obj) or default_exec_sec
+            wf_true_dur, wf_mult = _extract_workflow_true_duration_and_multiplier(raw_obj)
             found_in_idx = False
             raw_dur = fallback_dur
             if pg_name:
@@ -322,6 +353,10 @@ def _schedule_workflows(
                     object_kind="PodGroup",
                     name=pg_name,
                     fallback_sec=fallback_dur,
+                    interrupted_duration_multiplier=interrupted_duration_multiplier,
+                    interrupted_duration_override=interrupted_duration_override,
+                    workflow_true_duration_sec=wf_true_dur,
+                    workflow_missing_multiplier=wf_mult,
                 )
             if not found_in_idx:
                 raw_dur, found_in_idx = exec_index.resolve_duration_sec(
@@ -330,6 +365,10 @@ def _schedule_workflows(
                     name=name,
                     fallback_sec=fallback_dur,
                     parent_jobset_name=parent_js,
+                    interrupted_duration_multiplier=interrupted_duration_multiplier,
+                    interrupted_duration_override=interrupted_duration_override,
+                    workflow_true_duration_sec=wf_true_dur,
+                    workflow_missing_multiplier=wf_mult,
                 )
             comp_dur = max(min_pod_duration_sec, raw_dur / speedup)
             exec_str = format_pod_execution_seconds(comp_dur, min_seconds=min_pod_duration_sec)
@@ -340,6 +379,7 @@ def _schedule_workflows(
                 compressed_duration_sec=comp_dur,
                 pause_image_override=pause_image_override,
                 override_namespace=override_workload_namespace,
+                speedup=speedup,
             )
             raw_off = max(0.0, ev_epoch - t0_epoch)
             wall_off = raw_off / speedup
@@ -374,11 +414,19 @@ def _schedule_workflows(
             continue
         orig_ns = first_seen_orig_ns.get(key, ns)
         info = exec_index.lookup(orig_ns, kind, name)
-        if info and info.preempted_epochs and key in latest_obj_by_key:
+        cand_int_epochs = (info.preempted_epochs or info.interrupted_epochs) if info else []
+        if info and cand_int_epochs and key in latest_obj_by_key:
             raw_obj, lq_name = latest_obj_by_key[key]
-            preempt_epoch = min(info.preempted_epochs)
+            preempt_epoch = min(cand_int_epochs)
             fallback_dur = _extract_existing_pod_exec_seconds(raw_obj) or default_exec_sec
-            raw_dur = info.resolved_duration_sec(default_sec=fallback_dur)
+            wf_true_dur, wf_mult = _extract_workflow_true_duration_and_multiplier(raw_obj)
+            raw_dur = info.resolved_duration_sec(
+                default_sec=fallback_dur,
+                interrupted_duration_multiplier=interrupted_duration_multiplier,
+                interrupted_duration_override=interrupted_duration_override,
+                workflow_true_duration_sec=wf_true_dur,
+                workflow_missing_multiplier=wf_mult,
+            )
             comp_dur = max(min_pod_duration_sec, raw_dur / speedup)
             exec_str = format_pod_execution_seconds(comp_dur, min_seconds=min_pod_duration_sec)
             manifest, pod_cnt = _inject_pod_execution_time_and_sanitize_workflow(
@@ -388,6 +436,7 @@ def _schedule_workflows(
                 compressed_duration_sec=comp_dur,
                 pause_image_override=pause_image_override,
                 override_namespace=override_workload_namespace,
+                speedup=speedup,
             )
             raw_off = max(0.0, preempt_epoch - t0_epoch)
             wall_off = raw_off / speedup
@@ -448,12 +497,18 @@ def _parse_infra_resources(
     infra_event_epochs: list[float],
     inf_file: Path,
     *,
+    t0_epoch: float,
+    initial_window_sec: float,
+    speedup: float,
     override_workload_namespace: str | None,
     override_queueing_strategy: str | None,
     override_cq_fair_sharing_preemption: bool,
 ) -> _ParsedInfra:
-    """Validate and parse infra.json into Nodes, Kueue objects, Namespaces, and raw Pod events."""
+    """Validate and parse infra.json into Nodes, post-t0 Node events, Kueue objects, Namespaces, and raw Pod events."""
     nodes_by_name: dict[str, dict[str, Any]] = {}
+    node_idx_by_name: dict[str, int] = {}
+    scheduled_infra_events: list[ScheduledInfraEvent] = []
+    infra_seq = 0
     namespaces_by_name: dict[str, dict[str, Any]] = {}
     runtime_classes_by_name: dict[str, dict[str, Any]] = {}
     topologies_by_name: dict[str, dict[str, Any]] = {}
@@ -483,8 +538,38 @@ def _parse_infra_resources(
             n_name = validate_dns_label(
                 (pl.get("metadata") or {}).get("name"), f"{inf_file} event #{idx_inf} Node metadata.name"
             )
-            if ev_type != "Deleted" and n_name not in nodes_by_name:
-                nodes_by_name[n_name] = _prepare_node_manifest(pl, len(nodes_by_name))
+            if n_name not in node_idx_by_name:
+                node_idx_by_name[n_name] = len(node_idx_by_name)
+            n_idx = node_idx_by_name[n_name]
+            in_initial_window = ev_epoch <= (t0_epoch + initial_window_sec + 1e-6)
+            if in_initial_window:
+                if ev_type == "Deleted":
+                    nodes_by_name.pop(n_name, None)
+                else:
+                    nodes_by_name[n_name] = _prepare_node_manifest(pl, n_idx)
+            else:
+                raw_off = max(0.0, ev_epoch - t0_epoch)
+                wall_off = raw_off / max(1e-6, speedup)
+                ready_st = extract_node_ready_status(pl)
+                not_ready, no_exec = is_node_payload_unhealthy(pl)
+                prep_node = _prepare_node_manifest(pl, n_idx) if ev_type != "Deleted" else {}
+                scheduled_infra_events.append(
+                    ScheduledInfraEvent(
+                        target_wall_offset_sec=wall_off,
+                        seq=infra_seq,
+                        raw_offset_sec=raw_off,
+                        raw_offset_from_t0_sec=raw_off,
+                        event_timestamp=str(ev.get("timestamp") or ""),
+                        event_type=ev_type,
+                        object_kind="Node",
+                        name=n_name,
+                        ready_status=ready_st,
+                        is_not_ready=not_ready,
+                        has_no_execute_taint=no_exec,
+                        manifest=prep_node,
+                    )
+                )
+                infra_seq += 1
 
         elif kind == "Namespace":
             ns_name = validate_dns_label(
@@ -571,6 +656,7 @@ def _parse_infra_resources(
             elif ev_type == "Deleted" and p_key not in pod_delete_epochs:
                 pod_delete_epochs[p_key] = del_ts if del_ts is not None else ev_epoch
 
+    scheduled_infra_events.sort(key=lambda item: (item.target_wall_offset_sec, item.seq))
     return _ParsedInfra(
         nodes_by_name=nodes_by_name,
         namespaces_by_name=namespaces_by_name,
@@ -583,6 +669,7 @@ def _parse_infra_resources(
         lqs_by_key=lqs_by_key,
         pod_new_events=pod_new_events,
         pod_delete_epochs=pod_delete_epochs,
+        scheduled_infra_events=scheduled_infra_events,
     )
 
 
@@ -872,6 +959,8 @@ def _build_initial_workloads_and_pods(
     pause_image_override: str | None,
     override_workload_namespace: str | None,
     infra_pods_namespace: str,
+    interrupted_duration_multiplier: float | None = None,
+    interrupted_duration_override: InterruptedDurationOverride | None = None,
 ) -> tuple[list[InitialWorkloadPodGroup], list[InitialPodSpec], list[ScheduledWorkflowItem], int]:
     """Partition t0 running state into pre-admitted Kueue `PodGroup` workloads and non-Kueue `infra-pods`."""
     not_admitted_wf_names = [
@@ -1175,6 +1264,7 @@ def _build_initial_workloads_and_pods(
 
             raw_dur_cand = default_exec_sec
             has_finite_end = False
+            wf_true_cand, wf_mult_cand = _extract_workflow_true_duration_and_multiplier(cand.raw_obj)
             if cand.exec_info:
                 if cand.exec_info.full_end_epoch is not None and cand.exec_info.full_end_epoch > effective_start_epoch:
                     raw_dur_cand = cand.exec_info.full_end_epoch - effective_start_epoch
@@ -1182,6 +1272,21 @@ def _build_initial_workloads_and_pods(
                 elif cand.exec_info.full_duration_sec is not None and cand.exec_info.full_duration_sec > 0:
                     adm_ep = min(cand.exec_info.admitted_epochs) if cand.exec_info.admitted_epochs else t0_epoch
                     rem = (adm_ep + cand.exec_info.full_duration_sec) - effective_start_epoch
+                    if rem > 0:
+                        raw_dur_cand = rem
+                        has_finite_end = True
+                elif cand.exec_info.is_interrupted_only and any(
+                    r != "ScrapeEnded" for r in cand.exec_info.interruption_reasons
+                ):
+                    adm_ep = min(cand.exec_info.admitted_epochs) if cand.exec_info.admitted_epochs else t0_epoch
+                    resolved_tot = cand.exec_info.resolved_duration_sec(
+                        default_sec=default_exec_sec,
+                        interrupted_duration_multiplier=interrupted_duration_multiplier,
+                        interrupted_duration_override=interrupted_duration_override,
+                        workflow_true_duration_sec=wf_true_cand,
+                        workflow_missing_multiplier=wf_mult_cand,
+                    )
+                    rem = (adm_ep + resolved_tot) - effective_start_epoch
                     if rem > 0:
                         raw_dur_cand = rem
                         has_finite_end = True
@@ -1323,6 +1428,7 @@ def _build_initial_workloads_and_pods(
 
         # Build dynamic resubmit item (`spec.suspend = True`) if parent workflow object is available from workflows.json.
         resubmit_item: ScheduledWorkflowItem | None = None
+        cand_wf_true_dur, cand_wf_mult = _extract_workflow_true_duration_and_multiplier(cand.raw_obj)
         if cand.from_workflows_json and cand.raw_obj and cand.kind != "PodGroup":
             fallback_dur = _extract_existing_pod_exec_seconds(cand.raw_obj) or default_exec_sec
             raw_dur_full, found_idx = exec_index.resolve_duration_sec(
@@ -1330,6 +1436,10 @@ def _build_initial_workloads_and_pods(
                 object_kind=cand.kind,
                 name=cand.name,
                 fallback_sec=fallback_dur,
+                interrupted_duration_multiplier=interrupted_duration_multiplier,
+                interrupted_duration_override=interrupted_duration_override,
+                workflow_true_duration_sec=cand_wf_true_dur,
+                workflow_missing_multiplier=cand_wf_mult,
             )
             comp_dur_full = max(min_pod_duration_sec, raw_dur_full / speedup)
             exec_str_full = format_pod_execution_seconds(comp_dur_full, min_seconds=min_pod_duration_sec)
@@ -1341,6 +1451,7 @@ def _build_initial_workloads_and_pods(
                 pause_image_override=pause_image_override,
                 override_namespace=override_workload_namespace,
                 extra_pod_annotations={"kueue-optimizer.gke.io/preempted-t0-resubmit": "true"},
+                speedup=speedup,
             )
             resubmit_item = ScheduledWorkflowItem(
                 target_wall_offset_sec=0.0,
@@ -1407,7 +1518,9 @@ def _build_initial_workloads_and_pods(
 
                 ps_member_specs: list[InitialPodSpec] = []
                 for p_ns, p_name, _ev_ep, pl, del_ep in pts:
-                    # Fall back to execution-time.json full_end_epoch when individual pod lacked deletionTime
+                    # Fall back to execution-time.json full_end_epoch when individual pod lacked deletionTime,
+                    # and extend interrupted-only t0 pods (whose deletionTime came from preemption/failure rather
+                    # than natural completion) using the resolved multiplier or true-length override.
                     eff_del_ep = del_ep
                     if (
                         eff_del_ep is None
@@ -1416,6 +1529,35 @@ def _build_initial_workloads_and_pods(
                         and cand.exec_info.full_end_epoch > effective_start_epoch
                     ):
                         eff_del_ep = cand.exec_info.full_end_epoch
+                    elif (
+                        cand.exec_info
+                        and cand.exec_info.is_interrupted_only
+                        and (
+                            (eff_del_ep is not None and any(r != "ScrapeEnded" for r in cand.exec_info.interruption_reasons))
+                            or (
+                                eff_del_ep is None
+                                and (
+                                    interrupted_duration_override is not None
+                                    or interrupted_duration_multiplier is not None
+                                    or cand_wf_true_dur is not None
+                                    or cand_wf_mult is not None
+                                    or cand.exec_info.true_duration_sec is not None
+                                    or cand.exec_info.missing_duration_multiplier is not None
+                                )
+                            )
+                        )
+                    ):
+                        adm_ep = min(cand.exec_info.admitted_epochs) if cand.exec_info.admitted_epochs else t0_epoch
+                        resolved_tot = cand.exec_info.resolved_duration_sec(
+                            default_sec=default_exec_sec,
+                            interrupted_duration_multiplier=interrupted_duration_multiplier,
+                            interrupted_duration_override=interrupted_duration_override,
+                            workflow_true_duration_sec=cand_wf_true_dur,
+                            workflow_missing_multiplier=cand_wf_mult,
+                        )
+                        unint_end_ep = adm_ep + resolved_tot
+                        if eff_del_ep is None or unint_end_ep > eff_del_ep:
+                            eff_del_ep = unint_end_ep
 
                     if eff_del_ep is not None and eff_del_ep > effective_start_epoch:
                         rem_raw = eff_del_ep - effective_start_epoch
@@ -1868,8 +2010,17 @@ def load_scenario_bundle(
     override_queueing_strategy: str | None = None,
     override_cq_fair_sharing_preemption: bool = False,
     infra_pods_namespace: str = DEFAULT_INFRA_PODS_NAMESPACE,
+    interrupted_duration_multiplier: float | None = None,
+    interrupted_duration_override: str | float | dict[str, Any] | InterruptedDurationOverride | None = None,
 ) -> ScenarioBundle:
     """Index execution-time.json first, then load infra.json and workflows.json into a ScenarioBundle."""
+    if interrupted_duration_multiplier is not None and interrupted_duration_multiplier <= 1.0:
+        raise ValueError(
+            f"--interrupted-duration-multiplier must be > 1.0 so interrupted workloads replay longer "
+            f"than their interrupted recording (got {interrupted_duration_multiplier!r})."
+        )
+    parsed_override = parse_interrupted_duration_override(interrupted_duration_override)
+
     resolved_dir = scenario_dir.resolve()
     inf_file = (infra_path or (resolved_dir / "infra.json")).resolve()
     wf_file = (workflows_path or (resolved_dir / "workflows.json")).resolve()
@@ -1925,26 +2076,36 @@ def load_scenario_bundle(
         default_exec_sec=default_exec_sec,
         pause_image_override=pause_image_override,
         override_workload_namespace=override_workload_namespace,
+        interrupted_duration_multiplier=interrupted_duration_multiplier,
+        interrupted_duration_override=parsed_override,
     )
 
     parsed_infra = _parse_infra_resources(
         infra_events,
         infra_event_epochs,
         inf_file,
+        t0_epoch=t0_epoch,
+        initial_window_sec=initial_window_sec,
+        speedup=speedup,
         override_workload_namespace=override_workload_namespace,
         override_queueing_strategy=override_queueing_strategy,
         override_cq_fair_sharing_preemption=override_cq_fair_sharing_preemption,
     )
 
-    # Compute jump target from genuine NotAdmitted arrivals first (falling back to scheduled_workflows
-    # when no initial_not_admitted arrivals exist) so dynamic t0 preemption items don't distort t_start.
+    # Compute jump target from genuine NotAdmitted arrivals and post-t0 infra events so dynamic
+    # t0 preemption items don't distort t_start and we never jump past an early Node event.
     initial_jump_raw_sec = 0.0
     initial_jump_wall_sec = 0.0
-    if skip_initial_offset and scheduled_workflows:
-        not_adm_items = [w for w in scheduled_workflows if w.trigger_reason == "initial_not_admitted"]
-        anchor = not_adm_items[0] if not_adm_items else scheduled_workflows[0]
-        initial_jump_raw_sec = max(0.0, anchor.raw_offset_from_t0_sec)
-        initial_jump_wall_sec = max(0.0, anchor.target_wall_offset_sec)
+    if skip_initial_offset and (scheduled_workflows or parsed_infra.scheduled_infra_events):
+        cand_raw_offsets: list[float] = []
+        if scheduled_workflows:
+            not_adm_items = [w for w in scheduled_workflows if w.trigger_reason == "initial_not_admitted"]
+            anchor = not_adm_items[0] if not_adm_items else scheduled_workflows[0]
+            cand_raw_offsets.append(max(0.0, anchor.raw_offset_from_t0_sec))
+        if parsed_infra.scheduled_infra_events:
+            cand_raw_offsets.append(max(0.0, parsed_infra.scheduled_infra_events[0].raw_offset_from_t0_sec))
+        initial_jump_raw_sec = min(cand_raw_offsets) if cand_raw_offsets else 0.0
+        initial_jump_wall_sec = initial_jump_raw_sec / speedup
 
     effective_start_epoch = t0_epoch + initial_jump_raw_sec
     effective_start_iso = datetime.fromtimestamp(effective_start_epoch, tz=timezone.utc).strftime(
@@ -1968,12 +2129,19 @@ def load_scenario_bundle(
             pause_image_override=pause_image_override,
             override_workload_namespace=override_workload_namespace,
             infra_pods_namespace=infra_pods_namespace,
+            interrupted_duration_multiplier=interrupted_duration_multiplier,
+            interrupted_duration_override=parsed_override,
         )
     )
 
-    # Re-normalize scheduled workflow offsets if jumping ahead (or if superseded preemption items were removed).
-    if skip_initial_offset and scheduled_workflows:
-        initial_jump_raw_sec = max(0.0, scheduled_workflows[0].raw_offset_from_t0_sec)
+    # Re-normalize scheduled workflow and infra event offsets if jumping ahead.
+    if skip_initial_offset and (scheduled_workflows or parsed_infra.scheduled_infra_events):
+        recalc_offsets: list[float] = []
+        if scheduled_workflows:
+            recalc_offsets.append(max(0.0, scheduled_workflows[0].raw_offset_from_t0_sec))
+        if parsed_infra.scheduled_infra_events:
+            recalc_offsets.append(max(0.0, parsed_infra.scheduled_infra_events[0].raw_offset_from_t0_sec))
+        initial_jump_raw_sec = min(recalc_offsets) if recalc_offsets else 0.0
         initial_jump_wall_sec = initial_jump_raw_sec / speedup
         effective_start_epoch = t0_epoch + initial_jump_raw_sec
         effective_start_iso = datetime.fromtimestamp(effective_start_epoch, tz=timezone.utc).strftime(
@@ -1982,6 +2150,9 @@ def load_scenario_bundle(
         for item in scheduled_workflows:
             item.raw_offset_sec = max(0.0, item.raw_offset_from_t0_sec - initial_jump_raw_sec)
             item.target_wall_offset_sec = item.raw_offset_sec / speedup
+        for ie in parsed_infra.scheduled_infra_events:
+            ie.raw_offset_sec = max(0.0, ie.raw_offset_from_t0_sec - initial_jump_raw_sec)
+            ie.target_wall_offset_sec = ie.raw_offset_sec / speedup
 
     prereq_and_queue_docs, workload_namespaces = _synthesize_referenced_objects(
         parsed_infra,
@@ -2035,4 +2206,7 @@ def load_scenario_bundle(
         cluster_queue_names=sorted(parsed_infra.cqs_by_name.keys()),
         queueing_strategy=detected_strategy,
         initial_workloads=initial_workloads,
+        scheduled_infra_events=parsed_infra.scheduled_infra_events,
+        interrupted_duration_multiplier=interrupted_duration_multiplier,
+        interrupted_duration_override=parsed_override,
     )

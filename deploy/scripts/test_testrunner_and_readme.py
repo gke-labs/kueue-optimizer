@@ -1634,7 +1634,11 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
 
         # 3. Verify scale scenarios st46..st60 counts (5 quota-only without TAS, 10 with TAS, all >100 nodes & >1000 wls)
         suite_dir = repo_root / "testscenarios/self-tests"
-        scale_dirs = sorted(p for p in suite_dir.iterdir() if p.is_dir() and p.name.startswith("st") and int(p.name[2:4]) >= 46)
+        scale_dirs = sorted(
+            p
+            for p in suite_dir.iterdir()
+            if p.is_dir() and p.name.startswith("st") and 46 <= int(p.name[2:4]) <= 60
+        )
         self.assertEqual(len(scale_dirs), 15)
         no_tas = 0
         with_tas = 0
@@ -1710,6 +1714,345 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
             self.assertNotIn(("st-workloads", "t0pg-race-winner"), snap.evicted_workload_keys)
             self.assertIn(("st-workloads", "t0pg-evicted-victim"), snap.evicted_workload_keys)
             self.assertNotIn(("st-workloads", "t0pg-evicted-victim"), snap.finished_workload_keys)
+        finally:
+            mgr.close()
+
+    def test_wait_for_pods_ready_scaling_clamping_and_config_patching(self) -> None:
+        """Verify waitForPodsReady scales with --speedup, clamps to --duration, and renders valid Kueue config."""
+        # 1. Speedup scaling (40s / 5 = 8s, backoff 10s / 5 = 2s)
+        cfg_5x = testrunner.resolve_wait_for_pods_ready_config(
+            raw_timeout="40s",
+            raw_recovery_timeout="20s",
+            block_admission=True,
+            backoff_limit_count=1,
+            raw_backoff_base="10s",
+            raw_backoff_max="60s",
+            speedup=5.0,
+        )
+        self.assertTrue(cfg_5x.enabled)
+        self.assertAlmostEqual(cfg_5x.effective_timeout_sec, 8.0)
+        self.assertAlmostEqual(cfg_5x.effective_recovery_timeout_sec or 0.0, 4.0)
+        self.assertEqual(cfg_5x.effective_backoff_base_sec, 2)
+        self.assertEqual(cfg_5x.effective_backoff_max_sec, 12)
+        self.assertFalse(cfg_5x.clamped_timeout_to_duration)
+
+        # 2. Duration clamping (10m = 600s clamped to 50% of 24s = 12s)
+        cfg_clamped = testrunner.resolve_wait_for_pods_ready_config(
+            raw_timeout="10m",
+            speedup=1.0,
+            max_run_seconds=24.0,
+            cap_to_duration=True,
+        )
+        self.assertAlmostEqual(cfg_clamped.effective_timeout_sec, 12.0)
+        self.assertTrue(cfg_clamped.clamped_timeout_to_duration)
+
+        # 3. Minimum floor at extreme speedup (30s / 100 = 0.3s -> floored to 2.0s; 0s recoveryTimeout preserved)
+        cfg_floored = testrunner.resolve_wait_for_pods_ready_config(
+            raw_timeout="30s",
+            raw_recovery_timeout="0s",
+            speedup=100.0,
+            min_wall_timeout="2s",
+        )
+        self.assertAlmostEqual(cfg_floored.effective_timeout_sec, 2.0)
+        self.assertTrue(cfg_floored.floored_timeout_to_min)
+        self.assertEqual(cfg_floored.effective_recovery_timeout_sec, 0.0)
+
+        # 4. Patching controller_manager_config.yaml for waitForPodsReady & featureGates
+        with tempfile.TemporaryDirectory() as td:
+            base_dst = Path(td)
+            (base_dst / "config").mkdir()
+            (base_dst / "config" / "controller_manager_config.yaml").write_text(
+                "apiVersion: config.kueue.x-k8s.io/v1beta2\nkind: Configuration\ninternalCertManagement:\n  enable: false\n",
+                encoding="utf-8",
+            )
+            from chamber.manifests import (
+                parse_feature_gates_arg,
+                patch_kueue_feature_gates_config,
+                patch_kueue_wait_for_pods_ready_config,
+            )
+
+            patch_kueue_wait_for_pods_ready_config(base_dst, cfg_5x)
+            patch_kueue_feature_gates_config(base_dst, parse_feature_gates_arg("TASReplaceMultipleFailedNodes=true"))
+            rendered = (base_dst / "config" / "controller_manager_config.yaml").read_text(encoding="utf-8")
+            self.assertIn("waitForPodsReady:\n  timeout: 8s\n  recoveryTimeout: 4s\n  blockAdmission: true\n", rendered)
+            self.assertIn("backoffBaseSeconds: 2\n    backoffMaxSeconds: 12", rendered)
+            self.assertIn("featureGates:\n  TASReplaceMultipleFailedNodes: true\n", rendered)
+
+    def test_interrupted_workload_multiplier_and_true_length_override_precedence(self) -> None:
+        """Verify PartialExecution-only workloads always replay strictly longer than interrupted recordings."""
+        with tempfile.TemporaryDirectory() as td:
+            sc_dir = Path(td)
+            t0 = "2026-06-01T00:00:00Z"
+            t8 = "2026-06-01T00:00:08Z"
+            t14 = "2026-06-01T00:00:14Z"
+            (sc_dir / "infra.json").write_text(
+                "\n".join(
+                    json.dumps(x, separators=(",", ":"))
+                    for x in [
+                        {
+                            "timestamp": t0,
+                            "eventType": "New",
+                            "payload": {
+                                "apiVersion": "v1",
+                                "kind": "Node",
+                                "metadata": {"name": "n-0", "labels": {"type": "kwok"}},
+                                "spec": {},
+                                "status": {"capacity": {"cpu": "16", "memory": "64Gi"}, "allocatable": {"cpu": "16", "memory": "64Gi"}},
+                            },
+                        },
+                        {
+                            "timestamp": t0,
+                            "eventType": "New",
+                            "payload": {
+                                "apiVersion": "kueue.x-k8s.io/v1beta2",
+                                "kind": "ResourceFlavor",
+                                "metadata": {"name": "rf-main"},
+                                "spec": {"nodeLabels": {"type": "kwok"}},
+                            },
+                        },
+                        {
+                            "timestamp": t0,
+                            "eventType": "New",
+                            "payload": {
+                                "apiVersion": "kueue.x-k8s.io/v1beta2",
+                                "kind": "ClusterQueue",
+                                "metadata": {"name": "cq-main"},
+                                "spec": {
+                                    "namespaceSelector": {},
+                                    "resourceGroups": [
+                                        {
+                                            "coveredResources": ["cpu", "memory"],
+                                            "flavors": [
+                                                {
+                                                    "name": "rf-main",
+                                                    "resources": [
+                                                        {"name": "cpu", "nominalQuota": "16"},
+                                                        {"name": "memory", "nominalQuota": "64Gi"},
+                                                    ],
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                            },
+                        },
+                        {
+                            "timestamp": t0,
+                            "eventType": "New",
+                            "payload": {
+                                "apiVersion": "kueue.x-k8s.io/v1beta2",
+                                "kind": "LocalQueue",
+                                "metadata": {"name": "lq-main", "namespace": "default"},
+                                "spec": {"clusterQueue": "cq-main"},
+                            },
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def _job_ev(name: str) -> dict[str, object]:
+                return {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": name,
+                        "namespace": "default",
+                        "creationTime": t0,
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "batch/v1",
+                            "kind": "Job",
+                            "metadata": {"name": name, "namespace": "default", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+                            "spec": {
+                                "suspend": True,
+                                "parallelism": 1,
+                                "completions": 1,
+                                "template": {
+                                    "metadata": {},
+                                    "spec": {
+                                        "restartPolicy": "Never",
+                                        "containers": [
+                                            {
+                                                "name": "w",
+                                                "image": "registry.k8s.io/pause:3.10",
+                                                "resources": {"requests": {"cpu": "2", "memory": "4Gi"}},
+                                            }
+                                        ],
+                                    },
+                                },
+                            },
+                        },
+                    },
+                }
+
+            (sc_dir / "workflows.json").write_text(
+                "\n".join(json.dumps(_job_ev(n), separators=(",", ":")) for n in ("job-part-plain", "job-part-true", "job-full")) + "\n",
+                encoding="utf-8",
+            )
+            (sc_dir / "execution-time.json").write_text(
+                "\n".join(
+                    json.dumps(x, separators=(",", ":"))
+                    for x in [
+                        {
+                            "timestamp": t8,
+                            "eventType": "PartialExecution",
+                            "workloadState": "NotAdmitted",
+                            "payload": {
+                                "executionType": "Partial",
+                                "workloadName": "wl-1",
+                                "namespace": "default",
+                                "ownerKind": "Job",
+                                "ownerName": "job-part-plain",
+                                "creationTime": t0,
+                                "admittedTime": t0,
+                                "endTime": t8,
+                                "executionDurationSeconds": 8.0,
+                                "preempted": True,
+                                "interruptionReason": "Preempted",
+                            },
+                        },
+                        {
+                            "timestamp": t8,
+                            "eventType": "PartialExecution",
+                            "workloadState": "NotAdmitted",
+                            "payload": {
+                                "executionType": "Partial",
+                                "workloadName": "wl-2",
+                                "namespace": "default",
+                                "ownerKind": "Job",
+                                "ownerName": "job-part-true",
+                                "creationTime": t0,
+                                "admittedTime": t0,
+                                "endTime": t8,
+                                "executionDurationSeconds": 8.0,
+                                "preempted": False,
+                                "interruptionReason": "NodeFailure",
+                                "trueDurationSeconds": 21.0,
+                            },
+                        },
+                        {
+                            "timestamp": t14,
+                            "eventType": "FullExecution",
+                            "workloadState": "Admitted",
+                            "payload": {
+                                "executionType": "Full",
+                                "workloadName": "wl-3",
+                                "namespace": "default",
+                                "ownerKind": "Job",
+                                "ownerName": "job-full",
+                                "creationTime": t0,
+                                "admittedTime": t0,
+                                "endTime": t14,
+                                "executionDurationSeconds": 14.0,
+                                "preempted": False,
+                            },
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            # Default fallback (1.5x -> 12.0s on job-part-plain, 21.0s schema trueDuration on job-part-true, 14.0s FullExecution)
+            b_def = testrunner.load_scenario_bundle(sc_dir)
+            durs_def = {w.name: w.execution_duration_sec for w in b_def.scheduled_workflows}
+            self.assertAlmostEqual(durs_def["job-part-plain"], 12.0)
+            self.assertAlmostEqual(durs_def["job-part-true"], 21.0)
+            self.assertAlmostEqual(durs_def["job-full"], 14.0)
+
+            # Explicit CLI multiplier 2.5x -> 20.0s on job-part-plain, 21.0s schema trueDuration preserved, 14.0s FullExecution untouched
+            b_mult = testrunner.load_scenario_bundle(sc_dir, interrupted_duration_multiplier=2.5)
+            durs_mult = {w.name: w.execution_duration_sec for w in b_mult.scheduled_workflows}
+            self.assertAlmostEqual(durs_mult["job-part-plain"], 20.0)
+            self.assertAlmostEqual(durs_mult["job-part-true"], 21.0)
+            self.assertAlmostEqual(durs_mult["job-full"], 14.0)
+
+            # Explicit CLI override via JSON file -> overrides interrupted jobs, leaves FullExecution untouched
+            ov_path = sc_dir / "overrides.json"
+            ov_path.write_text(json.dumps({"job-part-plain": "30s", "job-part-true": 28}), encoding="utf-8")
+            b_ov = testrunner.load_scenario_bundle(sc_dir, interrupted_duration_override=f"@{ov_path}")
+            durs_ov = {w.name: w.execution_duration_sec for w in b_ov.scheduled_workflows}
+            self.assertAlmostEqual(durs_ov["job-part-plain"], 30.0)
+            self.assertAlmostEqual(durs_ov["job-part-true"], 28.0)
+            self.assertAlmostEqual(durs_ov["job-full"], 14.0)
+
+            # Reject multiplier <= 1.0 or override <= observed_partial (8.0s)
+            with self.assertRaises(ValueError):
+                testrunner.load_scenario_bundle(sc_dir, interrupted_duration_multiplier=1.0)
+            with self.assertRaises(ValueError):
+                testrunner.load_scenario_bundle(sc_dir, interrupted_duration_override="job-part-plain=6s")
+
+    def test_dynamic_node_events_and_deactivated_workload_completion(self) -> None:
+        """Verify post-t0 Node failure/recovery/deletion replay and deactivated Workload terminal accounting."""
+        sc61 = REPO_ROOT / "testscenarios" / "self-tests" / "st61-tas-single-node-failure-hotswap-same-rack"
+        b61 = testrunner.load_scenario_bundle(sc61)
+        self.assertEqual(len(b61.nodes), 8)
+        self.assertEqual(len(b61.scheduled_infra_events), 1)
+        ie = b61.scheduled_infra_events[0]
+        self.assertEqual(ie.object_kind, "Node")
+        self.assertEqual(ie.name, "st-node-00")
+        self.assertTrue(ie.is_not_ready)
+        self.assertAlmostEqual(ie.raw_offset_sec, 6.0)
+
+        # Verify _execute_scheduled_infra_event patches node + fails bound active pod + query_cluster_status counts deactivated workloads
+        calls: list[tuple[str, str]] = []
+
+        def fake_api(method: str, path: str, **_kw: object) -> tuple[int, bytes]:
+            calls.append((method, path))
+            if method == "GET" and path.startswith("/api/v1/pods?fieldSelector="):
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {"name": "pod-0", "namespace": "st-workloads"},
+                                    "spec": {"containers": [{"name": "worker", "image": "registry.k8s.io/pause:3.10"}]},
+                                    "status": {"phase": "Running"},
+                                }
+                            ]
+                        }
+                    ).encode("utf-8"),
+                )
+            if method == "GET" and path == "/apis/kueue.x-k8s.io/v1beta2/workloads":
+                return (
+                    200,
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {"name": "wl-deactivated", "namespace": "st-workloads"},
+                                    "spec": {"active": False},
+                                    "status": {
+                                        "conditions": [
+                                            {"type": "Admitted", "status": "False"},
+                                            {"type": "Evicted", "status": "True", "reason": "Deactivated"},
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    ).encode("utf-8"),
+                )
+            return 200, b'{"items":[]}'
+
+        from chamber_common import ChamberManager, query_cluster_status
+        from runner.replay import _execute_scheduled_infra_event
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-nf-test", apiserver_port=16498)
+        try:
+            with mock.patch.object(mgr, "api_request", side_effect=fake_api):
+                _execute_scheduled_infra_event(mgr, b61, ie, 6.0)
+                snap = query_cluster_status(mgr, workload_namespaces=["st-workloads"], include_kueue_workloads=True)
+            self.assertIn(("PATCH", "/api/v1/nodes/st-node-00"), calls)
+            self.assertIn(("PATCH", "/api/v1/nodes/st-node-00/status"), calls)
+            self.assertIn(("PATCH", "/api/v1/namespaces/st-workloads/pods/pod-0/status"), calls)
+            self.assertEqual(snap.workloads_finished, 1)
+            self.assertIn(("st-workloads", "wl-deactivated"), snap.finished_workload_keys)
         finally:
             mgr.close()
 

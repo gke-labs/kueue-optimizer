@@ -187,6 +187,29 @@ def _clean_metadata(meta: dict[str, Any], keep_annotations: bool = True) -> dict
     return cleaned
 
 
+def extract_node_ready_status(node_obj: dict[str, Any]) -> str | None:
+    """Return the Node's Ready condition status ('True', 'False', 'Unknown') if present, else None."""
+    conds = ((node_obj.get("status") or {}).get("conditions")) or []
+    for cond in conds:
+        if isinstance(cond, dict) and cond.get("type") == "Ready" and cond.get("status"):
+            return str(cond["status"])
+    return None
+
+
+def is_node_payload_unhealthy(node_obj: dict[str, Any]) -> tuple[bool, bool]:
+    """Return (is_not_ready, has_no_execute_taint) for a scraped or synthetic Node object."""
+    ready_st = extract_node_ready_status(node_obj)
+    ann = ((node_obj.get("metadata") or {}).get("annotations")) or {}
+    explicit_failed = str(ann.get("kueue-optimizer.gke.io/node-failed") or "").lower() == "true"
+    is_not_ready = explicit_failed or (ready_st in ("False", "Unknown"))
+    taints = ((node_obj.get("spec") or {}).get("taints")) or []
+    has_no_exec = any(
+        isinstance(t, dict) and str(t.get("effect") or "") == "NoExecute"
+        for t in taints
+    )
+    return is_not_ready, has_no_exec
+
+
 def _prepare_node_manifest(node_obj: dict[str, Any], node_idx: int) -> dict[str, Any]:
     """Prepare a scraped v1/Node manifest so KWOK initializes it with its exact scraped capacity."""
     node = json.loads(json.dumps(node_obj))
@@ -207,9 +230,15 @@ def _prepare_node_manifest(node_obj: dict[str, Any], node_idx: int) -> dict[str,
     alloc = dict(st.get("allocatable") or st.get("capacity") or {"cpu": "4", "memory": "16Gi", "pods": "110"})
     cap = dict(st.get("capacity") or alloc)
 
+    is_not_ready, _has_no_exec = is_node_payload_unhealthy(node)
+
     annotations = dict(meta.get("annotations") or {})
     annotations["kwok.x-k8s.io/node"] = "fake"
     annotations["node.alpha.kubernetes.io/ttl"] = "0"
+    if is_not_ready:
+        annotations["kueue-optimizer.gke.io/node-failed"] = "true"
+    else:
+        annotations.pop("kueue-optimizer.gke.io/node-failed", None)
     if "cpu" in alloc:
         annotations["kueue-optimizer.gke.io/node-cpu"] = str(alloc["cpu"])
     if "memory" in alloc:
@@ -329,6 +358,28 @@ def _extract_existing_pod_exec_seconds(obj: dict[str, Any]) -> float | None:
     return parse_positive_duration_annotation(tpl_ann, *dur_keys)
 
 
+def _extract_workflow_true_duration_and_multiplier(raw_obj: dict[str, Any] | None) -> tuple[float | None, float | None]:
+    """Extract optional true-execution-time-seconds and missing-duration-multiplier annotations from a workflow."""
+    if not isinstance(raw_obj, dict):
+        return None, None
+    ann = (raw_obj.get("metadata") or {}).get("annotations") or {}
+    true_dur = parse_positive_duration_annotation(
+        ann,
+        "kueue-optimizer.gke.io/true-execution-time-seconds",
+        "kueue-optimizer.gke.io/expected-execution-time-seconds",
+    )
+    mult: float | None = None
+    raw_mult = ann.get("kueue-optimizer.gke.io/missing-duration-multiplier")
+    if raw_mult is not None:
+        try:
+            mv = float(str(raw_mult).strip())
+            if mv > 1.0:
+                mult = mv
+        except (TypeError, ValueError):
+            pass
+    return true_dur, mult
+
+
 def _max_workflow_name_len(obj: dict[str, Any], kind: str) -> int:
     """Return the maximum allowed workflow name length so all generated child/workload names are < 63 chars."""
     spec = obj.get("spec") or {}
@@ -360,11 +411,13 @@ def _inject_pod_execution_time_and_sanitize_workflow(
     pause_image_override: str | None = None,
     override_namespace: str | None = None,
     extra_pod_annotations: dict[str, str] | None = None,
+    speedup: float = 1.0,
 ) -> tuple[dict[str, Any], int]:
     """Prepare a workflow object for submission and inject pod execution duration into all pod templates.
 
     Returns (prepared_manifest, total_pod_count).
     """
+    eff_speedup = max(1e-6, float(speedup))
     obj = json.loads(json.dumps(raw_obj))
     obj.pop("status", None)
     kind = str(obj.get("kind") or "")
@@ -383,6 +436,21 @@ def _inject_pod_execution_time_and_sanitize_workflow(
     ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = exec_str
     ann["kueue-optimizer.gke.io/real-duration-sec"] = f"{raw_duration_sec:.2f}"
     ann["kueue-optimizer.gke.io/compressed-duration-sec"] = f"{compressed_duration_sec:.3f}"
+
+    def _scale_startup_delay(src_ann: dict[str, Any]) -> str | None:
+        raw_delay = parse_positive_duration_annotation(src_ann, "kueue-optimizer.gke.io/pod-startup-delay-seconds")
+        if raw_delay is None or raw_delay <= 0:
+            return None
+        scaled = max(0.05, raw_delay / eff_speedup)
+        if abs(scaled - round(scaled)) < 1e-3 and round(scaled) >= 1:
+            return str(int(round(scaled)))
+        return f"{max(50, int(round(scaled * 1000)))}ms"
+
+    top_scaled_startup = _scale_startup_delay(ann)
+    if top_scaled_startup is not None:
+        ann["kueue-optimizer.gke.io/pod-startup-delay-seconds"] = top_scaled_startup
+    top_never_ready = str(ann.get("kueue-optimizer.gke.io/pod-never-ready") or "").lower() == "true"
+
     if extra_pod_annotations:
         ann.update({str(k): str(v) for k, v in extra_pod_annotations.items()})
     meta["annotations"] = ann
@@ -425,6 +493,11 @@ def _inject_pod_execution_time_and_sanitize_workflow(
         t_meta = tpl.setdefault("metadata", {})
         t_ann = dict(t_meta.get("annotations") or {})
         t_ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = exec_str
+        tpl_scaled_delay = _scale_startup_delay(t_ann) or top_scaled_startup
+        if tpl_scaled_delay is not None:
+            t_ann["kueue-optimizer.gke.io/pod-startup-delay-seconds"] = tpl_scaled_delay
+        if top_never_ready:
+            t_ann["kueue-optimizer.gke.io/pod-never-ready"] = "true"
         if extra_pod_annotations:
             t_ann.update({str(k): str(v) for k, v in extra_pod_annotations.items()})
         t_meta["annotations"] = t_ann

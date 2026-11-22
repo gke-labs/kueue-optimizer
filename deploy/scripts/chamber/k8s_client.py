@@ -156,9 +156,12 @@ class ChamberK8sClientMixin:
         path: str,
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
+        content_type: str | None = None,
     ) -> tuple[int, bytes]:
         """Perform a direct keep-alive HTTPS request against the KWOK kube-apiserver with auto-reconnect."""
         hdrs = {"Accept": "application/json", "Connection": "keep-alive"}
+        if content_type:
+            hdrs["Content-Type"] = content_type
         if headers:
             hdrs.update(headers)
         max_attempts = 6

@@ -69,6 +69,15 @@ flowchart TD
 | `--skip-initial-offset` / `--no-skip-initial-offset` | `True` | Jumps directly from `t0` to the timestamp of the first scheduled workflow. |
 | `--status-interval` | `3s` | Interval between live progress lines during replay. |
 | `--default-exec-seconds` | `10s` | Fallback raw pod duration when a workflow has no entry in `execution-time.json`. |
+| `--interrupted-duration-multiplier` | `1.5` (fallback) | Multiplier (`> 1.0`) applied to observed `PartialExecution` duration for workloads interrupted by preemption, node failure, `PodsReadyTimeout`, or scrape cutoff that lack a `FullExecution` entry. |
+| `--interrupted-duration-override` | `None` | Explicit true uninterrupted duration (`> observed partial duration`) for `PartialExecution`-only workloads: scalar (`45s`), `name=dur` pairs (`job-a=40s,job-b=60s`), or JSON map file (`@overrides.json`). |
+| `--wait-for-pods-ready` | `False` | Enables Kueue `waitForPodsReady` in `controller_manager_config.yaml` (auto-enabled when any `--wait-for-pods-ready-*` flag is set), automatically scaling `timeout`, `recoveryTimeout`, and `requeuingStrategy` backoffs by `1 / --speedup` and clamping to `<= 50%` of `--duration` (`--no-wait-for-pods-ready-cap-to-duration` disables clamping). |
+| `--wait-for-pods-ready-timeout` | `5m` (raw) | Raw trace `waitForPodsReady.timeout`, scaled by `1 / --speedup` (floored at `--wait-for-pods-ready-min-timeout`, default `2s`) and clamped to `--duration`. |
+| `--wait-for-pods-ready-recovery-timeout` | Unset | Raw trace `waitForPodsReady.recoveryTimeout` after pod/node failure (`0s` disables; scaled by `1 / --speedup` and clamped to `--duration`). |
+| `--wait-for-pods-ready-block-admission` | Unset | Configures `waitForPodsReady.blockAdmission` in Kueue controller config. |
+| `--wait-for-pods-ready-backoff-limit` | Unset | Configures `waitForPodsReady.requeuingStrategy.backoffLimitCount` before workload deactivation (`spec.active=false`). |
+| `--wait-for-pods-ready-backoff-base` / `--wait-for-pods-ready-backoff-max` | Unset | Raw trace `backoffBaseSeconds` / `backoffMaxSeconds` (scaled by `1 / --speedup`). |
+| `--kueue-feature-gates` | `""` | Comma-separated Kueue feature gate overrides rendered into `controller_manager_config.yaml` (e.g., `TASReplaceMultipleFailedNodes=true`). |
 | `--min-pod-duration` | `0.1s` | Floor on compressed pod duration `max(min_pod_duration, raw_duration / speedup)`. |
 | `--queueing-mode` | Scenario default | Overrides `ClusterQueue.spec.queueingStrategy` (`StrictFIFO` or `BestEffortFIFO`). |
 | `--fair-sharing` / `--no-fair-sharing` | `True` | Enables Preemption-Based Fair Sharing (`fairSharing.preemptionStrategies: [LessThanOrEqualToFinalShare, LessThanInitialShare]`) in `controller_manager_config.yaml` by default; pass `--no-fair-sharing` to evaluate Classical Preemption (incompatible with `--skip-chamber-deploy`, which inspects the live chamber `ConfigMap/kueue-manager-config`). |

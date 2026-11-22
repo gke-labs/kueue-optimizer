@@ -140,28 +140,43 @@ type ExecutionTimeEvent struct {
 	Payload       ExecutionTimePayload `json:"payload"`
 }
 
+// Interruption reason constants recorded on PartialExecution events in execution-time.json.
+const (
+	InterruptionReasonPreempted        = "Preempted"
+	InterruptionReasonNodeFailure      = "NodeFailure"
+	InterruptionReasonPodsReadyTimeout = "PodsReadyTimeout"
+	InterruptionReasonEvicted          = "Evicted"
+	InterruptionReasonFailed           = "Failed"
+	InterruptionReasonScrapeEnded      = "ScrapeEnded"
+)
+
 // ExecutionTimePayload holds the Kueue Workload admission, partial execution, or full execution details.
 type ExecutionTimePayload struct {
-	ExecutionType            string                          `json:"executionType,omitempty"`
-	WorkloadName             string                          `json:"workloadName"`
-	Namespace                string                          `json:"namespace"`
-	OwnerKind                string                          `json:"ownerKind,omitempty"`
-	OwnerName                string                          `json:"ownerName,omitempty"`
-	OwnerAPIVersion          string                          `json:"ownerAPIVersion,omitempty"`
-	LocalQueueName           string                          `json:"localQueueName,omitempty"`
-	ClusterQueueName         string                          `json:"clusterQueueName,omitempty"`
-	PriorityClassName        string                          `json:"priorityClassName,omitempty"`
-	Priority                 *int32                          `json:"priority,omitempty"`
-	PodSetAssignments        []kueuev1beta2.PodSetAssignment `json:"podSetAssignments,omitempty"`
-	CreationTime             metav1.Time                     `json:"creationTime"`
-	AdmittedTime             metav1.Time                     `json:"admittedTime"`
-	EndTime                  *metav1.Time                    `json:"endTime,omitempty"`
-	ExecutionDurationSeconds *float64                        `json:"executionDurationSeconds,omitempty"`
-	ExecutionDuration        string                          `json:"executionDuration,omitempty"`
-	Preempted                bool                            `json:"preempted"`
-	PreemptionCount          int                             `json:"preemptionCount,omitempty"`
-	Reason                   string                          `json:"reason,omitempty"`
-	Message                  string                          `json:"message,omitempty"`
+	ExecutionType             string                          `json:"executionType,omitempty"`
+	WorkloadName              string                          `json:"workloadName"`
+	Namespace                 string                          `json:"namespace"`
+	OwnerKind                 string                          `json:"ownerKind,omitempty"`
+	OwnerName                 string                          `json:"ownerName,omitempty"`
+	OwnerAPIVersion           string                          `json:"ownerAPIVersion,omitempty"`
+	LocalQueueName            string                          `json:"localQueueName,omitempty"`
+	ClusterQueueName          string                          `json:"clusterQueueName,omitempty"`
+	PriorityClassName         string                          `json:"priorityClassName,omitempty"`
+	Priority                  *int32                          `json:"priority,omitempty"`
+	PodSetAssignments         []kueuev1beta2.PodSetAssignment `json:"podSetAssignments,omitempty"`
+	UnhealthyNodes            []string                        `json:"unhealthyNodes,omitempty"`
+	CreationTime              metav1.Time                     `json:"creationTime"`
+	AdmittedTime              metav1.Time                     `json:"admittedTime"`
+	EndTime                   *metav1.Time                    `json:"endTime,omitempty"`
+	ExecutionDurationSeconds  *float64                        `json:"executionDurationSeconds,omitempty"`
+	ExecutionDuration         string                          `json:"executionDuration,omitempty"`
+	Preempted                 bool                            `json:"preempted"`
+	PreemptionCount           int                             `json:"preemptionCount,omitempty"`
+	InterruptionReason        string                          `json:"interruptionReason,omitempty"`
+	InterruptionCount         int                             `json:"interruptionCount,omitempty"`
+	TrueDurationSeconds       *float64                        `json:"trueDurationSeconds,omitempty"`
+	MissingDurationMultiplier *float64                        `json:"missingDurationMultiplier,omitempty"`
+	Reason                    string                          `json:"reason,omitempty"`
+	Message                   string                          `json:"message,omitempty"`
 }
 
 // JSONEventLog writes events in JSON Lines (NDJSON) format on disk — one compact,

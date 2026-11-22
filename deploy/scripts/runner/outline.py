@@ -19,8 +19,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from chamber.manifests import WaitForPodsReadyConfig
 from chamber.parsers import calc_summary_stats, format_duration_hms, parse_k8s_quantity
-from chamber.scenario import extract_workflow_pods_and_requests
+from chamber.scenario import DEFAULT_INTERRUPTED_DURATION_MULTIPLIER, extract_workflow_pods_and_requests
 from runner.loader import InitialPodSpec, ScenarioBundle, ScheduledWorkflowItem
 
 
@@ -234,13 +235,18 @@ def _print_timeline_and_index(
     speedup: float,
     enable_fair_sharing: bool | None,
     reused_chamber: bool,
+    wait_for_pods_ready: WaitForPodsReadyConfig | None = None,
 ) -> None:
     idx = bundle.exec_index
     durations = [
-        info.resolved_duration_sec()
+        info.resolved_duration_sec(
+            interrupted_duration_multiplier=bundle.interrupted_duration_multiplier,
+            interrupted_duration_override=bundle.interrupted_duration_override,
+        )
         for info in idx.by_workload_name.values()
         if (info.full_duration_sec is not None or info.partial_durations_sec)
     ]
+    interrupted_only_infos = [info for info in idx.by_workload_name.values() if info.is_interrupted_only]
     dur_stats = calc_summary_stats(durations)
     min_d = dur_stats["min"]
     max_d = dur_stats["max"]
@@ -290,6 +296,8 @@ def _print_timeline_and_index(
         )
         fs_mode_desc = f"{base_fs_desc} [detected from live chamber]" if reused_chamber else base_fs_desc
     print(f"  Kueue FairSharing Config  : {fs_mode_desc}")
+    if wait_for_pods_ready and wait_for_pods_ready.enabled:
+        print(f"  WaitForPodsReady Config   : {wait_for_pods_ready.summary_str()}")
     print("")
     print("  [1] TEST CASE LENGTH & TIMELINE")
     print(f"      Scenario Start (t0)   : {bundle.t0_iso}")
@@ -324,6 +332,29 @@ def _print_timeline_and_index(
         f"p90={p90_d:.1f}s, max={max_d:.1f}s "
         f"(at {speedup:g}x: min={min_d / speedup:.2f}s .. max={max_d / speedup:.2f}s)"
     )
+    if interrupted_only_infos:
+        reasons_tally: dict[str, int] = {}
+        for inf in interrupted_only_infos:
+            for r in inf.interruption_reasons or ["Interrupted"]:
+                reasons_tally[r] = reasons_tally.get(r, 0) + 1
+        reasons_desc = ", ".join(f"{k}={v}" for k, v in sorted(reasons_tally.items()))
+        if bundle.interrupted_duration_override is not None:
+            pol_desc = "explicit true-length override (--interrupted-duration-override)"
+        elif bundle.interrupted_duration_multiplier is not None:
+            pol_desc = f"CLI multiplier {bundle.interrupted_duration_multiplier:g}x (--interrupted-duration-multiplier)"
+        else:
+            pol_desc = (
+                f"schema trueDurationSeconds / missingDurationMultiplier "
+                f"(default fallback {DEFAULT_INTERRUPTED_DURATION_MULTIPLIER:g}x)"
+            )
+        print(
+            f"      Interrupted Workloads : {len(interrupted_only_infos)} PartialExecution-only "
+            f"[{reasons_desc}] -> replay policy: {pol_desc}"
+        )
+    if bundle.scheduled_infra_events:
+        print(
+            f"      Dynamic Infra Events  : {len(bundle.scheduled_infra_events)} post-t0 Node lifecycle event(s) scheduled"
+        )
 
 
 def _print_nodes_and_initial_usage(
@@ -580,6 +611,7 @@ def print_scenario_outline(
     enable_fair_sharing: bool | None = True,
     *,
     reused_chamber: bool = False,
+    wait_for_pods_ready: WaitForPodsReadyConfig | None = None,
 ) -> None:
     """Print a detailed description of the test case: length, execution-time index, nodes & initial usage, queues, and workflows."""
     cq_docs = [d for d in bundle.prereq_and_queue_docs if d.get("kind") == "ClusterQueue"]
@@ -593,7 +625,13 @@ def print_scenario_outline(
     init_usage = _summarize_initial_pod_usage(all_init_pods)
     queue_load = _summarize_queue_load(lq_docs, bundle.scheduled_workflows)
 
-    _print_timeline_and_index(bundle, speedup, enable_fair_sharing, reused_chamber)
+    _print_timeline_and_index(
+        bundle,
+        speedup,
+        enable_fair_sharing,
+        reused_chamber,
+        wait_for_pods_ready=wait_for_pods_ready,
+    )
     _print_nodes_and_initial_usage(bundle, node_summary, init_usage)
     _print_queues_section(cq_docs, lq_docs, rf_docs, topo_docs, cohort_docs, queue_load)
     _print_workflows_section(bundle, queue_load)
