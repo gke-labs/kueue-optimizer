@@ -621,7 +621,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         cli_feature_gates = parse_feature_gates_arg(args.kueue_feature_gates)
         merged_feature_gates: dict[str, bool] = {}
-        if sc_cfg is not None and sc_cfg.feature_gates:
+        if sc_cfg is not None and sc_cfg.raw_feature_gates:
+            merged_feature_gates.update(sc_cfg.raw_feature_gates)
+        elif sc_cfg is not None and sc_cfg.feature_gates:
             merged_feature_gates.update(sc_cfg.feature_gates)
         merged_feature_gates.update(cli_feature_gates)
         wfpr_cfg, merged_feature_gates = reconcile_wait_for_pods_ready_feature_gates(

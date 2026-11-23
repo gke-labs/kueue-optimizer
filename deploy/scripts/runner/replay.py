@@ -546,6 +546,100 @@ def _execute_scheduled_infra_event(
     return False, ""
 
 
+def _stamp_initial_workloads_for_bootstrap(
+    initial_workloads: list[InitialWorkloadPodGroup],
+    *,
+    now_dt: datetime | None = None,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Stamp back-dated admission seniority and `PodsReady=True` (`reason=Started`) onto t0 Workloads.
+
+    Including `PodsReady=True` prevents Kueue's `waitForPodsReady` controller from immediately evicting
+    pre-admitted t0 Workloads whose back-dated `Admitted` timestamp is older than `waitForPodsReady.timeout`.
+    """
+    ref_now = now_dt if now_dt is not None else datetime.now(timezone.utc)
+    stamped_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for idx_w, w in enumerate(initial_workloads):
+        age_offset = max(0.0, float(getattr(w, "original_age_sec", 0.0) or 0.0))
+        if age_offset == 0.0 and len(initial_workloads) > 1:
+            age_offset = float(len(initial_workloads) - idx_w)
+        wl_ts = datetime.fromtimestamp(ref_now.timestamp() - age_offset, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        st_copy = json.loads(json.dumps(w.workload_status))
+        conds = st_copy.setdefault("conditions", [])
+        has_pods_ready = False
+        for cond in conds:
+            if isinstance(cond, dict):
+                cond["lastTransitionTime"] = wl_ts
+                if cond.get("type") == "PodsReady":
+                    has_pods_ready = True
+                    cond["status"] = "True"
+                    cond.setdefault("reason", "Started")
+        if not has_pods_ready:
+            conds.append(
+                {
+                    "type": "PodsReady",
+                    "status": "True",
+                    "reason": "Started",
+                    "message": "All pods reached readiness and the workload is running",
+                    "lastTransitionTime": wl_ts,
+                    "observedGeneration": 1,
+                }
+            )
+        stamped_pairs.append((w.workload_manifest, st_copy))
+    return stamped_pairs
+
+
+def _pod_belongs_to_workflow(
+    pod_doc: dict[str, Any],
+    del_ev: ScheduledWorkflowDeletion,
+    *,
+    owned_job_names: set[str] | None = None,
+    owned_rs_names: set[str] | None = None,
+) -> bool:
+    """Return True if `pod_doc` belongs strictly to `del_ev` via exact name, owner labels, or ownerReferences."""
+    pm = pod_doc.get("metadata") or {}
+    pn = str(pm.get("name") or "")
+    if not pn:
+        return False
+    target = del_ev.applied_name
+    if del_ev.manifest_kind == "Pod":
+        return pn == target
+
+    job_set = owned_job_names or set()
+    rs_set = owned_rs_names or set()
+    for ref in pm.get("ownerReferences") or []:
+        if not isinstance(ref, dict):
+            continue
+        r_kind = str(ref.get("kind") or "")
+        r_name = str(ref.get("name") or "")
+        if r_name == target and (not del_ev.manifest_kind or r_kind in (del_ev.manifest_kind, del_ev.object_kind)):
+            return True
+        if r_kind == "Job" and r_name in job_set:
+            return True
+        if r_kind == "ReplicaSet" and r_name in rs_set:
+            return True
+
+    plbls = pm.get("labels") or {}
+    if del_ev.manifest_kind == "Job":
+        if plbls.get("batch.kubernetes.io/job-name") == target or plbls.get("job-name") == target:
+            return True
+    elif del_ev.manifest_kind == "JobSet":
+        if plbls.get("jobset.sigs.k8s.io/jobset-name") == target:
+            return True
+        if plbls.get("batch.kubernetes.io/job-name") in job_set or plbls.get("job-name") in job_set:
+            return True
+
+    if del_ev.object_kind == "PodGroup" and plbls.get("kueue.x-k8s.io/pod-group-name") == target:
+        return True
+    if del_ev.object_kind == "LeaderWorkerSet" and plbls.get("leaderworkerset.sigs.k8s.io/name") == target:
+        return True
+    if del_ev.object_kind in ("RayCluster", "RayJob") and plbls.get("ray.io/cluster") == target:
+        return True
+
+    return False
+
+
 def apply_scenario_queues_and_wait(
     mgr: ChamberManager,
     prereq_and_queue_docs: list[dict[str, Any]],
@@ -579,20 +673,7 @@ def apply_scenario_queues_and_wait(
             f"({wl_pod_total} pod(s)) before queue activation...",
             flush=True,
         )
-        now_dt = datetime.now(timezone.utc)
-        stamped_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        for idx_w, w in enumerate(initial_workloads):
-            age_offset = max(0.0, float(getattr(w, "original_age_sec", 0.0) or 0.0))
-            if age_offset == 0.0 and len(initial_workloads) > 1:
-                age_offset = float(len(initial_workloads) - idx_w)
-            wl_ts = datetime.fromtimestamp(now_dt.timestamp() - age_offset, tz=timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
-            st_copy = json.loads(json.dumps(w.workload_status))
-            for cond in st_copy.get("conditions") or []:
-                if isinstance(cond, dict):
-                    cond["lastTransitionTime"] = wl_ts
-            stamped_pairs.append((w.workload_manifest, st_copy))
+        stamped_pairs = _stamp_initial_workloads_for_bootstrap(initial_workloads)
         mgr.apply_pre_admitted_workloads_parallel(stamped_pairs)
         for iwl in initial_workloads[:8]:
             tas_tag = " [TAS]" if iwl.is_tas else ""
@@ -715,10 +796,12 @@ def run_scenario_replay(
     if not initial_state_already_bootstrapped:
         if bundle.initial_workloads:
             mgr.apply_pre_admitted_workloads_parallel(
-                [(w.workload_manifest, w.workload_status) for w in bundle.initial_workloads]
+                _stamp_initial_workloads_for_bootstrap(bundle.initial_workloads)
             )
-            mgr.apply_manifests_parallel(
-                [p.manifest for w in bundle.initial_workloads for p in w.pods], max_workers=16
+            init_wl_pods = [p for w in bundle.initial_workloads for p in w.pods]
+            mgr.apply_manifests_parallel([p.manifest for p in init_wl_pods], max_workers=16)
+            mgr.wait_for_pods_running(
+                [(p.namespace, str((p.manifest.get("metadata") or {}).get("name") or p.name)) for p in init_wl_pods]
             )
         if bundle.initial_pods:
             print(
@@ -727,6 +810,9 @@ def run_scenario_replay(
                 flush=True,
             )
             mgr.apply_manifests_parallel([p.manifest for p in bundle.initial_pods], max_workers=16)
+            mgr.wait_for_pods_running(
+                [(p.namespace, str((p.manifest.get("metadata") or {}).get("name") or p.name)) for p in bundle.initial_pods]
+            )
 
     event_heap: list[ScheduledWorkflowItem] = list(bundle.scheduled_workflows)
     heapq.heapify(event_heap)
@@ -861,27 +947,81 @@ def run_scenario_replay(
             del_ev.applied_name,
         )
         del_opts = json.dumps({"apiVersion": "meta/v1", "kind": "DeleteOptions", "propagationPolicy": "Foreground"}).encode("utf-8")
+
+        owned_job_names: set[str] = set()
+        owned_rs_names: set[str] = set()
+        if del_ev.manifest_kind == "JobSet":
+            st_j, raw_j = mgr.api_request("GET", f"/apis/batch/v1/namespaces/{del_ev.namespace}/jobs")
+            if st_j == 200 and raw_j:
+                try:
+                    for j_it in json.loads(raw_j.decode("utf-8")).get("items") or []:
+                        jm = j_it.get("metadata") or {}
+                        jn = str(jm.get("name") or "")
+                        if not jn:
+                            continue
+                        jlbls = jm.get("labels") or {}
+                        j_owners = jm.get("ownerReferences") or []
+                        if jlbls.get("jobset.sigs.k8s.io/jobset-name") == del_ev.applied_name or any(
+                            isinstance(ref, dict)
+                            and ref.get("kind") == "JobSet"
+                            and ref.get("name") == del_ev.applied_name
+                            for ref in j_owners
+                        ):
+                            owned_job_names.add(jn)
+                except Exception:
+                    pass
+        elif del_ev.manifest_kind == "Deployment":
+            st_rs, raw_rs = mgr.api_request("GET", f"/apis/apps/v1/namespaces/{del_ev.namespace}/replicasets")
+            if st_rs == 200 and raw_rs:
+                try:
+                    for rs_it in json.loads(raw_rs.decode("utf-8")).get("items") or []:
+                        rsm = rs_it.get("metadata") or {}
+                        rsn = str(rsm.get("name") or "")
+                        if not rsn:
+                            continue
+                        if any(
+                            isinstance(ref, dict)
+                            and ref.get("kind") == "Deployment"
+                            and ref.get("name") == del_ev.applied_name
+                            for ref in (rsm.get("ownerReferences") or [])
+                        ):
+                            owned_rs_names.add(rsn)
+                except Exception:
+                    pass
+
         mgr.api_request(
             "DELETE",
             del_path,
             body=del_opts,
             headers={"Content-Type": "application/json"},
         )
-        # Also remove pods & child Jobs in namespace belonging to this workflow so KWOK pods release nodes immediately.
+        for jn in sorted(owned_job_names):
+            mgr.api_request(
+                "DELETE",
+                f"/apis/batch/v1/namespaces/{del_ev.namespace}/jobs/{jn}",
+                body=del_opts,
+                headers={"Content-Type": "application/json"},
+            )
+        for rsn in sorted(owned_rs_names):
+            mgr.api_request(
+                "DELETE",
+                f"/apis/apps/v1/namespaces/{del_ev.namespace}/replicasets/{rsn}",
+                body=del_opts,
+                headers={"Content-Type": "application/json"},
+            )
+
+        # Remove pods strictly owned by this workflow so KWOK pods release nodes immediately without touching sibling jobs.
         st_p, raw_p = mgr.api_request("GET", f"/api/v1/namespaces/{del_ev.namespace}/pods")
         if st_p == 200 and raw_p:
-            pfx = f"{del_ev.applied_name}-"
             for p_it in json.loads(raw_p.decode("utf-8")).get("items") or []:
                 pm = p_it.get("metadata") or {}
                 pn = str(pm.get("name") or "")
-                plbls = pm.get("labels") or {}
-                owned = (
-                    pn == del_ev.applied_name
-                    or pn.startswith(pfx)
-                    or plbls.get("job-name") == del_ev.applied_name
-                    or plbls.get("jobset.sigs.k8s.io/jobset-name") == del_ev.applied_name
-                )
-                if owned and pn:
+                if pn and _pod_belongs_to_workflow(
+                    p_it,
+                    del_ev,
+                    owned_job_names=owned_job_names,
+                    owned_rs_names=owned_rs_names,
+                ):
                     mgr.api_request(
                         "DELETE",
                         f"/api/v1/namespaces/{del_ev.namespace}/pods/{pn}?gracePeriodSeconds=0",
@@ -934,7 +1074,7 @@ def run_scenario_replay(
             and w.incarnation_index == del_ev.incarnation_index
             for w in event_heap
         )
-        if unsubmitted_match and del_ev.delete_reason == "cancelled":
+        if unsubmitted_match:
             cancelled_unsubmitted_keys.add(
                 (del_ev.namespace, del_ev.object_kind, del_ev.name, del_ev.incarnation_index)
             )
@@ -942,14 +1082,17 @@ def run_scenario_replay(
             print(
                 f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "
                 f"Cancelled pending unsubmitted {del_ev.object_kind} '{del_ev.namespace}/{del_ev.name}' "
-                f"(incarnation={del_ev.incarnation_index})",
+                f"(incarnation={del_ev.incarnation_index}, reason={del_ev.delete_reason})",
                 flush=True,
             )
             return
 
-        # Check whether this submitted incarnation already finished cleanly in the chamber prior to deletion
-        # so faster chamber execution does not double-count both its Finished Workload and cancelled_workflow_count.
-        already_succeeded_in_chamber = False
+        # Check whether this submitted incarnation already reached Finished=True in the chamber prior to deletion:
+        # - If already Finished=True, record its Workload key in ever_finished_sched_wl_keys and do NOT also
+        #   increment cancelled_workflow_count (avoiding double-counting).
+        # - If NOT Finished=True (for BOTH `cancelled` and `before_recreate` deletions that cut short a still-running
+        #   or still-pending incarnation), increment cancelled_workflow_count so `done` never stalls below total_planned.
+        already_finished_in_chamber = False
         st_wls, raw_wls = mgr.api_request(
             "GET",
             f"/apis/kueue.x-k8s.io/v1beta2/namespaces/{del_ev.namespace}/workloads",
@@ -958,21 +1101,23 @@ def run_scenario_replay(
             try:
                 for wl_it in json.loads(raw_wls.decode("utf-8")).get("items") or []:
                     w_m = wl_it.get("metadata") or {}
+                    wl_n = str(w_m.get("name") or "")
                     owners = [
                         str(o.get("name") or "")
                         for o in (w_m.get("ownerReferences") or [])
                         if isinstance(o, dict)
                     ]
-                    if del_ev.applied_name in owners or str(w_m.get("name") or "") == del_ev.applied_name:
+                    if del_ev.applied_name in owners or wl_n == del_ev.applied_name:
                         conds = ((wl_it.get("status") or {}).get("conditions")) or []
                         if any(
                             isinstance(c, dict)
                             and c.get("type") == "Finished"
                             and c.get("status") == "True"
-                            and c.get("reason") == "Succeeded"
                             for c in conds
                         ):
-                            already_succeeded_in_chamber = True
+                            already_finished_in_chamber = True
+                            if wl_n and (del_ev.namespace, wl_n) not in initial_wl_keys:
+                                ever_finished_sched_wl_keys.add((del_ev.namespace, wl_n))
                             break
             except Exception:
                 pass
@@ -984,7 +1129,7 @@ def run_scenario_replay(
             for w in event_heap
         )
         _delete_workflow_and_children(del_ev, wait_gone=(del_ev.delete_reason == "before_recreate" or has_future_same_name))
-        if del_ev.delete_reason == "cancelled" and not already_succeeded_in_chamber:
+        if not already_finished_in_chamber:
             cancelled_workflow_count += 1
         print(
             f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "

@@ -4487,3 +4487,188 @@ func TestScrapePriorityClassesDeploymentFeatureGatesAndInfraWatch(t *testing.T) 
 		t.Errorf("expected ClusterQueue Update event, got %+v", evs[3])
 	}
 }
+
+func TestExtractPodEndTimeIgnoresInitContainersAndDeletionGraceTimestamp(t *testing.T) {
+	t0 := time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC)
+	initFinished := metav1.NewTime(t0.Add(-7190 * time.Second))
+	scrapeDeleteNow := t0.Add(600 * time.Second)
+	futureGraceTs := metav1.NewTime(scrapeDeleteNow.Add(30 * time.Second))
+
+	// Case 1 & 2 repro: long-running pod with terminated init container from startup (2h ago) and
+	// DeletionTimestamp (+30s grace in the future) deleted while its main container is still Running.
+	runningWithInitPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "long-running-pod",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0.Add(-7200 * time.Second)),
+			DeletionTimestamp: &futureGraceTs,
+		},
+		Spec: corev1.PodSpec{NodeName: "node-0"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "init-setup",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode:   0,
+						FinishedAt: initFinished,
+					},
+				},
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "main-trainer",
+				State: corev1.ContainerState{
+					Running: &corev1.ContainerStateRunning{
+						StartedAt: metav1.NewTime(t0.Add(-7189 * time.Second)),
+					},
+				},
+			}},
+		},
+	}
+	if got := ExtractPodEndTime(runningWithInitPod, scrapeDeleteNow); !got.Equal(scrapeDeleteNow) {
+		t.Fatalf("expected fallback event time %s when main container is still running, got %s", scrapeDeleteNow, got)
+	}
+
+	// Multi-container pod where 1 main container finished 1h ago and 2nd main container is still Running.
+	partialTermPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "multi-container-pod",
+			Namespace:         "ai-lab",
+			DeletionTimestamp: &futureGraceTs,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "helper",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							FinishedAt: metav1.NewTime(t0.Add(-3600 * time.Second)),
+						},
+					},
+				},
+				{
+					Name: "worker",
+					State: corev1.ContainerState{
+						Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(t0)},
+					},
+				},
+			},
+		},
+	}
+	if got := ExtractPodEndTime(partialTermPod, scrapeDeleteNow); !got.Equal(scrapeDeleteNow) {
+		t.Fatalf("expected fallback event time %s when any main container has not terminated, got %s", scrapeDeleteNow, got)
+	}
+
+	// Succeeded pod where all main containers have terminated returns the latest main container FinishedAt.
+	mainFinished := t0.Add(595 * time.Second)
+	succeededPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "done-pod", Namespace: "ai-lab"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "init-setup",
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{FinishedAt: initFinished},
+				},
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "c1",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{FinishedAt: metav1.NewTime(t0.Add(590 * time.Second))},
+					},
+				},
+				{
+					Name: "c2",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{FinishedAt: metav1.NewTime(mainFinished)},
+					},
+				},
+			},
+		},
+	}
+	if got := ExtractPodEndTime(succeededPod, scrapeDeleteNow); !got.Equal(mainFinished) {
+		t.Fatalf("expected latest main container FinishedAt %s, got %s", mainFinished, got)
+	}
+}
+
+func TestResolveWorkloadOwnerPreservesLWSAndStatefulSetOverGroupAnnotation(t *testing.T) {
+	hasher := NoopHasher{}
+
+	// 1. LeaderWorkerSet group workload (carries is-group-workload="true" AND non-controller Pod + LWS OwnerReferences)
+	lwsWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "lws-serving-0-abcde",
+			Namespace: "ai-lab",
+			Annotations: map[string]string{
+				KueueIsGroupWorkloadAnnotation: "true",
+				KueueJobOwnerGVKAnnotation:     "leaderworkerset.x-k8s.io/v1, Kind=LeaderWorkerSet",
+				KueueJobOwnerNameAnnotation:    "lws-serving",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "v1", Kind: "Pod", Name: "lws-serving-0-0"},
+				{APIVersion: "leaderworkerset.x-k8s.io/v1", Kind: "LeaderWorkerSet", Name: "lws-serving"},
+			},
+		},
+	}
+	kind, name, apiVer := resolveWorkloadOwner(lwsWl, hasher)
+	if kind != "LeaderWorkerSet" || name != "lws-serving" || apiVer != "leaderworkerset.x-k8s.io/v1" {
+		t.Fatalf("expected LeaderWorkerSet/lws-serving/leaderworkerset.x-k8s.io/v1, got %q/%q/%q", kind, name, apiVer)
+	}
+
+	// 2. StatefulSet group workload (carries is-group-workload="true" AND non-controller Pod + StatefulSet OwnerReferences)
+	stsWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "statefulset-db-12345",
+			Namespace: "ai-lab",
+			Annotations: map[string]string{
+				KueueIsGroupWorkloadAnnotation: "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "v1", Kind: "Pod", Name: "db-0"},
+				{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "db"},
+			},
+		},
+	}
+	kind, name, apiVer = resolveWorkloadOwner(stsWl, hasher)
+	if kind != "StatefulSet" || name != "db" || apiVer != "apps/v1" {
+		t.Fatalf("expected StatefulSet/db/apps/v1, got %q/%q/%q", kind, name, apiVer)
+	}
+
+	// 3. StatefulSet group workload after GC cleared OwnerReferences (retains job-owner annotations)
+	stsGCWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "statefulset-db-12345",
+			Namespace: "ai-lab",
+			Annotations: map[string]string{
+				KueueIsGroupWorkloadAnnotation: "true",
+				KueueJobOwnerGVKAnnotation:     "apps/v1, Kind=StatefulSet",
+				KueueJobOwnerNameAnnotation:    "db",
+			},
+		},
+	}
+	kind, name, apiVer = resolveWorkloadOwner(stsGCWl, hasher)
+	if kind != "StatefulSet" || name != "db" || apiVer != "apps/v1" {
+		t.Fatalf("expected StatefulSet/db/apps/v1 from job-owner annotations, got %q/%q/%q", kind, name, apiVer)
+	}
+
+	// 4. Plain PodGroup Workload (is-group-workload="true" with only member Pod OwnerReferences) stays PodGroup!
+	pgWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-pod-group",
+			Namespace: "ai-lab",
+			Annotations: map[string]string{
+				KueueIsGroupWorkloadAnnotation: "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "v1", Kind: "Pod", Name: "pg-worker-0"},
+				{APIVersion: "v1", Kind: "Pod", Name: "pg-worker-1"},
+			},
+		},
+	}
+	kind, name, apiVer = resolveWorkloadOwner(pgWl, hasher)
+	if kind != "PodGroup" || name != "my-pod-group" || apiVer != "v1" {
+		t.Fatalf("expected PodGroup/my-pod-group/v1 for plain pod group, got %q/%q/%q", kind, name, apiVer)
+	}
+}

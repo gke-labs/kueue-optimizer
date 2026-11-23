@@ -3446,6 +3446,536 @@ class FidelityReviewRegressionTests(unittest.TestCase):
             finally:
                 mgr.close()
 
+    def test_kueue_feature_gates_sanitizes_graduated_locked_deprecated_and_dependencies(self) -> None:
+        from chamber.manifests import (
+            discover_kueue_feature_gates_from_source,
+            parse_kueue_configuration_payload,
+            patch_kueue_feature_gates_config,
+            sanitize_kueue_feature_gates,
+        )
+
+        cleaned, warnings = sanitize_kueue_feature_gates(
+            {
+                "LendingLimit": True,  # graduated/removed in older Kueue
+                "ConfigurableResourceTransformations": True,  # graduated/removed
+                "TLSOptions": False,  # GA LockToDefault=True
+                "MetricForWorkloadCreationLatency": True,  # GA LockToDefault=True
+                "TASReplaceNodeDueToNotReadyOverFixedTime": False,  # Deprecated sunset gate
+                "DeferRayServiceFinalizationForRedisCleanup": True,  # Deprecated sunset gate
+                "TopologyAwareScheduling": False,
+                "TASProfileMixed": True,  # conflicts with TopologyAwareScheduling=False
+                "SchedulerLibraryDeepIntegration": True,  # depends on SchedulerLibraryIntegration -> TopologyAwareScheduling=False!
+                "DisableWaitForPodsReady": True,
+            }
+        )
+        self.assertEqual(
+            cleaned,
+            {
+                "DisableWaitForPodsReady": True,
+                "TopologyAwareScheduling": False,
+            },
+        )
+        self.assertTrue(any("LendingLimit" in w for w in warnings))
+        self.assertTrue(any("TLSOptions" in w for w in warnings))
+        self.assertTrue(any("DeferRayServiceFinalizationForRedisCleanup" in w for w in warnings))
+        self.assertTrue(any("TASProfileMixed" in w for w in warnings))
+
+        # Auto-enables default-off parent gate when parent is not explicitly disabled:
+        cleaned_deps, dep_warnings = sanitize_kueue_feature_gates({"SchedulerLibraryDeepIntegration": True})
+        self.assertEqual(
+            cleaned_deps,
+            {
+                "SchedulerLibraryDeepIntegration": True,
+                "SchedulerLibraryIntegration": True,
+            },
+        )
+        self.assertEqual(dep_warnings, [])
+
+        # parse_kueue_configuration_payload and patch_kueue_feature_gates_config strip unsupported gates cleanly:
+        parsed_cfg = parse_kueue_configuration_payload(
+            {
+                "apiVersion": "config.kueue.x-k8s.io/v1beta2",
+                "kind": "Configuration",
+                "featureGates": {
+                    "LendingLimit": True,
+                    "TLSOptions": True,
+                    "WaitForPodsReadyUnscheduledTimeout": True,
+                },
+            }
+        )
+        self.assertEqual(parsed_cfg.feature_gates, {"WaitForPodsReadyUnscheduledTimeout": True})
+        self.assertGreaterEqual(len(parsed_cfg.feature_gate_warnings), 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dst = Path(tmp)
+            cfg_dir = base_dst / "config"
+            cfg_dir.mkdir(parents=True)
+            cfg_file = cfg_dir / "controller_manager_config.yaml"
+            cfg_file.write_text(
+                "apiVersion: config.kueue.x-k8s.io/v1beta2\nkind: Configuration\ninternalCertManagement:\n  enable: false\n",
+                encoding="utf-8",
+            )
+            written_fg = patch_kueue_feature_gates_config(
+                base_dst,
+                {"OldRemovedGate": True, "TLSOptions": True, "DisableWaitForPodsReady": True},
+                emit_warnings=False,
+            )
+            self.assertEqual(written_fg, {"DisableWaitForPodsReady": True})
+            rendered = cfg_file.read_text(encoding="utf-8")
+            self.assertIn("DisableWaitForPodsReady: true", rendered)
+            self.assertNotIn("OldRemovedGate", rendered)
+            self.assertNotIn("TLSOptions", rendered)
+
+            # Custom Kueue source checkout discovery recognizes newly defined experimental gates:
+            fake_kueue = base_dst / "custom-kueue"
+            (fake_kueue / "pkg" / "features").mkdir(parents=True)
+            (fake_kueue / "pkg" / "features" / "kube_features.go").write_text(
+                'package features\nconst (\n\tMyBrandNewGate featuregate.Feature = "MyBrandNewGate"\n)\n'
+                'var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{\n'
+                '\tMyBrandNewGate: {\n\t\t{Version: version.MustParse("0.22"), Default: false, PreRelease: featuregate.Alpha},\n\t},\n}\n',
+                encoding="utf-8",
+            )
+            disc = discover_kueue_feature_gates_from_source(fake_kueue)
+            self.assertIsNotNone(disc)
+            cleaned_custom, _ = sanitize_kueue_feature_gates(
+                {"MyBrandNewGate": True, "OldRemovedGate": True},
+                kueue_build_dir=fake_kueue,
+            )
+            self.assertEqual(cleaned_custom, {"MyBrandNewGate": True})
+
+    def test_t0_bootstrap_stamps_pods_ready_true_when_admitted_is_backdated(self) -> None:
+        from runner.loader import load_scenario_bundle
+        from runner.replay import _stamp_initial_workloads_for_bootstrap
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sc_dir = Path(tmp)
+            infra_events = [
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "node-0", "labels": {"kubernetes.io/hostname": "node-0"}},
+                        "status": {"capacity": {"cpu": "8", "memory": "16Gi"}, "allocatable": {"cpu": "8", "memory": "16Gi"}},
+                    },
+                },
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "eventType": "New",
+                    "payload": {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ai-lab"}},
+                },
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "eventType": "New",
+                    "payload": {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ResourceFlavor", "metadata": {"name": "rf-main"}, "spec": {}},
+                },
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "cq-main"},
+                        "spec": {
+                            "namespaceSelector": {},
+                            "resourceGroups": [{"coveredResources": ["cpu", "memory"], "flavors": [{"name": "rf-main", "resources": [{"name": "cpu", "nominalQuota": "8"}, {"name": "memory", "nominalQuota": "16Gi"}]}]}],
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "eventType": "New",
+                    "payload": {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "LocalQueue", "metadata": {"name": "lq-main", "namespace": "ai-lab"}, "spec": {"clusterQueue": "cq-main"}},
+                },
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "long-job-0",
+                        "namespace": "ai-lab",
+                        "placement": "node-0",
+                        "resourceRequest": {"cpu": "2", "memory": "4Gi"},
+                        "ownerKind": "Job",
+                        "ownerName": "long-job",
+                        "workloadName": "job-long-job-12345",
+                    },
+                },
+            ]
+            # Admitted 2 hours BEFORE t0 (00:00:00Z vs t0=02:00:00Z), far older than default waitForPodsReady timeout!
+            wf_events = [
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "long-job",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-01-01T00:00:00Z",
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "batch/v1",
+                            "kind": "Job",
+                            "metadata": {"name": "long-job", "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+                            "spec": {
+                                "parallelism": 1,
+                                "completions": 1,
+                                "template": {"spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "pause", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}}]}},
+                            },
+                        },
+                    },
+                }
+            ]
+            exec_events = [
+                {
+                    "timestamp": "2026-01-01T02:00:00Z",
+                    "eventType": "Admitted",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "workloadName": "job-long-job-12345",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "long-job",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "creationTime": "2026-01-01T00:00:00Z",
+                        "admittedTime": "2026-01-01T00:00:00Z",
+                    },
+                },
+                {
+                    "timestamp": "2026-01-01T02:10:00Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "job-long-job-12345",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "long-job",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "creationTime": "2026-01-01T00:00:00Z",
+                        "admittedTime": "2026-01-01T00:00:00Z",
+                        "endTime": "2026-01-01T02:10:00Z",
+                        "executionDurationSeconds": 7800.0,
+                    },
+                },
+            ]
+            (sc_dir / "infra.json").write_text("\n".join(json.dumps(x) for x in infra_events) + "\n", encoding="utf-8")
+            (sc_dir / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf_events) + "\n", encoding="utf-8")
+            (sc_dir / "execution-time.json").write_text("\n".join(json.dumps(x) for x in exec_events) + "\n", encoding="utf-8")
+
+            bundle = load_scenario_bundle(sc_dir, speedup=1.0)
+            self.assertEqual(len(bundle.initial_workloads), 1)
+            iwl = bundle.initial_workloads[0]
+            self.assertAlmostEqual(iwl.original_age_sec, 7200.0, places=1)
+            cond_by_type = {c["type"]: c for c in iwl.workload_status["conditions"]}
+            self.assertIn("PodsReady", cond_by_type)
+            self.assertEqual(cond_by_type["PodsReady"]["status"], "True")
+            self.assertEqual(cond_by_type["PodsReady"]["reason"], "Started")
+
+            # Also verify _stamp_initial_workloads_for_bootstrap injects PodsReady=True if missing:
+            iwl.workload_status["conditions"] = [c for c in iwl.workload_status["conditions"] if c["type"] != "PodsReady"]
+            stamped = _stamp_initial_workloads_for_bootstrap([iwl])
+            stamped_conds = {c["type"]: c for c in stamped[0][1]["conditions"]}
+            self.assertEqual(stamped_conds["PodsReady"]["status"], "True")
+            self.assertEqual(stamped_conds["PodsReady"]["reason"], "Started")
+            self.assertEqual(stamped_conds["PodsReady"]["lastTransitionTime"], stamped_conds["Admitted"]["lastTransitionTime"])
+
+    def test_before_recreate_delete_on_running_incarnation_does_not_hang_completion(self) -> None:
+        from runner.loader import ScheduledWorkflowDeletion, load_scenario_bundle
+        from runner.replay import _pod_belongs_to_workflow, run_scenario_replay
+
+        # 1. Direct unit test of strict owner-based pod matching (Comment 5: no bare prefix match!)
+        del_jobset = ScheduledWorkflowDeletion(
+            target_wall_offset_sec=1.0,
+            seq=0,
+            raw_offset_sec=1.0,
+            raw_offset_from_t0_sec=1.0,
+            event_timestamp="2026-01-01T00:00:01Z",
+            object_kind="JobSet",
+            manifest_kind="JobSet",
+            manifest_api_version="jobset.x-k8s.io/v1alpha2",
+            name="train",
+            applied_name="train",
+            namespace="ai-lab",
+            delete_reason="cancelled",
+        )
+        pod_owned = {
+            "metadata": {
+                "name": "train-worker-0-0-abc",
+                "labels": {"jobset.sigs.k8s.io/jobset-name": "train", "job-name": "train-worker-0"},
+            }
+        }
+        pod_sibling_dash_2 = {
+            "metadata": {
+                "name": "train-2-worker-0-0-xyz",
+                "labels": {"jobset.sigs.k8s.io/jobset-name": "train-2", "job-name": "train-2-worker-0"},
+            }
+        }
+        pod_sibling_eval = {
+            "metadata": {
+                "name": "train-eval-0-def",
+                "labels": {"job-name": "train-eval"},
+                "ownerReferences": [{"kind": "Job", "name": "train-eval"}],
+            }
+        }
+        self.assertTrue(_pod_belongs_to_workflow(pod_owned, del_jobset, owned_job_names={"train-worker-0"}))
+        self.assertFalse(_pod_belongs_to_workflow(pod_sibling_dash_2, del_jobset, owned_job_names={"train-worker-0"}))
+        self.assertFalse(_pod_belongs_to_workflow(pod_sibling_eval, del_jobset, owned_job_names={"train-worker-0"}))
+
+        # 2. Replay loop test for Comment 4 (before_recreate firing while incarnation 0 is still running)
+        #    AND Comment 5 (sibling `train-2` & `train-eval` pods in namespace are NOT deleted when `train` is deleted).
+        with tempfile.TemporaryDirectory() as tmp:
+            sc_dir = Path(tmp)
+            infra_events = [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "node-0", "labels": {"kubernetes.io/hostname": "node-0"}},
+                        "status": {"capacity": {"cpu": "8", "memory": "16Gi"}, "allocatable": {"cpu": "8", "memory": "16Gi"}},
+                    },
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ai-lab"}},
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ResourceFlavor", "metadata": {"name": "rf-main"}, "spec": {}},
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "cq-main"},
+                        "spec": {
+                            "namespaceSelector": {},
+                            "resourceGroups": [{"coveredResources": ["cpu", "memory"], "flavors": [{"name": "rf-main", "resources": [{"name": "cpu", "nominalQuota": "8"}, {"name": "memory", "nominalQuota": "16Gi"}]}]}],
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "LocalQueue", "metadata": {"name": "lq-main", "namespace": "ai-lab"}, "spec": {"clusterQueue": "cq-main"}},
+                },
+            ]
+            job_obj = {
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {"name": "train", "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+                "spec": {
+                    "parallelism": 1,
+                    "completions": 1,
+                    "template": {"spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "pause", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}}]}},
+                },
+            }
+            wf_events = [
+                {
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "train",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-01-01T00:00:01Z",
+                        "localQueueName": "lq-main",
+                        "object": job_obj,
+                    },
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:05Z",
+                    "eventType": "Deleted",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "train",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-01-01T00:00:01Z",
+                        "localQueueName": "lq-main",
+                        "object": job_obj,
+                    },
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:06Z",
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "train",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-01-01T00:00:06Z",
+                        "localQueueName": "lq-main",
+                        "object": job_obj,
+                    },
+                },
+            ]
+            # Historical FullExecution for incarnation 0 causes loader.py to emit delete_reason="before_recreate"!
+            exec_events = [
+                {
+                    "timestamp": "2026-01-01T00:00:04Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "job-train-inc0",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "train",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "creationTime": "2026-01-01T00:00:01Z",
+                        "admittedTime": "2026-01-01T00:00:01Z",
+                        "endTime": "2026-01-01T00:00:04Z",
+                        "executionDurationSeconds": 3.0,
+                    },
+                },
+                {
+                    "timestamp": "2026-01-01T00:00:10Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "job-train-inc1",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "train",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "creationTime": "2026-01-01T00:00:06Z",
+                        "admittedTime": "2026-01-01T00:00:06Z",
+                        "endTime": "2026-01-01T00:00:10Z",
+                        "executionDurationSeconds": 4.0,
+                    },
+                },
+            ]
+            (sc_dir / "infra.json").write_text("\n".join(json.dumps(x) for x in infra_events) + "\n", encoding="utf-8")
+            (sc_dir / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf_events) + "\n", encoding="utf-8")
+            (sc_dir / "execution-time.json").write_text("\n".join(json.dumps(x) for x in exec_events) + "\n", encoding="utf-8")
+
+            bundle = load_scenario_bundle(sc_dir, speedup=20.0, skip_initial_offset=False)
+            self.assertEqual(len(bundle.scheduled_workflow_deletions), 1)
+            self.assertEqual(bundle.scheduled_workflow_deletions[0].delete_reason, "before_recreate")
+
+            mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-ut-recreate", apiserver_port=16498)
+            try:
+                sub_calls = 0
+                inc1_done = False
+                deleted_pod_paths: list[str] = []
+
+                def fake_apply(docs, max_workers=16):
+                    nonlocal sub_calls, inc1_done
+                    sub_calls += len(docs)
+                    if sub_calls >= 2:
+                        inc1_done = True
+
+                def fake_api_req(method: str, path: str, body=None, headers=None, content_type="application/json"):
+                    if method == "DELETE" and "/pods/" in path:
+                        deleted_pod_paths.append(path)
+                        return 200, b"{}"
+                    if method == "GET" and path == "/apis/batch/v1/namespaces/ai-lab/jobs/train":
+                        return 404, b""
+                    if method == "GET" and path == "/api/v1/namespaces/ai-lab/pods":
+                        return 200, json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "metadata": {
+                                            "name": "train-0-abc",
+                                            "labels": {"job-name": "train"},
+                                            "ownerReferences": [{"kind": "Job", "name": "train"}],
+                                        }
+                                    },
+                                    {
+                                        "metadata": {
+                                            "name": "train-2-worker-0",
+                                            "labels": {"jobset.sigs.k8s.io/jobset-name": "train-2"},
+                                        }
+                                    },
+                                    {
+                                        "metadata": {
+                                            "name": "train-eval-0",
+                                            "labels": {"job-name": "train-eval"},
+                                            "ownerReferences": [{"kind": "Job", "name": "train-eval"}],
+                                        }
+                                    },
+                                ]
+                            }
+                        ).encode("utf-8")
+                    if method == "GET" and path == "/apis/kueue.x-k8s.io/v1beta2/namespaces/ai-lab/workloads":
+                        # Incarnation 0 is STILL running (Admitted=True, NOT Finished) when before_recreate fires!
+                        return 200, json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "metadata": {
+                                            "name": "job-train-inc0",
+                                            "namespace": "ai-lab",
+                                            "ownerReferences": [{"kind": "Job", "name": "train"}],
+                                        },
+                                        "status": {"conditions": [{"type": "Admitted", "status": "True"}]},
+                                    }
+                                ]
+                            }
+                        ).encode("utf-8")
+                    return 200, b"{}"
+
+                def fake_query_status(*_a, **_kw):
+                    fin = {("ai-lab", "job-train-inc1")} if inc1_done else set()
+                    return ClusterStatusSnapshot(
+                        workloads_admitted=0 if inc1_done else 1,
+                        workloads_pending=0,
+                        workloads_finished=len(fin),
+                        pods_running=0,
+                        pods_pending=0,
+                        pods_succeeded=len(fin),
+                        pods_failed=0,
+                        jobsets_completed=0,
+                        jobsets_failed=0,
+                        cq_summary=[],
+                        finished_workload_keys=fin,
+                        present_workload_keys=fin,
+                        workloads_query_ok=True,
+                    )
+
+                with (
+                    mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply),
+                    mock.patch.object(mgr, "api_request", side_effect=fake_api_req),
+                    mock.patch("runner.replay.query_cluster_status", side_effect=fake_query_status),
+                ):
+                    start_ep, end_ep, sub_cnt, _ = run_scenario_replay(
+                        mgr=mgr,
+                        bundle=bundle,
+                        speedup=20.0,
+                        max_run_seconds=10.0,
+                        status_interval_sec=0.1,
+                        wait_for_completion=True,
+                        initial_state_already_bootstrapped=True,
+                    )
+
+                # Must finish right after incarnation 1 (~0.3-1.0s), NOT hang until max_run_seconds=10.0s!
+                self.assertEqual(sub_cnt, 2)
+                self.assertLess(end_ep - start_ep, 3.0)
+                # Only `train-0-abc` was deleted; `train-2-worker-0` and `train-eval-0` were NOT deleted!
+                self.assertEqual(
+                    deleted_pod_paths,
+                    ["/api/v1/namespaces/ai-lab/pods/train-0-abc?gracePeriodSeconds=0"],
+                )
+            finally:
+                mgr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

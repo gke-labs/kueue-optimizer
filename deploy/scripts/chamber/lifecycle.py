@@ -60,6 +60,7 @@ from chamber.manifests import (
     patch_registry_manifest,
     reconcile_wait_for_pods_ready_feature_gates,
     replace_yaml_section_field,
+    sanitize_kueue_feature_gates,
 )
 from chamber.parsers import (
     compute_prometheus_port,
@@ -361,11 +362,18 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             self.wait_for_pods_ready,
             self.kueue_feature_gates,
         )
+        allow_unknown_fg = bool(self.kueue_image and not self.kueue_build_dir)
         self._patch_registry_manifest(base_dst, self.registry_port, self.registry_memory_limit)
         self._patch_kueue_fair_sharing_config(base_dst, self.enable_fair_sharing, self.fair_sharing_strategies)
         self._patch_kueue_admission_fair_sharing_config(base_dst, self.admission_fair_sharing)
         self._patch_kueue_wait_for_pods_ready_config(base_dst, eff_wfpr)
-        self._patch_kueue_feature_gates_config(base_dst, eff_fg)
+        self._patch_kueue_feature_gates_config(
+            base_dst,
+            eff_fg,
+            kueue_build_dir=self.kueue_build_dir,
+            allow_unknown=allow_unknown_fg,
+            emit_warnings=True,
+        )
         self._patch_kueue_extra_configuration_fields(
             base_dst,
             resources_block=self.kueue_resources_config,
@@ -408,6 +416,130 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             )
         return base_dst
 
+    def _wait_for_kueue_rollout_with_fg_recovery(
+        self,
+        base_dst: Path,
+        active_fg: dict[str, bool],
+    ) -> None:
+        """Wait for deployment/kueue-controller-manager, auto-stripping any gate rejected by a newer Kueue image."""
+        fg_state = dict(active_fg)
+        deadline = time.monotonic() + 300.0
+        while time.monotonic() < deadline:
+            dep_proc = self.host_kubectl(
+                ["-n", self.chamber_namespace, "get", "deployment", "kueue-controller-manager", "-o", "json"],
+                check=False,
+                timeout=20.0,
+            )
+            if dep_proc.returncode == 0 and dep_proc.stdout:
+                try:
+                    dep_obj = json.loads(dep_proc.stdout)
+                except json.JSONDecodeError:
+                    dep_obj = {}
+                spec_reps = int(((dep_obj.get("spec") or {}).get("replicas")) or 1)
+                dep_st = dep_obj.get("status") or {}
+                obs_gen = int(dep_st.get("observedGeneration") or 0)
+                meta_gen = int(((dep_obj.get("metadata") or {}).get("generation")) or 1)
+                upd_reps = int(dep_st.get("updatedReplicas") or 0)
+                avail_reps = int(dep_st.get("availableReplicas") or 0)
+                ready_reps = int(dep_st.get("readyReplicas") or 0)
+                if obs_gen >= meta_gen and upd_reps >= spec_reps and avail_reps >= spec_reps and ready_reps >= spec_reps:
+                    return
+
+            if fg_state:
+                pods_proc = self.host_kubectl(
+                    [
+                        "-n",
+                        self.chamber_namespace,
+                        "get",
+                        "pods",
+                        "-l",
+                        "control-plane=controller-manager",
+                        "-o",
+                        "json",
+                    ],
+                    check=False,
+                    timeout=20.0,
+                )
+                rejected_gates: set[str] = set()
+                if pods_proc.returncode == 0 and pods_proc.stdout:
+                    try:
+                        pod_items = json.loads(pods_proc.stdout).get("items") or []
+                    except json.JSONDecodeError:
+                        pod_items = []
+                    for p_it in pod_items:
+                        p_name = str(((p_it.get("metadata") or {}).get("name")) or "")
+                        if not p_name or (p_it.get("metadata") or {}).get("deletionTimestamp"):
+                            continue
+                        c_statuses = ((p_it.get("status") or {}).get("containerStatuses")) or []
+                        crashed = False
+                        use_prev = False
+                        for cs in c_statuses:
+                            st_c = cs.get("state") or {}
+                            last_c = cs.get("lastState") or {}
+                            term_cur = st_c.get("terminated") or {}
+                            term_prev = last_c.get("terminated") or {}
+                            wait_cur = st_c.get("waiting") or {}
+                            if term_cur and int(term_cur.get("exitCode") or 0) != 0:
+                                crashed = True
+                            elif wait_cur.get("reason") in ("CrashLoopBackOff", "Error") and term_prev:
+                                crashed = True
+                                use_prev = True
+                        if not crashed:
+                            continue
+                        log_args = ["-n", self.chamber_namespace, "logs", p_name, "-c", "manager", "--tail=80"]
+                        if use_prev:
+                            log_args.append("--previous")
+                        log_proc = self.host_kubectl(log_args, check=False, timeout=15.0)
+                        log_txt = f"{log_proc.stdout or ''}\n{log_proc.stderr or ''}"
+                        for m_unrec in re.finditer(r"unrecognized feature gate:\s*([A-Za-z0-9_]+)", log_txt):
+                            if m_unrec.group(1) in fg_state:
+                                rejected_gates.add(m_unrec.group(1))
+                        for m_lock in re.finditer(r"cannot set feature gate\s+([A-Za-z0-9_]+)", log_txt):
+                            if m_lock.group(1) in fg_state:
+                                rejected_gates.add(m_lock.group(1))
+                if rejected_gates:
+                    dropped_list = ", ".join(sorted(rejected_gates))
+                    print(
+                        f"WARN: Chamber Kueue image rejected featureGate(s) [{dropped_list}]; "
+                        "stripping from kueue-manager-config and restarting kueue-controller-manager...",
+                        flush=True,
+                    )
+                    for rg in rejected_gates:
+                        fg_state.pop(rg, None)
+                    self._patch_kueue_feature_gates_config(
+                        base_dst,
+                        fg_state,
+                        kueue_build_dir=self.kueue_build_dir,
+                        allow_unknown=bool(self.kueue_image and not self.kueue_build_dir),
+                        emit_warnings=False,
+                    )
+                    cfg_file = base_dst / "config" / "controller_manager_config.yaml"
+                    if cfg_file.is_file():
+                        self._rendered_controller_manager_config_yaml = cfg_file.read_text(encoding="utf-8")
+                    self.host_kubectl(
+                        ["apply", "--server-side", "--force-conflicts", "-k", str(base_dst)],
+                        stream_output=True,
+                    )
+                    self.host_kubectl(
+                        ["-n", self.chamber_namespace, "rollout", "restart", "deployment/kueue-controller-manager"],
+                        stream_output=True,
+                    )
+            time.sleep(2.0)
+
+        # Final standard rollout check to surface kubectl's exact status error on timeout.
+        self.host_kubectl(
+            [
+                "-n",
+                self.chamber_namespace,
+                "rollout",
+                "status",
+                "--timeout=30s",
+                "deployment/kueue-controller-manager",
+            ],
+            timeout=45.0,
+            stream_output=True,
+        )
+
     def deploy_chamber(self, initial_nodes: list[dict[str, Any]] | None = None) -> None:
         self._ensure_namespace_safe_for_apply(record_creation=False)
         self._resolve_cluster_registry_port(check_cluster=True)
@@ -425,9 +557,14 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             if self.admission_fair_sharing and self.admission_fair_sharing.enabled
             else ""
         )
-        eff_wfpr_log, eff_fg_log = reconcile_wait_for_pods_ready_feature_gates(
+        eff_wfpr_log, raw_fg_log = reconcile_wait_for_pods_ready_feature_gates(
             self.wait_for_pods_ready,
             self.kueue_feature_gates,
+        )
+        eff_fg_log, _ = sanitize_kueue_feature_gates(
+            raw_fg_log,
+            kueue_build_dir=self.kueue_build_dir,
+            allow_unknown=bool(self.kueue_image and not self.kueue_build_dir),
         )
         wfpr_note = (
             f", WaitForPodsReady: [{eff_wfpr_log.summary_str()}]"
@@ -456,6 +593,9 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             flush=True,
         )
         for dep in CHAMBER_DEPLOYMENTS:
+            if dep == "deployment/kueue-controller-manager" and eff_fg_log:
+                self._wait_for_kueue_rollout_with_fg_recovery(base_dst, eff_fg_log)
+                continue
             self.host_kubectl(
                 [
                     "-n",

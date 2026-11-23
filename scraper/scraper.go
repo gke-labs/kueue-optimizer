@@ -1236,8 +1236,6 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 			rawWorkloadName = wl
 		} else if pg := pod.Labels[KueuePodGroupNameLabel]; pg != "" {
 			rawWorkloadName = pg
-			ownerKind = "PodGroup"
-			rawOwnerName = pg
 		}
 	}
 
@@ -1299,6 +1297,9 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 				}
 			case "LeaderWorkerSet":
 				ownerKind = "LeaderWorkerSet"
+				rawOwnerName = ref.Name
+			case "StatefulSet":
+				ownerKind = "StatefulSet"
 				rawOwnerName = ref.Name
 			case "RayJob":
 				ownerKind = "RayJob"
@@ -2152,35 +2153,73 @@ func (s *Scraper) handleRayClusterUnstructuredAt(eventType watch.EventType, u *u
 	s.handleRayClusterWatchEventAt(eventType, &rc, now)
 }
 
+func parseJobOwnerGVKAnnotation(ownerGVK string) (ownerKind, ownerAPIVersion string) {
+	trimmed := strings.TrimSpace(ownerGVK)
+	if trimmed == "" {
+		return "", ""
+	}
+	// Format 1: schema.GroupVersionKind.String(), e.g. "apps/v1, Kind=StatefulSet" or "/v1, Kind=Pod"
+	if gv, kindPart, ok := strings.Cut(trimmed, ", Kind="); ok {
+		k := strings.TrimSpace(kindPart)
+		apiVer := strings.TrimPrefix(strings.TrimSpace(gv), "/")
+		return k, apiVer
+	}
+	// Format 2: dot-separated "Kind.version.group" or "Kind.version"
+	parts := strings.SplitN(trimmed, ".", 3)
+	ownerKind = strings.TrimSpace(parts[0])
+	if len(parts) == 3 && strings.TrimSpace(parts[2]) != "" {
+		ownerAPIVersion = strings.TrimSpace(parts[2]) + "/" + strings.TrimSpace(parts[1])
+	} else if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+		ownerAPIVersion = strings.TrimSpace(parts[1])
+	} else {
+		ownerAPIVersion = trimmed
+	}
+	return ownerKind, ownerAPIVersion
+}
+
 func resolveWorkloadOwner(wl *kueuev1beta2.Workload, hasher SensitiveDataHasher) (ownerKind, ownerName, ownerAPIVersion string) {
 	if wl == nil {
 		return "", "", ""
 	}
-	if wl.Annotations != nil && wl.Annotations[KueueIsGroupWorkloadAnnotation] == "true" {
-		return "PodGroup", hasher.HashName(wl.Name), "v1"
-	}
+	// 1. Controller OwnerReferences always take precedence.
 	for _, ref := range wl.OwnerReferences {
 		if ref.Controller != nil && *ref.Controller {
 			return ref.Kind, hasher.HashNameForKind(ref.Kind, ref.Name), ref.APIVersion
 		}
 	}
+	// 2. Non-Pod OwnerReferences (e.g. LeaderWorkerSet and StatefulSet, which use SetOwnerReference
+	//    on group Workloads alongside member Pod OwnerReferences) take precedence over PodGroup.
+	for _, ref := range wl.OwnerReferences {
+		if ref.Kind != "" && ref.Kind != "Pod" {
+			return ref.Kind, hasher.HashNameForKind(ref.Kind, ref.Name), ref.APIVersion
+		}
+	}
+	// 3. Explicit Kueue job-owner annotations (set by LWS/StatefulSet/MultiKueue controllers and
+	//    retained even after Kubernetes GC removes OwnerReferences).
+	if wl.Annotations != nil {
+		annName := wl.Annotations[KueueJobOwnerNameAnnotation]
+		annGVK := wl.Annotations[KueueJobOwnerGVKAnnotation]
+		if annName != "" || annGVK != "" {
+			ownerKind, ownerAPIVersion = parseJobOwnerGVKAnnotation(annGVK)
+			if annName != "" {
+				ownerName = hasher.HashNameForKind(ownerKind, annName)
+			}
+			if ownerKind != "" && ownerName != "" {
+				return ownerKind, ownerName, ownerAPIVersion
+			}
+		}
+	}
+	// 4. Plain PodGroup Workloads (no higher-level controller/owner, though pod_controller may
+	//    attach non-controller member Pod OwnerReferences).
+	if wl.Annotations != nil && wl.Annotations[KueueIsGroupWorkloadAnnotation] == "true" {
+		return "PodGroup", hasher.HashName(wl.Name), "v1"
+	}
+	// 5. Remaining OwnerReference fallback (e.g. single Pod with non-controller Pod OwnerReference).
 	if len(wl.OwnerReferences) > 0 {
 		ref := wl.OwnerReferences[0]
 		return ref.Kind, hasher.HashNameForKind(ref.Kind, ref.Name), ref.APIVersion
 	}
-	if wl.Annotations != nil {
-		ownerName = wl.Annotations[KueueJobOwnerNameAnnotation]
-		ownerGVK := wl.Annotations[KueueJobOwnerGVKAnnotation]
-		if ownerGVK != "" {
-			parts := strings.Split(ownerGVK, ".")
-			ownerKind = parts[0]
-			ownerAPIVersion = ownerGVK
-		}
-		if ownerName != "" {
-			ownerName = hasher.HashNameForKind(ownerKind, ownerName)
-		}
-	}
-	return ownerKind, ownerName, ownerAPIVersion
+	return "", "", ""
 }
 
 func extractWorkloadPriorityClassName(wl *kueuev1beta2.Workload) string {

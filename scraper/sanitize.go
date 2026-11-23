@@ -857,34 +857,27 @@ func IsScheduledAndRunningPod(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending || pod.Status.Phase == ""
 }
 
-// ExtractPodEndTime extracts the timestamp when a Pod released its node resources (latest container
-// Terminated.FinishedAt for Succeeded/Failed pods, or DeletionTimestamp when deleted), falling back to fallback.
+// ExtractPodEndTime extracts the timestamp when a Pod released its node resources: the latest main
+// container Terminated.FinishedAt once all main containers have terminated, falling back to the
+// watch/scrape observation time when main containers have not all terminated yet. InitContainerStatuses
+// (which finish at pod startup) and DeletionTimestamp (which Kubernetes sets to request time +
+// terminationGracePeriodSeconds) are intentionally ignored.
 func ExtractPodEndTime(pod *corev1.Pod, fallback time.Time) time.Time {
-	if pod == nil {
+	if pod == nil || len(pod.Status.ContainerStatuses) == 0 {
 		return fallback.UTC()
 	}
 	var latest time.Time
 	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero() {
-			t := cs.State.Terminated.FinishedAt.Time.UTC()
-			if t.After(latest) {
-				latest = t
-			}
+		if cs.State.Terminated == nil || cs.State.Terminated.FinishedAt.IsZero() {
+			return fallback.UTC()
 		}
-	}
-	for _, cs := range pod.Status.InitContainerStatuses {
-		if cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero() {
-			t := cs.State.Terminated.FinishedAt.Time.UTC()
-			if t.After(latest) {
-				latest = t
-			}
+		t := cs.State.Terminated.FinishedAt.Time.UTC()
+		if t.After(latest) {
+			latest = t
 		}
 	}
 	if !latest.IsZero() {
 		return latest
-	}
-	if pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero() {
-		return pod.DeletionTimestamp.Time.UTC()
 	}
 	return fallback.UTC()
 }

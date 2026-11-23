@@ -41,6 +41,231 @@ VALID_FAIR_SHARING_STRATEGY_SETS: tuple[tuple[str, ...], ...] = (
     ("LessThanOrEqualToFinalShare", "LessThanInitialShare"),
 )
 
+# Known Kueue feature gates (v0.19 - v0.21+) used to strip unrecognized, graduated/removed,
+# GA-locked, or deprecated sunset gates scraped from older clusters so chamber Kueue never
+# fails LoadAndValidateFeatureGates on startup.
+KNOWN_KUEUE_FEATURE_GATES: frozenset[str] = frozenset(
+    {
+        "AdmissionFairSharing",
+        "AdmissionFairSharingAnchorAtQuotaReservation",
+        "AdmissionGatedBy",
+        "AssignQueueLabelsForPods",
+        "ClassicalPreemptionCandidateOrderCache",
+        "CleanupProvisioningRequestsOnEviction",
+        "ConcurrentAdmission",
+        "ConfigurablePreemptions",
+        "CustomMetricLabels",
+        "DeferRayServiceFinalizationForRedisCleanup",
+        "DeploymentJobUIDLabel",
+        "DisableWaitForPodsReady",
+        "DynamicQuotaOrchestration",
+        "ElasticJobsViaWorkloadSlices",
+        "ElasticJobsViaWorkloadSlicesFlavorChangeFromZero",
+        "ElasticJobsViaWorkloadSlicesForProvisioningRequests",
+        "ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp",
+        "ElasticJobsViaWorkloadSlicesWithTAS",
+        "EnforceProvisioningPodTemplateContents",
+        "FailureRecoveryPolicy",
+        "FairSharingPreemptWithinNominal",
+        "FairSharingPrioritizeNonBorrowing",
+        "FairSharingReevaluatePreemptionCandidates",
+        "FairSharingRefill",
+        "FairSharingVerifyFinalTargets",
+        "FastQuotaReleaseInPodIntegration",
+        "FinalizeTerminatingPodGroups",
+        "FinishOrphanedWorkloads",
+        "FlavorFungibility",
+        "FlavorFungibilityPreserveScanProgress",
+        "HighMaxParallelismWithinReconcile",
+        "KubeRayEvictOnInconsistentTopologyRequest",
+        "KubeRayServiceUsingTopLevelSuspend",
+        "KueueDRADeviceFeasibility",
+        "KueueDRAIntegration",
+        "KueueDRAIntegrationConsumableCapacity",
+        "KueueDRAIntegrationDeviceTaints",
+        "KueueDRAIntegrationExtendedResource",
+        "KueueDRAIntegrationPartitionableDevices",
+        "KueueDRAIntegrationPrioritizedList",
+        "KueueDRARejectWorkloadsWhenDRADisabled",
+        "LWSImmutableGroupSize",
+        "LocalQueueMetrics",
+        "MetricForWorkloadCreationLatency",
+        "MetricsAccessControl",
+        "MetricsForCohorts",
+        "MultiKueue",
+        "MultiKueueAdaptersForCustomJobs",
+        "MultiKueueBatchJobClearingTTLSecondsAfterFinishedOnWorkerCluster",
+        "MultiKueueClusterProfile",
+        "MultiKueueIncrementalDispatcherConfig",
+        "MultiKueueIncrementalDispatcherRespectConfigOrder",
+        "MultiKueueKubeConfigPathValidation",
+        "MultiKueueManagerQuotaAutomation",
+        "MultiKueueOrchestratedPreemption",
+        "MultiKueueRayInTreeAutoscaling",
+        "MultiKueueRemoteSpecSync",
+        "MultiKueueReuseClientConnectionConfigForWorkers",
+        "PartialAdmission",
+        "PodGroupSchedulingShapeOrdering",
+        "PodIntegrationCountSucceededPodsAsReady",
+        "PodIntegrationValidateGroupOwner",
+        "PodIntegrationVerifyRoleRequests",
+        "PrioritizePreemptorWorkloads",
+        "PriorityBoost",
+        "PrioritySortingWithinCohort",
+        "QuotaCheckStrategy",
+        "RayClusterHeadPodReady",
+        "RayServiceValidateUpgradeStrategy",
+        "ReclaimablePods",
+        "RecomputeAssignmentUponPreemptionTargetsOverlap",
+        "RejectUpdatesToCQWithInvalidOnFlavors",
+        "RemoveFinalizersWithStrictPatch",
+        "ReservedResourceNameValidation",
+        "SchedulerLibraryDeepIntegration",
+        "SchedulerLibraryIntegration",
+        "SchedulingEquivalenceHashing",
+        "SchedulingEquivalenceHashingIgnorePodSetName",
+        "ShortWorkloadNames",
+        "SkipAncestorCheckForDeletedWorkloads",
+        "SkipChildJobSuspension",
+        "SkipReassignmentForPodOwnedWorkloads",
+        "SparkApplicationIntegration",
+        "TASAssignmentsEncodingByHostnamePrefix",
+        "TASBalancedPlacement",
+        "TASCacheNodeMatchResults",
+        "TASCacheTopologyTree",
+        "TASCachingRemainingResources",
+        "TASFailedNodeReplacement",
+        "TASFailedNodeReplacementFailFast",
+        "TASGroupedPodSetSlicing",
+        "TASHandleOverlappingFlavors",
+        "TASLeaderPodSetFeasibility",
+        "TASMultiLayerTopology",
+        "TASNodeFeasibilityForAllLevels",
+        "TASPartialSlices",
+        "TASProfileMixed",
+        "TASRecomputeAssignmentWithinSchedulingCycle",
+        "TASRejectFalseUnconstrainedTopology",
+        "TASReplaceMultipleFailedNodes",
+        "TASReplaceNodeDueToNotReadyOverFixedTime",
+        "TASReplaceNodeOnNodeTaints",
+        "TASReplaceNodeOnPodTermination",
+        "TASRespectNodeAffinityPreferred",
+        "TASTopologySpreading",
+        "TASValidateWorkloadSliceSize",
+        "TLSOptions",
+        "TopologyAwareScheduling",
+        "UnadmittedWorkloadsExplicitStatus",
+        "UnadmittedWorkloadsObservability",
+        "ValidateRayAndSparkJobUpdates",
+        "VectorizedResourceRequests",
+        "VisibilityOnDemand",
+        "WaitForPodsReadyMaxNotReady",
+        "WaitForPodsReadyUnscheduledTimeout",
+        "WorkloadIdentifierAnnotations",
+        "WorkloadLevelWaitForPodsReady",
+        "WorkloadPriorityClassDefaulting",
+        "WorkloadRequestUseMergePatch",
+        "WorkloadValidateResourcesAreNonNegative",
+        "WorkloadValidationForPodSetMetadata",
+    }
+)
+
+# GA feature gates with LockToDefault=true in Kueue: setting != default crashes startup today,
+# and setting == default becomes an unrecognized-gate crash as soon as a newer Kueue removes them.
+LOCKED_GA_KUEUE_FEATURE_GATES: dict[str, bool] = {
+    "MetricForWorkloadCreationLatency": True,
+    "TASValidateWorkloadSliceSize": True,
+    "TLSOptions": True,
+    "ValidateRayAndSparkJobUpdates": True,
+}
+
+# Deprecated sunset feature gates slated for removal in newer Kueue releases.
+DEPRECATED_KUEUE_FEATURE_GATES: dict[str, bool] = {
+    "DeferRayServiceFinalizationForRedisCleanup": False,
+    "TASReplaceNodeDueToNotReadyOverFixedTime": False,
+}
+
+# Alpha default-off feature gates (used to auto-satisfy parent dependencies when a child gate is enabled).
+DEFAULT_OFF_KUEUE_FEATURE_GATES: frozenset[str] = frozenset(
+    {
+        "ConcurrentAdmission",
+        "ConfigurablePreemptions",
+        "CustomMetricLabels",
+        "DisableWaitForPodsReady",
+        "DynamicQuotaOrchestration",
+        "ElasticJobsViaWorkloadSlicesFlavorChangeFromZero",
+        "ElasticJobsViaWorkloadSlicesForProvisioningRequests",
+        "ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp",
+        "ElasticJobsViaWorkloadSlicesWithTAS",
+        "FailureRecoveryPolicy",
+        "FairSharingRefill",
+        "FastQuotaReleaseInPodIntegration",
+        "KubeRayEvictOnInconsistentTopologyRequest",
+        "KueueDRADeviceFeasibility",
+        "KueueDRAIntegrationDeviceTaints",
+        "KueueDRAIntegrationPrioritizedList",
+        "MetricsAccessControl",
+        "MultiKueueBatchJobClearingTTLSecondsAfterFinishedOnWorkerCluster",
+        "MultiKueueClusterProfile",
+        "MultiKueueManagerQuotaAutomation",
+        "MultiKueueRayInTreeAutoscaling",
+        "PrioritizePreemptorWorkloads",
+        "PriorityBoost",
+        "SchedulerLibraryDeepIntegration",
+        "SchedulerLibraryIntegration",
+        "ShortWorkloadNames",
+        "SkipChildJobSuspension",
+        "SparkApplicationIntegration",
+        "TASBalancedPlacement",
+        "TASRejectFalseUnconstrainedTopology",
+        "TASReplaceMultipleFailedNodes",
+        "TASRespectNodeAffinityPreferred",
+        "TASTopologySpreading",
+        "UnadmittedWorkloadsExplicitStatus",
+        "WaitForPodsReadyMaxNotReady",
+        "WaitForPodsReadyUnscheduledTimeout",
+        "WorkloadLevelWaitForPodsReady",
+        "WorkloadRequestUseMergePatch",
+    }
+)
+
+KUEUE_FEATURE_GATE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "AdmissionFairSharingAnchorAtQuotaReservation": ("AdmissionFairSharing",),
+    "ElasticJobsViaWorkloadSlicesFlavorChangeFromZero": ("ElasticJobsViaWorkloadSlices",),
+    "ElasticJobsViaWorkloadSlicesForProvisioningRequests": ("ElasticJobsViaWorkloadSlices",),
+    "ElasticJobsViaWorkloadSlicesWithTAS": ("ElasticJobsViaWorkloadSlices", "TopologyAwareScheduling"),
+    "FlavorFungibilityPreserveScanProgress": ("FlavorFungibility",),
+    "KueueDRADeviceFeasibility": ("KueueDRAIntegration", "TopologyAwareScheduling", "TASNodeFeasibilityForAllLevels"),
+    "KueueDRAIntegrationConsumableCapacity": ("KueueDRAIntegration",),
+    "KueueDRAIntegrationDeviceTaints": ("KueueDRADeviceFeasibility",),
+    "KueueDRAIntegrationExtendedResource": ("KueueDRAIntegration",),
+    "KueueDRAIntegrationPartitionableDevices": ("KueueDRAIntegration",),
+    "KueueDRAIntegrationPrioritizedList": ("KueueDRAIntegration",),
+    "MultiKueueRayInTreeAutoscaling": ("MultiKueue", "ElasticJobsViaWorkloadSlices", "SkipChildJobSuspension"),
+    "MultiKueueReuseClientConnectionConfigForWorkers": ("MultiKueue",),
+    "SchedulerLibraryDeepIntegration": ("SchedulerLibraryIntegration",),
+    "SchedulerLibraryIntegration": ("TopologyAwareScheduling",),
+    "SchedulingEquivalenceHashingIgnorePodSetName": ("SchedulingEquivalenceHashing",),
+    "TASBalancedPlacement": ("TopologyAwareScheduling",),
+    "TASFailedNodeReplacement": ("TopologyAwareScheduling",),
+    "TASFailedNodeReplacementFailFast": ("TopologyAwareScheduling", "TASFailedNodeReplacement"),
+    "TASGroupedPodSetSlicing": ("TopologyAwareScheduling",),
+    "TASHandleOverlappingFlavors": ("TopologyAwareScheduling",),
+    "TASLeaderPodSetFeasibility": ("TopologyAwareScheduling",),
+    "TASMultiLayerTopology": ("TopologyAwareScheduling",),
+    "TASNodeFeasibilityForAllLevels": ("TopologyAwareScheduling",),
+    "TASPartialSlices": ("TopologyAwareScheduling",),
+    "TASProfileMixed": ("TopologyAwareScheduling",),
+    "TASRecomputeAssignmentWithinSchedulingCycle": ("TopologyAwareScheduling",),
+    "TASRejectFalseUnconstrainedTopology": ("TopologyAwareScheduling",),
+    "TASReplaceMultipleFailedNodes": ("TopologyAwareScheduling", "TASFailedNodeReplacement"),
+    "TASReplaceNodeOnNodeTaints": ("TopologyAwareScheduling",),
+    "TASReplaceNodeOnPodTermination": ("TopologyAwareScheduling", "TASFailedNodeReplacement"),
+    "TASRespectNodeAffinityPreferred": ("TopologyAwareScheduling",),
+    "TASTopologySpreading": ("TopologyAwareScheduling",),
+    "UnadmittedWorkloadsExplicitStatus": ("UnadmittedWorkloadsObservability",),
+}
+
 
 def format_go_duration_seconds(seconds: float) -> str:
     """Format a non-negative duration in seconds as a Go time.ParseDuration string ('0s', '10s', '2500ms')."""
@@ -381,6 +606,136 @@ def reconcile_wait_for_pods_ready_feature_gates(
     return wfpr_cfg, fg
 
 
+def discover_kueue_feature_gates_from_source(
+    kueue_build_dir: Path | str | None,
+) -> tuple[frozenset[str], dict[str, bool], dict[str, bool], frozenset[str]] | None:
+    """Inspect `<kueue_build_dir>/pkg/features/kube_features.go` when building a custom Kueue checkout."""
+    if not kueue_build_dir:
+        return None
+    fg_go = Path(kueue_build_dir) / "pkg" / "features" / "kube_features.go"
+    if not fg_go.is_file():
+        return None
+    try:
+        text = fg_go.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    consts = dict(re.findall(r"^\t(\w+)\s+featuregate\.Feature\s*=\s*\"(\w+)\"", text, re.M))
+    if not consts:
+        return None
+    known = set(consts.values())
+    locked: dict[str, bool] = {}
+    deprecated: dict[str, bool] = {}
+    default_off: set[str] = set()
+    if "var defaultVersionedFeatureGates =" in text:
+        vblock = text.split("var defaultVersionedFeatureGates =", 1)[1].split("\n}\n", 1)[0]
+        for cname, body in re.findall(r"^\t(\w+):\s*\{(.*?)^\t\},", vblock, re.M | re.S):
+            gname = consts.get(cname, cname)
+            known.add(gname)
+            specs = re.findall(
+                r"Default:\s*(true|false),\s*PreRelease:\s*featuregate\.(\w+)(?:,\s*LockToDefault:\s*(true|false))?",
+                body,
+            )
+            if specs:
+                last_def, last_pre, last_lock = specs[-1]
+                def_bool = last_def == "true"
+                if last_lock == "true" or last_pre == "GA":
+                    locked[gname] = def_bool
+                elif last_pre == "Deprecated":
+                    deprecated[gname] = def_bool
+                elif not def_bool:
+                    default_off.add(gname)
+    return frozenset(known), locked, deprecated, frozenset(default_off)
+
+
+def sanitize_kueue_feature_gates(
+    feature_gates: dict[str, bool] | None,
+    *,
+    kueue_build_dir: Path | str | None = None,
+    allow_unknown: bool = False,
+) -> tuple[dict[str, bool], list[str]]:
+    """Filter unrecognized/graduated, GA-locked, deprecated, or dependency-conflicting Kueue featureGates.
+
+    Prevents scraped `Configuration.featureGates` from older clusters (or deprecated/graduated flags)
+    from crashing `kueue-controller-manager` startup in `kueue-optimizer` chambers running newer Kueue.
+    """
+    if not feature_gates:
+        return {}, []
+
+    discovered = discover_kueue_feature_gates_from_source(kueue_build_dir)
+    if discovered is not None:
+        known_gates, locked_gates, deprecated_gates, default_off_gates = discovered
+    else:
+        known_gates = KNOWN_KUEUE_FEATURE_GATES
+        locked_gates = LOCKED_GA_KUEUE_FEATURE_GATES
+        deprecated_gates = DEPRECATED_KUEUE_FEATURE_GATES
+        default_off_gates = DEFAULT_OFF_KUEUE_FEATURE_GATES
+
+    cleaned: dict[str, bool] = {}
+    warnings: list[str] = []
+
+    for raw_k in sorted(feature_gates):
+        k = str(raw_k).strip()
+        if not k:
+            continue
+        v = bool(feature_gates[raw_k])
+        if k in locked_gates:
+            locked_val = locked_gates[k]
+            if v != locked_val:
+                warnings.append(
+                    f"Dropping GA-locked Kueue featureGate '{k}={str(v).lower()}' "
+                    f"(locked to {str(locked_val).lower()} in Kueue)"
+                )
+            else:
+                warnings.append(
+                    f"Omitting graduated GA Kueue featureGate '{k}={str(v).lower()}' "
+                    f"(already locked to {str(locked_val).lower()} by default)"
+                )
+            continue
+        if k in deprecated_gates:
+            dep_val = deprecated_gates[k]
+            warnings.append(
+                f"Dropping deprecated Kueue featureGate '{k}={str(v).lower()}' "
+                f"(sunset default={str(dep_val).lower()}) for forward compatibility"
+            )
+            continue
+        if not allow_unknown and k not in known_gates:
+            warnings.append(
+                f"Dropping unrecognized or graduated Kueue featureGate '{k}={str(v).lower()}' "
+                "not supported by chamber Kueue"
+            )
+            continue
+        cleaned[k] = v
+
+    # Enforce parent feature-gate dependencies (matching Kueue SetFromMap / LoadAndValidateFeatureGates).
+    def _all_ancestors(gate: str) -> list[str]:
+        seen: list[str] = []
+        stack = list(KUEUE_FEATURE_GATE_DEPENDENCIES.get(gate, ()))
+        while stack:
+            parent = stack.pop(0)
+            if parent not in seen:
+                seen.append(parent)
+                stack.extend(KUEUE_FEATURE_GATE_DEPENDENCIES.get(parent, ()))
+        return seen
+
+    for gate in sorted(list(cleaned.keys())):
+        if not cleaned.get(gate):
+            continue
+        ancestors = _all_ancestors(gate)
+        disabled_anc = [anc for anc in ancestors if cleaned.get(anc) is False]
+        if disabled_anc:
+            cleaned.pop(gate, None)
+            warnings.append(
+                f"Dropping Kueue featureGate '{gate}=true' because parent dependency "
+                f"{disabled_anc[0]}=false is disabled"
+            )
+            continue
+        for anc in ancestors:
+            if anc not in cleaned and anc in default_off_gates and (allow_unknown or anc in known_gates):
+                cleaned[anc] = True
+
+    return cleaned, warnings
+
+
 def parse_feature_gates_arg(raw: str | dict[str, bool] | None) -> dict[str, bool]:
     """Parse comma-separated 'GateA=true,GateB=false' overrides into a dict[str, bool]."""
     if raw is None:
@@ -577,6 +932,8 @@ class KueueScenarioConfiguration:
     afs_raw: dict[str, Any] | None = None
     wfpr_raw: dict[str, Any] | None = None
     feature_gates: dict[str, bool] = field(default_factory=dict)
+    raw_feature_gates: dict[str, bool] = field(default_factory=dict)
+    feature_gate_warnings: tuple[str, ...] = ()
     resources_block: dict[str, Any] | None = None
     manage_jobs_without_queue_name: bool | None = None
     raw_doc: dict[str, Any] = field(default_factory=dict)
@@ -676,6 +1033,9 @@ def parse_kueue_configuration_payload(
     else:
         _, fg_parsed = reconcile_wait_for_pods_ready_feature_gates(None, fg_parsed)
 
+    raw_fg_copy = dict(fg_parsed)
+    fg_sanitized, fg_warnings = sanitize_kueue_feature_gates(fg_parsed)
+
     res_raw = doc.get("resources")
     if res_raw is not None and not isinstance(res_raw, dict):
         raise ValueError(f"{source_desc}: resources must be a mapping or null")
@@ -687,9 +1047,11 @@ def parse_kueue_configuration_payload(
     return KueueScenarioConfiguration(
         fair_sharing_enabled=fs_enabled,
         fair_sharing_strategies=fs_strategies,
-        afs_raw=dict(afs_raw) if isinstance(afs_raw, dict) else None,
+        afs_raw=dict(afs_raw) if isinstance(afs_raw, dict) and afs_raw else None,
         wfpr_raw=wfpr_clean,
-        feature_gates=fg_parsed,
+        feature_gates=fg_sanitized,
+        raw_feature_gates=raw_fg_copy,
+        feature_gate_warnings=tuple(fg_warnings),
         resources_block=dict(res_raw) if isinstance(res_raw, dict) and res_raw else None,
         manage_jobs_without_queue_name=mjwqn_raw,
         raw_doc=dict(doc),
@@ -1098,11 +1460,23 @@ def patch_kueue_wait_for_pods_ready_config(
 def patch_kueue_feature_gates_config(
     base_dst: Path,
     feature_gates: dict[str, bool] | None,
-) -> None:
-    """Configure or remove featureGates in controller_manager_config.yaml."""
+    *,
+    kueue_build_dir: Path | str | None = None,
+    allow_unknown: bool = False,
+    emit_warnings: bool = True,
+) -> dict[str, bool]:
+    """Validate, sanitize, and write (or remove) featureGates in controller_manager_config.yaml."""
+    sanitized_fg, fg_warnings = sanitize_kueue_feature_gates(
+        feature_gates,
+        kueue_build_dir=kueue_build_dir,
+        allow_unknown=allow_unknown,
+    )
+    if emit_warnings:
+        for warn_msg in fg_warnings:
+            print(f"WARN: {warn_msg}", flush=True)
     cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
     if not cfg_yaml.exists():
-        return
+        return sanitized_fg
     cfg_text = cfg_yaml.read_text(encoding="utf-8")
     cfg_text = re.sub(
         r"^featureGates:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
@@ -1110,12 +1484,13 @@ def patch_kueue_feature_gates_config(
         cfg_text,
         flags=re.MULTILINE,
     )
-    if feature_gates:
+    if sanitized_fg:
         lines = ["featureGates:"]
-        for k in sorted(feature_gates):
-            lines.append(f"  {k}: {str(bool(feature_gates[k])).lower()}")
+        for k in sorted(sanitized_fg):
+            lines.append(f"  {k}: {str(bool(sanitized_fg[k])).lower()}")
         cfg_text = _insert_top_level_kueue_config_block(cfg_text, lines)
     cfg_yaml.write_text(cfg_text, encoding="utf-8")
+    return sanitized_fg
 
 
 def patch_kustomize_kueue_image(base_dst: Path, image_ref: str) -> None:

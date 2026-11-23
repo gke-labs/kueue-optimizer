@@ -2315,6 +2315,14 @@ def _build_initial_workloads_and_pods(
                         "lastTransitionTime": admit_iso,
                         "observedGeneration": 1,
                     },
+                    {
+                        "type": "PodsReady",
+                        "status": "True",
+                        "reason": "Started",
+                        "message": "All pods reached readiness and the workload is running",
+                        "lastTransitionTime": admit_iso,
+                        "observedGeneration": 1,
+                    },
                 ],
             }
 
