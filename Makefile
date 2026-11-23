@@ -106,7 +106,7 @@ scraper-test: ## Run unit tests for the Go Kubernetes & Kueue cluster scraper
 	cd ./scraper && go test -v ./...
 
 .PHONY: self-tests
-self-tests: ## Deterministically generate all 80 self-test scenario directories (st01-st80 JSONs, READMEs, and AGENTS.md)
+self-tests: ## Deterministically generate all 90 self-test scenario directories (st01-st90 JSONs, READMEs, and AGENTS.md)
 	python3 ./testscenarios/self-tests/generate_self_test_suite.py
 	python3 ./deploy/scripts/generate_scenario_readme.py --all --root ./testscenarios/self-tests
 

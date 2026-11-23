@@ -89,6 +89,20 @@ type trackedWorkflowState struct {
 	workloadState  WorkloadState
 	lastDigest     string
 	lastPayload    any
+	replicas       int32
+	hasReplicas    bool
+	readyReplicas  int32
+	paused         bool
+	templateHash   string
+	strategySig    string
+}
+
+type deploymentEventMeta struct {
+	replicas      int32
+	readyReplicas int32
+	paused        bool
+	templateHash  string
+	strategySig   string
 }
 
 type workloadExecState struct {
@@ -118,8 +132,9 @@ type workloadExecState struct {
 }
 
 type workloadOwnerRef struct {
-	kind string
-	name string
+	kind    string
+	name    string
+	podName string
 }
 
 // Scraper coordinates periodic infrastructure/pod scraping and real-time watches for
@@ -136,21 +151,26 @@ type Scraper struct {
 	workflowsLog *JSONEventLog
 	execTimeLog  *JSONEventLog
 
-	mu                     sync.Mutex
-	infraCache             map[string]map[string]cachedObject // kind -> key -> cachedObject
-	podStates              map[string]*trackedPodState        // namespace/rawName -> trackedPodState
-	workflowStates         map[string]*trackedWorkflowState   // kind/namespace/rawName -> trackedWorkflowState
-	ownerStates            map[string]WorkloadState           // kind/namespace/rawName -> WorkloadState from Kueue Workload
-	ownerToWorkload        map[string]string                  // kind/namespace/rawOwnerName -> rawWorkloadName
-	workloadToOwner        map[string]workloadOwnerRef        // namespace/rawWorkloadName -> raw owner
-	workloadIsTAS          map[string]bool                    // namespace/rawWorkloadName -> uses TAS
-	workloadPodSets        map[string][]string                // namespace/rawWorkloadName -> podSet names
-	jobSetQueues           map[string]string                  // namespace/rawJobSetName -> localQueueName
-	jobToJobSet            map[string]string                  // namespace/rawJobName -> rawJobSetName
-	rayClusterToRayJob     map[string]string                  // namespace/rawRayClusterName -> rawRayJobName
-	replicaSetToDeployment     map[string]string                  // namespace/rawReplicaSetName -> rawDeploymentName
-	workloadStates             map[string]*workloadExecState      // namespace/rawWorkloadName -> workloadExecState
-	manageJobsWithoutQueueName bool                               // cached from Kueue Configuration
+	mu                         sync.Mutex
+	infraCache                 map[string]map[string]cachedObject        // kind -> key -> cachedObject
+	podStates                  map[string]*trackedPodState               // namespace/rawName -> trackedPodState
+	workflowStates             map[string]*trackedWorkflowState          // kind/namespace/rawName -> trackedWorkflowState
+	ownerStates                map[string]WorkloadState                  // kind/namespace/rawName -> WorkloadState from Kueue Workload
+	deploymentWlStates         map[string]map[string]WorkloadState       // Deployment/namespace/rawName -> rawWorkloadName -> WorkloadState
+	ownerToWorkload            map[string]string                         // kind/namespace/rawOwnerName -> rawWorkloadName
+	workloadToOwner            map[string]workloadOwnerRef               // namespace/rawWorkloadName -> raw owner
+	workloadIsTAS              map[string]bool                           // namespace/rawWorkloadName -> uses TAS
+	workloadPodSets            map[string][]string                       // namespace/rawWorkloadName -> podSet names
+	jobSetQueues               map[string]string                         // namespace/rawJobSetName -> localQueueName
+	jobToJobSet                map[string]string                         // namespace/rawJobName -> rawJobSetName
+	rayClusterToRayJob         map[string]string                         // namespace/rawRayClusterName -> rawRayJobName
+	deploymentUIDToKey         map[string]string                         // deployment UID -> namespace/rawDeploymentName
+	replicaSetToDeployment     map[string]string                         // namespace/rawReplicaSetName -> rawDeploymentName
+	podToReplicaSet            map[string]string                         // namespace/rawPodName -> rawReplicaSetName
+	podToDeployment            map[string]string                         // namespace/rawPodName -> rawDeploymentName
+	nonDeploymentPods          map[string]bool                           // namespace/rawPodName -> confirmed not Deployment-owned
+	workloadStates             map[string]*workloadExecState             // namespace/rawWorkloadName -> workloadExecState
+	manageJobsWithoutQueueName bool                                      // cached from Kueue Configuration
 }
 
 // NewScraper initializes a new Scraper with the given clients and configuration.
@@ -194,6 +214,7 @@ func NewScraper(
 		podStates:              make(map[string]*trackedPodState),
 		workflowStates:         make(map[string]*trackedWorkflowState),
 		ownerStates:            make(map[string]WorkloadState),
+		deploymentWlStates:     make(map[string]map[string]WorkloadState),
 		ownerToWorkload:        make(map[string]string),
 		workloadToOwner:        make(map[string]workloadOwnerRef),
 		workloadIsTAS:          make(map[string]bool),
@@ -201,7 +222,11 @@ func NewScraper(
 		jobSetQueues:           make(map[string]string),
 		jobToJobSet:            make(map[string]string),
 		rayClusterToRayJob:     make(map[string]string),
+		deploymentUIDToKey:     make(map[string]string),
 		replicaSetToDeployment: make(map[string]string),
+		podToReplicaSet:        make(map[string]string),
+		podToDeployment:        make(map[string]string),
+		nonDeploymentPods:      make(map[string]bool),
 		workloadStates:         make(map[string]*workloadExecState),
 	}
 }
@@ -217,8 +242,10 @@ func (s *Scraper) Run(ctx context.Context) error {
 	startupTime := time.Now().UTC()
 
 	// 0. Scrape Kueue controller Configuration up front so manageJobsWithoutQueueName is warm
-	// before t0 workflow discovery runs.
+	// before t0 workflow discovery runs, and pre-index Deployment -> ReplicaSet -> Pod ownership
+	// so per-Pod Kueue Workloads owned by Deployments resolve ownerKind="Deployment" at step 1.
 	s.scrapeKueueConfiguration(ctx, startupTime)
+	s.preindexInitialDeploymentOwnership(ctx)
 
 	// 1. Synchronously index existing Kueue Workloads first so ownerStates, ownerToWorkload,
 	// workloadToOwner, workloadIsTAS, and Admitted records exist before workflow and pod events.
@@ -1104,6 +1131,66 @@ func (s *Scraper) scrapePriorityClasses(ctx context.Context, now time.Time) {
 	s.reconcileInfraKind("PriorityClass", now, current)
 }
 
+func (s *Scraper) ensurePodDeploymentOwnership(pod *corev1.Pod) {
+	if pod == nil || s.kubeClient == nil {
+		return
+	}
+	podKey := pod.Namespace + "/" + pod.Name
+	var rsOwner, depOwner string
+	for _, ref := range pod.OwnerReferences {
+		switch ref.Kind {
+		case "Deployment":
+			depOwner = ref.Name
+		case "ReplicaSet":
+			rsOwner = ref.Name
+		}
+	}
+	if depOwner == "" && rsOwner == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.podToDeployment[podKey] != "" || s.nonDeploymentPods[podKey] {
+		s.mu.Unlock()
+		return
+	}
+	if depOwner == "" && rsOwner != "" {
+		depOwner = s.replicaSetToDeployment[pod.Namespace+"/"+rsOwner]
+	}
+	if depOwner != "" {
+		if rsOwner != "" {
+			s.replicaSetToDeployment[pod.Namespace+"/"+rsOwner] = depOwner
+		}
+		s.podToDeployment[podKey] = depOwner
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if rs, err := s.kubeClient.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, rsOwner, metav1.GetOptions{}); err == nil && rs != nil {
+		for _, ref := range rs.OwnerReferences {
+			if ref.Kind == "Deployment" && ref.Name != "" {
+				depOwner = ref.Name
+				break
+			}
+		}
+	}
+	s.mu.Lock()
+	if rsOwner != "" {
+		s.podToReplicaSet[podKey] = rsOwner
+	}
+	if depOwner != "" {
+		if rsOwner != "" {
+			s.replicaSetToDeployment[pod.Namespace+"/"+rsOwner] = depOwner
+		}
+		s.podToDeployment[podKey] = depOwner
+	} else {
+		s.nonDeploymentPods[podKey] = true
+	}
+	s.mu.Unlock()
+}
+
 func (s *Scraper) scrapeScheduledAndRunningPods(ctx context.Context, now time.Time) {
 	s.scrapeScheduledAndRunningPodsWithList(ctx, now, nil)
 }
@@ -1132,6 +1219,13 @@ func (s *Scraper) scrapeScheduledAndRunningPodsWithList(ctx context.Context, now
 	var events []InfraEvent
 	presentActive := make(map[string]bool, len(items))
 	terminalPods := make(map[string]*corev1.Pod)
+
+	for i := range items {
+		pod := &items[i]
+		if IsScheduledAndRunningPod(pod) {
+			s.ensurePodDeploymentOwnership(pod)
+		}
+	}
 
 	s.mu.Lock()
 	for i := range items {
@@ -1316,6 +1410,17 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 				if depName, ok := s.replicaSetToDeployment[ns+"/"+ref.Name]; ok && depName != "" {
 					ownerKind = "Deployment"
 					rawOwnerName = depName
+				} else if pod.Labels != nil {
+					if pth := pod.Labels["pod-template-hash"]; pth != "" && strings.HasSuffix(ref.Name, "-"+pth) {
+						candDep := strings.TrimSuffix(ref.Name, "-"+pth)
+						wfKey := "Deployment/" + ns + "/" + candDep
+						if _, tracked := s.workflowStates[wfKey]; tracked || s.deploymentWlStates[wfKey] != nil {
+							s.replicaSetToDeployment[ns+"/"+ref.Name] = candDep
+							s.podToDeployment[ns+"/"+pod.Name] = candDep
+							ownerKind = "Deployment"
+							rawOwnerName = candDep
+						}
+					}
 				}
 			case "Deployment":
 				if _, tracked := s.workflowStates["Deployment/"+ns+"/"+ref.Name]; tracked {
@@ -1326,6 +1431,13 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 			if ownerKind != "" {
 				break
 			}
+		}
+	}
+
+	if ownerKind == "" {
+		if depName, ok := s.podToDeployment[ns+"/"+pod.Name]; ok && depName != "" {
+			ownerKind = "Deployment"
+			rawOwnerName = depName
 		}
 	}
 
@@ -1340,13 +1452,15 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 	}
 
 	// 3. Cross-link between owner and Kueue Workload maps.
-	if rawWorkloadName == "" && ownerKind != "" && rawOwnerName != "" {
-		if wl, ok := s.ownerToWorkload[ownerKind+"/"+ns+"/"+rawOwnerName]; ok {
+	// Check per-Pod Workload linkage first so each Deployment replica Pod keeps its own
+	// individual Kueue Workload name rather than sharing the last Workload registered on the Deployment.
+	if rawWorkloadName == "" {
+		if wl, ok := s.ownerToWorkload["Pod/"+ns+"/"+pod.Name]; ok {
 			rawWorkloadName = wl
 		}
 	}
-	if rawWorkloadName == "" {
-		if wl, ok := s.ownerToWorkload["Pod/"+ns+"/"+pod.Name]; ok {
+	if rawWorkloadName == "" && ownerKind != "" && rawOwnerName != "" {
+		if wl, ok := s.ownerToWorkload[ownerKind+"/"+ns+"/"+rawOwnerName]; ok {
 			rawWorkloadName = wl
 		}
 	}
@@ -1363,11 +1477,12 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 	if rawWorkloadName == "" && ownerKind != "" && rawOwnerName != "" {
 		wfKey := ownerKind + "/" + ns + "/" + rawOwnerName
 		_, hasOwnerWl := s.ownerStates[wfKey]
+		_, hasDepWl := s.deploymentWlStates[wfKey]
 		var hasQueue bool
 		if wfSt, ok := s.workflowStates[wfKey]; ok && wfSt.localQueueName != "" {
 			hasQueue = true
 		}
-		if !hasOwnerWl && !hasQueue && !IsKueueManagedPod(pod) {
+		if !hasOwnerWl && !hasDepWl && !hasQueue && !IsKueueManagedPod(pod) {
 			ownerKind = ""
 			rawOwnerName = ""
 			podSetName = ""
@@ -1497,7 +1612,14 @@ func (s *Scraper) handlePodWatchEventAt(eventType watch.EventType, pod *corev1.P
 	key := pod.Namespace + "/" + pod.Name
 	var infraEvents []InfraEvent
 
+	if eventType != watch.Deleted && IsScheduledAndRunningPod(pod) {
+		s.ensurePodDeploymentOwnership(pod)
+	}
+
 	s.mu.Lock()
+	if eventType != watch.Deleted {
+		s.indexPodDeploymentOwnershipLocked(pod)
+	}
 	switch eventType {
 	case watch.Added, watch.Modified:
 		if IsScheduledAndRunningPod(pod) {
@@ -1671,6 +1793,32 @@ func (s *Scraper) recordWorkflowEvent(
 	payload any,
 	now time.Time,
 ) {
+	s.recordWorkflowEventWithMeta(
+		watchType,
+		kind,
+		rawName,
+		namespace,
+		creationTime,
+		localQueueName,
+		workloadState,
+		payload,
+		nil,
+		now,
+	)
+}
+
+func (s *Scraper) recordWorkflowEventWithMeta(
+	watchType watch.EventType,
+	kind string,
+	rawName string,
+	namespace string,
+	creationTime metav1.Time,
+	localQueueName string,
+	workloadState WorkloadState,
+	payload any,
+	deployMeta *deploymentEventMeta,
+	now time.Time,
+) {
 	key := kind + "/" + namespace + "/" + rawName
 	displayName := s.hasher.HashNameForKind(kind, rawName)
 	digest := canonicalDigest(payload)
@@ -1682,7 +1830,7 @@ func (s *Scraper) recordWorkflowEvent(
 	switch watchType {
 	case watch.Added, watch.Modified:
 		if !existed {
-			s.workflowStates[key] = &trackedWorkflowState{
+			newSt := &trackedWorkflowState{
 				kind:           kind,
 				name:           displayName,
 				namespace:      namespace,
@@ -1692,40 +1840,98 @@ func (s *Scraper) recordWorkflowEvent(
 				lastDigest:     digest,
 				lastPayload:    payload,
 			}
+			wfPayload := WorkflowPayload{
+				ObjectKind:     kind,
+				Name:           displayName,
+				Namespace:      namespace,
+				CreationTime:   creationTime,
+				LocalQueueName: localQueueName,
+				Object:         payload,
+			}
+			if deployMeta != nil {
+				r := deployMeta.replicas
+				rr := deployMeta.readyReplicas
+				p := deployMeta.paused
+				newSt.replicas = r
+				newSt.hasReplicas = true
+				newSt.readyReplicas = rr
+				newSt.paused = p
+				newSt.templateHash = deployMeta.templateHash
+				newSt.strategySig = deployMeta.strategySig
+				wfPayload.Replicas = &r
+				wfPayload.ReadyReplicas = &rr
+				wfPayload.Paused = &p
+				wfPayload.TemplateHash = deployMeta.templateHash
+			}
+			s.workflowStates[key] = newSt
 			ev = &WorkflowEvent{
 				Timestamp:     now,
 				EventType:     EventNew,
 				WorkloadState: workloadState,
-				Payload: WorkflowPayload{
-					ObjectKind:     kind,
-					Name:           displayName,
-					Namespace:      namespace,
-					CreationTime:   creationTime,
-					LocalQueueName: localQueueName,
-					Object:         payload,
-				},
+				Payload:       wfPayload,
 			}
 		} else if st.lastDigest != digest || st.workloadState != workloadState {
 			if localQueueName == "" {
 				localQueueName = st.localQueueName
 			}
+			var updateTypes []string
+			if deployMeta != nil {
+				if st.hasReplicas && deployMeta.replicas > st.replicas {
+					updateTypes = append(updateTypes, DeploymentUpdateScaleUp)
+				} else if st.hasReplicas && deployMeta.replicas < st.replicas {
+					updateTypes = append(updateTypes, DeploymentUpdateScaleDown)
+				}
+				if st.templateHash != "" && deployMeta.templateHash != "" && deployMeta.templateHash != st.templateHash {
+					updateTypes = append(updateTypes, DeploymentUpdateUpgrade)
+				}
+				if !st.paused && deployMeta.paused {
+					updateTypes = append(updateTypes, DeploymentUpdatePaused)
+				} else if st.paused && !deployMeta.paused {
+					updateTypes = append(updateTypes, DeploymentUpdateResumed)
+				}
+				if st.strategySig != "" && deployMeta.strategySig != "" && deployMeta.strategySig != st.strategySig {
+					updateTypes = append(updateTypes, DeploymentUpdateStrategyChange)
+				}
+				if st.workloadState != workloadState {
+					updateTypes = append(updateTypes, DeploymentUpdateStateTransition)
+				}
+				st.replicas = deployMeta.replicas
+				st.hasReplicas = true
+				st.readyReplicas = deployMeta.readyReplicas
+				st.paused = deployMeta.paused
+				st.templateHash = deployMeta.templateHash
+				st.strategySig = deployMeta.strategySig
+			}
 			st.lastDigest = digest
 			st.lastPayload = payload
 			st.localQueueName = localQueueName
 			st.workloadState = workloadState
+			wfPayload := WorkflowPayload{
+				ObjectKind:     kind,
+				Name:           displayName,
+				Namespace:      namespace,
+				CreationTime:   creationTime,
+				LocalQueueName: localQueueName,
+				Object:         payload,
+			}
+			if deployMeta != nil {
+				r := deployMeta.replicas
+				rr := deployMeta.readyReplicas
+				p := deployMeta.paused
+				wfPayload.Replicas = &r
+				wfPayload.ReadyReplicas = &rr
+				wfPayload.Paused = &p
+				wfPayload.TemplateHash = deployMeta.templateHash
+				wfPayload.UpdateTypes = updateTypes
+			}
 			ev = &WorkflowEvent{
 				Timestamp:     now,
 				EventType:     EventUpdate,
 				WorkloadState: workloadState,
-				Payload: WorkflowPayload{
-					ObjectKind:     kind,
-					Name:           displayName,
-					Namespace:      namespace,
-					CreationTime:   creationTime,
-					LocalQueueName: localQueueName,
-					Object:         payload,
-				},
+				Payload:       wfPayload,
 			}
+		} else if deployMeta != nil {
+			st.readyReplicas = deployMeta.readyReplicas
 		}
 	case watch.Deleted:
 		if existed {
@@ -1740,18 +1946,36 @@ func (s *Scraper) recordWorkflowEvent(
 		if workloadState == "" {
 			workloadState = WorkloadStateNotAdmitted
 		}
+		wfPayload := WorkflowPayload{
+			ObjectKind:     kind,
+			Name:           displayName,
+			Namespace:      namespace,
+			CreationTime:   creationTime,
+			LocalQueueName: localQueueName,
+			Object:         payload,
+		}
+		if deployMeta != nil {
+			r := deployMeta.replicas
+			rr := deployMeta.readyReplicas
+			p := deployMeta.paused
+			wfPayload.Replicas = &r
+			wfPayload.ReadyReplicas = &rr
+			wfPayload.Paused = &p
+			wfPayload.TemplateHash = deployMeta.templateHash
+		} else if existed && st.hasReplicas {
+			r := st.replicas
+			rr := st.readyReplicas
+			p := st.paused
+			wfPayload.Replicas = &r
+			wfPayload.ReadyReplicas = &rr
+			wfPayload.Paused = &p
+			wfPayload.TemplateHash = st.templateHash
+		}
 		ev = &WorkflowEvent{
 			Timestamp:     now,
 			EventType:     EventDeleted,
 			WorkloadState: workloadState,
-			Payload: WorkflowPayload{
-				ObjectKind:     kind,
-				Name:           displayName,
-				Namespace:      namespace,
-				CreationTime:   creationTime,
-				LocalQueueName: localQueueName,
-				Object:         payload,
-			},
+			Payload:       wfPayload,
 		}
 	}
 	s.mu.Unlock()
@@ -1957,10 +2181,21 @@ func (s *Scraper) shouldSkipDeployment(deploy *appsv1.Deployment) bool {
 	if IsKueueManagedDeployment(deploy) {
 		return false
 	}
+	wfKey := "Deployment/" + deploy.Namespace + "/" + deploy.Name
 	s.mu.Lock()
-	_, alreadyTracked := s.workflowStates["Deployment/"+deploy.Namespace+"/"+deploy.Name]
+	_, alreadyTracked := s.workflowStates[wfKey]
+	_, hasOwnerState := s.ownerStates[wfKey]
 	s.mu.Unlock()
-	return !alreadyTracked
+	return !alreadyTracked && !hasOwnerState
+}
+
+func extractDeploymentTemplateHashFromPayload(payload map[string]any) string {
+	spec, _ := payload["spec"].(map[string]any)
+	tpl, _ := spec["template"].(map[string]any)
+	meta, _ := tpl["metadata"].(map[string]any)
+	ann, _ := meta["annotations"].(map[string]any)
+	h, _ := ann[KueueOptimizerTemplateHashAnnot].(string)
+	return h
 }
 
 func (s *Scraper) handleDeploymentWatchEvent(eventType watch.EventType, deploy *appsv1.Deployment) {
@@ -1972,12 +2207,39 @@ func (s *Scraper) handleDeploymentWatchEventAt(eventType watch.EventType, deploy
 		return
 	}
 	lq := ExtractDeploymentLocalQueueName(deploy)
+	replicas := int32(1)
+	if deploy.Spec.Replicas != nil {
+		replicas = *deploy.Spec.Replicas
+	}
 	s.mu.Lock()
+	if deploy.UID != "" {
+		if eventType == watch.Deleted {
+			delete(s.deploymentUIDToKey, string(deploy.UID))
+		} else {
+			s.deploymentUIDToKey[string(deploy.UID)] = deploy.Namespace + "/" + deploy.Name
+		}
+	}
 	wlState := s.determineGroupWorkloadStateLocked("Deployment", deploy.Namespace, deploy.Name, deploy.Status.ReadyReplicas, deploy.Status.Replicas)
+	if lq != "" && wlState == WorkloadStateAdmissionInProgress && deploy.Status.ReadyReplicas == 0 {
+		if _, hasOwnerWl := s.ownerStates["Deployment/"+deploy.Namespace+"/"+deploy.Name]; !hasOwnerWl {
+			wlState = WorkloadStateNotAdmitted
+		}
+	}
 	s.mu.Unlock()
 
 	payload := SanitizeDeployment(deploy, s.cfg.PauseImage, s.hasher)
-	s.recordWorkflowEvent(eventType, "Deployment", deploy.Name, deploy.Namespace, deploy.CreationTimestamp, lq, wlState, payload, now)
+	tplHash := extractDeploymentTemplateHashFromPayload(payload)
+	if tplHash == "" {
+		tplHash = ComputePodTemplateRevisionHash(&deploy.Spec.Template, s.hasher)
+	}
+	meta := &deploymentEventMeta{
+		replicas:      replicas,
+		readyReplicas: deploy.Status.ReadyReplicas,
+		paused:        deploy.Spec.Paused,
+		templateHash:  tplHash,
+		strategySig:   canonicalDigest(deploy.Spec.Strategy),
+	}
+	s.recordWorkflowEventWithMeta(eventType, "Deployment", deploy.Name, deploy.Namespace, deploy.CreationTimestamp, lq, wlState, payload, meta, now)
 }
 
 func (s *Scraper) handleLeaderWorkerSetWatchEvent(eventType watch.EventType, lws *leaderworkersetv1.LeaderWorkerSet) {
@@ -2036,6 +2298,33 @@ func (s *Scraper) handleRayJobWatchEventAt(eventType watch.EventType, rj *rayv1.
 	s.recordWorkflowEvent(eventType, "RayJob", rj.Name, rj.Namespace, rj.CreationTimestamp, lq, wlState, payload, now)
 }
 
+func (s *Scraper) indexPodDeploymentOwnershipLocked(pod *corev1.Pod) {
+	if pod == nil || pod.Name == "" {
+		return
+	}
+	podKey := pod.Namespace + "/" + pod.Name
+	for _, ref := range pod.OwnerReferences {
+		switch ref.Kind {
+		case "Deployment":
+			if ref.Name != "" {
+				s.podToDeployment[podKey] = ref.Name
+				return
+			}
+		case "ReplicaSet":
+			if ref.Name != "" {
+				s.podToReplicaSet[podKey] = ref.Name
+				if depName, ok := s.replicaSetToDeployment[pod.Namespace+"/"+ref.Name]; ok && depName != "" {
+					s.podToDeployment[podKey] = depName
+				}
+				return
+			}
+		}
+	}
+	if IsStandaloneKueuePod(pod) {
+		s.nonDeploymentPods[podKey] = true
+	}
+}
+
 func (s *Scraper) handleReplicaSetWatchEvent(eventType watch.EventType, rs *appsv1.ReplicaSet) {
 	if rs == nil {
 		return
@@ -2054,11 +2343,13 @@ func (s *Scraper) handleReplicaSetWatchEvent(eventType watch.EventType, rs *apps
 	s.mu.Lock()
 	if eventType == watch.Deleted {
 		delete(s.replicaSetToDeployment, key)
-	} else if _, tracked := s.workflowStates["Deployment/"+rs.Namespace+"/"+parentDeploy]; tracked ||
-		ExtractLocalQueueName(rs) != "" ||
-		(rs.Labels != nil && rs.Labels[KueueManagedLabel] == "true") ||
-		(rs.Spec.Template.Labels != nil && (rs.Spec.Template.Labels[KueueQueueLabel] != "" || rs.Spec.Template.Labels[KueueManagedLabel] == "true")) {
+	} else {
 		s.replicaSetToDeployment[key] = parentDeploy
+		for podKey, rsName := range s.podToReplicaSet {
+			if podKey == rs.Namespace+"/"+strings.TrimPrefix(podKey, rs.Namespace+"/") && rsName == rs.Name {
+				s.podToDeployment[podKey] = parentDeploy
+			}
+		}
 	}
 	s.mu.Unlock()
 }
@@ -2240,7 +2531,15 @@ func workloadUsesTAS(wl *kueuev1beta2.Workload) bool {
 		return false
 	}
 	for i := range wl.Spec.PodSets {
-		if wl.Spec.PodSets[i].TopologyRequest != nil {
+		tr := wl.Spec.PodSets[i].TopologyRequest
+		if tr == nil {
+			continue
+		}
+		if (tr.Required != nil && *tr.Required != "") ||
+			(tr.Preferred != nil && *tr.Preferred != "") ||
+			(tr.Unconstrained != nil && *tr.Unconstrained) ||
+			(tr.PodSetSliceRequiredTopology != nil && *tr.PodSetSliceRequiredTopology != "") ||
+			len(tr.PodsetSliceRequiredTopologyConstraints) > 0 {
 			return true
 		}
 	}
@@ -2259,6 +2558,134 @@ func workloadUsesTAS(wl *kueuev1beta2.Workload) bool {
 // or when clean completion wins a race against in-flight preemption) records into execution-time.json.
 func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev1beta2.Workload) {
 	s.handleWorkloadWatchEventAt(eventType, wl, time.Now().UTC())
+}
+
+func (s *Scraper) recomputeDeploymentOwnerStateLocked(ownerKey string) {
+	wlMap := s.deploymentWlStates[ownerKey]
+	if len(wlMap) == 0 {
+		delete(s.deploymentWlStates, ownerKey)
+		delete(s.ownerStates, ownerKey)
+		return
+	}
+	var anyInProgress bool
+	for _, st := range wlMap {
+		if st == WorkloadStateAdmitted {
+			s.ownerStates[ownerKey] = WorkloadStateAdmitted
+			return
+		}
+		if st == WorkloadStateAdmissionInProgress {
+			anyInProgress = true
+		}
+	}
+	if anyInProgress {
+		s.ownerStates[ownerKey] = WorkloadStateAdmissionInProgress
+	} else {
+		s.ownerStates[ownerKey] = WorkloadStateNotAdmitted
+	}
+}
+
+func (s *Scraper) resolveDeploymentOwnerForPodWorkload(ns, rawPodName string, wl *kueuev1beta2.Workload) string {
+	if ns == "" || rawPodName == "" {
+		return ""
+	}
+	podKey := ns + "/" + rawPodName
+
+	s.mu.Lock()
+	if depName := s.podToDeployment[podKey]; depName != "" {
+		s.mu.Unlock()
+		return depName
+	}
+	if rsName := s.podToReplicaSet[podKey]; rsName != "" {
+		if depName := s.replicaSetToDeployment[ns+"/"+rsName]; depName != "" {
+			s.podToDeployment[podKey] = depName
+			s.mu.Unlock()
+			return depName
+		}
+	}
+	if wl != nil && wl.Labels != nil {
+		if jobUID := wl.Labels[KueueJobUIDLabel]; jobUID != "" {
+			if depKey := s.deploymentUIDToKey[jobUID]; depKey != "" {
+				if depNS, depName, ok := strings.Cut(depKey, "/"); ok && depNS == ns && depName != "" {
+					s.podToDeployment[podKey] = depName
+					s.mu.Unlock()
+					return depName
+				}
+			}
+		}
+	}
+	// Match standard ReplicaSet pod naming (<rsName>-<5char>) when ReplicaSet is already indexed.
+	var bestRSLen int
+	var matchedDeploy string
+	rsPrefix := ns + "/"
+	for rsKey, depName := range s.replicaSetToDeployment {
+		if !strings.HasPrefix(rsKey, rsPrefix) || depName == "" {
+			continue
+		}
+		rsName := rsKey[len(rsPrefix):]
+		if strings.HasPrefix(rawPodName, rsName+"-") && len(rawPodName) > len(rsName)+1 && len(rsName) > bestRSLen {
+			bestRSLen = len(rsName)
+			matchedDeploy = depName
+		}
+	}
+	if matchedDeploy != "" {
+		s.podToDeployment[podKey] = matchedDeploy
+		s.mu.Unlock()
+		return matchedDeploy
+	}
+	alreadyConfirmedStandalone := s.nonDeploymentPods[podKey]
+	kubeClient := s.kubeClient
+	s.mu.Unlock()
+
+	if kubeClient == nil || alreadyConfirmedStandalone {
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	pod, err := kubeClient.CoreV1().Pods(ns).Get(ctx, rawPodName, metav1.GetOptions{})
+	if err != nil || pod == nil {
+		return ""
+	}
+	var rsOwner string
+	var depOwner string
+	for _, ref := range pod.OwnerReferences {
+		switch ref.Kind {
+		case "Deployment":
+			depOwner = ref.Name
+		case "ReplicaSet":
+			rsOwner = ref.Name
+		}
+	}
+	if depOwner == "" && rsOwner != "" {
+		s.mu.Lock()
+		depOwner = s.replicaSetToDeployment[ns+"/"+rsOwner]
+		s.mu.Unlock()
+		if depOwner == "" {
+			if rs, rsErr := kubeClient.AppsV1().ReplicaSets(ns).Get(ctx, rsOwner, metav1.GetOptions{}); rsErr == nil && rs != nil {
+				for _, ref := range rs.OwnerReferences {
+					if ref.Kind == "Deployment" && ref.Name != "" {
+						depOwner = ref.Name
+						break
+					}
+				}
+			}
+		}
+	}
+
+	s.mu.Lock()
+	if rsOwner != "" {
+		s.podToReplicaSet[podKey] = rsOwner
+	}
+	if depOwner != "" {
+		if rsOwner != "" {
+			s.replicaSetToDeployment[ns+"/"+rsOwner] = depOwner
+		}
+		s.podToDeployment[podKey] = depOwner
+	} else {
+		s.nonDeploymentPods[podKey] = true
+	}
+	s.mu.Unlock()
+	return depOwner
 }
 
 func (s *Scraper) handleDeletedWorkloadKeyLocked(key string, deletionTime *metav1.Time, now time.Time) *ExecutionTimeEvent {
@@ -2328,7 +2755,28 @@ func (s *Scraper) handleDeletedWorkloadKeyLocked(key string, deletionTime *metav
 		if len(parts) == 2 {
 			ns, rawWlName := parts[0], parts[1]
 			oKey := ownerRef.kind + "/" + ns + "/" + ownerRef.name
-			if s.ownerToWorkload[oKey] == rawWlName {
+			if ownerRef.podName != "" {
+				pKey := ns + "/" + ownerRef.podName
+				if s.ownerToWorkload["Pod/"+pKey] == rawWlName {
+					delete(s.ownerToWorkload, "Pod/"+pKey)
+				}
+				delete(s.podToDeployment, pKey)
+				delete(s.podToReplicaSet, pKey)
+				delete(s.nonDeploymentPods, pKey)
+			}
+			if ownerRef.kind == "Deployment" {
+				if wlMap, ok := s.deploymentWlStates[oKey]; ok {
+					delete(wlMap, rawWlName)
+					s.recomputeDeploymentOwnerStateLocked(oKey)
+				}
+				if s.ownerToWorkload[oKey] == rawWlName {
+					delete(s.ownerToWorkload, oKey)
+					for remWl := range s.deploymentWlStates[oKey] {
+						s.ownerToWorkload[oKey] = remWl
+						break
+					}
+				}
+			} else if s.ownerToWorkload[oKey] == rawWlName {
 				delete(s.ownerToWorkload, oKey)
 				delete(s.ownerStates, oKey)
 			}
@@ -2358,8 +2806,19 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	if rawOwnerKind == "" || rawOwnerName == "" {
 		return
 	}
-	ownerKey := rawOwnerKind + "/" + wl.Namespace + "/" + rawOwnerName
 	ownerKind, ownerName, ownerAPIVersion := resolveWorkloadOwner(wl, s.hasher)
+	var rawPodOwnerName string
+	if rawOwnerKind == "Pod" {
+		rawPodOwnerName = rawOwnerName
+		if depName := s.resolveDeploymentOwnerForPodWorkload(wl.Namespace, rawOwnerName, wl); depName != "" {
+			rawOwnerKind = "Deployment"
+			rawOwnerName = depName
+			ownerKind = "Deployment"
+			ownerName = s.hasher.HashNameForKind("Deployment", depName)
+			ownerAPIVersion = "apps/v1"
+		}
+	}
+	ownerKey := rawOwnerKind + "/" + wl.Namespace + "/" + rawOwnerName
 	workloadName := s.hasher.HashName(wl.Name)
 	localQueueName := string(wl.Spec.QueueName)
 	priorityClassName := extractWorkloadPriorityClassName(wl)
@@ -2451,7 +2910,7 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 			s.ownerToWorkload[ref.Kind+"/"+wl.Namespace+"/"+ref.Name] = wl.Name
 		}
 	}
-	s.workloadToOwner[key] = workloadOwnerRef{kind: rawOwnerKind, name: rawOwnerName}
+	s.workloadToOwner[key] = workloadOwnerRef{kind: rawOwnerKind, name: rawOwnerName, podName: rawPodOwnerName}
 	s.workloadIsTAS[key] = usesTAS
 	if len(podSetNames) > 0 {
 		s.workloadPodSets[key] = podSetNames
@@ -2476,17 +2935,29 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 			finishedCond.Reason != kueuev1beta2.WorkloadFinishedReasonOwnerNotFound &&
 			finishedCond.Reason != kueuev1beta2.WorkloadFinishedReasonOutOfSync))
 
+	var thisWlState WorkloadState
 	switch {
 	case finishedCleanly:
-		s.ownerStates[ownerKey] = WorkloadStateAdmitted
+		thisWlState = WorkloadStateAdmitted
 	case isPreempted || isEvicted || (isFinished && !finishedCleanly):
-		s.ownerStates[ownerKey] = WorkloadStateNotAdmitted
+		thisWlState = WorkloadStateNotAdmitted
 	case isAdmitted:
-		s.ownerStates[ownerKey] = WorkloadStateAdmitted
+		thisWlState = WorkloadStateAdmitted
 	case (quotaReservedCond != nil && quotaReservedCond.Status == metav1.ConditionTrue) || wl.Status.Admission != nil:
-		s.ownerStates[ownerKey] = WorkloadStateAdmissionInProgress
+		thisWlState = WorkloadStateAdmissionInProgress
 	default:
-		s.ownerStates[ownerKey] = WorkloadStateNotAdmitted
+		thisWlState = WorkloadStateNotAdmitted
+	}
+	if rawOwnerKind == "Deployment" {
+		wlMap, exists := s.deploymentWlStates[ownerKey]
+		if !exists {
+			wlMap = make(map[string]WorkloadState)
+			s.deploymentWlStates[ownerKey] = wlMap
+		}
+		wlMap[wl.Name] = thisWlState
+		s.recomputeDeploymentOwnerStateLocked(ownerKey)
+	} else {
+		s.ownerStates[ownerKey] = thisWlState
 	}
 
 	st, ok := s.workloadStates[key]
@@ -2564,7 +3035,11 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 		hadRevokedReservation
 
 	if interruptionCategory == "" && isFinished && !finishedCleanly && wasEverAdmitted {
-		interruptionCategory = InterruptionReasonFailed
+		if finishedCond.Reason == kueuev1beta2.WorkloadFinishedReasonOwnerNotFound {
+			interruptionCategory = InterruptionReasonDeleted
+		} else {
+			interruptionCategory = InterruptionReasonFailed
+		}
 		interruptTime = finishedCond.LastTransitionTime.Time.UTC()
 		interruptReason = finishedCond.Reason
 		interruptMsg = finishedCond.Message
@@ -2971,6 +3446,42 @@ func compareMetaOrder(a, b metav1.Object) bool {
 	return a.GetName() < b.GetName()
 }
 
+func (s *Scraper) preindexInitialDeploymentOwnership(ctx context.Context) {
+	if s.kubeClient == nil || ctx.Err() != nil {
+		return
+	}
+	if depList, err := s.kubeClient.AppsV1().Deployments("").List(ctx, metav1.ListOptions{}); err == nil && depList != nil {
+		s.mu.Lock()
+		for i := range depList.Items {
+			d := &depList.Items[i]
+			if d.UID != "" {
+				s.deploymentUIDToKey[string(d.UID)] = d.Namespace + "/" + d.Name
+			}
+		}
+		s.mu.Unlock()
+	}
+	if rsList, err := s.kubeClient.AppsV1().ReplicaSets("").List(ctx, metav1.ListOptions{}); err == nil && rsList != nil {
+		s.mu.Lock()
+		for i := range rsList.Items {
+			rs := &rsList.Items[i]
+			for _, ref := range rs.OwnerReferences {
+				if ref.Kind == "Deployment" && ref.Name != "" {
+					s.replicaSetToDeployment[rs.Namespace+"/"+rs.Name] = ref.Name
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
+	}
+	if podList, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{}); err == nil && podList != nil {
+		s.mu.Lock()
+		for i := range podList.Items {
+			s.indexPodDeploymentOwnershipLocked(&podList.Items[i])
+		}
+		s.mu.Unlock()
+	}
+}
+
 func (s *Scraper) syncInitialWorkloads(ctx context.Context, now time.Time) string {
 	if s.kueueClient == nil || ctx.Err() != nil {
 		return ""
@@ -3172,18 +3683,28 @@ func (s *Scraper) reconcileWorkflowDeletionsOnRelist(kind string, presentRawKeys
 		if wlState == "" {
 			wlState = WorkloadStateNotAdmitted
 		}
+		wfPayload := WorkflowPayload{
+			ObjectKind:     st.kind,
+			Name:           st.name,
+			Namespace:      st.namespace,
+			CreationTime:   st.creationTime,
+			LocalQueueName: st.localQueueName,
+			Object:         st.lastPayload,
+		}
+		if st.hasReplicas {
+			r := st.replicas
+			rr := st.readyReplicas
+			p := st.paused
+			wfPayload.Replicas = &r
+			wfPayload.ReadyReplicas = &rr
+			wfPayload.Paused = &p
+			wfPayload.TemplateHash = st.templateHash
+		}
 		deletedEvents = append(deletedEvents, WorkflowEvent{
 			Timestamp:     now,
 			EventType:     EventDeleted,
 			WorkloadState: wlState,
-			Payload: WorkflowPayload{
-				ObjectKind:     st.kind,
-				Name:           st.name,
-				Namespace:      st.namespace,
-				CreationTime:   st.creationTime,
-				LocalQueueName: st.localQueueName,
-				Object:         st.lastPayload,
-			},
+			Payload:       wfPayload,
 		})
 	}
 	s.mu.Unlock()

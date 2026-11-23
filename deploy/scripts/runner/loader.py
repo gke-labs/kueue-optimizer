@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path
 import statistics
 import time
@@ -119,6 +120,54 @@ class ScheduledWorkflowItem:
 
 
 @dataclass(order=True)
+class ScheduledWorkflowUpdate:
+    """Scheduled spec mutation of an active Deployment workflow recorded as Update in workflows.json."""
+
+    target_wall_offset_sec: float
+    seq: int
+    raw_offset_sec: float = field(compare=False)
+    raw_offset_from_t0_sec: float = field(compare=False)
+    event_timestamp: str = field(compare=False)
+    object_kind: str = field(compare=False)
+    name: str = field(compare=False)
+    applied_name: str = field(compare=False)
+    namespace: str = field(compare=False)
+    local_queue_name: str = field(compare=False)
+    incarnation_index: int = field(compare=False, default=0)
+    replicas: int = field(compare=False, default=1)
+    paused: bool = field(compare=False, default=False)
+    template_hash: str = field(compare=False, default="")
+    update_types: tuple[str, ...] = field(compare=False, default_factory=tuple)
+    manifest: dict[str, Any] = field(compare=False, default_factory=dict)
+
+
+@dataclass
+class InitialDeploymentBootstrap:
+    """Representation of an apps/v1 Deployment running (fully or partially admitted) at t0."""
+
+    namespace: str
+    name: str
+    applied_name: str
+    local_queue_name: str
+    cluster_queue_name: str
+    desired_replicas: int
+    admitted_replicas: int
+    paused: bool
+    original_age_sec: float
+    placements: list[str]
+    per_pod_requests: dict[str, str]
+    priority_class_name: str
+    priority: int | None
+    is_tas: bool
+    manifest: dict[str, Any]
+    cq_doc: dict[str, Any]
+    flavors_by_name: dict[str, dict[str, Any]] = field(default_factory=dict)
+    topologies_by_name: dict[str, dict[str, Any]] = field(default_factory=dict)
+    nodes_by_name: dict[str, dict[str, Any]] = field(default_factory=dict)
+    scraped_pod_set_assignments: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(order=True)
 class ScheduledWorkflowDeletion:
     """Scheduled deletion of a workflow (or t0 PodGroup) recorded as Deleted in workflows.json."""
 
@@ -195,6 +244,7 @@ class _AdmittedInitialCandidate:
     deleted_epoch: float | None = None
     deleted_ts_str: str = ""
     incarnation_index: int = 0
+    ready_replicas: int | None = None
 
 
 @dataclass
@@ -230,7 +280,9 @@ class ScenarioBundle:
     cluster_queue_names: list[str]
     queueing_strategy: str
     initial_workloads: list[InitialWorkloadPodGroup] = field(default_factory=list)
+    initial_deployments: list[InitialDeploymentBootstrap] = field(default_factory=list)
     scheduled_infra_events: list[ScheduledInfraEvent] = field(default_factory=list)
+    scheduled_workflow_updates: list[ScheduledWorkflowUpdate] = field(default_factory=list)
     scheduled_workflow_deletions: list[ScheduledWorkflowDeletion] = field(default_factory=list)
     interrupted_duration_multiplier: float | None = None
     interrupted_duration_override: InterruptedDurationOverride | None = None
@@ -240,7 +292,9 @@ class ScenarioBundle:
 
     @property
     def initial_workload_pods_count(self) -> int:
-        return sum(len(w.pods) for w in self.initial_workloads)
+        return sum(len(w.pods) for w in self.initial_workloads) + sum(
+            d.admitted_replicas for d in self.initial_deployments
+        )
 
 
 @dataclass
@@ -308,6 +362,10 @@ class _WorkflowIncarnation:
     deleted_epoch: float | None = None
     deleted_ts_str: str = ""
     member_objs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    ready_replicas: int | None = None
+    last_spec_digest: str = ""
+    last_prepared_manifest: dict[str, Any] = field(default_factory=dict)
+    updates: list[ScheduledWorkflowUpdate] = field(default_factory=list)
 
 
 def _dict_has_kueue_domain(d: Any) -> bool:
@@ -364,6 +422,86 @@ def _default_manifest_gvk_for_kind(kind: str) -> tuple[str, str]:
     return ("v1", "Pod")
 
 
+def _extract_deployment_template_hash(manifest: dict[str, Any]) -> str:
+    spec = manifest.get("spec") or {}
+    tpl = spec.get("template") or {}
+    t_meta = tpl.get("metadata") or {}
+    t_ann = t_meta.get("annotations") or {}
+    return str(t_ann.get("kueue-optimizer.gke.io/template-hash") or "")
+
+
+def _deployment_spec_digest(manifest: dict[str, Any]) -> str:
+    meta = manifest.get("metadata") or {}
+    labels = {
+        str(k): str(v)
+        for k, v in (meta.get("labels") or {}).items()
+        if str(k) != "kueue-optimizer.gke.io/testrunner"
+    }
+    anns = {
+        str(k): str(v)
+        for k, v in (meta.get("annotations") or {}).items()
+        if str(k)
+        not in (
+            "kueue-optimizer.gke.io/pod-execution-time-seconds",
+            "kueue-optimizer.gke.io/real-duration-sec",
+            "kueue-optimizer.gke.io/compressed-duration-sec",
+        )
+    }
+    return json.dumps(
+        {
+            "spec": manifest.get("spec") or {},
+            "labels": labels,
+            "annotations": anns,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _classify_deployment_spec_update(
+    prev_manifest: dict[str, Any],
+    new_manifest: dict[str, Any],
+    explicit_types: Any = None,
+) -> tuple[str, ...]:
+    prev_spec = prev_manifest.get("spec") or {}
+    new_spec = new_manifest.get("spec") or {}
+    prev_rep = int(prev_spec["replicas"]) if prev_spec.get("replicas") is not None else 1
+    new_rep = int(new_spec["replicas"]) if new_spec.get("replicas") is not None else 1
+    prev_paused = bool(prev_spec.get("paused", False))
+    new_paused = bool(new_spec.get("paused", False))
+    prev_tpl_sig = json.dumps(prev_spec.get("template") or {}, sort_keys=True, separators=(",", ":"))
+    new_tpl_sig = json.dumps(new_spec.get("template") or {}, sort_keys=True, separators=(",", ":"))
+    prev_strat_sig = json.dumps(prev_spec.get("strategy") or {}, sort_keys=True, separators=(",", ":"))
+    new_strat_sig = json.dumps(new_spec.get("strategy") or {}, sort_keys=True, separators=(",", ":"))
+
+    inferred: list[str] = []
+    if new_rep > prev_rep:
+        inferred.append("ScaleUp")
+    elif new_rep < prev_rep:
+        inferred.append("ScaleDown")
+    if new_tpl_sig != prev_tpl_sig:
+        inferred.append("Upgrade")
+    if not prev_paused and new_paused:
+        inferred.append("Paused")
+    elif prev_paused and not new_paused:
+        inferred.append("Resumed")
+    if new_strat_sig != prev_strat_sig:
+        inferred.append("StrategyChange")
+
+    if isinstance(explicit_types, list):
+        explicit_clean = [
+            str(x)
+            for x in explicit_types
+            if str(x) and str(x) != "StateTransition"
+        ]
+        for inf in inferred:
+            if inf not in explicit_clean:
+                explicit_clean.append(inf)
+        if explicit_clean:
+            return tuple(explicit_clean)
+    return tuple(inferred) if inferred else ("SpecUpdate",)
+
+
 def _schedule_workflows(
     workflow_events: list[dict[str, Any]],
     workflow_event_epochs: list[float],
@@ -381,18 +519,20 @@ def _schedule_workflows(
     manage_jobs_without_queue_name: bool = False,
 ) -> tuple[
     list[ScheduledWorkflowItem],
+    list[ScheduledWorkflowUpdate],
     list[ScheduledWorkflowDeletion],
     list[_AdmittedInitialCandidate],
     list[tuple[str, str, str]],
     int,
 ]:
-    """Track workflow lifecycles (including deletions and re-creations) chronologically."""
+    """Track workflow lifecycles (including Deployment updates, deletions, and re-creations) chronologically."""
     from chamber.parsers import parse_rfc3339_epoch
 
     incarnations_by_key: dict[tuple[str, str, str], list[_WorkflowIncarnation]] = {}
     active_inc_by_key: dict[tuple[str, str, str], _WorkflowIncarnation] = {}
     skipped_child_count = 0
     seq = 0
+    upd_seq = 0
 
     for idx_wf, ev in enumerate(workflow_events):
         ev_type = str(ev.get("eventType") or "")
@@ -502,6 +642,12 @@ def _schedule_workflows(
 
         if cur_inc is None:
             inc_list = incarnations_by_key.setdefault(key, [])
+            init_rr: int | None = None
+            if kind == "Deployment" and pl.get("readyReplicas") is not None:
+                try:
+                    init_rr = max(0, int(pl["readyReplicas"]))
+                except (TypeError, ValueError):
+                    init_rr = None
             cur_inc = _WorkflowIncarnation(
                 inc_id=len(inc_list),
                 ns=ns,
@@ -514,14 +660,86 @@ def _schedule_workflows(
                 creation_epoch=ev_creation_ep,
                 raw_obj=raw_obj,
                 lq_name=lq_name,
+                ready_replicas=init_rr,
             )
+            if kind == "Deployment":
+                init_dep_doc, _ = _inject_pod_execution_time_and_sanitize_workflow(
+                    raw_obj=raw_obj,
+                    exec_str="1",
+                    raw_duration_sec=1.0,
+                    compressed_duration_sec=1.0,
+                    pause_image_override=pause_image_override,
+                    override_namespace=override_workload_namespace,
+                    speedup=speedup,
+                    min_pod_duration_sec=min_pod_duration_sec,
+                )
+                cur_inc.last_prepared_manifest = init_dep_doc
+                cur_inc.last_spec_digest = _deployment_spec_digest(init_dep_doc)
             inc_list.append(cur_inc)
             active_inc_by_key[key] = cur_inc
         else:
-            cur_inc.raw_obj = raw_obj
-            cur_inc.lq_name = lq_name or cur_inc.lq_name
             if cur_inc.creation_epoch is None and ev_creation_ep is not None:
                 cur_inc.creation_epoch = ev_creation_ep
+            cur_inc.lq_name = lq_name or cur_inc.lq_name
+            if kind == "Deployment":
+                upd_doc, _ = _inject_pod_execution_time_and_sanitize_workflow(
+                    raw_obj=raw_obj,
+                    exec_str="1",
+                    raw_duration_sec=1.0,
+                    compressed_duration_sec=1.0,
+                    pause_image_override=pause_image_override,
+                    override_namespace=override_workload_namespace,
+                    speedup=speedup,
+                    min_pod_duration_sec=min_pod_duration_sec,
+                )
+                upd_digest = _deployment_spec_digest(upd_doc)
+                if ev_epoch <= t0_epoch + 1e-6 and cur_inc.scheduled_item is None:
+                    cur_inc.raw_obj = raw_obj
+                    cur_inc.last_prepared_manifest = upd_doc
+                    cur_inc.last_spec_digest = upd_digest
+                    if pl.get("readyReplicas") is not None:
+                        try:
+                            cur_inc.ready_replicas = max(0, int(pl["readyReplicas"]))
+                        except (TypeError, ValueError):
+                            pass
+                elif upd_digest != cur_inc.last_spec_digest:
+                    upd_types = _classify_deployment_spec_update(
+                        cur_inc.last_prepared_manifest,
+                        upd_doc,
+                        pl.get("updateTypes"),
+                    )
+                    cur_inc.last_prepared_manifest = upd_doc
+                    cur_inc.last_spec_digest = upd_digest
+                    upd_spec = upd_doc.get("spec") or {}
+                    upd_rep = int(upd_spec["replicas"]) if upd_spec.get("replicas") is not None else 1
+                    upd_paused = bool(upd_spec.get("paused", False))
+                    upd_tpl_hash = str(pl.get("templateHash") or _extract_deployment_template_hash(upd_doc))
+                    applied_upd_name = str((upd_doc.get("metadata") or {}).get("name") or name)
+                    raw_upd_off = max(0.0, ev_epoch - t0_epoch)
+                    wall_upd_off = raw_upd_off / speedup
+                    cur_inc.updates.append(
+                        ScheduledWorkflowUpdate(
+                            target_wall_offset_sec=wall_upd_off,
+                            seq=upd_seq,
+                            raw_offset_sec=raw_upd_off,
+                            raw_offset_from_t0_sec=raw_upd_off,
+                            event_timestamp=ev_ts_str,
+                            object_kind=kind,
+                            name=name,
+                            applied_name=applied_upd_name,
+                            namespace=ns,
+                            local_queue_name=cur_inc.lq_name,
+                            incarnation_index=cur_inc.inc_id,
+                            replicas=upd_rep,
+                            paused=upd_paused,
+                            template_hash=upd_tpl_hash,
+                            update_types=upd_types,
+                            manifest=upd_doc,
+                        )
+                    )
+                    upd_seq += 1
+            else:
+                cur_inc.raw_obj = raw_obj
 
         if cur_inc.scheduled_item is not None:
             continue
@@ -605,6 +823,7 @@ def _schedule_workflows(
             seq += 1
 
     all_scheduled_items: list[ScheduledWorkflowItem] = []
+    scheduled_updates: list[ScheduledWorkflowUpdate] = []
     scheduled_deletions: list[ScheduledWorkflowDeletion] = []
     admitted_candidates: list[_AdmittedInitialCandidate] = []
     skipped_admitted: list[tuple[str, str, str]] = []
@@ -615,6 +834,9 @@ def _schedule_workflows(
             # Drop any incarnation that was both created and deleted at or before t0.
             if inc.deleted_epoch is not None and inc.deleted_epoch <= t0_epoch + 1e-6:
                 continue
+
+            if inc.updates:
+                scheduled_updates.extend(inc.updates)
 
             info = exec_index.lookup(
                 inc.orig_ns,
@@ -627,7 +849,8 @@ def _schedule_workflows(
 
             # Check if a workload first seen Admitted was recorded as preempted/interrupted in execution-time.json
             # even if workflows.json lacked a separate Update(NotAdmitted) event.
-            if inc.scheduled_item is None and inc.first_seen_state != "NotAdmitted" and inc.kind != "PodGroup":
+            # Deployments running at t0 are bootstrapped as real apps/v1 Deployments, so ReplicaSet handles pod replacement.
+            if inc.scheduled_item is None and inc.first_seen_state != "NotAdmitted" and inc.kind not in ("PodGroup", "Deployment"):
                 cand_int_epochs = (info.preempted_epochs or info.interrupted_epochs) if info else []
                 if info and cand_int_epochs:
                     preempt_epoch = min(cand_int_epochs)
@@ -707,6 +930,7 @@ def _schedule_workflows(
                         deleted_epoch=inc.deleted_epoch,
                         deleted_ts_str=inc.deleted_ts_str,
                         incarnation_index=inc.inc_id,
+                        ready_replicas=inc.ready_replicas,
                     )
                 )
 
@@ -787,8 +1011,16 @@ def _schedule_workflows(
             item.seq,
         ),
     )
+    scheduled_updates.sort(key=lambda u: (u.target_wall_offset_sec, u.seq))
     scheduled_deletions.sort(key=lambda d: (d.target_wall_offset_sec, d.seq))
-    return scheduled_workflows, scheduled_deletions, admitted_candidates, skipped_admitted, skipped_child_count
+    return (
+        scheduled_workflows,
+        scheduled_updates,
+        scheduled_deletions,
+        admitted_candidates,
+        skipped_admitted,
+        skipped_child_count,
+    )
 
 
 def _parse_infra_resources(
@@ -1187,7 +1419,8 @@ def _extract_workflow_podset_templates(
         parallelism = max(1, int(spec.get("parallelism") or spec.get("completions") or 1))
         _pod_tpl_to_entry("main", parallelism, spec.get("template") or {})
     elif kind in ("Deployment", "StatefulSet", "ReplicaSet"):
-        replicas = max(1, int(spec.get("replicas") or 1))
+        raw_rep = spec.get("replicas")
+        replicas = max(0, int(raw_rep)) if raw_rep is not None else 1
         _pod_tpl_to_entry("main", replicas, spec.get("template") or {})
     elif kind == "LeaderWorkerSet":
         replicas = max(1, int(spec.get("replicas") or 1))
@@ -1718,8 +1951,9 @@ def _build_initial_workloads_and_pods(
             for rk, rv in (pl.get("resourceRequest") or {}).items():
                 rem_node_alloc[plc][rk] = rem_node_alloc[plc].get(rk, 0.0) - parse_k8s_quantity(rv, rk)
 
-    # Materialize Class 1 `InitialWorkloadPodGroup`s and collect any preempted items superseded by dynamic resubmit.
+    # Materialize Class 1 `InitialWorkloadPodGroup`s and `InitialDeploymentBootstrap`s, and collect any preempted items superseded by dynamic resubmit.
     initial_workloads: list[InitialWorkloadPodGroup] = []
+    initial_deployments: list[InitialDeploymentBootstrap] = []
     superseded_preempt_seqs: set[int] = set()
     used_wl_names_by_ns: dict[str, set[str]] = {}
     used_pod_names_by_ns: dict[str, set[str]] = {}
@@ -1730,6 +1964,143 @@ def _build_initial_workloads_and_pods(
             cand, parsed_infra, manage_jobs_without_queue_name=manage_jobs_without_queue_name
         )
         cand_pods = list(matched_pods_by_cand.get(c_idx) or [])
+
+        # Bootstrap t0 apps/v1 Deployments natively as real Deployment objects (supporting full or partial t0 readiness,
+        # mid-run ScaleUp/ScaleDown/Upgrade/Pause/Resume,ReplicaSet pod replacement on preemption, and Delete/Recreate).
+        if cand.kind == "Deployment" and cand.from_workflows_json and cand.raw_obj and lq_name and cq_name:
+            dep_spec_raw = cand.raw_obj.get("spec") or {}
+            raw_rep_val = dep_spec_raw.get("replicas")
+            desired_replicas = max(0, int(raw_rep_val)) if raw_rep_val is not None else 1
+            if cand.ready_replicas is not None:
+                k_admitted = min(desired_replicas, max(0, int(cand.ready_replicas)))
+                if k_admitted == 0 and cand_pods:
+                    k_admitted = min(desired_replicas, len(cand_pods))
+            elif cand_pods:
+                k_admitted = min(desired_replicas, len(cand_pods))
+            else:
+                k_admitted = desired_replicas
+
+            ps_groups_dep = _extract_workflow_podset_templates(cand.raw_obj, "Deployment")
+            dep_per_pod_reqs: dict[str, str] = (
+                dict(ps_groups_dep[0][2]) if ps_groups_dep else {"cpu": "1", "memory": "1Gi"}
+            )
+            dep_is_tas = bool(ps_groups_dep[0][3]) if ps_groups_dep else False
+
+            cq_doc_dep = parsed_infra.cqs_by_name[cq_name]
+            cq_flvs_dep = [
+                str(f.get("name") or "")
+                for rg in ((cq_doc_dep.get("spec") or {}).get("resourceGroups") or [])
+                for f in (rg.get("flavors") or [])
+                if isinstance(f, dict) and f.get("name")
+            ]
+            flv_doc_dep = parsed_infra.flavors_by_name.get(cq_flvs_dep[0]) if cq_flvs_dep else None
+
+            dep_placements = [str(pt[3].get("placement") or "") for pt in cand_pods[:k_admitted]]
+            while len(dep_placements) < k_admitted:
+                used_dep_nodes = {plc for plc in dep_placements if plc}
+                chosen_node_dep = ""
+                for prefer_unused in (True, False):
+                    for n_name, n_doc in parsed_infra.nodes_by_name.items():
+                        if prefer_unused and n_name in used_dep_nodes:
+                            continue
+                        if not _node_Matches_flavor(n_doc, flv_doc_dep):
+                            continue
+                        fits = all(
+                            rem_node_alloc.get(n_name, {}).get(rk, 0.0) + 1e-6 >= parse_k8s_quantity(rv, rk)
+                            for rk, rv in dep_per_pod_reqs.items()
+                            if rk in rem_node_alloc.get(n_name, {})
+                        )
+                        if fits:
+                            chosen_node_dep = n_name
+                            for rk, rv in dep_per_pod_reqs.items():
+                                if rk in rem_node_alloc[n_name]:
+                                    rem_node_alloc[n_name][rk] -= parse_k8s_quantity(rv, rk)
+                            break
+                    if chosen_node_dep:
+                        break
+                if not chosen_node_dep and parsed_infra.nodes_by_name:
+                    chosen_node_dep = next(iter(parsed_infra.nodes_by_name.keys()))
+                dep_placements.append(chosen_node_dep)
+
+            dep_manifest, _ = _inject_pod_execution_time_and_sanitize_workflow(
+                raw_obj=cand.raw_obj,
+                exec_str="1",
+                raw_duration_sec=1.0,
+                compressed_duration_sec=1.0,
+                pause_image_override=pause_image_override,
+                override_namespace=override_workload_namespace,
+                speedup=speedup,
+                min_pod_duration_sec=min_pod_duration_sec,
+            )
+            dep_meta = dep_manifest.setdefault("metadata", {})
+            dep_labels = dict(dep_meta.get("labels") or {})
+            if lq_name and not dep_labels.get("kueue.x-k8s.io/queue-name"):
+                dep_labels["kueue.x-k8s.io/queue-name"] = lq_name
+            dep_meta["labels"] = dep_labels
+            applied_dep_name = str(dep_meta.get("name") or cand.name)
+
+            raw_anns_dep = (cand.raw_obj.get("metadata") or {}).get("annotations") or {}
+            pc_name_dep_raw = (
+                str(dep_labels.get("kueue.x-k8s.io/priority-class") or "")
+                or (cand.exec_info.priority_class_name if cand.exec_info else "")
+            )
+            pc_name_dep = validate_dns_label(pc_name_dep_raw, "kueue.x-k8s.io/priority-class") if pc_name_dep_raw else ""
+            prio_val_dep: int | None = cand.exec_info.priority if cand.exec_info else None
+            if prio_val_dep is None and raw_anns_dep.get("kueue-optimizer.gke.io/priority") is not None:
+                try:
+                    prio_val_dep = int(raw_anns_dep["kueue-optimizer.gke.io/priority"])
+                except (TypeError, ValueError):
+                    prio_val_dep = None
+            if prio_val_dep is None and pc_name_dep and pc_name_dep in parsed_infra.priority_classes_by_name:
+                try:
+                    prio_val_dep = int(parsed_infra.priority_classes_by_name[pc_name_dep].get("value") or 0)
+                except (TypeError, ValueError):
+                    prio_val_dep = 0
+
+            orig_ref_ep_dep: float | None = None
+            if cand.exec_info and cand.exec_info.admitted_epochs:
+                orig_ref_ep_dep = min(cand.exec_info.admitted_epochs)
+            if cand.creation_epoch is not None and (
+                orig_ref_ep_dep is None or orig_ref_ep_dep >= effective_start_epoch - 1e-6
+            ):
+                orig_ref_ep_dep = (
+                    min(orig_ref_ep_dep, cand.creation_epoch) if orig_ref_ep_dep is not None else cand.creation_epoch
+                )
+            orig_age_dep = (
+                max(0.0, (effective_start_epoch - orig_ref_ep_dep) / max(1e-6, speedup))
+                if orig_ref_ep_dep is not None
+                else 0.0
+            )
+
+            initial_deployments.append(
+                InitialDeploymentBootstrap(
+                    namespace=cand.namespace,
+                    name=cand.name,
+                    applied_name=applied_dep_name,
+                    local_queue_name=lq_name,
+                    cluster_queue_name=cq_name,
+                    desired_replicas=desired_replicas,
+                    admitted_replicas=k_admitted,
+                    paused=bool((dep_manifest.get("spec") or {}).get("paused", False)),
+                    original_age_sec=orig_age_dep,
+                    placements=dep_placements,
+                    per_pod_requests=dep_per_pod_reqs,
+                    priority_class_name=pc_name_dep,
+                    priority=prio_val_dep,
+                    is_tas=dep_is_tas,
+                    manifest=dep_manifest,
+                    cq_doc=cq_doc_dep,
+                    flavors_by_name=dict(parsed_infra.flavors_by_name),
+                    topologies_by_name=dict(parsed_infra.topologies_by_name),
+                    nodes_by_name=dict(parsed_infra.nodes_by_name),
+                    scraped_pod_set_assignments=list(
+                        cand.exec_info.pod_set_assignments if cand.exec_info else []
+                    ),
+                )
+            )
+            if cand.preempt_item is not None:
+                superseded_preempt_seqs.add(cand.preempt_item.seq)
+            continue
 
         # Tier 4: Synthesize missing pods when a scenario or vanilla-K8s t0 scrape specifies an Admitted
         # workflow in workflows.json with fewer bound Pod events in infra.json than expected (0 or partial binding).
@@ -2372,6 +2743,7 @@ def _build_initial_workloads_and_pods(
 
     # Order initial running workloads oldest-first so Kueue admission/creation order matches trace seniority.
     initial_workloads.sort(key=lambda iwl: (-iwl.original_age_sec, iwl.workload_name))
+    initial_deployments.sort(key=lambda idep: (-idep.original_age_sec, idep.applied_name))
 
     # Remove any static historical preemption resubmissions now handled dynamically on Evicted=True,
     # and keep scheduled_workflows sorted by (target_wall_offset_sec, creation_epoch, raw_offset_from_t0_sec, seq).
@@ -2476,13 +2848,20 @@ def _build_initial_workloads_and_pods(
             )
         )
 
-    return initial_workloads, initial_infra_pods, scheduled_workflows, expired_initial_pods_count
+    return (
+        initial_workloads,
+        initial_deployments,
+        initial_infra_pods,
+        scheduled_workflows,
+        expired_initial_pods_count,
+    )
 
 
 def _schedule_post_t0_non_kueue_pods(
     parsed_infra: _ParsedInfra,
     scheduled_workflows: list[ScheduledWorkflowItem],
     initial_workloads: list[InitialWorkloadPodGroup],
+    initial_deployments: list[InitialDeploymentBootstrap] | None = None,
     *,
     t0_epoch: float,
     effective_start_epoch: float,
@@ -2504,6 +2883,11 @@ def _schedule_post_t0_non_kueue_pods(
     for iwl in initial_workloads:
         if iwl.owner_name:
             kueue_wf_names_by_ns.setdefault(iwl.namespace, set()).add(iwl.owner_name)
+    for idep in initial_deployments or []:
+        if idep.name:
+            kueue_wf_names_by_ns.setdefault(idep.namespace, set()).add(idep.name)
+        if idep.applied_name:
+            kueue_wf_names_by_ns.setdefault(idep.namespace, set()).add(idep.applied_name)
 
     kueue_prefixes_by_ns: dict[str, tuple[str, ...]] = {
         ns: tuple(
@@ -2678,7 +3062,9 @@ def _apply_missing_duration_policy(
     missing_items = [
         sw
         for sw in scheduled_workflows
-        if not sw.indexed_from_execution_time and not sw.has_explicit_pod_exec_annotation
+        if sw.object_kind != "Deployment"
+        and not sw.indexed_from_execution_time
+        and not sw.has_explicit_pod_exec_annotation
     ]
     if not missing_items:
         return [], 0
@@ -2804,8 +3190,10 @@ def _apply_missing_duration_policy(
 def _synthesize_referenced_objects(
     parsed_infra: _ParsedInfra,
     initial_workloads: list[InitialWorkloadPodGroup],
+    initial_deployments: list[InitialDeploymentBootstrap],
     initial_pods: list[InitialPodSpec],
     scheduled_workflows: list[ScheduledWorkflowItem],
+    scheduled_updates: list[ScheduledWorkflowUpdate],
     infra_pods_namespace: str,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Synthesize missing Namespaces, Cohorts, WorkloadPriorityClasses, PriorityClasses, and RuntimeClasses."""
@@ -2822,10 +3210,14 @@ def _synthesize_referenced_objects(
             referenced_namespaces.add(ie.name)
     for iwl in initial_workloads:
         referenced_namespaces.add(iwl.namespace)
+    for idep in initial_deployments:
+        referenced_namespaces.add(idep.namespace)
     for ipod in initial_pods:
         referenced_namespaces.add(ipod.namespace)
     for sw in scheduled_workflows:
         referenced_namespaces.add(sw.namespace)
+    for su in scheduled_updates:
+        referenced_namespaces.add(su.namespace)
 
     parsed_infra.namespaces_by_name[infra_pods_namespace] = build_namespace_manifest(
         infra_pods_namespace,
@@ -2875,11 +3267,26 @@ def _synthesize_referenced_objects(
                         "globalDefault": False,
                     }
 
-    all_wf_items: list[ScheduledWorkflowItem] = list(scheduled_workflows) + [
-        iwl.resubmit_item for iwl in initial_workloads if iwl.resubmit_item is not None
+    for idx_idep, idep in enumerate(initial_deployments):
+        if idep.priority_class_name and idep.priority_class_name not in parsed_infra.priority_classes_by_name:
+            prio_val_dep = int(idep.priority if idep.priority is not None else (1000 - idx_idep))
+            parsed_infra.priority_classes_by_name[idep.priority_class_name] = build_priority_class_manifest(
+                idep.priority_class_name, value=prio_val_dep
+            )
+
+    all_wf_manifests: list[tuple[str, dict[str, Any]]] = [
+        (sw.object_kind, sw.manifest) for sw in scheduled_workflows
+    ] + [
+        (iwl.resubmit_item.object_kind, iwl.resubmit_item.manifest)
+        for iwl in initial_workloads
+        if iwl.resubmit_item is not None
+    ] + [
+        ("Deployment", idep.manifest) for idep in initial_deployments
+    ] + [
+        (su.object_kind, su.manifest) for su in scheduled_updates
     ]
-    for idx_pc, sw in enumerate(all_wf_items):
-        w_meta = sw.manifest.get("metadata") or {}
+    for idx_pc, (wf_obj_kind, wf_manifest) in enumerate(all_wf_manifests):
+        w_meta = wf_manifest.get("metadata") or {}
         w_labels = w_meta.get("labels") or {}
         w_ann = w_meta.get("annotations") or {}
         pc_name = w_labels.get("kueue.x-k8s.io/priority-class")
@@ -2891,8 +3298,8 @@ def _synthesize_referenced_objects(
                     pc_name_clean, value=prio_val
                 )
         # Synthesize RuntimeClass and scheduling.k8s.io/v1 PriorityClass referenced by pod templates
-        w_spec = sw.manifest.get("spec") or {}
-        m_kind = str(sw.manifest.get("kind") or sw.object_kind)
+        w_spec = wf_manifest.get("spec") or {}
+        m_kind = str(wf_manifest.get("kind") or wf_obj_kind)
         candidate_pod_specs: list[dict[str, Any]] = []
         if m_kind == "JobSet":
             for rj in w_spec.get("replicatedJobs") or []:
@@ -3049,6 +3456,7 @@ def load_scenario_bundle(
 
     (
         scheduled_workflows,
+        scheduled_updates,
         scheduled_deletions,
         admitted_candidates,
         skipped_admitted,
@@ -3069,11 +3477,16 @@ def load_scenario_bundle(
         manage_jobs_without_queue_name=manage_without_queue,
     )
 
-    # Compute jump target from genuine NotAdmitted arrivals and post-t0 infra/deletion events so dynamic
-    # t0 preemption items don't distort t_start and we never jump past an early Node/Queue/Delete event.
+    # Compute jump target from genuine NotAdmitted arrivals and post-t0 infra/update/deletion events so dynamic
+    # t0 preemption items don't distort t_start and we never jump past an early Node/Queue/Update/Delete event.
     initial_jump_raw_sec = 0.0
     initial_jump_wall_sec = 0.0
-    if skip_initial_offset and (scheduled_workflows or parsed_infra.scheduled_infra_events or scheduled_deletions):
+    if skip_initial_offset and (
+        scheduled_workflows
+        or parsed_infra.scheduled_infra_events
+        or scheduled_updates
+        or scheduled_deletions
+    ):
         cand_raw_offsets: list[float] = []
         if scheduled_workflows:
             not_adm_items = [
@@ -3085,6 +3498,8 @@ def load_scenario_bundle(
             cand_raw_offsets.append(max(0.0, anchor.raw_offset_from_t0_sec))
         if parsed_infra.scheduled_infra_events:
             cand_raw_offsets.append(max(0.0, parsed_infra.scheduled_infra_events[0].raw_offset_from_t0_sec))
+        if scheduled_updates:
+            cand_raw_offsets.append(max(0.0, scheduled_updates[0].raw_offset_from_t0_sec))
         if scheduled_deletions:
             cand_raw_offsets.append(max(0.0, scheduled_deletions[0].raw_offset_from_t0_sec))
         initial_jump_raw_sec = min(cand_raw_offsets) if cand_raw_offsets else 0.0
@@ -3095,7 +3510,13 @@ def load_scenario_bundle(
         "%Y-%m-%dT%H:%M:%S.%fZ"
     )
 
-    initial_workloads, initial_pods, scheduled_workflows, expired_initial_pods_count = (
+    (
+        initial_workloads,
+        initial_deployments,
+        initial_pods,
+        scheduled_workflows,
+        expired_initial_pods_count,
+    ) = (
         _build_initial_workloads_and_pods(
             parsed_infra,
             admitted_candidates,
@@ -3132,6 +3553,7 @@ def load_scenario_bundle(
         parsed_infra,
         scheduled_workflows,
         initial_workloads,
+        initial_deployments,
         t0_epoch=t0_epoch,
         effective_start_epoch=effective_start_epoch,
         initial_window_sec=initial_window_sec,
@@ -3142,13 +3564,20 @@ def load_scenario_bundle(
         infra_pods_namespace=infra_pods_namespace,
     )
 
-    # Re-normalize scheduled workflow, deletion, and infra event offsets if jumping ahead.
-    if skip_initial_offset and (scheduled_workflows or parsed_infra.scheduled_infra_events or scheduled_deletions):
+    # Re-normalize scheduled workflow, update, deletion, and infra event offsets if jumping ahead.
+    if skip_initial_offset and (
+        scheduled_workflows
+        or parsed_infra.scheduled_infra_events
+        or scheduled_updates
+        or scheduled_deletions
+    ):
         recalc_offsets: list[float] = []
         if scheduled_workflows:
             recalc_offsets.append(max(0.0, scheduled_workflows[0].raw_offset_from_t0_sec))
         if parsed_infra.scheduled_infra_events:
             recalc_offsets.append(max(0.0, parsed_infra.scheduled_infra_events[0].raw_offset_from_t0_sec))
+        if scheduled_updates:
+            recalc_offsets.append(max(0.0, scheduled_updates[0].raw_offset_from_t0_sec))
         if scheduled_deletions:
             recalc_offsets.append(max(0.0, scheduled_deletions[0].raw_offset_from_t0_sec))
         initial_jump_raw_sec = min(recalc_offsets) if recalc_offsets else 0.0
@@ -3163,6 +3592,9 @@ def load_scenario_bundle(
         for ie in parsed_infra.scheduled_infra_events:
             ie.raw_offset_sec = max(0.0, ie.raw_offset_from_t0_sec - initial_jump_raw_sec)
             ie.target_wall_offset_sec = ie.raw_offset_sec / speedup
+        for upd in scheduled_updates:
+            upd.raw_offset_sec = max(0.0, upd.raw_offset_from_t0_sec - initial_jump_raw_sec)
+            upd.target_wall_offset_sec = upd.raw_offset_sec / speedup
         for del_ev in scheduled_deletions:
             del_ev.raw_offset_sec = max(0.0, del_ev.raw_offset_from_t0_sec - initial_jump_raw_sec)
             del_ev.target_wall_offset_sec = del_ev.raw_offset_sec / speedup
@@ -3175,13 +3607,16 @@ def load_scenario_bundle(
             item.seq,
         )
     )
+    scheduled_updates.sort(key=lambda u: (u.target_wall_offset_sec, u.seq))
     scheduled_deletions.sort(key=lambda d: (d.target_wall_offset_sec, d.seq))
 
     prereq_and_queue_docs, workload_namespaces = _synthesize_referenced_objects(
         parsed_infra,
         initial_workloads,
+        initial_deployments,
         initial_pods,
         scheduled_workflows,
+        scheduled_updates,
         infra_pods_namespace,
     )
 
@@ -3189,6 +3624,7 @@ def load_scenario_bundle(
         override_workload_namespace
         or (scheduled_workflows[0].namespace if scheduled_workflows else None)
         or (initial_workloads[0].namespace if initial_workloads else None)
+        or (initial_deployments[0].namespace if initial_deployments else None)
         or workload_namespaces[0]
     )
 
@@ -3231,7 +3667,9 @@ def load_scenario_bundle(
         cluster_queue_names=all_cq_names,
         queueing_strategy=detected_strategy,
         initial_workloads=initial_workloads,
+        initial_deployments=initial_deployments,
         scheduled_infra_events=parsed_infra.scheduled_infra_events,
+        scheduled_workflow_updates=scheduled_updates,
         scheduled_workflow_deletions=scheduled_deletions,
         interrupted_duration_multiplier=interrupted_duration_multiplier,
         interrupted_duration_override=parsed_override,

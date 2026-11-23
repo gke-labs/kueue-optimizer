@@ -233,6 +233,11 @@ stateDiagram-v2
 | `namespace` | `string` | **Yes** | Plain (unhashed) namespace name. |
 | `creationTime` | `string` (RFC3339 UTC) | **Yes** | `metadata.creationTimestamp` of the workflow object. |
 | `localQueueName` | `string` | **Yes** | Plain (unhashed) Kueue `LocalQueue` name extracted from `kueue.x-k8s.io/queue-name` (on the object's labels/annotations, pod template labels, or inherited from the parent `JobSet` for child `Job`s). Empty string `""` if the object is not associated with a Kueue queue. |
+| `replicas` | `integer` | Optional (`Deployment`) | Desired replica count (`spec.replicas`, defaulting to `1` when unset; `0` on scale-to-zero) recorded on `Deployment` events (`"New"`, `"Update"`, `"Deleted"`). Omitted for non-`Deployment` kinds. |
+| `readyReplicas` | `integer` | Optional (`Deployment`) | Observed `status.readyReplicas` at the event timestamp. At $t_0$ (`"New"`), this captures full vs. partial $t_0$ admission (for example `readyReplicas: 4` with `replicas: 6` when 4 pods are running and 2 remain Kueue-gated). Omitted for non-`Deployment` kinds. |
+| `paused` | `boolean` | Optional (`Deployment`) | Observed `spec.paused` flag on `Deployment` events (`true` when rollouts are paused; `false` otherwise). Omitted for non-`Deployment` kinds. |
+| `templateHash` | `string` | Optional (`Deployment`) | Deterministic privacy-preserving revision digest (`"th-<16-hex>"`, keyed with the per-run HMAC salt when `--hash-names` is enabled) computed over `spec.template` prior to container image/command/env sanitization and stamped onto `spec.template.metadata.annotations["kueue-optimizer.gke.io/template-hash"]`. Ensures rolling upgrades across image/command/env changes survive sanitization and trigger authentic `ReplicaSet` rollouts during chamber replay. |
+| `updateTypes` | `string[]` | Optional (`Deployment` `"Update"`) | Classification of `Deployment` changes on `"Update"` events: any combination of `"ScaleUp"`, `"ScaleDown"`, `"Upgrade"`, `"Paused"`, `"Resumed"`, `"StrategyChange"`, and `"StateTransition"`. Omitted when empty or on non-`"Update"` / non-`Deployment` events. |
 | `object` | `object` | **Yes** | The Kubernetes resource object as submitted to the cluster (`apiVersion`, `kind`, `metadata`, `spec`), sanitized according to Section 4.3. |
 
 ### 4.3 Sanitization Rules Applied to `payload.object`
@@ -241,6 +246,7 @@ Every workflow object in `workflows.json` is sanitized before being hashed for c
 
 1. **Container Image & Command Replacement**:
    - All `containers`, `initContainers`, and `ephemeralContainers` (as well as `RayCluster` `autoscalerOptions.image` and `historyServerOptions.collectorOptions.image` when set) have their `image` replaced with the pause container image (`registry.k8s.io/pause:3.10` by default, configurable via `--pause-image`) and `command` set to `nil`.
+   - For `Deployment` objects, before sanitizing `spec.template`, `cluster-scraper` computes a deterministic `th-<16-hex>` digest of `spec.template` (keyed with the per-run HMAC-SHA256 salt when `--hash-names` is enabled) and writes it to `spec.template.metadata.annotations["kueue-optimizer.gke.io/template-hash"]` (and `payload.templateHash`) so rolling upgrades that only change container images, arguments, or environment variables remain distinct in `workflows.json` without leaking sensitive container metadata.
 2. **Command-Line Arguments & Job Metadata Stripped**:
    - Container and `RayCluster.spec.autoscalerOptions` `args` are set to `nil`.
    - `RayJob.spec.entrypoint`, `RayJob.spec.runtimeEnvYAML`, and `RayJob.spec.jobId` are cleared (`""`), and `RayJob.spec.metadata` is set to `nil`.

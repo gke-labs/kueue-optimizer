@@ -1612,7 +1612,9 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
         st50_dir = repo_root / "testscenarios/self-tests/st50-scale-quota-mixed-apis-infra-128n-1064w"
         st50_bundle = testrunner.load_scenario_bundle(scenario_dir=st50_dir, skip_initial_offset=False)
         self.assertEqual(len(st50_bundle.nodes), 128)
-        self.assertEqual(len(st50_bundle.initial_workloads), 64)
+        self.assertEqual(len(st50_bundle.initial_workloads), 48)
+        self.assertEqual(len(st50_bundle.initial_deployments), 16)
+        self.assertEqual(len(st50_bundle.initial_workloads) + len(st50_bundle.initial_deployments), 64)
         self.assertEqual(st50_bundle.initial_workload_pods_count, 80)
         self.assertEqual(len(st50_bundle.initial_pods), 16)
         self.assertEqual(len(st50_bundle.scheduled_workflows), 1000)
@@ -3975,6 +3977,276 @@ class FidelityReviewRegressionTests(unittest.TestCase):
                 )
             finally:
                 mgr.close()
+
+
+class DeploymentScrapingAndReplayTests(unittest.TestCase):
+    """Unit tests covering Deployment manifest sanitization, st81-st90 bundle loading, updates, and saturation."""
+
+    def test_deployment_sanitization_restart_policy_scale_zero_and_long_running_annotations(self) -> None:
+        from runner.validation import _inject_pod_execution_time_and_sanitize_workflow
+
+        raw_deploy = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "srv-zero", "namespace": "ai-lab"},
+            "spec": {
+                "replicas": 0,
+                "paused": False,
+                "selector": {"matchLabels": {"app": "srv-zero"}},
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "kueue-optimizer.gke.io/template-hash": "th-0000000000000001",
+                            "kueue-optimizer.gke.io/pod-execution-time-seconds": "10",
+                        }
+                    },
+                    "spec": {
+                        "containers": [{"name": "srv", "resources": {"requests": {"cpu": "2"}}}],
+                    },
+                },
+            },
+        }
+        doc, pod_cnt = _inject_pod_execution_time_and_sanitize_workflow(
+            raw_obj=raw_deploy,
+            exec_str="10",
+            raw_duration_sec=10.0,
+            compressed_duration_sec=10.0,
+        )
+        self.assertEqual(pod_cnt, 0)
+        self.assertEqual(doc["spec"]["replicas"], 0)
+        self.assertIs(doc["spec"]["paused"], False)
+        tpl = doc["spec"]["template"]
+        self.assertEqual(tpl["spec"]["restartPolicy"], "Always")
+        self.assertEqual(tpl["metadata"]["annotations"]["kueue-optimizer.gke.io/long-running-pod"], "true")
+        self.assertEqual(tpl["metadata"]["annotations"]["kueue-optimizer.gke.io/infinite-duration"], "true")
+        self.assertEqual(
+            tpl["metadata"]["annotations"]["kueue-optimizer.gke.io/template-hash"],
+            "th-0000000000000001",
+        )
+        self.assertNotIn("kueue-optimizer.gke.io/pod-execution-time-seconds", tpl["metadata"]["annotations"])
+
+    def test_st81_to_st90_deployment_scenarios_load_and_validate_cleanly(self) -> None:
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+
+        b81 = testrunner.load_scenario_bundle(
+            suite_dir / "st81-deployment-scale-up-headroom",
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b81.scheduled_workflows), 1)
+        self.assertEqual(len(b81.scheduled_workflow_updates), 1)
+        self.assertEqual(b81.scheduled_workflow_updates[0].replicas, 6)
+        self.assertIn("ScaleUp", b81.scheduled_workflow_updates[0].update_types)
+
+        b83 = testrunner.load_scenario_bundle(
+            suite_dir / "st83-deployment-scale-down-unblocks-batch-and-zero",
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b83.scheduled_workflows), 3)
+        self.assertEqual([u.replicas for u in b83.scheduled_workflow_updates], [4, 0])
+        self.assertTrue(all("ScaleDown" in u.update_types for u in b83.scheduled_workflow_updates))
+
+        b85 = testrunner.load_scenario_bundle(
+            suite_dir / "st85-deployment-rolling-upgrade-max-unavailable",
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b85.scheduled_workflow_updates), 1)
+        self.assertEqual(b85.scheduled_workflow_updates[0].update_types, ("Upgrade",))
+        self.assertEqual(b85.scheduled_workflow_updates[0].template_hash, "th-0000000000000002")
+
+        b87 = testrunner.load_scenario_bundle(
+            suite_dir / "st87-deployment-pause-defers-rollout-and-resume",
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b87.scheduled_workflow_updates), 3)
+        self.assertEqual([u.paused for u in b87.scheduled_workflow_updates], [True, True, False])
+        self.assertEqual(
+            [u.update_types for u in b87.scheduled_workflow_updates],
+            [("Paused",), ("Upgrade",), ("Resumed",)],
+        )
+
+        b89 = testrunner.load_scenario_bundle(
+            suite_dir / "st89-deployment-t0-partial-status-and-preemption",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b89.initial_deployments), 3)
+        self.assertEqual(len(b89.initial_pods), 0)
+        by_name_89 = {d.name: (d.admitted_replicas, d.desired_replicas) for d in b89.initial_deployments}
+        self.assertEqual(
+            by_name_89,
+            {"steady-srv": (2, 2), "bg-embed": (2, 2), "partial-api": (4, 6)},
+        )
+        self.assertEqual(b89.initial_workload_pods_count, 8)
+        self.assertEqual(len(b89.scheduled_workflows), 1)
+        self.assertEqual(b89.scheduled_workflows[0].name, "urgent-eval")
+
+        b90 = testrunner.load_scenario_bundle(
+            suite_dir / "st90-deployment-t0-delete-and-recreate-lifecycle",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b90.initial_deployments), 1)
+        self.assertEqual(b90.initial_deployments[0].name, "ephemeral-srv")
+        self.assertEqual(b90.initial_deployments[0].admitted_replicas, 4)
+        self.assertEqual(len(b90.scheduled_workflow_deletions), 2)
+        self.assertEqual(
+            [(d.name, d.incarnation_index) for d in b90.scheduled_workflow_deletions],
+            [("ephemeral-srv", 0), ("canary-srv", 0)],
+        )
+        self.assertEqual(
+            [(w.name, w.incarnation_index, w.pod_count) for w in b90.scheduled_workflows],
+            [("ephemeral-srv", 1, 6), ("canary-srv", 0, 2)],
+        )
+
+    def test_deployment_replay_scale_to_zero_and_retired_vs_preempted_saturation(self) -> None:
+        from datetime import datetime, timezone
+        import time
+
+        from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot
+        from metrics.saturation import report_effective_uninterrupted_saturation
+        from runner.replay import run_scenario_replay
+
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+        b83 = testrunner.load_scenario_bundle(
+            suite_dir / "st83-deployment-scale-down-unblocks-batch-and-zero",
+            speedup=40.0,
+        )
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-ut83", apiserver_port=16499)
+        try:
+            applied_updates: list[int] = []
+            live_wls: list[dict] = []
+
+            def _mk_srv_wl(idx: int, admit_iso: str) -> dict:
+                return {
+                    "metadata": {
+                        "name": f"pod-srv-pool-rs-{idx}",
+                        "namespace": "st-workloads",
+                        "ownerReferences": [{"kind": "Pod", "name": f"srv-pool-rs-{idx}"}],
+                    },
+                    "spec": {
+                        "podSets": [
+                            {
+                                "name": "main",
+                                "count": 1,
+                                "template": {
+                                    "metadata": {},
+                                    "spec": {
+                                        "containers": [
+                                            {
+                                                "name": "srv",
+                                                "resources": {
+                                                    "requests": {
+                                                        "cpu": "2",
+                                                        "memory": "8Gi",
+                                                        "google.com/tpu": "2",
+                                                    }
+                                                },
+                                            }
+                                        ]
+                                    },
+                                },
+                            }
+                        ]
+                    },
+                    "status": {
+                        "admission": {"clusterQueue": "cq-dep-scaledown"},
+                        "conditions": [
+                            {"type": "Admitted", "status": "True", "lastTransitionTime": admit_iso}
+                        ],
+                    },
+                }
+
+            t_start_iso = datetime.fromtimestamp(time.time() - 5.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            def fake_apply_parallel(docs, **_kw):
+                for d in docs:
+                    if d.get("kind") == "Deployment":
+                        live_wls[:] = [_mk_srv_wl(i, t_start_iso) for i in range(8)]
+
+            def fake_ssa(doc):
+                if doc.get("kind") == "Deployment":
+                    rep = int(doc["spec"]["replicas"])
+                    applied_updates.append(rep)
+                    now_ret_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    kept = live_wls[:rep]
+                    # Simulate half of retired Deployment pod Workloads lingering in etcd with OwnerNotFound before GC.
+                    lingering: list[dict] = []
+                    for idx_r, old_w in enumerate(live_wls[rep:]):
+                        if idx_r % 2 == 0:
+                            w_cp = json.loads(json.dumps(old_w))
+                            w_cp["status"]["conditions"].append(
+                                {
+                                    "type": "Finished",
+                                    "status": "True",
+                                    "reason": "OwnerNotFound",
+                                    "message": "The workload's owner no longer exists",
+                                    "lastTransitionTime": now_ret_iso,
+                                }
+                            )
+                            lingering.append(w_cp)
+                    live_wls[:] = kept + lingering
+
+            def fake_api_req(method, path, **_kw):
+                if method == "GET" and path.endswith("/workloads"):
+                    return 200, json.dumps({"items": list(live_wls)}).encode("utf-8")
+                if method == "GET" and path == "/api/v1/nodes":
+                    return 200, json.dumps({"items": b83.nodes}).encode("utf-8")
+                if method == "GET" and path == "/api/v1/pods":
+                    return 200, json.dumps({"items": []}).encode("utf-8")
+                return 200, b"{}"
+
+            def fake_q_status(*_a, **_kw):
+                fin = {("st-workloads", "job-batch-0"), ("st-workloads", "job-batch-1")} if applied_updates else set()
+                return ClusterStatusSnapshot(
+                    workloads_admitted=len(live_wls),
+                    workloads_pending=0,
+                    workloads_finished=len(fin),
+                    pods_running=len(live_wls),
+                    pods_pending=0,
+                    pods_succeeded=len(fin),
+                    pods_failed=0,
+                    jobsets_completed=0,
+                    jobsets_failed=0,
+                    cq_summary=[],
+                    finished_workload_keys=fin,
+                    present_workload_keys=fin | {("st-workloads", w["metadata"]["name"]) for w in live_wls},
+                    workloads_query_ok=True,
+                )
+
+            with (
+                mock.patch.object(mgr, "ensure_kwok_connection"),
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply_parallel),
+                mock.patch.object(mgr, "ssa_apply_doc", side_effect=fake_ssa),
+                mock.patch.object(mgr, "api_request", side_effect=fake_api_req),
+                mock.patch("runner.replay.query_cluster_status", side_effect=fake_q_status),
+            ):
+                s_ep, e_ep, sub_cnt, _ = run_scenario_replay(
+                    mgr=mgr,
+                    bundle=b83,
+                    speedup=40.0,
+                    max_run_seconds=10.0,
+                    status_interval_sec=0.1,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+                sat_snap = mgr.capture_cluster_saturation_snapshot(eval_epoch=e_ep)
+
+            self.assertEqual(sub_cnt, 3)
+            self.assertEqual(applied_updates, [4, 0])
+            self.assertLess(e_ep - s_ep, 4.0)
+            self.assertIsNotNone(sat_snap)
+            self.assertEqual(len(sat_snap["workloads"]), 8)
+
+            sat_rows, sat_subtitle = report_effective_uninterrupted_saturation(
+                sat_snap,
+                start_epoch=s_ep - 5.0,
+                end_epoch=e_ep + 1.0,
+            )
+            self.assertTrue(len(sat_rows) >= 3)
+            self.assertIn("Qualifying Workloads: 8 (completed=8", sat_subtitle)
+            self.assertIn("Excluded (preempted/reclaimed/failed): 0", sat_subtitle)
+        finally:
+            mgr.close()
 
 
 if __name__ == "__main__":

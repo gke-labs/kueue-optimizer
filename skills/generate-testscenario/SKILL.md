@@ -118,7 +118,7 @@ python3 deploy/scripts/generate_scenario_readme.py testscenarios/<scenario-slug>
 # 2. Verify full bundle parsing, execution-time indexing (100% hit rate), and resource totals offline:
 python3 deploy/scripts/testrunner.py testscenarios/<scenario-slug> --dry-run
 
-# 3. If modifying the 80-scenario self-test suite (testscenarios/self-tests/), regenerate and verify zero drift:
+# 3. If modifying the 90-scenario self-test suite (testscenarios/self-tests/), regenerate and verify zero drift:
 make self-tests
 make self-tests-check
 

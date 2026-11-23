@@ -60,6 +60,8 @@ const (
 	KueuePodSetUnconstrainedTopologyAnnot = "kueue.x-k8s.io/podset-unconstrained-topology"
 	KueuePodSetSliceRequiredTopologyAnnot = "kueue.x-k8s.io/podset-slice-required-topology"
 	KueuePodSetSliceConstraintsAnnot      = "kueue.x-k8s.io/podset-slice-required-topology-constraints"
+	KueueJobUIDLabel                      = "kueue.x-k8s.io/job-uid"
+	KueueOptimizerTemplateHashAnnot       = "kueue-optimizer.gke.io/template-hash"
 )
 
 // nonHashedKinds lists object kinds whose names must NEVER be hashed even when --hash-names is enabled.
@@ -1266,13 +1268,49 @@ func SanitizeLeaderWorkerSet(lws *leaderworkersetv1.LeaderWorkerSet, pauseImage 
 	return toMapWithoutStatus(cp)
 }
 
-// SanitizeDeployment sanitizes an apps/v1 Deployment for workflows.json.
+// ComputePodTemplateRevisionHash returns a deterministic privacy-preserving revision digest
+// ("th-<16-hex>") of a PodTemplateSpec prior to image/command/env sanitization so Deployment
+// rolling upgrades remain observable in workflows.json and trigger authentic ReplicaSet rollouts
+// during chamber replay without leaking container images, arguments, or environment variables.
+// When --hash-names is enabled, the digest is keyed with the per-run HMAC-SHA256 salt.
+func ComputePodTemplateRevisionHash(tpl *corev1.PodTemplateSpec, hasher SensitiveDataHasher) string {
+	if tpl == nil {
+		return ""
+	}
+	cp := tpl.DeepCopy()
+	cp.ObjectMeta.ManagedFields = nil
+	cp.ObjectMeta.CreationTimestamp = metav1.Time{}
+	rawBytes, err := json.Marshal(cp)
+	if err != nil {
+		return ""
+	}
+	if hm, ok := hasher.(*hmacSensitiveDataHasher); ok && len(hm.salt) > 0 {
+		mac := hmac.New(sha256.New, hm.salt)
+		_, _ = mac.Write([]byte("deployment-template:"))
+		_, _ = mac.Write(rawBytes)
+		sum := mac.Sum(nil)
+		return "th-" + hex.EncodeToString(sum[:8])
+	}
+	sum := sha256.Sum256(rawBytes)
+	return "th-" + hex.EncodeToString(sum[:8])
+}
+
+// SanitizeDeployment sanitizes an apps/v1 Deployment for workflows.json while stamping
+// kueue-optimizer.gke.io/template-hash on spec.template.metadata.annotations so rolling
+// upgrades across image/command/env changes survive sanitization.
 func SanitizeDeployment(deploy *appsv1.Deployment, pauseImage string, hasher SensitiveDataHasher) map[string]any {
 	cp := deploy.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}
+	tplHash := ComputePodTemplateRevisionHash(&cp.Spec.Template, hasher)
 	SanitizeWorkflowObjectMeta(&cp.ObjectMeta, hasher)
 	cp.Spec.Selector = SanitizeLabelSelector(cp.Spec.Selector, hasher)
 	SanitizePodTemplateSpec(&cp.Spec.Template, pauseImage, hasher)
+	if tplHash != "" {
+		if cp.Spec.Template.Annotations == nil {
+			cp.Spec.Template.Annotations = make(map[string]string, 1)
+		}
+		cp.Spec.Template.Annotations[KueueOptimizerTemplateHashAnnot] = tplHash
+	}
 	return toMapWithoutStatus(cp)
 }
 

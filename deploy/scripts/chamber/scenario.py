@@ -600,7 +600,8 @@ def extract_workflow_pods_and_requests(
         parallelism = max(1, int(spec.get("parallelism") or spec.get("completions") or 1))
         _accumulate_pod_group(((spec.get("template") or {}).get("spec")) or {}, parallelism)
     elif resolved_kind in ("Deployment", "StatefulSet", "ReplicaSet"):
-        replicas = max(1, int(spec.get("replicas") or 1))
+        raw_rep = spec.get("replicas")
+        replicas = max(0, int(raw_rep)) if raw_rep is not None else 1
         _accumulate_pod_group(((spec.get("template") or {}).get("spec")) or {}, replicas)
     elif resolved_kind == "LeaderWorkerSet":
         replicas = max(1, int(spec.get("replicas") or 1))

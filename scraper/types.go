@@ -129,13 +129,32 @@ type WorkflowEvent struct {
 	Payload       WorkflowPayload `json:"payload"`
 }
 
+// DeploymentUpdateType constants recorded in WorkflowPayload.UpdateTypes on Deployment Update events.
+const (
+	DeploymentUpdateScaleUp         = "ScaleUp"
+	DeploymentUpdateScaleDown       = "ScaleDown"
+	DeploymentUpdateUpgrade         = "Upgrade"
+	DeploymentUpdatePaused          = "Paused"
+	DeploymentUpdateResumed         = "Resumed"
+	DeploymentUpdateStrategyChange  = "StrategyChange"
+	DeploymentUpdateStateTransition = "StateTransition"
+)
+
 // WorkflowPayload holds the recorded workflow object along with its creation time and LocalQueue name.
+// For Deployment workflows, optional lifecycle metadata (Replicas, ReadyReplicas, Paused, TemplateHash,
+// and UpdateTypes on Update events) captures scale-up/scale-down, rolling upgrades across image/env
+// sanitization, pause/resume transitions, and t0 partial/full replica readiness.
 type WorkflowPayload struct {
 	ObjectKind     string      `json:"objectKind"`
 	Name           string      `json:"name"`
 	Namespace      string      `json:"namespace"`
 	CreationTime   metav1.Time `json:"creationTime"`
 	LocalQueueName string      `json:"localQueueName"`
+	Replicas       *int32      `json:"replicas,omitempty"`
+	ReadyReplicas  *int32      `json:"readyReplicas,omitempty"`
+	Paused         *bool       `json:"paused,omitempty"`
+	TemplateHash   string      `json:"templateHash,omitempty"`
+	UpdateTypes    []string    `json:"updateTypes,omitempty"`
 	Object         any         `json:"object"`
 }
 

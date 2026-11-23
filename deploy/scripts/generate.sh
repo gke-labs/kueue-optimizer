@@ -349,6 +349,10 @@ spec:
       operator: In
       values:
       - Running
+    - key: .metadata.annotations["kueue-optimizer.gke.io/long-running-pod"]
+      operator: NotIn
+      values:
+      - "true"
   delay:
     durationMilliseconds: 10000
     durationFrom:
