@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -560,7 +560,7 @@ def _schedule_workflows(
             continue
 
         pg_name = (
-            str(((raw_meta.get("labels") or {}).get("kueue.x-k8s.io/pod-group-name")) or "").strip()
+            _get_pod_meta_annotation_or_label(raw_meta, "kueue.x-k8s.io/pod-group-name")
             if kind == "Pod"
             else ""
         )
@@ -1553,6 +1553,21 @@ def _resolve_cq_and_lq_for_candidate(
     return lq_name, cq_name
 
 
+def _get_pod_meta_annotation_or_label(meta: dict[str, Any] | None, key: str) -> str:
+    """Read a Kueue pod-group metadata key from annotations first, falling back to legacy labels."""
+    if not isinstance(meta, dict):
+        return ""
+    anns = meta.get("annotations") or {}
+    if isinstance(anns, dict):
+        val = str(anns.get(key) or "").strip()
+        if val:
+            return val
+    lbls = meta.get("labels") or {}
+    if isinstance(lbls, dict):
+        return str(lbls.get(key) or "").strip()
+    return ""
+
+
 def _resolve_podset_assignment_for_group(
     *,
     role_hash: str,
@@ -1562,6 +1577,9 @@ def _resolve_podset_assignment_for_group(
     cq_doc: dict[str, Any],
     parsed_infra: _ParsedInfra,
     scraped_psas: list[dict[str, Any]],
+    ps_hint: str = "",
+    group_index: int = 0,
+    total_groups: int = 1,
 ) -> tuple[dict[str, Any], bool]:
     """Construct a valid Kueue `PodSetAssignment` and return `(psa_dict, uses_tas)`."""
     cq_rgs = ((cq_doc.get("spec") or {}).get("resourceGroups")) or []
@@ -1589,11 +1607,56 @@ def _resolve_podset_assignment_for_group(
     if not target_resources:
         target_resources = [rk for rk in reqs if rk != "ephemeral-storage"]
 
-    scraped_flavors: dict[str, str] = {}
-    for s_psa in scraped_psas:
-        for rk, fn in (s_psa.get("flavors") or {}).items():
-            if str(fn) in parsed_infra.flavors_by_name:
-                scraped_flavors[str(rk)] = str(fn)
+    def _valid_psa_flavors(s_psa: dict[str, Any]) -> dict[str, str]:
+        return {
+            str(rk): str(fn)
+            for rk, fn in (s_psa.get("flavors") or {}).items()
+            if str(fn) in parsed_infra.flavors_by_name
+        }
+
+    def _psa_matches_node(s_psa: dict[str, Any]) -> bool:
+        flvs = _valid_psa_flavors(s_psa)
+        if not flvs:
+            return False
+        if sample_node is None:
+            return True
+        return all(_node_Matches_flavor(sample_node, parsed_infra.flavors_by_name.get(fn)) for fn in flvs.values())
+
+    matched_psa: dict[str, Any] | None = None
+    if scraped_psas:
+        hint_names = {n for n in (ps_hint, role_hash) if n}
+        for s_psa in scraped_psas:
+            if str(s_psa.get("name") or "") in hint_names:
+                matched_psa = s_psa
+                break
+        if matched_psa is None and len(scraped_psas) == 1:
+            matched_psa = scraped_psas[0]
+        if matched_psa is None:
+            node_compatible = [s_psa for s_psa in scraped_psas if _psa_matches_node(s_psa)]
+            if len(node_compatible) == 1:
+                matched_psa = node_compatible[0]
+            elif len(node_compatible) > 1:
+                count_matches = [s_psa for s_psa in node_compatible if s_psa.get("count") == count]
+                if len(count_matches) == 1:
+                    matched_psa = count_matches[0]
+        if (
+            matched_psa is None
+            and len(scraped_psas) == total_groups
+            and 0 <= group_index < len(scraped_psas)
+            and _psa_matches_node(scraped_psas[group_index])
+        ):
+            matched_psa = scraped_psas[group_index]
+
+    if matched_psa is not None:
+        scraped_flavors: dict[str, str] = _valid_psa_flavors(matched_psa)
+    else:
+        # No assignment could be tied to this pod group. Still trust Kueue's recorded flavor for every
+        # resource on which all scraped assignments agree; only disputed resources fall back to the node.
+        flavors_seen: dict[str, set[str]] = {}
+        for s_psa in scraped_psas:
+            for rk, fn in _valid_psa_flavors(s_psa).items():
+                flavors_seen.setdefault(rk, set()).add(fn)
+        scraped_flavors = {rk: next(iter(fns)) for rk, fns in flavors_seen.items() if len(fns) == 1}
 
     flavors_map: dict[str, str] = {}
     resource_usage: dict[str, str] = {}
@@ -2129,11 +2192,9 @@ def _build_initial_workloads_and_pods(
                             ps_groups_raw[gk_m] = (m_ps, m_cnt, m_reqs, m_tas)
                 ps_groups = list(ps_groups_raw.values())
                 if len(ps_groups) == 1 and cand.member_objs:
-                    pg_tot_str = str(
-                        (((cand.member_objs[0].get("metadata") or {}).get("labels") or {}).get(
-                            "kueue.x-k8s.io/pod-group-total-count"
-                        ))
-                        or ""
+                    pg_tot_str = _get_pod_meta_annotation_or_label(
+                        cand.member_objs[0].get("metadata"),
+                        "kueue.x-k8s.io/pod-group-total-count",
                     )
                     try:
                         pg_tot = int(pg_tot_str)
@@ -2443,6 +2504,9 @@ def _build_initial_workloads_and_pods(
                     cq_doc=cq_doc,
                     parsed_infra=parsed_infra,
                     scraped_psas=scraped_psas,
+                    ps_hint=ps_hint,
+                    group_index=g_idx,
+                    total_groups=len(chunk),
                 )
                 if psa_uses_tas:
                     any_tas_in_wl = True
@@ -2931,7 +2995,7 @@ def _schedule_post_t0_non_kueue_pods(
         is_kueue_pod = bool(
             pl.get("workloadName")
             or p_labels.get("kueue.x-k8s.io/queue-name")
-            or p_labels.get("kueue.x-k8s.io/pod-group-name")
+            or _get_pod_meta_annotation_or_label(p_meta, "kueue.x-k8s.io/pod-group-name")
             or p_labels.get("kueue.x-k8s.io/managed") == "true"
         )
         if not is_kueue_pod and p_owner_name and p_owner_kind not in ("DaemonSet", "StatefulSet", "Node"):
@@ -3522,22 +3586,28 @@ def load_scenario_bundle(
         "%Y-%m-%dT%H:%M:%S.%fZ"
     )
 
-    (
-        initial_workloads,
-        initial_deployments,
-        initial_pods,
-        scheduled_workflows,
-        expired_initial_pods_count,
-    ) = (
-        _build_initial_workloads_and_pods(
+    base_scheduled_workflows = [dc_replace(w) for w in scheduled_workflows]
+    base_scheduled_deletions = [dc_replace(d) for d in scheduled_deletions]
+    base_infra_events = list(parsed_infra.scheduled_infra_events)
+    base_lqs_by_key = dict(parsed_infra.lqs_by_key)
+
+    def _build_for_effective_start(eff_start_ep: float):
+        # Every build starts from the same inputs. The build steps below append post-t0 non-Kueue Pod
+        # events and synthesized LocalQueues to parsed_infra, so restore both before building again.
+        parsed_infra.scheduled_infra_events[:] = base_infra_events
+        parsed_infra.lqs_by_key.clear()
+        parsed_infra.lqs_by_key.update(base_lqs_by_key)
+        sched_wfs_in = [dc_replace(w) for w in base_scheduled_workflows]
+        sched_dels_in = [dc_replace(d) for d in base_scheduled_deletions]
+        init_wls, init_deps, init_pods, sched_wfs_out, expired_cnt = _build_initial_workloads_and_pods(
             parsed_infra,
             admitted_candidates,
-            scheduled_workflows,
-            scheduled_deletions,
+            sched_wfs_in,
+            sched_dels_in,
             earliest_admit_by_ns,
             exec_index,
             t0_epoch=t0_epoch,
-            effective_start_epoch=effective_start_epoch,
+            effective_start_epoch=eff_start_ep,
             initial_window_sec=initial_window_sec,
             speedup=speedup,
             min_pod_duration_sec=min_pod_duration_sec,
@@ -3550,54 +3620,95 @@ def load_scenario_bundle(
             interrupted_duration_override=parsed_override,
             manage_jobs_without_queue_name=manage_without_queue,
         )
-    )
+        miss_warns, imp_cnt = _apply_missing_duration_policy(
+            sched_wfs_out,
+            exec_index,
+            policy=missing_duration_policy,
+            default_exec_sec=default_exec_sec,
+            speedup=speedup,
+            min_pod_duration_sec=min_pod_duration_sec,
+        )
+        _schedule_post_t0_non_kueue_pods(
+            parsed_infra,
+            sched_wfs_out,
+            init_wls,
+            init_deps,
+            t0_epoch=t0_epoch,
+            effective_start_epoch=eff_start_ep,
+            initial_window_sec=initial_window_sec,
+            speedup=speedup,
+            min_pod_duration_sec=min_pod_duration_sec,
+            infinite_pod_duration_sec=infinite_pod_duration_sec,
+            pause_image_override=pause_image_override,
+            infra_pods_namespace=infra_pods_namespace,
+        )
+        sched_wfs_out.sort(
+            key=lambda item: (
+                round(item.raw_offset_from_t0_sec, 6),
+                item.creation_epoch,
+                item.seq,
+            )
+        )
+        return init_wls, init_deps, init_pods, sched_wfs_out, sched_dels_in, expired_cnt, miss_warns, imp_cnt
 
-    missing_warnings, imputed_count = _apply_missing_duration_policy(
-        scheduled_workflows,
-        exec_index,
-        policy=missing_duration_policy,
-        default_exec_sec=default_exec_sec,
-        speedup=speedup,
-        min_pod_duration_sec=min_pod_duration_sec,
-    )
-
-    _schedule_post_t0_non_kueue_pods(
-        parsed_infra,
-        scheduled_workflows,
+    (
         initial_workloads,
         initial_deployments,
-        t0_epoch=t0_epoch,
-        effective_start_epoch=effective_start_epoch,
-        initial_window_sec=initial_window_sec,
-        speedup=speedup,
-        min_pod_duration_sec=min_pod_duration_sec,
-        infinite_pod_duration_sec=infinite_pod_duration_sec,
-        pause_image_override=pause_image_override,
-        infra_pods_namespace=infra_pods_namespace,
-    )
+        initial_pods,
+        scheduled_workflows,
+        scheduled_deletions,
+        expired_initial_pods_count,
+        missing_warnings,
+        imputed_count,
+    ) = _build_for_effective_start(effective_start_epoch)
 
     # Re-normalize scheduled workflow, update, deletion, and infra event offsets if jumping ahead.
+    # If the effective start shifts (e.g., an unsuperseded early t0 PartialExecution occurs before the
+    # first NotAdmitted arrival), rebuild initial workloads and pods at the converged effective_start_epoch
+    # so t0 lifetimes and expired-pod filtering match the final timeline.
     if skip_initial_offset and (
         scheduled_workflows
         or parsed_infra.scheduled_infra_events
         or scheduled_updates
         or scheduled_deletions
     ):
-        recalc_offsets: list[float] = []
-        if scheduled_workflows:
-            recalc_offsets.append(max(0.0, scheduled_workflows[0].raw_offset_from_t0_sec))
-        if parsed_infra.scheduled_infra_events:
-            recalc_offsets.append(max(0.0, parsed_infra.scheduled_infra_events[0].raw_offset_from_t0_sec))
-        if scheduled_updates:
-            recalc_offsets.append(max(0.0, scheduled_updates[0].raw_offset_from_t0_sec))
-        if scheduled_deletions:
-            recalc_offsets.append(max(0.0, scheduled_deletions[0].raw_offset_from_t0_sec))
-        initial_jump_raw_sec = min(recalc_offsets) if recalc_offsets else 0.0
-        initial_jump_wall_sec = initial_jump_raw_sec / speedup
-        effective_start_epoch = t0_epoch + initial_jump_raw_sec
-        effective_start_iso = datetime.fromtimestamp(effective_start_epoch, tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%S.%fZ"
-        )
+        rebuild_count = 0
+        while True:
+            recalc_offsets: list[float] = []
+            if scheduled_workflows:
+                recalc_offsets.append(max(0.0, scheduled_workflows[0].raw_offset_from_t0_sec))
+            if parsed_infra.scheduled_infra_events:
+                recalc_offsets.append(max(0.0, parsed_infra.scheduled_infra_events[0].raw_offset_from_t0_sec))
+            if scheduled_updates:
+                recalc_offsets.append(max(0.0, scheduled_updates[0].raw_offset_from_t0_sec))
+            if scheduled_deletions:
+                recalc_offsets.append(max(0.0, scheduled_deletions[0].raw_offset_from_t0_sec))
+            recalc_jump_raw_sec = min(recalc_offsets) if recalc_offsets else 0.0
+            if abs(recalc_jump_raw_sec - initial_jump_raw_sec) <= 1e-6:
+                break
+            if rebuild_count >= 3:
+                raise ValueError(
+                    f"{resolved_dir}: initial time jump did not settle after {rebuild_count} rebuilds "
+                    f"(last two candidates: +{initial_jump_raw_sec:.3f}s and +{recalc_jump_raw_sec:.3f}s); "
+                    f"rerun with --no-skip-initial-offset"
+                )
+            rebuild_count += 1
+            initial_jump_raw_sec = recalc_jump_raw_sec
+            initial_jump_wall_sec = initial_jump_raw_sec / speedup
+            effective_start_epoch = t0_epoch + initial_jump_raw_sec
+            effective_start_iso = datetime.fromtimestamp(effective_start_epoch, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            )
+            (
+                initial_workloads,
+                initial_deployments,
+                initial_pods,
+                scheduled_workflows,
+                scheduled_deletions,
+                expired_initial_pods_count,
+                missing_warnings,
+                imputed_count,
+            ) = _build_for_effective_start(effective_start_epoch)
         for item in scheduled_workflows:
             item.raw_offset_sec = max(0.0, item.raw_offset_from_t0_sec - initial_jump_raw_sec)
             item.target_wall_offset_sec = item.raw_offset_sec / speedup

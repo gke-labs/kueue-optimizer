@@ -291,9 +291,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--wait-for-pods-ready-requeue-timestamp",
-        default="Eviction",
+        default=None,
         choices=["Eviction", "Creation"],
-        help="Configure waitForPodsReady.requeuingStrategy.timestamp ('Eviction' or 'Creation'; default: Eviction)",
+        help="Configure waitForPodsReady.requeuingStrategy.timestamp ('Eviction' or 'Creation'; default: scenario value or Eviction)",
     )
     parser.add_argument(
         "--wait-for-pods-ready-backoff-limit",
@@ -648,6 +648,7 @@ def main(argv: list[str] | None = None) -> int:
             args.wait_for_pods_ready_recovery_timeout,
             args.wait_for_pods_ready_unscheduled_timeout,
             args.wait_for_pods_ready_block_admission,
+            args.wait_for_pods_ready_requeue_timestamp,
             args.wait_for_pods_ready_backoff_limit,
             args.wait_for_pods_ready_backoff_base,
             args.wait_for_pods_ready_backoff_max,
@@ -816,53 +817,55 @@ def main(argv: list[str] | None = None) -> int:
         scraper_proc: subprocess.Popen[str] | None = None
         scraper_log_fh = None
         scrape_out_dir: Path | None = None
-        if args.scrape_output_dir.strip():
-            scrape_out_dir = Path(args.scrape_output_dir.strip()).resolve()
-            scrape_out_dir.mkdir(parents=True, exist_ok=True)
-            for stale_name in ("infra.json", "workflows.json", "execution-time.json", "scraper.log"):
-                stale_file = scrape_out_dir / stale_name
-                if stale_file.exists():
-                    stale_file.unlink()
-            scraper_bin = Path(args.scraper_bin).resolve()
-            if not scraper_bin.is_file():
-                raise RuntimeError(
-                    f"cluster-scraper binary not found at {scraper_bin}; build it with 'make scraper-build'"
-                )
-            scraper_cmd = [
-                str(scraper_bin),
-                "--kubeconfig",
-                str(mgr.kubeconfig_path),
-                "--output-dir",
-                str(scrape_out_dir),
-                "--interval",
-                str(args.scrape_interval_sec),
-                "--qps",
-                "500",
-                "--burst",
-                "1000",
-            ]
-            if args.scrape_hash_names:
-                scraper_cmd.append("--hash-names")
-            scraper_log_fh = (scrape_out_dir / "scraper.log").open("w", encoding="utf-8")
-            print(
-                f"==> Starting cluster-scraper at exact chamber t0 -> {scrape_out_dir} "
-                f"(hash_names={args.scrape_hash_names}, interval={args.scrape_interval_sec})...",
-                flush=True,
-            )
-            scraper_proc = subprocess.Popen(
-                scraper_cmd,
-                stdout=scraper_log_fh,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            _wait_for_scraper_t0_barrier(
-                scrape_out_dir,
-                scraper_proc,
-                expected_nodes=len(bundle.nodes),
-                expected_cqs=len(bundle.cluster_queue_names),
-            )
-
+        replay_started = False
         try:
+            if args.scrape_output_dir.strip():
+                scrape_out_dir = Path(args.scrape_output_dir.strip()).resolve()
+                scrape_out_dir.mkdir(parents=True, exist_ok=True)
+                for stale_name in ("infra.json", "workflows.json", "execution-time.json", "scraper.log"):
+                    stale_file = scrape_out_dir / stale_name
+                    if stale_file.exists():
+                        stale_file.unlink()
+                scraper_bin = Path(args.scraper_bin).resolve()
+                if not scraper_bin.is_file():
+                    raise RuntimeError(
+                        f"cluster-scraper binary not found at {scraper_bin}; build it with 'make scraper-build'"
+                    )
+                scraper_cmd = [
+                    str(scraper_bin),
+                    "--kubeconfig",
+                    str(mgr.kubeconfig_path),
+                    "--output-dir",
+                    str(scrape_out_dir),
+                    "--interval",
+                    str(args.scrape_interval_sec),
+                    "--qps",
+                    "500",
+                    "--burst",
+                    "1000",
+                ]
+                if args.scrape_hash_names:
+                    scraper_cmd.append("--hash-names")
+                scraper_log_fh = (scrape_out_dir / "scraper.log").open("w", encoding="utf-8")
+                print(
+                    f"==> Starting cluster-scraper at exact chamber t0 -> {scrape_out_dir} "
+                    f"(hash_names={args.scrape_hash_names}, interval={args.scrape_interval_sec})...",
+                    flush=True,
+                )
+                scraper_proc = subprocess.Popen(
+                    scraper_cmd,
+                    stdout=scraper_log_fh,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                _wait_for_scraper_t0_barrier(
+                    scrape_out_dir,
+                    scraper_proc,
+                    expected_nodes=len(bundle.nodes),
+                    expected_cqs=len(bundle.cluster_queue_names),
+                )
+
+            replay_started = True
             start_epoch, end_epoch, submitted_count, total_pods = run_scenario_replay(
                 mgr=mgr,
                 bundle=bundle,
@@ -874,8 +877,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         finally:
             if scraper_proc is not None:
-                # Allow watch streams to deliver final Succeeded/Finished events before graceful SIGTERM flush.
-                time.sleep(1.5)
+                if replay_started:
+                    # Allow watch streams to deliver final Succeeded/Finished events before graceful SIGTERM flush.
+                    time.sleep(1.5)
                 if scraper_proc.poll() is None:
                     scraper_proc.send_signal(signal.SIGTERM)
                     try:
@@ -883,9 +887,9 @@ def main(argv: list[str] | None = None) -> int:
                     except subprocess.TimeoutExpired:
                         scraper_proc.kill()
                         scraper_proc.wait(timeout=5.0)
-                if scraper_log_fh is not None:
-                    scraper_log_fh.close()
                 print(f"==> Flushed and stopped cluster-scraper ({scrape_out_dir}).", flush=True)
+            if scraper_log_fh is not None:
+                scraper_log_fh.close()
 
         final_snap = query_cluster_status(
             mgr,

@@ -606,7 +606,7 @@ def _pod_belongs_to_workflow(
     if not pn:
         return False
     target = del_ev.applied_name
-    if del_ev.manifest_kind == "Pod":
+    if del_ev.manifest_kind == "Pod" and del_ev.object_kind != "PodGroup":
         return pn == target
 
     job_set = owned_job_names or set()
@@ -624,6 +624,7 @@ def _pod_belongs_to_workflow(
             return True
 
     plbls = pm.get("labels") or {}
+    panns = pm.get("annotations") or {}
     if del_ev.manifest_kind == "Job":
         if plbls.get("batch.kubernetes.io/job-name") == target or plbls.get("job-name") == target:
             return True
@@ -633,7 +634,10 @@ def _pod_belongs_to_workflow(
         if plbls.get("batch.kubernetes.io/job-name") in job_set or plbls.get("job-name") in job_set:
             return True
 
-    if del_ev.object_kind == "PodGroup" and plbls.get("kueue.x-k8s.io/pod-group-name") == target:
+    if del_ev.object_kind == "PodGroup" and (
+        panns.get("kueue.x-k8s.io/pod-group-name") == target
+        or plbls.get("kueue.x-k8s.io/pod-group-name") == target
+    ):
         return True
     if del_ev.object_kind == "LeaderWorkerSet" and plbls.get("leaderworkerset.sigs.k8s.io/name") == target:
         return True
@@ -1124,6 +1128,9 @@ def run_scenario_replay(
         if idep.desired_replicas > 0
     }
     deferred_infra_logged_seqs: set[int] = set()
+    # Wall offset before which no workflow may be created. Set after creating one creation-time tier
+    # while later tiers wait, so each tier gets a creationTimestamp in a later whole second.
+    fifo_gate_wall_sec = 0.0
 
     known_deploy_names_by_ns: dict[str, set[str]] = {}
     active_deployment_replicas: dict[tuple[str, str], int] = {}
@@ -1809,7 +1816,9 @@ def run_scenario_replay(
         sim_elapsed = wall_elapsed * speedup
         next_candidates: list[float] = []
         if event_heap:
-            next_candidates.append(max(0.0, event_heap[0].target_wall_offset_sec - wall_elapsed))
+            next_candidates.append(
+                max(0.0, max(event_heap[0].target_wall_offset_sec, fifo_gate_wall_sec) - wall_elapsed)
+            )
         if update_heap:
             next_candidates.append(max(0.0, update_heap[0].target_wall_offset_sec - wall_elapsed))
         if delete_heap:
@@ -1917,7 +1926,11 @@ def run_scenario_replay(
                 continue
 
             due_batch: list[ScheduledWorkflowItem] = []
-            while event_heap and event_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
+            while (
+                (time.monotonic() - t0_mono) >= fifo_gate_wall_sec
+                and event_heap
+                and event_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono)
+            ):
                 cand_it = heapq.heappop(event_heap)
                 c_key = (cand_it.namespace, cand_it.object_kind, cand_it.name, cand_it.incarnation_index)
                 if c_key in cancelled_unsubmitted_keys:
@@ -1949,14 +1962,21 @@ def run_scenario_replay(
                             groups.append([x])
                         else:
                             groups[-1].append(x)
-                    for g_idx, grp in enumerate(groups):
-                        mgr.apply_manifests_parallel(
-                            [it_g.manifest for it_g in grp],
-                            max_workers=min(24, max(1, len(grp))),
-                        )
-                        if g_idx + 1 < len(groups):
-                            rem_sec = max(0.05, 1.02 - (time.time() % 1.0))
-                            time.sleep(rem_sec)
+                    # Create only the earliest creation_epoch tier now. Later tiers go back onto event_heap
+                    # unchanged and wait behind fifo_gate_wall_sec, which is set from the moment this tier
+                    # was actually created. Infra/delete events, --duration and SIGINT stay responsive, a
+                    # slow status poll cannot put two tiers into the same second, and a workflow that
+                    # becomes due meanwhile is sorted behind the waiting tiers instead of passing them.
+                    first_grp = groups[0]
+                    mgr.apply_manifests_parallel(
+                        [it_g.manifest for it_g in first_grp],
+                        max_workers=min(24, max(1, len(first_grp))),
+                    )
+                    for grp in groups[1:]:
+                        for it_g in grp:
+                            heapq.heappush(event_heap, it_g)
+                    fifo_gate_wall_sec = (time.monotonic() - t0_mono) + max(0.05, 1.02 - (time.time() % 1.0))
+                    due_batch = first_grp
                 elif len(distinct_c_epochs) > 1 and len(due_batch) <= 24:
                     mgr.apply_manifests_parallel([item.manifest for item in due_batch], max_workers=1)
                 else:
@@ -2109,7 +2129,7 @@ def run_scenario_replay(
             if (not event_heap and not update_heap and not delete_heap) or initial_wl_keys or known_deploy_names_by_ns:
                 wake_candidates.append(next_poll_mono - now_mono)
             if event_heap:
-                wake_candidates.append(event_heap[0].target_wall_offset_sec - wall_elapsed)
+                wake_candidates.append(max(event_heap[0].target_wall_offset_sec, fifo_gate_wall_sec) - wall_elapsed)
             if update_heap:
                 wake_candidates.append(update_heap[0].target_wall_offset_sec - wall_elapsed)
             if delete_heap:

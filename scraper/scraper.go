@@ -170,6 +170,7 @@ type Scraper struct {
 	podToDeployment            map[string]string                         // namespace/rawPodName -> rawDeploymentName
 	nonDeploymentPods          map[string]bool                           // namespace/rawPodName -> confirmed not Deployment-owned
 	workloadStates             map[string]*workloadExecState             // namespace/rawWorkloadName -> workloadExecState
+	preFinishedWorkloads       map[string]string                         // namespace/rawWorkloadName -> UID of Workload already Finished=True at t0
 	manageJobsWithoutQueueName bool                                      // cached from Kueue Configuration
 }
 
@@ -228,6 +229,7 @@ func NewScraper(
 		podToDeployment:        make(map[string]string),
 		nonDeploymentPods:      make(map[string]bool),
 		workloadStates:         make(map[string]*workloadExecState),
+		preFinishedWorkloads:   make(map[string]string),
 	}
 }
 
@@ -623,6 +625,8 @@ func SanitizeKueueConfigurationYAML(rawYAML string) (map[string]any, bool) {
 		return nil, false
 	}
 
+	isV1Beta1 := apiVer == "config.kueue.x-k8s.io/v1beta1"
+
 	out := map[string]any{
 		"apiVersion": "config.kueue.x-k8s.io/v1beta2",
 		"kind":       "Configuration",
@@ -630,9 +634,10 @@ func SanitizeKueueConfigurationYAML(rawYAML string) (map[string]any, bool) {
 
 	if fsVal, exists := raw["fairSharing"]; exists && fsVal != nil {
 		if fsMap, ok := fsVal.(map[string]any); ok {
-			enabled := true
-			if en, hasEn := fsMap["enable"].(bool); hasEn && !en {
-				enabled = false
+			// In v1beta1, fairSharing.enable defaulted to false when omitted; in v1beta2, presence enables it.
+			enabled := !isV1Beta1
+			if en, hasEn := fsMap["enable"].(bool); hasEn {
+				enabled = en
 			}
 			if enabled {
 				cleanFS := map[string]any{}
@@ -665,14 +670,24 @@ func SanitizeKueueConfigurationYAML(rawYAML string) (map[string]any, bool) {
 		}
 	}
 
-	if wfprVal, exists := raw["waitForPodsReady"]; exists && wfprVal != nil {
-		if wfprMap, ok := wfprVal.(map[string]any); ok && len(wfprMap) > 0 {
-			if en, hasEn := wfprMap["enable"].(bool); hasEn && !en {
-				if fgOut == nil {
-					fgOut = make(map[string]any, 1)
-				}
-				fgOut["DisableWaitForPodsReady"] = true
-			} else {
+	ensureDisableWFPR := func() {
+		if fgOut == nil {
+			fgOut = make(map[string]any, 1)
+		}
+		if _, alreadySet := fgOut["DisableWaitForPodsReady"]; !alreadySet {
+			fgOut["DisableWaitForPodsReady"] = true
+		}
+	}
+
+	wfprVal, hasWFPR := raw["waitForPodsReady"]
+	if hasWFPR && wfprVal != nil {
+		if wfprMap, ok := wfprVal.(map[string]any); ok {
+			// In v1beta1, waitForPodsReady.enable defaulted to false when omitted; in v1beta2, waitForPodsReady is ON unless disabled.
+			en, hasEn := wfprMap["enable"].(bool)
+			wfprDisabled := (hasEn && !en) || (isV1Beta1 && !hasEn)
+			if wfprDisabled {
+				ensureDisableWFPR()
+			} else if len(wfprMap) > 0 {
 				cleanWFPR := make(map[string]any, len(wfprMap))
 				for k, v := range wfprMap {
 					if k == "enable" {
@@ -685,6 +700,9 @@ func SanitizeKueueConfigurationYAML(rawYAML string) (map[string]any, bool) {
 				}
 			}
 		}
+	} else if isV1Beta1 {
+		// In v1beta1, omitting waitForPodsReady completely also meant waitForPodsReady was disabled.
+		ensureDisableWFPR()
 	}
 
 	if len(fgOut) > 0 {
@@ -1315,7 +1333,12 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 	var rawWorkloadName, ownerKind, rawOwnerName, podSetName string
 
 	// 1. Direct Kueue Workload annotations/labels on the Pod.
+	// Since Kueue v0.18, pod-group-name is read from annotations before labels.
+	var podGroupName string
 	if pod.Annotations != nil {
+		if pg := pod.Annotations[KueuePodGroupNameLabel]; pg != "" {
+			podGroupName = pg
+		}
 		if wl := pod.Annotations[KueueWorkloadAnnot]; wl != "" {
 			rawWorkloadName = wl
 		} else if wl := pod.Annotations[KueueWorkloadSliceNameAnnot]; wl != "" {
@@ -1325,12 +1348,16 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 			podSetName = rh
 		}
 	}
+	if podGroupName == "" && pod.Labels != nil {
+		podGroupName = pod.Labels[KueuePodGroupNameLabel]
+	}
 	if rawWorkloadName == "" && pod.Labels != nil {
 		if wl := pod.Labels[KueuePrebuiltWorkloadLabel]; wl != "" {
 			rawWorkloadName = wl
-		} else if pg := pod.Labels[KueuePodGroupNameLabel]; pg != "" {
-			rawWorkloadName = pg
 		}
+	}
+	if rawWorkloadName == "" && podGroupName != "" {
+		rawWorkloadName = podGroupName
 	}
 
 	// 2. Resolve top-level workflow owner via Pod labels and OwnerReferences.
@@ -1442,9 +1469,9 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 	}
 
 	if ownerKind == "" && IsStandaloneKueuePod(pod) {
-		if pod.Labels != nil && pod.Labels[KueuePodGroupNameLabel] != "" {
+		if podGroupName != "" {
 			ownerKind = "PodGroup"
-			rawOwnerName = pod.Labels[KueuePodGroupNameLabel]
+			rawOwnerName = podGroupName
 		} else {
 			ownerKind = "Pod"
 			rawOwnerName = pod.Name
@@ -2791,6 +2818,21 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 		return
 	}
 	key := wl.Namespace + "/" + wl.Name
+	s.mu.Lock()
+	if prevUID, skipped := s.preFinishedWorkloads[key]; skipped {
+		if eventType == watch.Deleted {
+			delete(s.preFinishedWorkloads, key)
+			s.mu.Unlock()
+			return
+		}
+		if string(wl.UID) == prevUID {
+			s.mu.Unlock()
+			return
+		}
+		// Workload name was recreated with a new UID; resume tracking normally.
+		delete(s.preFinishedWorkloads, key)
+	}
+	s.mu.Unlock()
 	if eventType == watch.Deleted {
 		s.mu.Lock()
 		delEv := s.handleDeletedWorkloadKeyLocked(key, wl.DeletionTimestamp, now)
@@ -3498,7 +3540,17 @@ func (s *Scraper) syncInitialWorkloads(ctx context.Context, now time.Time) strin
 		return compareMetaOrder(&list.Items[i], &list.Items[j])
 	})
 	for i := range list.Items {
-		s.handleWorkloadWatchEventAt(watch.Added, &list.Items[i], now)
+		wl := &list.Items[i]
+		// Skip historical Workloads that already reached Finished=True prior to scrape start t0 so
+		// their pre-t0 runs do not contaminate execution-time.json or duration imputation.
+		if apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueuev1beta2.WorkloadFinished) {
+			key := wl.Namespace + "/" + wl.Name
+			s.mu.Lock()
+			s.preFinishedWorkloads[key] = string(wl.UID)
+			s.mu.Unlock()
+			continue
+		}
+		s.handleWorkloadWatchEventAt(watch.Added, wl, now)
 	}
 	if list.ResourceVersion != "" {
 		return list.ResourceVersion
