@@ -311,7 +311,7 @@ def _print_timeline_and_index(
         print(f"  AdmissionFairSharing      : {admission_fair_sharing.summary_str()}{afs_src}")
     elif config_from_scenario:
         print("  AdmissionFairSharing      : disabled [from scenario Configuration]")
-    if wait_for_pods_ready and wait_for_pods_ready.enabled:
+    if wait_for_pods_ready and (not wait_for_pods_ready.enabled or wait_for_pods_ready.configured):
         print(f"  WaitForPodsReady Config   : {wait_for_pods_ready.summary_str()}")
     print("")
     print("  [1] TEST CASE LENGTH & TIMELINE")

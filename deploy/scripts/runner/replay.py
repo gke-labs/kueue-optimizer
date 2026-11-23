@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace as dc_replace
 from datetime import datetime, timezone
 import heapq
 import json
@@ -219,35 +220,209 @@ def _patch_node_ready_condition(
     )
 
 
+PROTECTED_PREREQ_INFRA_KINDS = frozenset(
+    {
+        "Namespace",
+        "PriorityClass",
+        "WorkloadPriorityClass",
+        "RuntimeClass",
+        "Topology",
+    }
+)
+DEFERRED_QUEUE_INFRA_KINDS = frozenset(
+    {
+        "LocalQueue",
+        "ClusterQueue",
+        "ResourceFlavor",
+        "Cohort",
+    }
+)
+
+
+def _extract_cq_flavors_and_cohort(cq_doc: dict[str, Any]) -> tuple[str, set[str]]:
+    spec = (cq_doc.get("spec") or {}) if isinstance(cq_doc, dict) else {}
+    cohort = str(spec.get("cohortName") or spec.get("cohort") or "").strip()
+    flavors: set[str] = set()
+    for rg in spec.get("resourceGroups") or []:
+        if isinstance(rg, dict):
+            for flv in rg.get("flavors") or []:
+                if isinstance(flv, dict) and flv.get("name"):
+                    flavors.add(str(flv["name"]))
+    return cohort, flavors
+
+
+def _is_kueue_infra_object_still_in_use(
+    mgr: ChamberManager,
+    ie: ScheduledInfraEvent,
+    *,
+    event_heap: list[ScheduledWorkflowItem],
+    cancelled_unsubmitted_keys: set[tuple[str, str, str, int]],
+    active_initial_wls: list[Any],
+    lq_to_cq: dict[tuple[str, str], str],
+    cq_to_cohort: dict[str, str],
+    cq_to_flavors: dict[str, set[str]],
+    submitted_non_cancelled: list[tuple[str, str, str]],
+) -> tuple[bool, str]:
+    """Return `(True, reason)` if any unsubmitted or incomplete chamber workload still depends on `ie`."""
+    kind = ie.object_kind
+    target_ns = ie.namespace
+    target_name = ie.name
+
+    def _cq_uses_target(cq_n: str) -> bool:
+        if not cq_n:
+            return False
+        if kind == "ClusterQueue":
+            return cq_n == target_name
+        if kind == "Cohort":
+            return cq_to_cohort.get(cq_n, "") == target_name
+        if kind == "ResourceFlavor":
+            return target_name in cq_to_flavors.get(cq_n, set())
+        return False
+
+    def _lq_uses_target(ns_val: str, lq_val: str) -> bool:
+        if kind == "LocalQueue":
+            return ns_val == target_ns and lq_val == target_name
+        cq_n = lq_to_cq.get((ns_val, lq_val), "")
+        if cq_n:
+            return _cq_uses_target(cq_n)
+        # Conservative fallback when a workflow omits queue-name (e.g., manageJobsWithoutQueueName or single CQ)
+        if not lq_val and len(cq_to_flavors) == 1:
+            return _cq_uses_target(next(iter(cq_to_flavors.keys())))
+        return False
+
+    # 1. Unsubmitted future workflows in event_heap
+    for w in event_heap:
+        c_key = (w.namespace, w.object_kind, w.name, w.incarnation_index)
+        if c_key in cancelled_unsubmitted_keys:
+            continue
+        if _lq_uses_target(w.namespace, w.local_queue_name):
+            return True, f"unsubmitted workflow '{w.namespace}/{w.name}' still queued in replay timeline"
+
+    # 2. Active t0 initial workloads
+    for iwl in active_initial_wls:
+        if kind == "LocalQueue" and iwl.namespace == target_ns and iwl.local_queue_name == target_name:
+            return True, f"active t0 Workload '{iwl.namespace}/{iwl.workload_name}'"
+        if kind != "LocalQueue" and _cq_uses_target(iwl.cluster_queue_name):
+            return True, f"active t0 Workload '{iwl.namespace}/{iwl.workload_name}'"
+
+    # 3. Live Kueue Workloads (and newly submitted workflows awaiting Workload creation) in the chamber
+    st_wl, raw_wl = mgr.api_request("GET", "/apis/kueue.x-k8s.io/v1beta2/workloads")
+    if st_wl != 200 or not raw_wl:
+        return True, "transient workload API check"
+
+    try:
+        wl_items = json.loads(raw_wl.decode("utf-8")).get("items") or []
+    except Exception:
+        return True, "workload JSON parse retry"
+
+    seen_owner_names_by_ns: dict[str, set[str]] = {}
+    for wl in wl_items:
+        w_meta = wl.get("metadata") or {}
+        w_ns = str(w_meta.get("namespace") or "default")
+        w_name = str(w_meta.get("name") or "")
+        for oref in w_meta.get("ownerReferences") or []:
+            if isinstance(oref, dict) and oref.get("name"):
+                seen_owner_names_by_ns.setdefault(w_ns, set()).add(str(oref["name"]))
+        w_spec = wl.get("spec") or {}
+        if w_spec.get("active") is False:
+            continue
+        w_status = wl.get("status") or {}
+        conds = w_status.get("conditions") or []
+        is_finished = any(
+            isinstance(c, dict) and c.get("type") == "Finished" and c.get("status") == "True"
+            for c in conds
+        )
+        if is_finished:
+            continue
+        w_lq = str(w_spec.get("queueName") or "")
+        adm_cq = str(((w_status.get("admission") or {}).get("clusterQueue")) or "")
+        if kind == "LocalQueue" and w_ns == target_ns and w_lq == target_name:
+            return True, f"incomplete Workload '{w_ns}/{w_name}'"
+        if kind != "LocalQueue" and (_cq_uses_target(adm_cq) or _lq_uses_target(w_ns, w_lq)):
+            return True, f"incomplete Workload '{w_ns}/{w_name}'"
+
+    # Guard the brief controller-creation window right after submitting a parent JobSet/Job before its Workload exists
+    for sub_ns, sub_lq, sub_applied_name in submitted_non_cancelled:
+        if sub_applied_name not in seen_owner_names_by_ns.get(sub_ns, set()):
+            if _lq_uses_target(sub_ns, sub_lq):
+                return True, f"newly submitted workflow '{sub_ns}/{sub_applied_name}' awaiting Workload reconciliation"
+
+    return False, ""
+
+
 def _execute_scheduled_infra_event(
     mgr: ChamberManager,
     bundle: ScenarioBundle,
     ie: ScheduledInfraEvent,
     wall_elapsed: float,
-) -> None:
-    """Apply a scheduled post-t0 Node, Queue/Quota, PriorityClass, RuntimeClass, Namespace, or non-Kueue Pod event."""
+    *,
+    event_heap: list[ScheduledWorkflowItem] | None = None,
+    cancelled_unsubmitted_keys: set[tuple[str, str, str, int]] | None = None,
+    active_initial_wls: list[Any] | None = None,
+    lq_to_cq: dict[tuple[str, str], str] | None = None,
+    cq_to_cohort: dict[str, str] | None = None,
+    cq_to_flavors: dict[str, set[str]] | None = None,
+    submitted_non_cancelled: list[tuple[str, str, str]] | None = None,
+) -> tuple[bool, str]:
+    """Apply a scheduled post-t0 Node, Queue/Quota, PriorityClass, RuntimeClass, Namespace, or non-Kueue Pod event.
+
+    Returns `(deferred, defer_reason)`: `(True, reason)` when a queue/flavor/cohort deletion is safely
+    deferred because chamber workloads depending on it have not finished yet; `(False, "")` otherwise.
+    """
     if ie.object_kind != "Node":
         target_label = f"{ie.namespace}/{ie.name}" if ie.namespace else ie.name
         if ie.event_type == "Deleted":
-            if ie.object_kind == "Namespace":
-                # Keep workload namespaces intact so Kueue Workload history and end-of-run metrics remain readable.
-                return
+            if ie.object_kind in PROTECTED_PREREQ_INFRA_KINDS:
+                # Keep workload namespaces and static scheduling prerequisites intact so delayed arrivals,
+                # Kueue Workload history, and end-of-run metrics remain readable.
+                return False, ""
+            if ie.object_kind in DEFERRED_QUEUE_INFRA_KINDS and lq_to_cq is not None:
+                in_use, use_reason = _is_kueue_infra_object_still_in_use(
+                    mgr,
+                    ie,
+                    event_heap=event_heap or [],
+                    cancelled_unsubmitted_keys=cancelled_unsubmitted_keys or set(),
+                    active_initial_wls=active_initial_wls or [],
+                    lq_to_cq=lq_to_cq,
+                    cq_to_cohort=cq_to_cohort or {},
+                    cq_to_flavors=cq_to_flavors or {},
+                    submitted_non_cancelled=submitted_non_cancelled or [],
+                )
+                if in_use:
+                    return True, use_reason
             del_path = _delete_rest_path("", ie.object_kind, ie.namespace, ie.name)
             mgr.api_delete(del_path, ignore_not_found=True)
+            if ie.object_kind == "LocalQueue" and lq_to_cq is not None:
+                lq_to_cq.pop((ie.namespace, ie.name), None)
+            elif ie.object_kind == "ClusterQueue":
+                if cq_to_cohort is not None:
+                    cq_to_cohort.pop(ie.name, None)
+                if cq_to_flavors is not None:
+                    cq_to_flavors.pop(ie.name, None)
             print(
                 f"  - [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
                 f"Deleted {ie.object_kind} '{target_label}'",
                 flush=True,
             )
-            return
+            return False, ""
         if ie.manifest:
             mgr.ssa_apply_doc(ie.manifest)
+            if ie.object_kind == "LocalQueue" and lq_to_cq is not None:
+                cq_ref = str(((ie.manifest.get("spec") or {}).get("clusterQueue")) or "")
+                if cq_ref:
+                    lq_to_cq[(ie.namespace, ie.name)] = cq_ref
+            elif ie.object_kind == "ClusterQueue":
+                c_ref, flvs = _extract_cq_flavors_and_cohort(ie.manifest)
+                if cq_to_cohort is not None:
+                    cq_to_cohort[ie.name] = c_ref
+                if cq_to_flavors is not None:
+                    cq_to_flavors[ie.name] = flvs
             print(
                 f"  * [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
                 f"Applied {ie.event_type} {ie.object_kind} '{target_label}'",
                 flush=True,
             )
-        return
+        return False, ""
 
     allowed_ns = set(bundle.workload_namespaces) | {bundle.infra_pods_namespace}
     if ie.event_type == "Deleted":
@@ -264,7 +439,7 @@ def _execute_scheduled_infra_event(
             f"Deleted Node '{ie.name}' (failed {failed_pods} bound pod(s))",
             flush=True,
         )
-        return
+        return False, ""
 
     if ie.event_type == "New":
         mgr.ssa_apply_doc(ie.manifest)
@@ -292,7 +467,7 @@ def _execute_scheduled_infra_event(
             f"Added Node '{ie.name}' (Ready={'False' if ie.is_not_ready else 'True'})",
             flush=True,
         )
-        return
+        return False, ""
 
     # ie.event_type == "Update"
     spec_in = dict((ie.manifest.get("spec") or {}) if isinstance(ie.manifest, dict) else {})
@@ -368,6 +543,7 @@ def _execute_scheduled_infra_event(
             f"Node '{ie.name}' updated/recovered (Ready=True, unschedulable={bool(spec_in.get('unschedulable', False))})",
             flush=True,
         )
+    return False, ""
 
 
 def apply_scenario_queues_and_wait(
@@ -568,11 +744,32 @@ def run_scenario_replay(
     }
     resubmitted_initial_wls: set[tuple[str, str]] = set()
     ever_finished_sched_wl_keys: set[tuple[str, str]] = set()
+    ever_finished_init_wl_keys: set[tuple[str, str]] = set()
     cancelled_workflow_count = 0
-    cancelled_unsubmitted_keys: set[tuple[str, str, str]] = set()
+    cancelled_unsubmitted_keys: set[tuple[str, str, str, int]] = set()
     recreated_names: set[tuple[str, str]] = {
-        (d.namespace, d.applied_name) for d in bundle.scheduled_workflow_deletions if d.delete_reason == "before_recreate"
+        (d.namespace, d.applied_name)
+        for d in bundle.scheduled_workflow_deletions
+        if d.delete_reason == "before_recreate" or d.has_later_incarnation
     }
+    lq_to_cq: dict[tuple[str, str], str] = {}
+    cq_to_cohort: dict[str, str] = {}
+    cq_to_flavors: dict[str, set[str]] = {}
+    for q_doc in bundle.prereq_and_queue_docs:
+        q_kind = str(q_doc.get("kind") or "")
+        q_meta = q_doc.get("metadata") or {}
+        q_name = str(q_meta.get("name") or "")
+        if q_kind == "LocalQueue" and q_name:
+            q_ns = str(q_meta.get("namespace") or "default")
+            cq_ref = str(((q_doc.get("spec") or {}).get("clusterQueue")) or "")
+            if cq_ref:
+                lq_to_cq[(q_ns, q_name)] = cq_ref
+        elif q_kind == "ClusterQueue" and q_name:
+            c_ref, flvs = _extract_cq_flavors_and_cohort(q_doc)
+            cq_to_cohort[q_name] = c_ref
+            cq_to_flavors[q_name] = flvs
+    submitted_non_cancelled: dict[tuple[str, str], tuple[str, str, str]] = {}
+    deferred_infra_logged_seqs: set[int] = set()
 
     total_planned = len(bundle.scheduled_workflows)
     submitted_count = 0
@@ -619,6 +816,12 @@ def run_scenario_replay(
                 continue
             it = iwl.resubmit_item
             mgr.ssa_apply_doc(it.manifest)
+            resub_applied = str((it.manifest.get("metadata") or {}).get("name") or it.name)
+            submitted_non_cancelled[(it.namespace, resub_applied)] = (
+                it.namespace,
+                it.local_queue_name,
+                resub_applied,
+            )
             total_planned += 1
             submitted_count += 1
             total_pods_submitted += it.pod_count
@@ -722,32 +925,71 @@ def run_scenario_replay(
             include_kueue_workloads=True,
         )
         ever_finished_sched_wl_keys.update(pre_snap.finished_workload_keys - initial_wl_keys)
+        ever_finished_init_wl_keys.update(pre_snap.finished_workload_keys & initial_wl_keys)
 
         unsubmitted_match = any(
-            w.namespace == del_ev.namespace and w.object_kind == del_ev.object_kind and w.name == del_ev.name
+            w.namespace == del_ev.namespace
+            and w.object_kind == del_ev.object_kind
+            and w.name == del_ev.name
+            and w.incarnation_index == del_ev.incarnation_index
             for w in event_heap
         )
         if unsubmitted_match and del_ev.delete_reason == "cancelled":
-            cancelled_unsubmitted_keys.add((del_ev.namespace, del_ev.object_kind, del_ev.name))
+            cancelled_unsubmitted_keys.add(
+                (del_ev.namespace, del_ev.object_kind, del_ev.name, del_ev.incarnation_index)
+            )
             total_planned = max(0, total_planned - 1)
             print(
                 f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "
-                f"Cancelled pending unsubmitted {del_ev.object_kind} '{del_ev.namespace}/{del_ev.name}'",
+                f"Cancelled pending unsubmitted {del_ev.object_kind} '{del_ev.namespace}/{del_ev.name}' "
+                f"(incarnation={del_ev.incarnation_index})",
                 flush=True,
             )
             return
 
+        # Check whether this submitted incarnation already finished cleanly in the chamber prior to deletion
+        # so faster chamber execution does not double-count both its Finished Workload and cancelled_workflow_count.
+        already_succeeded_in_chamber = False
+        st_wls, raw_wls = mgr.api_request(
+            "GET",
+            f"/apis/kueue.x-k8s.io/v1beta2/namespaces/{del_ev.namespace}/workloads",
+        )
+        if st_wls == 200 and raw_wls:
+            try:
+                for wl_it in json.loads(raw_wls.decode("utf-8")).get("items") or []:
+                    w_m = wl_it.get("metadata") or {}
+                    owners = [
+                        str(o.get("name") or "")
+                        for o in (w_m.get("ownerReferences") or [])
+                        if isinstance(o, dict)
+                    ]
+                    if del_ev.applied_name in owners or str(w_m.get("name") or "") == del_ev.applied_name:
+                        conds = ((wl_it.get("status") or {}).get("conditions")) or []
+                        if any(
+                            isinstance(c, dict)
+                            and c.get("type") == "Finished"
+                            and c.get("status") == "True"
+                            and c.get("reason") == "Succeeded"
+                            for c in conds
+                        ):
+                            already_succeeded_in_chamber = True
+                            break
+            except Exception:
+                pass
+
+        submitted_non_cancelled.pop((del_ev.namespace, del_ev.applied_name), None)
         has_future_same_name = any(
             w.namespace == del_ev.namespace
             and str((w.manifest.get("metadata") or {}).get("name") or w.name) == del_ev.applied_name
             for w in event_heap
         )
         _delete_workflow_and_children(del_ev, wait_gone=(del_ev.delete_reason == "before_recreate" or has_future_same_name))
-        if del_ev.delete_reason == "cancelled":
+        if del_ev.delete_reason == "cancelled" and not already_succeeded_in_chamber:
             cancelled_workflow_count += 1
         print(
             f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "
-            f"Deleted {del_ev.object_kind} '{del_ev.namespace}/{del_ev.name}' (reason={del_ev.delete_reason})",
+            f"Deleted {del_ev.object_kind} '{del_ev.namespace}/{del_ev.name}' "
+            f"(incarnation={del_ev.incarnation_index}, reason={del_ev.delete_reason})",
             flush=True,
         )
 
@@ -787,6 +1029,7 @@ def run_scenario_replay(
             include_kueue_workloads=True,
         )
         ever_finished_sched_wl_keys.update(snap.finished_workload_keys - initial_wl_keys)
+        ever_finished_init_wl_keys.update(snap.finished_workload_keys & initial_wl_keys)
         _check_and_resubmit_evicted_initial_workloads(snap, wall_elapsed)
         return snap
 
@@ -814,8 +1057,39 @@ def run_scenario_replay(
                 due_infra.append(heapq.heappop(infra_heap))
 
             if due_infra:
+                active_init_wls = [
+                    iwl
+                    for wl_k, iwl in initial_wl_by_key.items()
+                    if wl_k not in resubmitted_initial_wls and wl_k not in ever_finished_init_wl_keys
+                ]
                 for ie in due_infra:
-                    _execute_scheduled_infra_event(mgr, bundle, ie, time.monotonic() - t0_mono)
+                    now_el = time.monotonic() - t0_mono
+                    deferred, defer_reason = _execute_scheduled_infra_event(
+                        mgr,
+                        bundle,
+                        ie,
+                        now_el,
+                        event_heap=event_heap,
+                        cancelled_unsubmitted_keys=cancelled_unsubmitted_keys,
+                        active_initial_wls=active_init_wls,
+                        lq_to_cq=lq_to_cq,
+                        cq_to_cohort=cq_to_cohort,
+                        cq_to_flavors=cq_to_flavors,
+                        submitted_non_cancelled=list(submitted_non_cancelled.values()),
+                    )
+                    if deferred:
+                        if ie.seq not in deferred_infra_logged_seqs:
+                            deferred_infra_logged_seqs.add(ie.seq)
+                            target_lbl = f"{ie.namespace}/{ie.name}" if ie.namespace else ie.name
+                            print(
+                                f"  ~ [t={now_el:.2f}s wall / +{ie.raw_offset_sec:.2f}s] "
+                                f"Deferring Deleted {ie.object_kind} '{target_lbl}' until workloads finish ({defer_reason})",
+                                flush=True,
+                            )
+                        heapq.heappush(
+                            infra_heap,
+                            dc_replace(ie, target_wall_offset_sec=now_el + max(1.0, poll_interval_sec)),
+                        )
                 continue
 
             # Execute due workflow deletions BEFORE same-timestamp creations so delete-and-recreate works cleanly.
@@ -831,7 +1105,7 @@ def run_scenario_replay(
             due_batch: list[ScheduledWorkflowItem] = []
             while event_heap and event_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
                 cand_it = heapq.heappop(event_heap)
-                c_key = (cand_it.namespace, cand_it.object_kind, cand_it.name)
+                c_key = (cand_it.namespace, cand_it.object_kind, cand_it.name, cand_it.incarnation_index)
                 if c_key in cancelled_unsubmitted_keys:
                     cancelled_unsubmitted_keys.discard(c_key)
                     continue
@@ -876,6 +1150,12 @@ def run_scenario_replay(
 
                 now_off = time.monotonic() - t0_mono
                 for item in due_batch:
+                    it_applied = str((item.manifest.get("metadata") or {}).get("name") or item.name)
+                    submitted_non_cancelled[(item.namespace, it_applied)] = (
+                        item.namespace,
+                        item.local_queue_name,
+                        it_applied,
+                    )
                     submitted_count += 1
                     total_pods_submitted += item.pod_count
 

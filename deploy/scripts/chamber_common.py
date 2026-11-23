@@ -146,6 +146,7 @@ from chamber import (  # noqa: F401
     patch_kueue_feature_gates_config,
     patch_kueue_wait_for_pods_ready_config,
     query_cluster_status,
+    reconcile_wait_for_pods_ready_feature_gates,
     resolve_admission_fair_sharing_config,
     resolve_fair_sharing_arg,
     resolve_kubeconfig_path,

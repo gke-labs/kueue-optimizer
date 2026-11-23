@@ -1,12 +1,11 @@
 # Agent Execution & Cross-Examination Guide — `st59-scale-tas-borrowing-limit-128n-1048w`
 
 > **AUTO-GENERATED FILE — DO NOT HAND-EDIT.**
-> This file is generated from [`../generate_self_test_suite.py`](../generate_self_test_suite.py).
-> If you change any scenario definition, pairing rule, or expected metric band, update `generate_self_test_suite.py` and re-run:
+> This file is generated via `make self-tests` from [`../generate_self_test_suite.py`](../generate_self_test_suite.py).
+> If you change any scenario definition, pairing rule, or expected metric band, update `generate_self_test_suite.py` and run:
 > ```bash
-> python3 testscenarios/self-tests/generate_self_test_suite.py
-> python3 deploy/scripts/generate_scenario_readme.py --all
-> python3 testscenarios/self-tests/generate_self_test_suite.py --check
+> make self-tests
+> make self-tests-check
 > ```
 
 ## 1. Scenario Identity & Dedicated Chamber Isolation
@@ -107,7 +106,6 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 If `infra.json`, `workflows.json`, `execution-time.json`, `README.md`, or this `AGENTS.md` gets out of sync with `generate_self_test_suite.py` or `deploy/scripts/generate_scenario_readme.py`, immediately synchronize all artifacts and verify zero drift:
 
 ```bash
-python3 testscenarios/self-tests/generate_self_test_suite.py
-python3 deploy/scripts/generate_scenario_readme.py --all
-python3 testscenarios/self-tests/generate_self_test_suite.py --check
+make self-tests
+make self-tests-check
 ```

@@ -58,6 +58,7 @@ from chamber.manifests import (
     patch_kueue_wait_for_pods_ready_config,
     patch_kustomize_kueue_image,
     patch_registry_manifest,
+    reconcile_wait_for_pods_ready_feature_gates,
     replace_yaml_section_field,
 )
 from chamber.parsers import (
@@ -356,11 +357,15 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         )
         kust_yaml.write_text(kust_text, encoding="utf-8")
 
+        eff_wfpr, eff_fg = reconcile_wait_for_pods_ready_feature_gates(
+            self.wait_for_pods_ready,
+            self.kueue_feature_gates,
+        )
         self._patch_registry_manifest(base_dst, self.registry_port, self.registry_memory_limit)
         self._patch_kueue_fair_sharing_config(base_dst, self.enable_fair_sharing, self.fair_sharing_strategies)
         self._patch_kueue_admission_fair_sharing_config(base_dst, self.admission_fair_sharing)
-        self._patch_kueue_wait_for_pods_ready_config(base_dst, self.wait_for_pods_ready)
-        self._patch_kueue_feature_gates_config(base_dst, self.kueue_feature_gates)
+        self._patch_kueue_wait_for_pods_ready_config(base_dst, eff_wfpr)
+        self._patch_kueue_feature_gates_config(base_dst, eff_fg)
         self._patch_kueue_extra_configuration_fields(
             base_dst,
             resources_block=self.kueue_resources_config,
@@ -420,14 +425,18 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             if self.admission_fair_sharing and self.admission_fair_sharing.enabled
             else ""
         )
+        eff_wfpr_log, eff_fg_log = reconcile_wait_for_pods_ready_feature_gates(
+            self.wait_for_pods_ready,
+            self.kueue_feature_gates,
+        )
         wfpr_note = (
-            f", WaitForPodsReady: [{self.wait_for_pods_ready.summary_str()}]"
-            if self.wait_for_pods_ready and self.wait_for_pods_ready.enabled
+            f", WaitForPodsReady: [{eff_wfpr_log.summary_str()}]"
+            if eff_wfpr_log and (not eff_wfpr_log.enabled or eff_wfpr_log.configured)
             else ""
         )
         fg_note = (
-            f", FeatureGates: {self.kueue_feature_gates}"
-            if self.kueue_feature_gates
+            f", FeatureGates: {eff_fg_log}"
+            if eff_fg_log
             else ""
         )
         print(

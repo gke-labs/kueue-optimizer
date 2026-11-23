@@ -28,14 +28,13 @@ Always include the updated `README.md` file(s) alongside your scenario or script
 
 ## Keep the 80-Scenario Self-Test Suite (`testscenarios/self-tests/`) Synchronized & Cross-Examined
 
-All 80 scenarios in `testscenarios/self-tests/` (`st01`–`st80`, covering baseline calibration, queueing & TAS, intra-CQ preemption, Cohort borrowing/reclaim, Fair Sharing, resource/admission edge cases, `t0` initial-workload bootstrap/preemption/Fair Sharing/Cohort reclaims, `>100`-node `>1,000`-workload scale + live `cluster-scraper` validation, mid-scenario node failures & TAS placement hot-swap, `waitForPodsReady` `--speedup`/`--duration` scaling, interrupted-workload `PartialExecution` multiplier/override replay, and declarative Kueue controller `Configuration` statements covering enabling/disabling Fair Sharing globally, changing `preemptionStrategies` rules, and enabling/disabling `AdmissionFairSharing`), their per-scenario `AGENTS.md` guides, the suite-level `testscenarios/self-tests/AGENTS.md`, and `testscenarios/self-tests/README.md` are auto-generated from `testscenarios/self-tests/generate_self_test_suite.py` (with `st46`–`st60` in `testscenarios/self-tests/scale_scenarios.py`, `st61`–`st75` in `testscenarios/self-tests/failure_preemption_scenarios.py`, and `st76`–`st80` in `testscenarios/self-tests/kueue_config_scenarios.py`).
+All 80 scenarios in `testscenarios/self-tests/` (`st01`–`st80`, covering baseline calibration, queueing & TAS, intra-CQ preemption, Cohort borrowing/reclaim, Fair Sharing, resource/admission edge cases, `t0` initial-workload bootstrap/preemption/Fair Sharing/Cohort reclaims, `>100`-node `>1,000`-workload scale + live `cluster-scraper` validation, mid-scenario node failures & TAS placement hot-swap, `waitForPodsReady` `--speedup`/`--duration` scaling, interrupted-workload `PartialExecution` multiplier/override replay, and declarative Kueue controller `Configuration` statements covering enabling/disabling Fair Sharing globally, changing `preemptionStrategies` rules, and enabling/disabling `AdmissionFairSharing`) are deterministically generated via `make self-tests` from `testscenarios/self-tests/generate_self_test_suite.py` (with `st46`–`st60` in `testscenarios/self-tests/scale_scenarios.py`, `st61`–`st75` in `testscenarios/self-tests/failure_preemption_scenarios.py`, and `st76`–`st80` in `testscenarios/self-tests/kueue_config_scenarios.py`).
 
 1. **Always pair and cross-examine runs in separate isolated chambers**: Follow `testscenarios/self-tests/AGENTS.md` and each scenario's local `AGENTS.md` — execute each test side-by-side with its designated paired counterpart(s) in **separate isolated `kueue-optimizer` chambers** (`--namespace kueue-optimizer-chamber-stXX --port 164XX` per scenario, up to 7 parallel chambers; never reuse a single chamber across scenarios with `--skip-chamber-deploy`) and cross-check the expected directional and numerical shifts across Sections `5.1`–`5.4`.
 2. **Never allow drift**: Whenever `generate_self_test_suite.py`, any scenario definition, or any pairing rule is modified (or suspected of drift), run the full synchronization and check pipeline:
    ```bash
-   python3 testscenarios/self-tests/generate_self_test_suite.py
-   python3 deploy/scripts/generate_scenario_readme.py --all
-   python3 testscenarios/self-tests/generate_self_test_suite.py --check
+   make self-tests
+   make self-tests-check
    ```
 
 ---

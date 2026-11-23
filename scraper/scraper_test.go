@@ -4105,13 +4105,17 @@ featureGates:
 		}
 	}
 
-	// Legacy v1beta1 fairSharing.enable: false must normalize to fairSharing omitted.
+	// Legacy v1beta1 fairSharing.enable: false must normalize to fairSharing omitted,
+	// and legacy waitForPodsReady.enable: false must set featureGates.DisableWaitForPodsReady=true.
 	legacyDisabledYAML := `apiVersion: config.kueue.x-k8s.io/v1beta1
 kind: Configuration
 fairSharing:
   enable: false
   preemptionStrategies:
   - LessThanOrEqualToFinalShare
+waitForPodsReady:
+  enable: false
+  timeout: 10m
 `
 	legacySanitized, ok := SanitizeKueueConfigurationYAML(legacyDisabledYAML)
 	if !ok {
@@ -4119,6 +4123,13 @@ fairSharing:
 	}
 	if _, hasFS := legacySanitized["fairSharing"]; hasFS {
 		t.Errorf("expected legacy fairSharing.enable=false to omit fairSharing, got %+v", legacySanitized)
+	}
+	if _, hasWFPR := legacySanitized["waitForPodsReady"]; hasWFPR {
+		t.Errorf("expected legacy waitForPodsReady.enable=false to omit waitForPodsReady, got %+v", legacySanitized)
+	}
+	fgSan, _ := legacySanitized["featureGates"].(map[string]any)
+	if fgSan["DisableWaitForPodsReady"] != true {
+		t.Errorf("expected legacy waitForPodsReady.enable=false to set featureGates.DisableWaitForPodsReady=true, got %+v", legacySanitized)
 	}
 
 	// Integration test: missing ConfigMap is a graceful no-op; adding/updating/deleting emits New -> suppressed -> Update -> Deleted.

@@ -628,16 +628,40 @@ func SanitizeKueueConfigurationYAML(rawYAML string) (map[string]any, bool) {
 		}
 	}
 
-	if wfprVal, exists := raw["waitForPodsReady"]; exists && wfprVal != nil {
-		if wfprMap, ok := wfprVal.(map[string]any); ok && len(wfprMap) > 0 {
-			out["waitForPodsReady"] = wfprMap
+	var fgOut map[string]any
+	if fgVal, exists := raw["featureGates"]; exists && fgVal != nil {
+		if fgMap, ok := fgVal.(map[string]any); ok && len(fgMap) > 0 {
+			fgOut = make(map[string]any, len(fgMap))
+			for k, v := range fgMap {
+				fgOut[k] = v
+			}
 		}
 	}
 
-	if fgVal, exists := raw["featureGates"]; exists && fgVal != nil {
-		if fgMap, ok := fgVal.(map[string]any); ok && len(fgMap) > 0 {
-			out["featureGates"] = fgMap
+	if wfprVal, exists := raw["waitForPodsReady"]; exists && wfprVal != nil {
+		if wfprMap, ok := wfprVal.(map[string]any); ok && len(wfprMap) > 0 {
+			if en, hasEn := wfprMap["enable"].(bool); hasEn && !en {
+				if fgOut == nil {
+					fgOut = make(map[string]any, 1)
+				}
+				fgOut["DisableWaitForPodsReady"] = true
+			} else {
+				cleanWFPR := make(map[string]any, len(wfprMap))
+				for k, v := range wfprMap {
+					if k == "enable" {
+						continue
+					}
+					cleanWFPR[k] = v
+				}
+				if len(cleanWFPR) > 0 {
+					out["waitForPodsReady"] = cleanWFPR
+				}
+			}
 		}
+	}
+
+	if len(fgOut) > 0 {
+		out["featureGates"] = fgOut
 	}
 
 	if resVal, exists := raw["resources"]; exists && resVal != nil {

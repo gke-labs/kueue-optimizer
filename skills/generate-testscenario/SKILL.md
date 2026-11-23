@@ -118,8 +118,9 @@ python3 deploy/scripts/generate_scenario_readme.py testscenarios/<scenario-slug>
 # 2. Verify full bundle parsing, execution-time indexing (100% hit rate), and resource totals offline:
 python3 deploy/scripts/testrunner.py testscenarios/<scenario-slug> --dry-run
 
-# 3. If modifying the 80-scenario self-test suite (testscenarios/self-tests/), verify zero drift:
-python3 testscenarios/self-tests/generate_self_test_suite.py --check
+# 3. If modifying the 80-scenario self-test suite (testscenarios/self-tests/), regenerate and verify zero drift:
+make self-tests
+make self-tests-check
 
 # 4. Verify zero hardcoded machine- or user-specific absolute paths in tracked/new files:
 git grep -nE "/(usr/local|home)/" -- testscenarios/ skills/ AGENTS.md || true

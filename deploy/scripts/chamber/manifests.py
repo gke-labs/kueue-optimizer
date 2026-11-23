@@ -29,7 +29,7 @@ from chamber.parsers import parse_duration_seconds, parse_k8s_quantity
 from chamber.yaml_utils import to_clean_yaml
 
 
-DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC = 300.0
+DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC = 1800.0  # 30m default in Kueue > v0.19
 DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC = 2.0
 DEFAULT_WAIT_FOR_PODS_READY_MAX_DURATION_FRACTION = 0.5
 DEFAULT_AFS_SAMPLING_INTERVAL_SEC = 300.0
@@ -53,9 +53,15 @@ def format_go_duration_seconds(seconds: float) -> str:
 
 @dataclass
 class WaitForPodsReadyConfig:
-    """Resolved Kueue waitForPodsReady configuration adjusted for --speedup and --duration."""
+    """Resolved Kueue waitForPodsReady configuration adjusted for --speedup and --duration.
 
-    enabled: bool = False
+    In Kueue > v0.19, `waitForPodsReady` is enabled by default (`timeout: 30m`) when the
+    `waitForPodsReady` YAML section is omitted (`enabled=True, configured=False`), and can only
+    be disabled globally via `featureGates.DisableWaitForPodsReady=true` (`enabled=False`).
+    """
+
+    enabled: bool = True
+    configured: bool = False
     raw_timeout_sec: float = DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC
     effective_timeout_sec: float = DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC
     clamped_timeout_to_duration: bool = False
@@ -63,6 +69,10 @@ class WaitForPodsReadyConfig:
     raw_recovery_timeout_sec: float | None = None
     effective_recovery_timeout_sec: float | None = None
     clamped_recovery_to_duration: bool = False
+    raw_unscheduled_timeout_sec: float | None = None
+    effective_unscheduled_timeout_sec: float | None = None
+    clamped_unscheduled_to_duration: bool = False
+    clamped_unscheduled_to_timeout: bool = False
     block_admission: bool | None = None
     requeuing_timestamp: str = "Eviction"
     backoff_limit_count: int | None = None
@@ -71,10 +81,23 @@ class WaitForPodsReadyConfig:
     raw_backoff_max_sec: float | None = None
     effective_backoff_max_sec: int | None = None
 
+    def required_feature_gates(self) -> dict[str, bool]:
+        """Return Kueue feature gates required to realize this waitForPodsReady configuration."""
+        if not self.enabled:
+            return {"DisableWaitForPodsReady": True}
+        if self.configured and self.effective_unscheduled_timeout_sec is not None:
+            return {"WaitForPodsReadyUnscheduledTimeout": True}
+        return {}
+
     def summary_str(self) -> str:
         if not self.enabled:
-            return "disabled"
-        notes: list[str] = [f"timeout={format_go_duration_seconds(self.effective_timeout_sec)} (raw {format_go_duration_seconds(self.raw_timeout_sec)})"]
+            return "disabled (DisableWaitForPodsReady=true)"
+        if not self.configured:
+            return "default (enabled in Kueue, timeout=30m)"
+        notes: list[str] = [
+            f"timeout={format_go_duration_seconds(self.effective_timeout_sec)} "
+            f"(raw {format_go_duration_seconds(self.raw_timeout_sec)})"
+        ]
         if self.clamped_timeout_to_duration:
             notes.append("clamped-to-duration")
         elif self.floored_timeout_to_min:
@@ -88,6 +111,20 @@ class WaitForPodsReadyConfig:
                     else ""
                 )
             )
+        if self.effective_unscheduled_timeout_sec is not None:
+            unsch_note = (
+                f"unscheduledTimeout={format_go_duration_seconds(self.effective_unscheduled_timeout_sec)}"
+                + (
+                    f" (raw {format_go_duration_seconds(self.raw_unscheduled_timeout_sec)})"
+                    if self.raw_unscheduled_timeout_sec is not None
+                    else ""
+                )
+            )
+            if self.clamped_unscheduled_to_timeout:
+                unsch_note += " [clamped-to-timeout]"
+            elif self.clamped_unscheduled_to_duration:
+                unsch_note += " [clamped-to-duration]"
+            notes.append(unsch_note)
         if self.block_admission is not None:
             notes.append(f"blockAdmission={str(self.block_admission).lower()}")
         if self.effective_backoff_base_sec is not None:
@@ -104,6 +141,7 @@ def resolve_wait_for_pods_ready_config(
     enabled: bool | None = None,
     raw_timeout: str | float | None = None,
     raw_recovery_timeout: str | float | None = None,
+    raw_unscheduled_timeout: str | float | None = None,
     block_admission: bool | None = None,
     requeuing_timestamp: str | None = None,
     backoff_limit_count: int | None = None,
@@ -121,15 +159,24 @@ def resolve_wait_for_pods_ready_config(
         for x in (
             raw_timeout,
             raw_recovery_timeout,
+            raw_unscheduled_timeout,
             block_admission,
             backoff_limit_count,
             raw_backoff_base,
             raw_backoff_max,
         )
-    )
-    eff_enabled = bool(enabled) if enabled is not None else has_explicit_subflag
-    if not eff_enabled:
-        return WaitForPodsReadyConfig(enabled=False)
+    ) or (requeuing_timestamp is not None and str(requeuing_timestamp).strip() not in ("", "Eviction"))
+
+    if enabled is False:
+        if has_explicit_subflag:
+            raise ValueError(
+                "Cannot combine --no-wait-for-pods-ready / DisableWaitForPodsReady with "
+                "waitForPodsReady timeout, unscheduledTimeout, recoveryTimeout, or backoff settings"
+            )
+        return WaitForPodsReadyConfig(enabled=False, configured=False)
+
+    if enabled is None and not has_explicit_subflag:
+        return WaitForPodsReadyConfig(enabled=True, configured=False)
 
     eff_speedup = max(1e-6, float(speedup))
     min_floor = (
@@ -188,6 +235,36 @@ def resolve_wait_for_pods_ready_config(
                 eff_rec_sec = duration_cap
                 clamped_rec = True
 
+    raw_unsch_sec: float | None = None
+    eff_unsch_sec: float | None = None
+    clamped_unsch_dur = False
+    clamped_unsch_timeout = False
+    if raw_unscheduled_timeout is not None and str(raw_unscheduled_timeout).strip() != "":
+        raw_unsch_sec = (
+            float(raw_unscheduled_timeout)
+            if isinstance(raw_unscheduled_timeout, (int, float))
+            else parse_duration_seconds(str(raw_unscheduled_timeout))
+        )
+        if raw_unsch_sec is None or raw_unsch_sec < 0:
+            raise ValueError(
+                f"--wait-for-pods-ready-unscheduled-timeout must be >= 0 (got {raw_unscheduled_timeout!r})"
+            )
+        if raw_unsch_sec > raw_t + 1e-6:
+            raise ValueError(
+                f"waitForPodsReady.unscheduledTimeout ({raw_unscheduled_timeout!r}) must not exceed "
+                f"waitForPodsReady.timeout ({format_go_duration_seconds(raw_t)})"
+            )
+        if raw_unsch_sec == 0:
+            eff_unsch_sec = 0.0
+        else:
+            eff_unsch_sec = max(min_floor, raw_unsch_sec / eff_speedup)
+            if duration_cap is not None and eff_unsch_sec > duration_cap:
+                eff_unsch_sec = duration_cap
+                clamped_unsch_dur = True
+            if eff_unsch_sec > scaled_t:
+                eff_unsch_sec = scaled_t
+                clamped_unsch_timeout = True
+
     raw_bb_sec: float | None = None
     eff_bb_sec: int | None = None
     if raw_backoff_base is not None and str(raw_backoff_base).strip() != "":
@@ -231,6 +308,7 @@ def resolve_wait_for_pods_ready_config(
 
     return WaitForPodsReadyConfig(
         enabled=True,
+        configured=True,
         raw_timeout_sec=raw_t,
         effective_timeout_sec=scaled_t,
         clamped_timeout_to_duration=clamped_t,
@@ -238,6 +316,10 @@ def resolve_wait_for_pods_ready_config(
         raw_recovery_timeout_sec=raw_rec_sec,
         effective_recovery_timeout_sec=eff_rec_sec,
         clamped_recovery_to_duration=clamped_rec,
+        raw_unscheduled_timeout_sec=raw_unsch_sec,
+        effective_unscheduled_timeout_sec=eff_unsch_sec,
+        clamped_unscheduled_to_duration=clamped_unsch_dur,
+        clamped_unscheduled_to_timeout=clamped_unsch_timeout,
         block_admission=block_admission,
         requeuing_timestamp=req_ts,
         backoff_limit_count=backoff_limit_count,
@@ -246,6 +328,57 @@ def resolve_wait_for_pods_ready_config(
         raw_backoff_max_sec=raw_bm_sec,
         effective_backoff_max_sec=eff_bm_sec,
     )
+
+
+def reconcile_wait_for_pods_ready_feature_gates(
+    wfpr_cfg: WaitForPodsReadyConfig | None,
+    feature_gates: dict[str, bool] | None,
+    *,
+    cli_wfpr_override: bool | None = None,
+    cli_feature_gates: dict[str, bool] | None = None,
+) -> tuple[WaitForPodsReadyConfig | None, dict[str, bool]]:
+    """Synchronize WaitForPodsReadyConfig with DisableWaitForPodsReady / WaitForPodsReadyUnscheduledTimeout gates."""
+    fg = dict(feature_gates or {})
+    cli_fg = dict(cli_feature_gates or {})
+
+    if cli_wfpr_override is True:
+        if cli_fg.get("DisableWaitForPodsReady") is True:
+            raise ValueError(
+                "Cannot combine --wait-for-pods-ready with featureGates.DisableWaitForPodsReady=true"
+            )
+        if fg.get("DisableWaitForPodsReady") is True:
+            fg.pop("DisableWaitForPodsReady", None)
+
+    if fg.get("DisableWaitForPodsReady") is True:
+        if wfpr_cfg is not None and wfpr_cfg.configured:
+            raise ValueError(
+                "Cannot combine waitForPodsReady configuration with featureGates.DisableWaitForPodsReady=true"
+            )
+        if fg.get("WaitForPodsReadyUnscheduledTimeout") is True:
+            raise ValueError(
+                "Enabling WaitForPodsReadyUnscheduledTimeout together with DisableWaitForPodsReady is rejected by Kueue"
+            )
+        wfpr_cfg = WaitForPodsReadyConfig(enabled=False, configured=False)
+
+    if wfpr_cfg is not None:
+        if not wfpr_cfg.enabled:
+            if cli_fg.get("DisableWaitForPodsReady") is False:
+                raise ValueError(
+                    "Cannot combine --no-wait-for-pods-ready with featureGates.DisableWaitForPodsReady=false"
+                )
+            if fg.get("WaitForPodsReadyUnscheduledTimeout") is True:
+                raise ValueError(
+                    "Enabling WaitForPodsReadyUnscheduledTimeout together with DisableWaitForPodsReady is rejected by Kueue"
+                )
+            fg["DisableWaitForPodsReady"] = True
+        elif wfpr_cfg.configured and wfpr_cfg.effective_unscheduled_timeout_sec is not None:
+            if fg.get("WaitForPodsReadyUnscheduledTimeout") is False:
+                raise ValueError(
+                    "waitForPodsReady.unscheduledTimeout requires featureGates.WaitForPodsReadyUnscheduledTimeout=true"
+                )
+            fg["WaitForPodsReadyUnscheduledTimeout"] = True
+
+    return wfpr_cfg, fg
 
 
 def parse_feature_gates_arg(raw: str | dict[str, bool] | None) -> dict[str, bool]:
@@ -497,27 +630,6 @@ def parse_kueue_configuration_payload(
         # Validate values immediately via resolve_admission_fair_sharing_config.
         resolve_admission_fair_sharing_config(scenario_afs=afs_raw, speedup=1.0)
 
-    wfpr_raw = doc.get("waitForPodsReady")
-    if wfpr_raw is not None:
-        if not isinstance(wfpr_raw, dict):
-            raise ValueError(
-                f"{source_desc}: waitForPodsReady must be a mapping or null, got {type(wfpr_raw).__name__}"
-            )
-        req_strat = wfpr_raw.get("requeuingStrategy") or {}
-        if not isinstance(req_strat, dict):
-            raise ValueError(f"{source_desc}: waitForPodsReady.requeuingStrategy must be a mapping")
-        resolve_wait_for_pods_ready_config(
-            enabled=True,
-            raw_timeout=wfpr_raw.get("timeout"),
-            raw_recovery_timeout=wfpr_raw.get("recoveryTimeout"),
-            block_admission=wfpr_raw.get("blockAdmission"),
-            requeuing_timestamp=req_strat.get("timestamp"),
-            backoff_limit_count=req_strat.get("backoffLimitCount"),
-            raw_backoff_base=req_strat.get("backoffBaseSeconds"),
-            raw_backoff_max=req_strat.get("backoffMaxSeconds"),
-            speedup=1.0,
-        )
-
     fg_raw = doc.get("featureGates")
     fg_parsed: dict[str, bool] = {}
     if fg_raw is not None:
@@ -527,6 +639,42 @@ def parse_kueue_configuration_payload(
             if not isinstance(v, bool):
                 raise ValueError(f"{source_desc}: featureGates[{k!r}] must be a boolean, got {v!r}")
             fg_parsed[str(k)] = v
+
+    wfpr_raw = doc.get("waitForPodsReady")
+    wfpr_clean: dict[str, Any] | None = None
+    if wfpr_raw is not None:
+        if not isinstance(wfpr_raw, dict):
+            raise ValueError(
+                f"{source_desc}: waitForPodsReady must be a mapping or null, got {type(wfpr_raw).__name__}"
+            )
+        # Normalize legacy v1beta1 `waitForPodsReady.enable: false` into DisableWaitForPodsReady=true.
+        if wfpr_raw.get("enable") is False:
+            if fg_parsed.get("DisableWaitForPodsReady") is False:
+                raise ValueError(
+                    f"{source_desc}: waitForPodsReady.enable=false conflicts with featureGates.DisableWaitForPodsReady=false"
+                )
+            fg_parsed["DisableWaitForPodsReady"] = True
+            wfpr_clean = None
+        else:
+            wfpr_clean = {k: v for k, v in wfpr_raw.items() if k != "enable"}
+            req_strat = wfpr_clean.get("requeuingStrategy") or {}
+            if not isinstance(req_strat, dict):
+                raise ValueError(f"{source_desc}: waitForPodsReady.requeuingStrategy must be a mapping")
+            validated_wfpr = resolve_wait_for_pods_ready_config(
+                enabled=True,
+                raw_timeout=wfpr_clean.get("timeout"),
+                raw_recovery_timeout=wfpr_clean.get("recoveryTimeout"),
+                raw_unscheduled_timeout=wfpr_clean.get("unscheduledTimeout"),
+                block_admission=wfpr_clean.get("blockAdmission"),
+                requeuing_timestamp=req_strat.get("timestamp"),
+                backoff_limit_count=req_strat.get("backoffLimitCount"),
+                raw_backoff_base=req_strat.get("backoffBaseSeconds"),
+                raw_backoff_max=req_strat.get("backoffMaxSeconds"),
+                speedup=1.0,
+            )
+            _, fg_parsed = reconcile_wait_for_pods_ready_feature_gates(validated_wfpr, fg_parsed)
+    else:
+        _, fg_parsed = reconcile_wait_for_pods_ready_feature_gates(None, fg_parsed)
 
     res_raw = doc.get("resources")
     if res_raw is not None and not isinstance(res_raw, dict):
@@ -540,7 +688,7 @@ def parse_kueue_configuration_payload(
         fair_sharing_enabled=fs_enabled,
         fair_sharing_strategies=fs_strategies,
         afs_raw=dict(afs_raw) if isinstance(afs_raw, dict) else None,
-        wfpr_raw=dict(wfpr_raw) if isinstance(wfpr_raw, dict) else None,
+        wfpr_raw=wfpr_clean,
         feature_gates=fg_parsed,
         resources_block=dict(res_raw) if isinstance(res_raw, dict) and res_raw else None,
         manage_jobs_without_queue_name=mjwqn_raw,
@@ -913,7 +1061,7 @@ def patch_kueue_wait_for_pods_ready_config(
         cfg_text,
         flags=re.MULTILINE,
     )
-    if wfpr_cfg is not None and wfpr_cfg.enabled:
+    if wfpr_cfg is not None and wfpr_cfg.enabled and wfpr_cfg.configured:
         lines = [
             "waitForPodsReady:",
             f"  timeout: {format_go_duration_seconds(wfpr_cfg.effective_timeout_sec)}",
@@ -921,6 +1069,10 @@ def patch_kueue_wait_for_pods_ready_config(
         if wfpr_cfg.effective_recovery_timeout_sec is not None:
             lines.append(
                 f"  recoveryTimeout: {format_go_duration_seconds(wfpr_cfg.effective_recovery_timeout_sec)}"
+            )
+        if wfpr_cfg.effective_unscheduled_timeout_sec is not None:
+            lines.append(
+                f"  unscheduledTimeout: {format_go_duration_seconds(wfpr_cfg.effective_unscheduled_timeout_sec)}"
             )
         if wfpr_cfg.block_admission is not None:
             lines.append(f"  blockAdmission: {str(bool(wfpr_cfg.block_admission)).lower()}")

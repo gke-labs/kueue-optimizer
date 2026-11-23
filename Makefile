@@ -105,8 +105,17 @@ scraper-build: ## Build the Go Kubernetes & Kueue cluster scraper binary (./scra
 scraper-test: ## Run unit tests for the Go Kubernetes & Kueue cluster scraper
 	cd ./scraper && go test -v ./...
 
+.PHONY: self-tests
+self-tests: ## Deterministically generate all 80 self-test scenario directories (st01-st80 JSONs, READMEs, and AGENTS.md)
+	python3 ./testscenarios/self-tests/generate_self_test_suite.py
+	python3 ./deploy/scripts/generate_scenario_readme.py --all --root ./testscenarios/self-tests
+
+.PHONY: self-tests-check
+self-tests-check: ## Verify generated self-test scenarios and top-level docs are 100% in sync with zero drift
+	python3 ./testscenarios/self-tests/generate_self_test_suite.py --check
+
 .PHONY: python-test
-python-test: ## Run unit tests for the Python chamber registry and metrics reporting scripts
+python-test: ## Run Python unit tests
 	python3 -m unittest discover -s deploy/scripts -p "test_*.py" -v
 
 .PHONY: test

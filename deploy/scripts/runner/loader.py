@@ -135,6 +135,8 @@ class ScheduledWorkflowDeletion:
     namespace: str = field(compare=False)
     delete_reason: str = field(compare=False, default="cancelled")  # "cancelled" | "before_recreate"
     initial_workload_name: str = field(compare=False, default="")
+    incarnation_index: int = field(compare=False, default=0)
+    has_later_incarnation: bool = field(compare=False, default=False)
 
 
 @dataclass(order=True)
@@ -770,6 +772,8 @@ def _schedule_workflows(
                             applied_name=applied_name,
                             namespace=inc.ns,
                             delete_reason="before_recreate" if (completed_cleanly and has_later_incarnation) else "cancelled",
+                            incarnation_index=inc.inc_id,
+                            has_later_incarnation=has_later_incarnation,
                         )
                     )
                     del_seq += 1
@@ -2331,6 +2335,7 @@ def _build_initial_workloads_and_pods(
                         del_ev.namespace == ns
                         and del_ev.object_kind == cand.kind
                         and del_ev.name == cand.name
+                        and del_ev.incarnation_index == cand.incarnation_index
                         and not del_ev.initial_workload_name
                     ):
                         del_ev.initial_workload_name = wl_k8s_name

@@ -76,6 +76,7 @@ from chamber_common import (
     parse_feature_gates_arg,
     parse_interrupted_duration_override,
     query_cluster_status,
+    reconcile_wait_for_pods_ready_feature_gates,
     resolve_admission_fair_sharing_config,
     resolve_fair_sharing_arg,
     resolve_wait_for_pods_ready_config,
@@ -258,19 +259,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Enable Kueue waitForPodsReady in controller_manager_config.yaml (auto-enabled when any "
-            "--wait-for-pods-ready-* timeout/backoff flag is passed; automatically scaled to --speedup and --duration)"
+            "Enable or disable Kueue waitForPodsReady in controller_manager_config.yaml "
+            "(--no-wait-for-pods-ready sets featureGates.DisableWaitForPodsReady=true; auto-configured when any "
+            "--wait-for-pods-ready-* timeout/backoff flag is passed; scaled to --speedup and --duration)"
         ),
     )
     parser.add_argument(
         "--wait-for-pods-ready-timeout",
         default=None,
-        help="Raw trace waitForPodsReady.timeout (e.g. '30s', '5m'), scaled by 1/--speedup and clamped to --duration",
+        help="Raw trace waitForPodsReady.timeout (e.g. '30s', '30m'), scaled by 1/--speedup and clamped to --duration",
     )
     parser.add_argument(
         "--wait-for-pods-ready-recovery-timeout",
         default=None,
         help="Raw trace waitForPodsReady.recoveryTimeout after pod/node failure (e.g. '15s', '0s' to disable)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-unscheduled-timeout",
+        default=None,
+        help=(
+            "Raw trace waitForPodsReady.unscheduledTimeout for unscheduled pods (e.g. '15s', '0s' to disable; "
+            "automatically enables featureGates.WaitForPodsReadyUnscheduledTimeout=true)"
+        ),
     )
     parser.add_argument(
         "--wait-for-pods-ready-block-admission",
@@ -574,6 +584,11 @@ def main(argv: list[str] | None = None) -> int:
                 if args.wait_for_pods_ready_recovery_timeout is not None
                 else (sc_wfpr.get("recoveryTimeout") if sc_wfpr else None)
             ),
+            raw_unscheduled_timeout=(
+                args.wait_for_pods_ready_unscheduled_timeout
+                if args.wait_for_pods_ready_unscheduled_timeout is not None
+                else (sc_wfpr.get("unscheduledTimeout") if sc_wfpr else None)
+            ),
             block_admission=(
                 args.wait_for_pods_ready_block_admission
                 if args.wait_for_pods_ready_block_admission is not None
@@ -604,10 +619,17 @@ def main(argv: list[str] | None = None) -> int:
             min_wall_timeout=args.wait_for_pods_ready_min_timeout,
             cap_to_duration=args.wait_for_pods_ready_cap_to_duration,
         )
+        cli_feature_gates = parse_feature_gates_arg(args.kueue_feature_gates)
         merged_feature_gates: dict[str, bool] = {}
         if sc_cfg is not None and sc_cfg.feature_gates:
             merged_feature_gates.update(sc_cfg.feature_gates)
-        merged_feature_gates.update(parse_feature_gates_arg(args.kueue_feature_gates))
+        merged_feature_gates.update(cli_feature_gates)
+        wfpr_cfg, merged_feature_gates = reconcile_wait_for_pods_ready_feature_gates(
+            wfpr_cfg,
+            merged_feature_gates,
+            cli_wfpr_override=args.wait_for_pods_ready,
+            cli_feature_gates=cli_feature_gates,
+        )
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -622,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
             args.wait_for_pods_ready,
             args.wait_for_pods_ready_timeout,
             args.wait_for_pods_ready_recovery_timeout,
+            args.wait_for_pods_ready_unscheduled_timeout,
             args.wait_for_pods_ready_block_admission,
             args.wait_for_pods_ready_backoff_limit,
             args.wait_for_pods_ready_backoff_base,

@@ -3039,6 +3039,413 @@ class FidelityReviewRegressionTests(unittest.TestCase):
         finally:
             mgr.close()
 
+    def test_wfpr_disable_feature_gate_and_unscheduled_timeout(self) -> None:
+        """Verify Kueue > v0.19 DisableWaitForPodsReady gate, default-enabled summary, and unscheduledTimeout."""
+        from chamber.manifests import (
+            parse_kueue_configuration_payload,
+            reconcile_wait_for_pods_ready_feature_gates,
+        )
+
+        # 1. Default omitted state: enabled in Kueue (> v0.19, timeout=30m), configured=False, no DisableWaitForPodsReady
+        cfg_default = testrunner.resolve_wait_for_pods_ready_config()
+        self.assertTrue(cfg_default.enabled)
+        self.assertFalse(cfg_default.configured)
+        self.assertIn("default (enabled in Kueue, timeout=30m)", cfg_default.summary_str())
+        eff_def, fg_def = reconcile_wait_for_pods_ready_feature_gates(cfg_default, {})
+        self.assertEqual(fg_def, {})
+
+        # 2. Explicit --no-wait-for-pods-ready: enabled=False -> injects DisableWaitForPodsReady=true in controller_manager_config.yaml
+        cfg_disabled = testrunner.resolve_wait_for_pods_ready_config(enabled=False)
+        self.assertFalse(cfg_disabled.enabled)
+        self.assertIn("DisableWaitForPodsReady=true", cfg_disabled.summary_str())
+        mgr_dis = ChamberManager(
+            chamber_namespace="kueue-optimizer-chamber-ut-wfpr-dis",
+            wait_for_pods_ready=cfg_disabled,
+        )
+        try:
+            base_dst = mgr_dis.prepare_tmp_deploy_dir(prefer_cluster_pki=False)
+            rendered_dis = (base_dst / "config" / "controller_manager_config.yaml").read_text(encoding="utf-8")
+            self.assertNotIn("waitForPodsReady:", rendered_dis)
+            self.assertIn("DisableWaitForPodsReady: true", rendered_dis)
+        finally:
+            mgr_dis.close()
+
+        # 3. unscheduledTimeout scaling, auto-enabling WaitForPodsReadyUnscheduledTimeout=true, and <= timeout validation
+        cfg_unsch = testrunner.resolve_wait_for_pods_ready_config(
+            raw_timeout="60s",
+            raw_unscheduled_timeout="20s",
+            speedup=5.0,
+        )
+        self.assertTrue(cfg_unsch.enabled)
+        self.assertTrue(cfg_unsch.configured)
+        self.assertAlmostEqual(cfg_unsch.effective_timeout_sec, 12.0)
+        self.assertAlmostEqual(cfg_unsch.effective_unscheduled_timeout_sec or 0.0, 4.0)
+        mgr_unsch = ChamberManager(
+            chamber_namespace="kueue-optimizer-chamber-ut-wfpr-unsch",
+            wait_for_pods_ready=cfg_unsch,
+        )
+        try:
+            base_dst2 = mgr_unsch.prepare_tmp_deploy_dir(prefer_cluster_pki=False)
+            rendered_unsch = (base_dst2 / "config" / "controller_manager_config.yaml").read_text(encoding="utf-8")
+            self.assertIn("unscheduledTimeout: 4s", rendered_unsch)
+            self.assertIn("WaitForPodsReadyUnscheduledTimeout: true", rendered_unsch)
+        finally:
+            mgr_unsch.close()
+
+        with self.assertRaises(ValueError):
+            # unscheduledTimeout > timeout must be rejected
+            testrunner.resolve_wait_for_pods_ready_config(raw_timeout="10s", raw_unscheduled_timeout="20s")
+        with self.assertRaises(ValueError):
+            # DisableWaitForPodsReady + WaitForPodsReadyUnscheduledTimeout must be rejected
+            reconcile_wait_for_pods_ready_feature_gates(
+                cfg_disabled,
+                {"WaitForPodsReadyUnscheduledTimeout": True},
+            )
+
+        # Legacy v1beta1 waitForPodsReady.enable=false normalizes to DisableWaitForPodsReady=true
+        parsed_legacy = parse_kueue_configuration_payload(
+            {
+                "apiVersion": "config.kueue.x-k8s.io/v1beta1",
+                "kind": "Configuration",
+                "waitForPodsReady": {"enable": False, "timeout": "10m"},
+            }
+        )
+        self.assertIsNone(parsed_legacy.wfpr_raw)
+        self.assertTrue(parsed_legacy.feature_gates.get("DisableWaitForPodsReady"))
+
+    def test_deferred_queue_deletion_and_incarnation_cancellation_fidelity(self) -> None:
+        """Verify CQ/LQ deletions defer while workloads remain active/queued, and incarnation-0 cancel spares incarnation-1."""
+        from runner.loader import load_scenario_bundle
+        from runner.replay import _execute_scheduled_infra_event, run_scenario_replay
+
+        with tempfile.TemporaryDirectory() as td:
+            sc_dir = Path(td)
+            infra_lines = [
+                {
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "node-0", "labels": {"type": "kwok"}},
+                        "status": {"capacity": {"cpu": "16", "memory": "64Gi", "pods": "110"}, "allocatable": {"cpu": "16", "memory": "64Gi", "pods": "110"}},
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ai-lab"}},
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ResourceFlavor",
+                        "metadata": {"name": "rf-main"},
+                        "spec": {"nodeLabels": {"type": "kwok"}},
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "cq-main"},
+                        "spec": {
+                            "namespaceSelector": {},
+                            "resourceGroups": [
+                                {
+                                    "coveredResources": ["cpu", "memory"],
+                                    "flavors": [
+                                        {
+                                            "name": "rf-main",
+                                            "resources": [
+                                                {"name": "cpu", "nominalQuota": "16"},
+                                                {"name": "memory", "nominalQuota": "64Gi"},
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "LocalQueue",
+                        "metadata": {"name": "lq-main", "namespace": "ai-lab"},
+                        "spec": {"clusterQueue": "cq-main"},
+                    },
+                },
+                # Premature CQ deletion at t=3s while workloads are still active/queued!
+                {
+                    "timestamp": "2026-06-01T00:00:03Z",
+                    "eventType": "Deleted",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "cq-main"},
+                    },
+                },
+            ]
+            # Incarnation 0 of 'train' created at t=0s, cancelled while running at t=2s (PartialExecution Deleted);
+            # Incarnation 1 of 'train' created at t=4s (still in event_heap when t=2s cancel fires!) and finishes!
+            wf_lines = [
+                {
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "train",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-06-01T00:00:00Z",
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "batch/v1",
+                            "kind": "Job",
+                            "metadata": {"name": "train", "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+                            "spec": {"parallelism": 1, "completions": 1, "template": {"spec": {"containers": [{"name": "c", "image": "pause", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}}]}}},
+                        },
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:02Z",
+                    "eventType": "Deleted",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "train",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-06-01T00:00:00Z",
+                        "localQueueName": "lq-main",
+                        "object": {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "train", "namespace": "ai-lab"}},
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:04Z",
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "train",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-06-01T00:00:04Z",
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "batch/v1",
+                            "kind": "Job",
+                            "metadata": {"name": "train", "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+                            "spec": {"parallelism": 1, "completions": 1, "template": {"spec": {"containers": [{"name": "c", "image": "pause", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}}]}}},
+                        },
+                    },
+                },
+            ]
+            exec_lines = [
+                {
+                    "timestamp": "2026-06-01T00:00:00Z",
+                    "eventType": "Admitted",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "workloadName": "job-train-inc0",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "train",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "creationTime": "2026-06-01T00:00:00Z",
+                        "admittedTime": "2026-06-01T00:00:00Z",
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:02Z",
+                    "eventType": "PartialExecution",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "executionType": "Partial",
+                        "workloadName": "job-train-inc0",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "train",
+                        "creationTime": "2026-06-01T00:00:00Z",
+                        "admittedTime": "2026-06-01T00:00:00Z",
+                        "endTime": "2026-06-01T00:00:02Z",
+                        "executionDurationSeconds": 2,
+                        "interruptionReason": "Deleted",
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:10Z",
+                    "eventType": "FullExecution",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "executionType": "Full",
+                        "workloadName": "job-train-inc1",
+                        "namespace": "ai-lab",
+                        "ownerKind": "Job",
+                        "ownerName": "train",
+                        "creationTime": "2026-06-01T00:00:04Z",
+                        "admittedTime": "2026-06-01T00:00:04Z",
+                        "endTime": "2026-06-01T00:00:10Z",
+                        "executionDurationSeconds": 6,
+                    },
+                },
+            ]
+            (sc_dir / "infra.json").write_text("\n".join(json.dumps(x) for x in infra_lines) + "\n", encoding="utf-8")
+            (sc_dir / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf_lines) + "\n", encoding="utf-8")
+            (sc_dir / "execution-time.json").write_text("\n".join(json.dumps(x) for x in exec_lines) + "\n", encoding="utf-8")
+
+            bundle = load_scenario_bundle(
+                scenario_dir=sc_dir,
+                infra_path=None,
+                workflows_path=None,
+                execution_time_path=None,
+                speedup=20.0,
+                min_pod_duration_sec=0.1,
+                infinite_pod_duration_sec=86400.0,
+                default_exec_sec=10.0,
+                initial_window_sec=0.5,
+                skip_initial_offset=True,
+                pause_image_override="",
+                override_workload_namespace=None,
+                override_queueing_strategy=None,
+                override_cq_fair_sharing_preemption=None,
+            )
+            self.assertEqual(len(bundle.scheduled_workflows), 2)
+            self.assertEqual([w.incarnation_index for w in bundle.scheduled_workflows], [0, 1])
+            self.assertEqual(len(bundle.scheduled_workflow_deletions), 1)
+            self.assertEqual(bundle.scheduled_workflow_deletions[0].incarnation_index, 0)
+            self.assertEqual(bundle.scheduled_workflow_deletions[0].delete_reason, "cancelled")
+
+            mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-ut-del", workload_namespace="ai-lab")
+            submitted_docs: list[str] = []
+            deleted_paths: list[str] = []
+            cq_delete_calls: list[str] = []
+            inc1_finished = False
+            try:
+                def fake_apply(docs, max_workers=24):
+                    nonlocal inc1_finished
+                    for d in docs:
+                        nm = str((d.get("metadata") or {}).get("name") or "")
+                        submitted_docs.append(nm)
+                        if len(submitted_docs) == 2:
+                            inc1_finished = True
+
+                def fake_api_delete(path: str, ignore_not_found: bool = True) -> None:
+                    cq_delete_calls.append(path)
+
+                def fake_api_req(method: str, path: str, **_kw):
+                    if method == "DELETE":
+                        deleted_paths.append(path)
+                        return 200, b"{}"
+                    if method == "GET" and path.endswith("/pods"):
+                        return 200, b'{"items":[]}'
+                    if method == "GET" and "/jobs/" in path:
+                        return 404, b""
+                    if method == "GET" and path.endswith("/workloads"):
+                        if inc1_finished:
+                            return 200, json.dumps(
+                                {
+                                    "items": [
+                                        {
+                                            "metadata": {"name": "job-train-inc1", "namespace": "ai-lab"},
+                                            "spec": {"queueName": "lq-main"},
+                                            "status": {"conditions": [{"type": "Finished", "status": "True", "reason": "Succeeded"}]},
+                                        }
+                                    ]
+                                }
+                            ).encode("utf-8")
+                        return 200, json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "metadata": {
+                                            "name": "job-train-inc0",
+                                            "namespace": "ai-lab",
+                                            "ownerReferences": [{"name": "train"}],
+                                        },
+                                        "spec": {"queueName": "lq-main"},
+                                        "status": {
+                                            "admission": {"clusterQueue": "cq-main"},
+                                            "conditions": [{"type": "Admitted", "status": "True"}],
+                                        },
+                                    }
+                                ]
+                            }
+                        ).encode("utf-8")
+                    return 200, b"{}"
+
+                def fake_query_status(*_a, **_kw):
+                    fin_keys = {("ai-lab", "job-train-inc1")} if inc1_finished else set()
+                    return ClusterStatusSnapshot(
+                        workloads_admitted=0 if inc1_finished else 1,
+                        workloads_pending=0,
+                        workloads_finished=len(fin_keys),
+                        pods_running=0,
+                        pods_pending=0,
+                        pods_succeeded=1 if inc1_finished else 0,
+                        pods_failed=0,
+                        jobsets_completed=0,
+                        jobsets_failed=0,
+                        cq_summary=[],
+                        finished_workload_keys=fin_keys,
+                        present_workload_keys=fin_keys,
+                        workloads_query_ok=True,
+                    )
+
+                with (
+                    mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply),
+                    mock.patch.object(mgr, "api_delete", side_effect=fake_api_delete),
+                    mock.patch.object(mgr, "api_request", side_effect=fake_api_req),
+                    mock.patch("runner.replay.query_cluster_status", side_effect=fake_query_status),
+                ):
+                    _, _, sub_cnt, _ = run_scenario_replay(
+                        mgr=mgr,
+                        bundle=bundle,
+                        speedup=20.0,
+                        max_run_seconds=5.0,
+                        status_interval_sec=0.2,
+                        wait_for_completion=True,
+                        initial_state_already_bootstrapped=True,
+                    )
+
+                # BOTH incarnation 0 AND incarnation 1 were submitted (incarnation 1 was NOT dropped!),
+                # running incarnation 0 WAS deleted via DELETE /apis/batch/v1/namespaces/ai-lab/jobs/train,
+                # AND ClusterQueue 'cq-main' was NOT prematurely deleted at t=3s while incarnation 1 was still queued!
+                self.assertEqual(sub_cnt, 2)
+                self.assertEqual(len(submitted_docs), 2)
+                self.assertTrue(any("/apis/batch/v1/namespaces/ai-lab/jobs/" in p for p in deleted_paths))
+                self.assertEqual(cq_delete_calls, [])
+
+                # Also verify directly that once all dependent workloads finish, _execute_scheduled_infra_event deletes CQ cleanly
+                ie_del_cq = bundle.scheduled_infra_events[0]
+                with (
+                    mock.patch.object(mgr, "api_delete", side_effect=fake_api_delete),
+                    mock.patch.object(mgr, "api_request", side_effect=fake_api_req),
+                ):
+                    deferred_after, _ = _execute_scheduled_infra_event(
+                        mgr,
+                        bundle,
+                        ie_del_cq,
+                        1.0,
+                        event_heap=[],
+                        cancelled_unsubmitted_keys=set(),
+                        active_initial_wls=[],
+                        lq_to_cq={("ai-lab", "lq-main"): "cq-main"},
+                        cq_to_cohort={"cq-main": ""},
+                        cq_to_flavors={"cq-main": {"rf-main"}},
+                        submitted_non_cancelled=[],
+                    )
+                self.assertFalse(deferred_after)
+                self.assertEqual(cq_delete_calls, ["/apis/kueue.x-k8s.io/v1beta2/clusterqueues/cq-main"])
+            finally:
+                mgr.close()
+
 
 if __name__ == "__main__":
     unittest.main()
