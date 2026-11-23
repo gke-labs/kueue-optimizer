@@ -218,6 +218,10 @@ spec:
       operator: NotIn
       values:
       - "True"
+    - key: .metadata.annotations["kueue-optimizer.gke.io/node-failed"]
+      operator: NotIn
+      values:
+      - "true"
 NODE_INIT_EOF
   echo "---"
   kubectl --kubeconfig=/dev/null kustomize "${KWOK_REPO}/kustomize/stage/node/heartbeat-with-lease"
@@ -246,6 +250,15 @@ spec:
       operator: NotIn
       values:
       - "True"
+    - key: .metadata.annotations["kueue-optimizer.gke.io/pod-never-ready"]
+      operator: NotIn
+      values:
+      - "true"
+  delay:
+    durationMilliseconds: 0
+    durationFrom:
+      jq:
+        expression: '(.metadata.annotations["kueue-optimizer.gke.io/pod-startup-delay-seconds"] // "0") | tostring | if . == "" then "0s" elif test("[a-zA-Z]$") then . else . + "s" end'
   next:
     statusTemplate: |
       {{ $now := Now }}
@@ -409,6 +422,20 @@ spec:
 STAGE_EOF
 } > "${MANIFESTS_DIR}/kwok-stages.yaml"
 cp "${KWOK_REPO}/kustomize/kwok/kwok.yaml" "${CONFIG_DIR}/kwok.yaml"
+python3 - "${CONFIG_DIR}/kwok.yaml" <<'PYEOF'
+import sys
+import yaml
+
+p = sys.argv[1]
+with open(p, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+opts = cfg.setdefault("options", {})
+opts["nodeLeaseParallelism"] = 32
+opts["podPlayStageParallelism"] = 64
+opts["nodePlayStageParallelism"] = 32
+with open(p, "w", encoding="utf-8") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False)
+PYEOF
 
 # Generate initial simulated KWOK Nodes
 {
@@ -508,7 +535,12 @@ for doc in docs:
             "LessThanOrEqualToFinalShare",
             "LessThanInitialShare",
         ]
-        cfg_obj.setdefault("controller", {}).setdefault("groupKindConcurrency", {})["JobSet.jobset.x-k8s.io"] = 5
+        gk_conc = cfg_obj.setdefault("controller", {}).setdefault("groupKindConcurrency", {})
+        gk_conc["Job.batch"] = 20
+        gk_conc["Pod"] = 20
+        gk_conc["Workload.kueue.x-k8s.io"] = 20
+        gk_conc["JobSet.jobset.x-k8s.io"] = 20
+        cfg_obj["clientConnection"] = {"qps": 1000, "burst": 2000}
         manager_config_str = yaml.safe_dump(cfg_obj, sort_keys=False)
         continue
 
@@ -555,6 +587,20 @@ for doc in docs:
             cc = wh.setdefault("clientConfig", {})
             cc["caBundle"] = ca_bundle
             cc.setdefault("service", {})["port"] = 9443
+            if kind == "MutatingWebhookConfiguration" and wh.get("name") == "mpod.kb.io":
+                obj_sel = wh.setdefault("objectSelector", {})
+                obj_exprs = obj_sel.setdefault("matchExpressions", [])
+                if not any(
+                    ex.get("key") == "kueue-optimizer.gke.io/initial-pod" and ex.get("operator") == "NotIn"
+                    for ex in obj_exprs
+                ):
+                    obj_exprs.append(
+                        {
+                            "key": "kueue-optimizer.gke.io/initial-pod",
+                            "operator": "NotIn",
+                            "values": ["true"],
+                        }
+                    )
         bootstrap_docs.append(doc)
         continue
 
@@ -624,7 +670,7 @@ for doc in docs:
         cfg_obj.setdefault("webhook", {})["port"] = 9443
         cfg_obj.setdefault("leaderElection", {})["leaderElect"] = False
         cfg_obj["leaderElection"].setdefault("resourceName", "6d4f6a47.jobset.x-k8s.io")
-        cfg_obj.setdefault("clientConnection", {"qps": 500, "burst": 500})
+        cfg_obj["clientConnection"] = {"qps": 1000, "burst": 2000}
         cfg_obj.setdefault("internalCertManagement", {})["enable"] = False
         manager_config_str = yaml.safe_dump(cfg_obj, sort_keys=False)
         continue
@@ -660,6 +706,20 @@ for doc in docs:
             cc = wh.setdefault("clientConfig", {})
             cc["caBundle"] = ca_bundle
             cc.setdefault("service", {})["port"] = 9443
+            if kind == "MutatingWebhookConfiguration" and wh.get("name") == "mpod.kb.io":
+                obj_sel = wh.setdefault("objectSelector", {})
+                obj_exprs = obj_sel.setdefault("matchExpressions", [])
+                if not any(
+                    ex.get("key") == "kueue-optimizer.gke.io/initial-pod" and ex.get("operator") == "NotIn"
+                    for ex in obj_exprs
+                ):
+                    obj_exprs.append(
+                        {
+                            "key": "kueue-optimizer.gke.io/initial-pod",
+                            "operator": "NotIn",
+                            "values": ["true"],
+                        }
+                    )
         bootstrap_docs.append(doc)
         continue
 

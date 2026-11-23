@@ -26,6 +26,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kueuev1beta2 "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 )
 
 // EventType represents the lifecycle event type recorded by the scraper.
@@ -59,18 +60,27 @@ const (
 // business-specific container commands and images from workflow specifications.
 const DefaultPauseImage = "registry.k8s.io/pause:3.10"
 
+// DefaultKueueNamespace and DefaultKueueConfigMapName identify the standard
+// ConfigMap holding Kueue's controller_manager_config.yaml Configuration document.
+const (
+	DefaultKueueNamespace     = "kueue-system"
+	DefaultKueueConfigMapName = "kueue-manager-config"
+)
+
 // Config holds runtime configuration for the Kubernetes and Kueue load test scraper.
 type Config struct {
-	Kubeconfig        string
-	Interval          time.Duration
-	Duration          time.Duration
-	HashNames         bool
-	PauseImage        string
-	ExtraHashLabels   []string
-	HashSalt          []byte
-	InfraFile         string
-	WorkflowsFile     string
-	ExecutionTimeFile string
+	Kubeconfig         string
+	Interval           time.Duration
+	Duration           time.Duration
+	HashNames          bool
+	PauseImage         string
+	ExtraHashLabels    []string
+	HashSalt           []byte
+	InfraFile          string
+	WorkflowsFile      string
+	ExecutionTimeFile  string
+	KueueNamespace     string
+	KueueConfigMapName string
 }
 
 // InfraEvent represents a single event stored in infra.json.
@@ -82,7 +92,8 @@ type InfraEvent struct {
 }
 
 // ScrapedPodPayload contains strictly the allowed fields for scheduled and running pods:
-// placement, resource request, scheduling time, first notice time, and deletion time
+// placement, resource request, scheduling time, first notice time, deletion time, and
+// optional sanitized Kueue workload/owner linkage metadata for startup pod-to-quota sync
 // (plus apiVersion, kind, name, and namespace to identify the pod object).
 // No container information, args, commands, secrets, volumes, annotations, or labels are stored.
 type ScrapedPodPayload struct {
@@ -95,6 +106,11 @@ type ScrapedPodPayload struct {
 	SchedulingTime  *metav1.Time        `json:"schedulingTime,omitempty"`
 	FirstNoticeTime metav1.Time         `json:"firstNoticeTime"`
 	DeletionTime    *metav1.Time        `json:"deletionTime,omitempty"`
+	WorkloadName    string              `json:"workloadName,omitempty"`
+	OwnerKind       string              `json:"ownerKind,omitempty"`
+	OwnerName       string              `json:"ownerName,omitempty"`
+	PodSetName      string              `json:"podSetName,omitempty"`
+	IsTAS           bool                `json:"isTAS,omitempty"`
 }
 
 // WorkflowEvent represents a single event stored in workflows.json for Jobs, JobSets,
@@ -133,25 +149,44 @@ type ExecutionTimeEvent struct {
 	Payload       ExecutionTimePayload `json:"payload"`
 }
 
+// Interruption reason constants recorded on PartialExecution events in execution-time.json.
+const (
+	InterruptionReasonPreempted        = "Preempted"
+	InterruptionReasonNodeFailure      = "NodeFailure"
+	InterruptionReasonPodsReadyTimeout = "PodsReadyTimeout"
+	InterruptionReasonEvicted          = "Evicted"
+	InterruptionReasonFailed           = "Failed"
+	InterruptionReasonDeleted          = "Deleted"
+	InterruptionReasonScrapeEnded      = "ScrapeEnded"
+)
+
 // ExecutionTimePayload holds the Kueue Workload admission, partial execution, or full execution details.
 type ExecutionTimePayload struct {
-	ExecutionType            string       `json:"executionType,omitempty"`
-	WorkloadName             string       `json:"workloadName"`
-	Namespace                string       `json:"namespace"`
-	OwnerKind                string       `json:"ownerKind,omitempty"`
-	OwnerName                string       `json:"ownerName,omitempty"`
-	OwnerAPIVersion          string       `json:"ownerAPIVersion,omitempty"`
-	LocalQueueName           string       `json:"localQueueName,omitempty"`
-	ClusterQueueName         string       `json:"clusterQueueName,omitempty"`
-	CreationTime             metav1.Time  `json:"creationTime"`
-	AdmittedTime             metav1.Time  `json:"admittedTime"`
-	EndTime                  *metav1.Time `json:"endTime,omitempty"`
-	ExecutionDurationSeconds *float64     `json:"executionDurationSeconds,omitempty"`
-	ExecutionDuration        string       `json:"executionDuration,omitempty"`
-	Preempted                bool         `json:"preempted"`
-	PreemptionCount          int          `json:"preemptionCount,omitempty"`
-	Reason                   string       `json:"reason,omitempty"`
-	Message                  string       `json:"message,omitempty"`
+	ExecutionType             string                          `json:"executionType,omitempty"`
+	WorkloadName              string                          `json:"workloadName"`
+	Namespace                 string                          `json:"namespace"`
+	OwnerKind                 string                          `json:"ownerKind,omitempty"`
+	OwnerName                 string                          `json:"ownerName,omitempty"`
+	OwnerAPIVersion           string                          `json:"ownerAPIVersion,omitempty"`
+	LocalQueueName            string                          `json:"localQueueName,omitempty"`
+	ClusterQueueName          string                          `json:"clusterQueueName,omitempty"`
+	PriorityClassName         string                          `json:"priorityClassName,omitempty"`
+	Priority                  *int32                          `json:"priority,omitempty"`
+	PodSetAssignments         []kueuev1beta2.PodSetAssignment `json:"podSetAssignments,omitempty"`
+	UnhealthyNodes            []string                        `json:"unhealthyNodes,omitempty"`
+	CreationTime              metav1.Time                     `json:"creationTime"`
+	AdmittedTime              metav1.Time                     `json:"admittedTime"`
+	EndTime                   *metav1.Time                    `json:"endTime,omitempty"`
+	ExecutionDurationSeconds  *float64                        `json:"executionDurationSeconds,omitempty"`
+	ExecutionDuration         string                          `json:"executionDuration,omitempty"`
+	Preempted                 bool                            `json:"preempted"`
+	PreemptionCount           int                             `json:"preemptionCount,omitempty"`
+	InterruptionReason        string                          `json:"interruptionReason,omitempty"`
+	InterruptionCount         int                             `json:"interruptionCount,omitempty"`
+	TrueDurationSeconds       *float64                        `json:"trueDurationSeconds,omitempty"`
+	MissingDurationMultiplier *float64                        `json:"missingDurationMultiplier,omitempty"`
+	Reason                    string                          `json:"reason,omitempty"`
+	Message                   string                          `json:"message,omitempty"`
 }
 
 // JSONEventLog writes events in JSON Lines (NDJSON) format on disk — one compact,
@@ -203,6 +238,16 @@ func (l *JSONEventLog) Append(event any) error {
 		return fmt.Errorf("append event to %s: %w", l.path, err)
 	}
 	l.count++
+	return nil
+}
+
+// Sync flushes buffered kernel file data to stable storage.
+func (l *JSONEventLog) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nil
+	}
 	return l.file.Sync()
 }
 
@@ -220,6 +265,7 @@ func (l *JSONEventLog) Close() error {
 	if l.file == nil {
 		return nil
 	}
+	_ = l.file.Sync()
 	err := l.file.Close()
 	l.file = nil
 	return err

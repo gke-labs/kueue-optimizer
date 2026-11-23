@@ -46,14 +46,24 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 
 from chamber_common import (
+    AdmissionFairSharingConfig,
     ChamberManager,
+    DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES,
     DEFAULT_FALLBACK_EXEC_SEC,
     DEFAULT_INFRA_PODS_NAMESPACE,
+    DEFAULT_INTERRUPTED_DURATION_MULTIPLIER,
     DEFAULT_PAUSE_IMAGE,
+    DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC,
+    InterruptedDurationOverride,
+    KueueScenarioConfiguration,
+    ROOT_DIR,
+    WaitForPodsReadyConfig,
     add_common_chamber_args,
     docs_to_pretty_yaml,
     env_bool,
@@ -62,14 +72,23 @@ from chamber_common import (
     managed_chamber,
     normalize_queueing_strategy,
     parse_duration_seconds,
+    parse_fair_sharing_strategies,
+    parse_feature_gates_arg,
+    parse_interrupted_duration_override,
     query_cluster_status,
+    reconcile_wait_for_pods_ready_feature_gates,
+    resolve_admission_fair_sharing_config,
     resolve_fair_sharing_arg,
+    resolve_wait_for_pods_ready_config,
 )
 from runner.loader import (
     DEFAULT_INFINITE_POD_DURATION_SEC,
     DEFAULT_SCENARIO_DIR,
     InitialPodSpec,
+    InitialWorkloadPodGroup,
     ScenarioBundle,
+    ScheduledInfraEvent,
+    ScheduledWorkflowDeletion,
     ScheduledWorkflowItem,
     load_scenario_bundle,
 )
@@ -93,20 +112,30 @@ __all__ = [
     "ALLOWED_INFRA_GVKS",
     "ALLOWED_WORKFLOW_GVKS",
     "ALLOWED_WORKFLOW_KINDS",
+    "AdmissionFairSharingConfig",
     "DEFAULT_INFINITE_POD_DURATION_SEC",
     "DEFAULT_SCENARIO_DIR",
     "InitialPodSpec",
+    "InitialWorkloadPodGroup",
+    "InterruptedDurationOverride",
+    "KueueScenarioConfiguration",
     "MAX_K8S_NAME_LEN",
     "SERVER_METADATA_FIELDS",
     "SYSTEM_NAMESPACES",
     "ScenarioBundle",
+    "ScheduledInfraEvent",
+    "ScheduledWorkflowDeletion",
     "ScheduledWorkflowItem",
+    "WaitForPodsReadyConfig",
     "apply_scenario_queues_and_wait",
     "build_arg_parser",
     "cleanup_scenario_workloads",
     "load_scenario_bundle",
     "main",
+    "parse_interrupted_duration_override",
     "print_scenario_outline",
+    "resolve_admission_fair_sharing_config",
+    "resolve_wait_for_pods_ready_config",
     "run_scenario_replay",
     "validate_workflow_events",
 ]
@@ -192,6 +221,112 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--missing-duration-policy",
+        choices=("impute", "fallback", "error"),
+        default="impute",
+        help=(
+            "How to handle never-admitted/unindexed workflows missing from execution-time.json: "
+            "'impute' (default: peer median from same queue/shape with warning), "
+            "'fallback' (use --default-exec-seconds with warning), or 'error' (fail fast)"
+        ),
+    )
+    parser.add_argument(
+        "--interrupted-duration-multiplier",
+        "--partial-duration-multiplier",
+        dest="interrupted_duration_multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Multiplier (> 1.0) applied to observed PartialExecution duration for workloads interrupted by "
+            "preemption, node failure, or scrape cutoff that lack a FullExecution entry "
+            f"(default when neither override nor schema multiplier is set: {DEFAULT_INTERRUPTED_DURATION_MULTIPLIER:g}x)"
+        ),
+    )
+    parser.add_argument(
+        "--interrupted-duration-override",
+        "--true-duration-override",
+        dest="interrupted_duration_override",
+        default=None,
+        help=(
+            "Explicit true uninterrupted execution duration (> observed partial duration) for PartialExecution-only "
+            "workloads: accepts a global duration (e.g. '45s'), 'name=duration' pairs ('job-a=40s,job-b=60s'), "
+            "or a JSON map file path ('@overrides.json')"
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready",
+        dest="wait_for_pods_ready",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable or disable Kueue waitForPodsReady in controller_manager_config.yaml "
+            "(--no-wait-for-pods-ready sets featureGates.DisableWaitForPodsReady=true; auto-configured when any "
+            "--wait-for-pods-ready-* timeout/backoff flag is passed; scaled to --speedup and --duration)"
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-timeout",
+        default=None,
+        help="Raw trace waitForPodsReady.timeout (e.g. '30s', '30m'), scaled by 1/--speedup and clamped to --duration",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-recovery-timeout",
+        default=None,
+        help="Raw trace waitForPodsReady.recoveryTimeout after pod/node failure (e.g. '15s', '0s' to disable)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-unscheduled-timeout",
+        default=None,
+        help=(
+            "Raw trace waitForPodsReady.unscheduledTimeout for unscheduled pods (e.g. '15s', '0s' to disable; "
+            "automatically enables featureGates.WaitForPodsReadyUnscheduledTimeout=true)"
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-block-admission",
+        dest="wait_for_pods_ready_block_admission",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Configure waitForPodsReady.blockAdmission in Kueue controller config",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-requeue-timestamp",
+        default="Eviction",
+        choices=["Eviction", "Creation"],
+        help="Configure waitForPodsReady.requeuingStrategy.timestamp ('Eviction' or 'Creation'; default: Eviction)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-backoff-limit",
+        type=int,
+        default=None,
+        help="Configure waitForPodsReady.requeuingStrategy.backoffLimitCount before workload deactivation",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-backoff-base",
+        default=None,
+        help="Raw trace waitForPodsReady.requeuingStrategy.backoffBaseSeconds (scaled by 1/--speedup)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-backoff-max",
+        default=None,
+        help="Raw trace waitForPodsReady.requeuingStrategy.backoffMaxSeconds (scaled by 1/--speedup)",
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-min-timeout",
+        default=f"{DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC:g}s",
+        help=(
+            "Minimum wall-clock waitForPodsReady timeout floor after --speedup scaling "
+            f"(default: {DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC:g}s)"
+        ),
+    )
+    parser.add_argument(
+        "--wait-for-pods-ready-cap-to-duration",
+        dest="wait_for_pods_ready_cap_to_duration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clamp scaled waitForPodsReady timeout to <= 50%% of --duration when --duration is set (default: true)",
+    )
+    parser.add_argument(
         "--infinite-pod-duration",
         default=str(int(DEFAULT_INFINITE_POD_DURATION_SEC)),
         help=(
@@ -272,7 +407,65 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=5,
         help="Number of sample Nodes, Initial Pods, and Workflows to print in --dry-run mode (0 = print all; default: 5)",
     )
+    parser.add_argument(
+        "--scrape-output-dir",
+        default=env_str("SCRAPE_OUTPUT_DIR", ""),
+        help=(
+            "Optional directory where cluster-scraper captures live infra.json, workflows.json, and "
+            "execution-time.json starting at exact chamber t0 through scenario replay completion"
+        ),
+    )
+    parser.add_argument(
+        "--scrape-interval-sec",
+        default=env_str("CLUSTER_SCRAPER_INTERVAL", "30s"),
+        help="Periodic reconciliation interval passed to cluster-scraper --interval when --scrape-output-dir is set (default: 30s)",
+    )
+    parser.add_argument(
+        "--scrape-hash-names",
+        action="store_true",
+        default=False,
+        help="Pass --hash-names to cluster-scraper when --scrape-output-dir is set",
+    )
+    parser.add_argument(
+        "--scraper-bin",
+        default=env_str("CLUSTER_SCRAPER_BIN", str(ROOT_DIR / "scraper" / "cluster-scraper")),
+        help="Path to compiled cluster-scraper binary used when --scrape-output-dir is set",
+    )
     return parser
+
+
+def _wait_for_scraper_t0_barrier(
+    scrape_dir: Path,
+    proc: subprocess.Popen[str],
+    *,
+    expected_nodes: int,
+    expected_cqs: int,
+    timeout_sec: float = 45.0,
+) -> None:
+    """Wait until cluster-scraper completes its initial t0 List+ScrapeOnce sync before replay starts."""
+    infra_path = scrape_dir / "infra.json"
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"cluster-scraper exited prematurely with code {proc.returncode}; inspect {scrape_dir / 'scraper.log'}"
+            )
+        if infra_path.is_file():
+            try:
+                text = infra_path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            node_hits = text.count('"kind":"Node"')
+            cq_hits = text.count('"kind":"ClusterQueue"')
+            # ScrapeOnce writes Nodes first and RuntimeClasses/ClusterQueues/Pods before flushing logs at t0.
+            if node_hits >= expected_nodes and cq_hits >= expected_cqs:
+                # Give watch goroutines 0.25s to open Watch streams after ScrapeOnce finishes.
+                time.sleep(0.25)
+                return
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"Timed out after {timeout_sec:.0f}s waiting for cluster-scraper t0 barrier in {scrape_dir}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -284,12 +477,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.speedup <= 0:
         parser.error("--speedup / --time-compression must be > 0")
-
-    enable_fair_sharing = resolve_fair_sharing_arg(
-        args.fair_sharing,
-        args.skip_chamber_deploy and not args.cleanup and not args.cleanup_workloads,
-        parser,
-    )
 
     if args.cleanup_after:
         args.no_cleanup = False
@@ -322,30 +509,157 @@ def main(argv: list[str] | None = None) -> int:
             registry_memory_limit=args.registry_memory_limit,
             kueue_image=args.kueue_image,
             kueue_build_dir=args.kueue_build_dir,
-            enable_fair_sharing=enable_fair_sharing,
         )
         mgr.cleanup_chamber()
         return 0
 
     infra_pods_ns = args.infra_pods_namespace.strip() or DEFAULT_INFRA_PODS_NAMESPACE
 
-    bundle = load_scenario_bundle(
-        scenario_dir=args.scenario_dir,
-        infra_path=args.infra_file,
-        workflows_path=args.workflows_file,
-        execution_time_path=args.execution_time_file,
-        speedup=args.speedup,
-        min_pod_duration_sec=min_pod_duration_sec,
-        infinite_pod_duration_sec=infinite_pod_sec,
-        default_exec_sec=default_exec_sec,
-        initial_window_sec=initial_window_sec,
-        skip_initial_offset=args.skip_initial_offset,
-        pause_image_override=args.pause_image,
-        override_workload_namespace=override_wl_ns,
-        override_queueing_strategy=override_q_strategy,
-        override_cq_fair_sharing_preemption=args.cq_fair_sharing_preemption,
-        infra_pods_namespace=infra_pods_ns,
+    try:
+        bundle = load_scenario_bundle(
+            scenario_dir=args.scenario_dir,
+            infra_path=args.infra_file,
+            workflows_path=args.workflows_file,
+            execution_time_path=args.execution_time_file,
+            speedup=args.speedup,
+            min_pod_duration_sec=min_pod_duration_sec,
+            infinite_pod_duration_sec=infinite_pod_sec,
+            default_exec_sec=default_exec_sec,
+            initial_window_sec=initial_window_sec,
+            skip_initial_offset=args.skip_initial_offset,
+            pause_image_override=args.pause_image,
+            override_workload_namespace=override_wl_ns,
+            override_queueing_strategy=override_q_strategy,
+            override_cq_fair_sharing_preemption=args.cq_fair_sharing_preemption,
+            infra_pods_namespace=infra_pods_ns,
+            interrupted_duration_multiplier=args.interrupted_duration_multiplier,
+            interrupted_duration_override=args.interrupted_duration_override,
+            missing_duration_policy=args.missing_duration_policy,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    sc_cfg = bundle.kueue_configuration
+    enable_fair_sharing = resolve_fair_sharing_arg(
+        args.fair_sharing,
+        args.skip_chamber_deploy and not args.cleanup_workloads,
+        parser,
+        scenario_default=sc_cfg.fair_sharing_enabled if sc_cfg is not None else None,
     )
+
+    try:
+        if args.fair_sharing_strategies is not None:
+            fair_sharing_strategies = parse_fair_sharing_strategies(args.fair_sharing_strategies)
+        elif sc_cfg is not None:
+            fair_sharing_strategies = sc_cfg.fair_sharing_strategies
+        else:
+            fair_sharing_strategies = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+
+        afs_cfg = resolve_admission_fair_sharing_config(
+            enabled=args.admission_fair_sharing,
+            raw_usage_half_life=args.afs_usage_half_life,
+            raw_usage_sampling_interval=args.afs_sampling_interval,
+            resource_weights=args.afs_resource_weights,
+            scenario_afs=sc_cfg.afs_raw if sc_cfg is not None else None,
+            speedup=args.speedup,
+            max_run_seconds=max_run_seconds,
+        )
+
+        sc_wfpr = sc_cfg.wfpr_raw if sc_cfg is not None else None
+        sc_wfpr_req = (sc_wfpr.get("requeuingStrategy") or {}) if isinstance(sc_wfpr, dict) else {}
+        eff_wfpr_enabled = (
+            args.wait_for_pods_ready
+            if args.wait_for_pods_ready is not None
+            else (True if sc_wfpr is not None else None)
+        )
+        wfpr_cfg = resolve_wait_for_pods_ready_config(
+            enabled=eff_wfpr_enabled,
+            raw_timeout=(
+                args.wait_for_pods_ready_timeout
+                if args.wait_for_pods_ready_timeout is not None
+                else (sc_wfpr.get("timeout") if sc_wfpr else None)
+            ),
+            raw_recovery_timeout=(
+                args.wait_for_pods_ready_recovery_timeout
+                if args.wait_for_pods_ready_recovery_timeout is not None
+                else (sc_wfpr.get("recoveryTimeout") if sc_wfpr else None)
+            ),
+            raw_unscheduled_timeout=(
+                args.wait_for_pods_ready_unscheduled_timeout
+                if args.wait_for_pods_ready_unscheduled_timeout is not None
+                else (sc_wfpr.get("unscheduledTimeout") if sc_wfpr else None)
+            ),
+            block_admission=(
+                args.wait_for_pods_ready_block_admission
+                if args.wait_for_pods_ready_block_admission is not None
+                else (sc_wfpr.get("blockAdmission") if sc_wfpr else None)
+            ),
+            requeuing_timestamp=(
+                args.wait_for_pods_ready_requeue_timestamp
+                if args.wait_for_pods_ready_requeue_timestamp is not None
+                else sc_wfpr_req.get("timestamp")
+            ),
+            backoff_limit_count=(
+                args.wait_for_pods_ready_backoff_limit
+                if args.wait_for_pods_ready_backoff_limit is not None
+                else sc_wfpr_req.get("backoffLimitCount")
+            ),
+            raw_backoff_base=(
+                args.wait_for_pods_ready_backoff_base
+                if args.wait_for_pods_ready_backoff_base is not None
+                else sc_wfpr_req.get("backoffBaseSeconds")
+            ),
+            raw_backoff_max=(
+                args.wait_for_pods_ready_backoff_max
+                if args.wait_for_pods_ready_backoff_max is not None
+                else sc_wfpr_req.get("backoffMaxSeconds")
+            ),
+            speedup=args.speedup,
+            max_run_seconds=max_run_seconds,
+            min_wall_timeout=args.wait_for_pods_ready_min_timeout,
+            cap_to_duration=args.wait_for_pods_ready_cap_to_duration,
+        )
+        cli_feature_gates = parse_feature_gates_arg(args.kueue_feature_gates)
+        merged_feature_gates: dict[str, bool] = {}
+        if sc_cfg is not None and sc_cfg.raw_feature_gates:
+            merged_feature_gates.update(sc_cfg.raw_feature_gates)
+        elif sc_cfg is not None and sc_cfg.feature_gates:
+            merged_feature_gates.update(sc_cfg.feature_gates)
+        merged_feature_gates.update(cli_feature_gates)
+        wfpr_cfg, merged_feature_gates = reconcile_wait_for_pods_ready_feature_gates(
+            wfpr_cfg,
+            merged_feature_gates,
+            cli_wfpr_override=args.wait_for_pods_ready,
+            cli_feature_gates=cli_feature_gates,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    has_cli_controller_override = any(
+        x is not None
+        for x in (
+            args.fair_sharing_strategies,
+            args.admission_fair_sharing,
+            args.afs_usage_half_life,
+            args.afs_sampling_interval,
+            args.afs_resource_weights,
+            args.wait_for_pods_ready,
+            args.wait_for_pods_ready_timeout,
+            args.wait_for_pods_ready_recovery_timeout,
+            args.wait_for_pods_ready_unscheduled_timeout,
+            args.wait_for_pods_ready_block_admission,
+            args.wait_for_pods_ready_backoff_limit,
+            args.wait_for_pods_ready_backoff_base,
+            args.wait_for_pods_ready_backoff_max,
+            args.kueue_feature_gates,
+        )
+    )
+    if args.skip_chamber_deploy and not args.cleanup_workloads and (has_cli_controller_override or sc_cfg is not None):
+        parser.error(
+            "Scenario Kueue Configuration statements and controller config CLI flags (--fair-sharing-strategies, "
+            "--admission-fair-sharing*, --wait-for-pods-ready*, --kueue-feature-gates) cannot be combined with "
+            "--skip-chamber-deploy because Kueue's controller configuration is only applied when deploying a chamber."
+        )
 
     mgr = ChamberManager(
         chamber_namespace=args.namespace,
@@ -358,6 +672,12 @@ def main(argv: list[str] | None = None) -> int:
         kueue_image=args.kueue_image,
         kueue_build_dir=args.kueue_build_dir,
         enable_fair_sharing=enable_fair_sharing,
+        fair_sharing_strategies=fair_sharing_strategies,
+        admission_fair_sharing=afs_cfg,
+        wait_for_pods_ready=wfpr_cfg,
+        kueue_feature_gates=merged_feature_gates,
+        kueue_resources_config=sc_cfg.resources_block if sc_cfg is not None else None,
+        manage_jobs_without_queue_name=sc_cfg.manage_jobs_without_queue_name if sc_cfg is not None else None,
     )
 
     if args.cleanup_workloads:
@@ -381,18 +701,38 @@ def main(argv: list[str] | None = None) -> int:
             speedup=args.speedup,
             enable_fair_sharing=outline_fs,
             reused_chamber=args.skip_chamber_deploy,
+            wait_for_pods_ready=wfpr_cfg,
+            fair_sharing_strategies=fair_sharing_strategies,
+            admission_fair_sharing=afs_cfg,
+            config_from_scenario=sc_cfg is not None,
         )
         limit = args.dry_run_limit
         sample_nodes = bundle.nodes[:limit] if limit > 0 else bundle.nodes
         sample_pods = bundle.initial_pods[:limit] if limit > 0 else bundle.initial_pods
         sample_wfs = bundle.scheduled_workflows[:limit] if limit > 0 else bundle.scheduled_workflows
+        if sc_cfg is not None:
+            print("# === Kueue Controller Configuration (from scenario infra.json) ===")
+            print(docs_to_pretty_yaml([sc_cfg.raw_doc]), end="")
+            print("---")
         print(f"# === KWOK Nodes (showing {len(sample_nodes)} of {len(bundle.nodes)}) ===")
         print(docs_to_pretty_yaml(sample_nodes), end="")
         print("---\n# === Namespaces, ResourceFlavors, Topologies, ClusterQueues, LocalQueues ===")
         print(docs_to_pretty_yaml(bundle.prereq_and_queue_docs), end="")
+        if bundle.initial_workloads:
+            sample_iwls = bundle.initial_workloads[:limit] if limit > 0 else bundle.initial_workloads
+            print(
+                f"---\n# === Initial Pre-Admitted Kueue PodGroup Workloads at t0 "
+                f"(showing {len(sample_iwls)} of {len(bundle.initial_workloads)}) ==="
+            )
+            print(
+                docs_to_pretty_yaml(
+                    [{**w.workload_manifest, "status": w.workload_status} for w in sample_iwls]
+                ),
+                end="",
+            )
         if bundle.initial_pods:
             print(
-                f"---\n# === Initial Running Pods at t0 (showing {len(sample_pods)} of {len(bundle.initial_pods)}) ==="
+                f"---\n# === Initial Non-Kueue Running Pods at t0 (showing {len(sample_pods)} of {len(bundle.initial_pods)}) ==="
             )
             print(docs_to_pretty_yaml([p.manifest for p in sample_pods]), end="")
         print(
@@ -407,6 +747,10 @@ def main(argv: list[str] | None = None) -> int:
         speedup=args.speedup,
         enable_fair_sharing=banner_fs,
         reused_chamber=args.skip_chamber_deploy,
+        wait_for_pods_ready=wfpr_cfg,
+        fair_sharing_strategies=fair_sharing_strategies,
+        admission_fair_sharing=afs_cfg,
+        config_from_scenario=sc_cfg is not None,
     )
 
     should_cleanup_chamber = not args.no_cleanup
@@ -438,6 +782,7 @@ def main(argv: list[str] | None = None) -> int:
         mgr.wait_for_crds()
         mgr.apply_kwok_stages()
         mgr.ensure_kueue_webhook_namespace_exclusions(excluded_namespaces=(bundle.infra_pods_namespace,))
+        mgr.sync_kueue_configuration_to_kwok_apiserver()
 
         for ns in bundle.workload_namespaces:
             mgr.workload_namespace = ns
@@ -449,20 +794,90 @@ def main(argv: list[str] | None = None) -> int:
             mgr.sync_kwok_nodes(bundle.nodes, remove_stale=True)
 
         print(
-            f"==> Applying Namespaces, ResourceFlavors, ClusterQueues ({', '.join(bundle.cluster_queue_names)}), "
+            f"==> Applying Namespaces, ResourceFlavors, initial t0 state, ClusterQueues ({', '.join(bundle.cluster_queue_names)}), "
             f"and LocalQueues from infra.json...",
             flush=True,
         )
-        apply_scenario_queues_and_wait(mgr, bundle.prereq_and_queue_docs)
-
-        start_epoch, end_epoch, submitted_count, total_pods = run_scenario_replay(
-            mgr=mgr,
-            bundle=bundle,
-            speedup=args.speedup,
-            max_run_seconds=max_run_seconds,
-            status_interval_sec=status_interval_sec,
-            wait_for_completion=args.wait_for_completion,
+        apply_scenario_queues_and_wait(
+            mgr,
+            bundle.prereq_and_queue_docs,
+            initial_workloads=bundle.initial_workloads,
+            initial_pods=bundle.initial_pods,
         )
+
+        scraper_proc: subprocess.Popen[str] | None = None
+        scraper_log_fh = None
+        scrape_out_dir: Path | None = None
+        if args.scrape_output_dir.strip():
+            scrape_out_dir = Path(args.scrape_output_dir.strip()).resolve()
+            scrape_out_dir.mkdir(parents=True, exist_ok=True)
+            for stale_name in ("infra.json", "workflows.json", "execution-time.json", "scraper.log"):
+                stale_file = scrape_out_dir / stale_name
+                if stale_file.exists():
+                    stale_file.unlink()
+            scraper_bin = Path(args.scraper_bin).resolve()
+            if not scraper_bin.is_file():
+                raise RuntimeError(
+                    f"cluster-scraper binary not found at {scraper_bin}; build it with 'make scraper-build'"
+                )
+            scraper_cmd = [
+                str(scraper_bin),
+                "--kubeconfig",
+                str(mgr.kubeconfig_path),
+                "--output-dir",
+                str(scrape_out_dir),
+                "--interval",
+                str(args.scrape_interval_sec),
+                "--qps",
+                "500",
+                "--burst",
+                "1000",
+            ]
+            if args.scrape_hash_names:
+                scraper_cmd.append("--hash-names")
+            scraper_log_fh = (scrape_out_dir / "scraper.log").open("w", encoding="utf-8")
+            print(
+                f"==> Starting cluster-scraper at exact chamber t0 -> {scrape_out_dir} "
+                f"(hash_names={args.scrape_hash_names}, interval={args.scrape_interval_sec})...",
+                flush=True,
+            )
+            scraper_proc = subprocess.Popen(
+                scraper_cmd,
+                stdout=scraper_log_fh,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            _wait_for_scraper_t0_barrier(
+                scrape_out_dir,
+                scraper_proc,
+                expected_nodes=len(bundle.nodes),
+                expected_cqs=len(bundle.cluster_queue_names),
+            )
+
+        try:
+            start_epoch, end_epoch, submitted_count, total_pods = run_scenario_replay(
+                mgr=mgr,
+                bundle=bundle,
+                speedup=args.speedup,
+                max_run_seconds=max_run_seconds,
+                status_interval_sec=status_interval_sec,
+                wait_for_completion=args.wait_for_completion,
+                initial_state_already_bootstrapped=True,
+            )
+        finally:
+            if scraper_proc is not None:
+                # Allow watch streams to deliver final Succeeded/Finished events before graceful SIGTERM flush.
+                time.sleep(1.5)
+                if scraper_proc.poll() is None:
+                    scraper_proc.send_signal(signal.SIGTERM)
+                    try:
+                        scraper_proc.wait(timeout=15.0)
+                    except subprocess.TimeoutExpired:
+                        scraper_proc.kill()
+                        scraper_proc.wait(timeout=5.0)
+                if scraper_log_fh is not None:
+                    scraper_log_fh.close()
+                print(f"==> Flushed and stopped cluster-scraper ({scrape_out_dir}).", flush=True)
 
         final_snap = query_cluster_status(
             mgr,
@@ -490,9 +905,17 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  Wall-Clock Duration     : {end_epoch - start_epoch:.1f}s ({format_duration_hms(end_epoch - start_epoch)})"
         )
-        print(f"  Initial Pods Placed     : {len(bundle.initial_pods)}")
+        if bundle.initial_workloads:
+            print(
+                f"  Initial Kueue Workloads : {len(bundle.initial_workloads)} PodGroup(s) "
+                f"({bundle.initial_workload_pods_count} pod(s))"
+            )
+        print(f"  Initial Infra Pods      : {len(bundle.initial_pods)}")
+        planned_denom = max(len(bundle.scheduled_workflows), submitted_count)
+        resub_extra = max(0, submitted_count - len(bundle.scheduled_workflows))
+        resub_note = f" [+{resub_extra} preempted-t0 resubmit]" if resub_extra > 0 else ""
         print(
-            f"  Workflows Submitted     : {submitted_count}/{len(bundle.scheduled_workflows)} ({total_pods} total pods)"
+            f"  Workflows Submitted     : {submitted_count}/{planned_denom}{resub_note} ({total_pods} total pods)"
         )
         print(
             f"  Workloads Status        : admitted={final_snap.workloads_admitted}, "

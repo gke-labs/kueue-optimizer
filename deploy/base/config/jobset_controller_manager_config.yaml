@@ -26,5 +26,5 @@ metrics:
 webhook:
   port: 9443
 clientConnection:
-  qps: 500
-  burst: 500
+  qps: 1000
+  burst: 2000

@@ -11,13 +11,13 @@ For the complete output format, event envelope, `workloadState` state machine, a
 ## Features
 
 - **Hybrid Periodic + Watch Recording**:
-  - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, and `WorkloadPriorityClass`es, emitting events only when canonical object state changes.
-  - Watches `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, Kueue-managed `Deployment`s, `RayJob`s, `RayCluster`s, and Kueue `Workload`s in real time to capture exact creation, admission, scheduling, preemption, completion, and deletion timestamps.
+  - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, `PriorityClass`es (`scheduling.k8s.io/v1`), Kueue controller `Configuration` (`ConfigMap/kueue-manager-config` plus `Deployment/kueue-controller-manager` `--feature-gates` CLI overrides and custom `--config` ConfigMap discovery in `--kueue-namespace`), and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, and `WorkloadPriorityClass`es, emitting events only when canonical object state changes (ignoring volatile `metadata.resourceVersion`, `metadata.generation`, and `status.conditions[].lastHeartbeatTime`).
+  - Watches `Node`s, `Pod`s, Kueue-managed `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, Kueue `ClusterQueue`s/`Cohort`s/`LocalQueue`s/`ResourceFlavor`s/`Topology`/`WorkloadPriorityClass`es, and Kueue `Workload`s in real time (preserving `ResourceVersion`s across watch reconnects) to capture exact mid-run node/queue/quota changes, workload creation, admission, scheduling, interruptions (`PartialExecution` across `Preempted`, `NodeFailure`, `PodsReadyTimeout`, `Evicted`, `Failed`, `Deleted`, and shutdown `ScrapeEnded`), `unhealthyNodes` TAS hot-swaps, completion (`FullExecution`), and deletion timestamps.
   - Gracefully handles optional CRDs (`JobSet`, `LeaderWorkerSet`, `RayJob`, `RayCluster`, Kueue APIs) if they are not installed on the target cluster, retrying periodically without failing.
 - **Strict Data Sanitization** (see [`SCRAPER-SCHEMA.md`](SCRAPER-SCHEMA.md) for the full field-by-field specification):
   - **Nodes (`infra.json`)**: Retains only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`), stripping node network/system metadata (`nodeInfo`, `daemonEndpoints`, `addresses`), cached images, attached volumes, cloud/cluster-identifying node labels, and disallowed annotations.
   - **Queues, Cohorts, RuntimeClasses & Topology (`infra.json`)**: `Namespace`, `RuntimeClass`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, and `WorkloadPriorityClass` records omit `.status` (and free-form `WorkloadPriorityClass.description`), `metadata.managedFields`, and disallowed/sensitive annotations.
-  - **Scheduled Pods (`infra.json`)**: Stores **only** node placement, effective resource requests, scheduling time, first notice time, and deletion time.
+  - **Scheduled Pods (`infra.json`)**: Stores **only** node placement, effective resource requests, scheduling time, first notice time, deletion time, and optional sanitized Kueue workload/owner linkage (`workloadName`, `ownerKind`, `ownerName`, `podSetName`, `isTAS`).
   - **Workflow Specs (`workflows.json`)**:
     - Replaces container and Ray sidecar images with a pause image (`registry.k8s.io/pause:3.10` by default) and clears commands, arguments, and environment variables (`env` / `envFrom`).
     - Strips probes, lifecycle hooks, volumes, secrets, credentials, pod/service/network identity fields, `.status`, and `metadata.managedFields`.
@@ -28,8 +28,8 @@ For the complete output format, event envelope, `workloadState` state machine, a
     - **Resource names & references**: Workload, Pod, Job, JobSet, Deployment, LeaderWorkerSet, and Ray object names, along with `ownerReferences` and name-holding annotations.
     - **Label values (keys are never hashed)**: Values of built-in organizational/identity labels (e.g. `owner`, `team`, `customer`, `project`, `cost-center`), workload-referencing labels, and any additional keys or `<domain>/*` patterns passed via `--extra-hash-labels` across metadata, selectors, and affinities.
   - Infrastructure object names (`Node`, `Namespace`, `RuntimeClass`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, `WorkloadPriorityClass`) remain in plain text so cluster topology and queue hierarchy stay inspectable.
-- **Streaming NDJSON Output**:
-  - Appends and `fsync`s one compact JSON object per line with no outer array wrapper, enabling `O(1)`-memory streaming consumption.
+- **Streaming NDJSON Output & Unified `t0` Startup Barrier**:
+  - Executes all initial `List()` barriers (`Workload`s, `JobSet`s, `Job`s, `Deployment`s, dynamic CRDs, `Pod`s, `Node`s, and Kueue queues/topologies) against a single unified `t0` timestamp (skipping pre-`t0` already-terminal historical tombstones while capturing bound non-terminal pods in both `Running` and `Pending`/`ContainerCreating` phases, and emitting `Deleted` events when pods reach `Succeeded`/`Failed` or are deleted), flushing via `fsync` at each barrier/reconciliation tick and on shutdown.
 
 ---
 
@@ -111,6 +111,8 @@ go run . -n 15s --duration 10m --output-dir /tmp/kueue-trace
 | `--execution-time-file` | — | `execution-time.json` | Filename (relative to `--output-dir`) or absolute path for Kueue `Workload` admission and partial/full execution events. |
 | `--hash-names` | `--sha256-names` | `false` | Replace names of `Workload`s, `Pod`s, `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, and `RayCluster`s, and also enable hashing of sensitive, workload-referencing, and `--extra-hash-labels` label values across scraped objects and selectors using per-run HMAC-SHA256 digests. |
 | `--pause-image` | — | `registry.k8s.io/pause:3.10` | Pause container image substituted into all sanitized workflow container specs. |
+| `--kueue-namespace` | — | `kueue-system` | Namespace containing the Kueue controller `ConfigMap` (`""` disables `Configuration` scraping). |
+| `--kueue-configmap` | — | `kueue-manager-config` | Name of the Kueue controller `ConfigMap` holding `controller_manager_config.yaml` (`""` disables `Configuration` scraping). |
 | `--extra-hash-labels` | — | `""` | Comma-separated additional list of label keys or `<domain>/*` patterns (matched case-insensitively; flag may also be repeated) to deterministically hash across scraped objects and selectors in addition to the built-in sensitive label list (requires `--hash-names`). |
 | `--qps` | — | `200` | Kubernetes API client QPS rate limit. |
 | `--burst` | — | `400` | Kubernetes API client burst limit. |
@@ -161,11 +163,15 @@ rules:
   - apiGroups: [""]
     resources: ["nodes", "namespaces", "pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["kueue-manager-config"]
+    verbs: ["get"]
   - apiGroups: ["node.k8s.io"]
     resources: ["runtimeclasses"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]

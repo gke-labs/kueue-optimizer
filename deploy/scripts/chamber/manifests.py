@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Any
@@ -24,7 +25,1037 @@ from chamber.constants import (
     DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES,
     DEFAULT_FLAVOR_NAME,
 )
-from chamber.parsers import parse_k8s_quantity
+from chamber.parsers import parse_duration_seconds, parse_k8s_quantity
+from chamber.yaml_utils import to_clean_yaml
+
+
+DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC = 1800.0  # 30m default in Kueue > v0.19
+DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC = 2.0
+DEFAULT_WAIT_FOR_PODS_READY_MAX_DURATION_FRACTION = 0.5
+DEFAULT_AFS_SAMPLING_INTERVAL_SEC = 300.0
+DEFAULT_AFS_MIN_SAMPLING_WALL_SEC = 0.5
+
+VALID_FAIR_SHARING_STRATEGY_SETS: tuple[tuple[str, ...], ...] = (
+    ("LessThanOrEqualToFinalShare",),
+    ("LessThanInitialShare",),
+    ("LessThanOrEqualToFinalShare", "LessThanInitialShare"),
+)
+
+# Known Kueue feature gates (v0.19 - v0.21+) used to strip unrecognized, graduated/removed,
+# GA-locked, or deprecated sunset gates scraped from older clusters so chamber Kueue never
+# fails LoadAndValidateFeatureGates on startup.
+KNOWN_KUEUE_FEATURE_GATES: frozenset[str] = frozenset(
+    {
+        "AdmissionFairSharing",
+        "AdmissionFairSharingAnchorAtQuotaReservation",
+        "AdmissionGatedBy",
+        "AssignQueueLabelsForPods",
+        "ClassicalPreemptionCandidateOrderCache",
+        "CleanupProvisioningRequestsOnEviction",
+        "ConcurrentAdmission",
+        "ConfigurablePreemptions",
+        "CustomMetricLabels",
+        "DeferRayServiceFinalizationForRedisCleanup",
+        "DeploymentJobUIDLabel",
+        "DisableWaitForPodsReady",
+        "DynamicQuotaOrchestration",
+        "ElasticJobsViaWorkloadSlices",
+        "ElasticJobsViaWorkloadSlicesFlavorChangeFromZero",
+        "ElasticJobsViaWorkloadSlicesForProvisioningRequests",
+        "ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp",
+        "ElasticJobsViaWorkloadSlicesWithTAS",
+        "EnforceProvisioningPodTemplateContents",
+        "FailureRecoveryPolicy",
+        "FairSharingPreemptWithinNominal",
+        "FairSharingPrioritizeNonBorrowing",
+        "FairSharingReevaluatePreemptionCandidates",
+        "FairSharingRefill",
+        "FairSharingVerifyFinalTargets",
+        "FastQuotaReleaseInPodIntegration",
+        "FinalizeTerminatingPodGroups",
+        "FinishOrphanedWorkloads",
+        "FlavorFungibility",
+        "FlavorFungibilityPreserveScanProgress",
+        "HighMaxParallelismWithinReconcile",
+        "KubeRayEvictOnInconsistentTopologyRequest",
+        "KubeRayServiceUsingTopLevelSuspend",
+        "KueueDRADeviceFeasibility",
+        "KueueDRAIntegration",
+        "KueueDRAIntegrationConsumableCapacity",
+        "KueueDRAIntegrationDeviceTaints",
+        "KueueDRAIntegrationExtendedResource",
+        "KueueDRAIntegrationPartitionableDevices",
+        "KueueDRAIntegrationPrioritizedList",
+        "KueueDRARejectWorkloadsWhenDRADisabled",
+        "LWSImmutableGroupSize",
+        "LocalQueueMetrics",
+        "MetricForWorkloadCreationLatency",
+        "MetricsAccessControl",
+        "MetricsForCohorts",
+        "MultiKueue",
+        "MultiKueueAdaptersForCustomJobs",
+        "MultiKueueBatchJobClearingTTLSecondsAfterFinishedOnWorkerCluster",
+        "MultiKueueClusterProfile",
+        "MultiKueueIncrementalDispatcherConfig",
+        "MultiKueueIncrementalDispatcherRespectConfigOrder",
+        "MultiKueueKubeConfigPathValidation",
+        "MultiKueueManagerQuotaAutomation",
+        "MultiKueueOrchestratedPreemption",
+        "MultiKueueRayInTreeAutoscaling",
+        "MultiKueueRemoteSpecSync",
+        "MultiKueueReuseClientConnectionConfigForWorkers",
+        "PartialAdmission",
+        "PodGroupSchedulingShapeOrdering",
+        "PodIntegrationCountSucceededPodsAsReady",
+        "PodIntegrationValidateGroupOwner",
+        "PodIntegrationVerifyRoleRequests",
+        "PrioritizePreemptorWorkloads",
+        "PriorityBoost",
+        "PrioritySortingWithinCohort",
+        "QuotaCheckStrategy",
+        "RayClusterHeadPodReady",
+        "RayServiceValidateUpgradeStrategy",
+        "ReclaimablePods",
+        "RecomputeAssignmentUponPreemptionTargetsOverlap",
+        "RejectUpdatesToCQWithInvalidOnFlavors",
+        "RemoveFinalizersWithStrictPatch",
+        "ReservedResourceNameValidation",
+        "SchedulerLibraryDeepIntegration",
+        "SchedulerLibraryIntegration",
+        "SchedulingEquivalenceHashing",
+        "SchedulingEquivalenceHashingIgnorePodSetName",
+        "ShortWorkloadNames",
+        "SkipAncestorCheckForDeletedWorkloads",
+        "SkipChildJobSuspension",
+        "SkipReassignmentForPodOwnedWorkloads",
+        "SparkApplicationIntegration",
+        "TASAssignmentsEncodingByHostnamePrefix",
+        "TASBalancedPlacement",
+        "TASCacheNodeMatchResults",
+        "TASCacheTopologyTree",
+        "TASCachingRemainingResources",
+        "TASFailedNodeReplacement",
+        "TASFailedNodeReplacementFailFast",
+        "TASGroupedPodSetSlicing",
+        "TASHandleOverlappingFlavors",
+        "TASLeaderPodSetFeasibility",
+        "TASMultiLayerTopology",
+        "TASNodeFeasibilityForAllLevels",
+        "TASPartialSlices",
+        "TASProfileMixed",
+        "TASRecomputeAssignmentWithinSchedulingCycle",
+        "TASRejectFalseUnconstrainedTopology",
+        "TASReplaceMultipleFailedNodes",
+        "TASReplaceNodeDueToNotReadyOverFixedTime",
+        "TASReplaceNodeOnNodeTaints",
+        "TASReplaceNodeOnPodTermination",
+        "TASRespectNodeAffinityPreferred",
+        "TASTopologySpreading",
+        "TASValidateWorkloadSliceSize",
+        "TLSOptions",
+        "TopologyAwareScheduling",
+        "UnadmittedWorkloadsExplicitStatus",
+        "UnadmittedWorkloadsObservability",
+        "ValidateRayAndSparkJobUpdates",
+        "VectorizedResourceRequests",
+        "VisibilityOnDemand",
+        "WaitForPodsReadyMaxNotReady",
+        "WaitForPodsReadyUnscheduledTimeout",
+        "WorkloadIdentifierAnnotations",
+        "WorkloadLevelWaitForPodsReady",
+        "WorkloadPriorityClassDefaulting",
+        "WorkloadRequestUseMergePatch",
+        "WorkloadValidateResourcesAreNonNegative",
+        "WorkloadValidationForPodSetMetadata",
+    }
+)
+
+# GA feature gates with LockToDefault=true in Kueue: setting != default crashes startup today,
+# and setting == default becomes an unrecognized-gate crash as soon as a newer Kueue removes them.
+LOCKED_GA_KUEUE_FEATURE_GATES: dict[str, bool] = {
+    "MetricForWorkloadCreationLatency": True,
+    "TASValidateWorkloadSliceSize": True,
+    "TLSOptions": True,
+    "ValidateRayAndSparkJobUpdates": True,
+}
+
+# Deprecated sunset feature gates slated for removal in newer Kueue releases.
+DEPRECATED_KUEUE_FEATURE_GATES: dict[str, bool] = {
+    "DeferRayServiceFinalizationForRedisCleanup": False,
+    "TASReplaceNodeDueToNotReadyOverFixedTime": False,
+}
+
+# Alpha default-off feature gates (used to auto-satisfy parent dependencies when a child gate is enabled).
+DEFAULT_OFF_KUEUE_FEATURE_GATES: frozenset[str] = frozenset(
+    {
+        "ConcurrentAdmission",
+        "ConfigurablePreemptions",
+        "CustomMetricLabels",
+        "DisableWaitForPodsReady",
+        "DynamicQuotaOrchestration",
+        "ElasticJobsViaWorkloadSlicesFlavorChangeFromZero",
+        "ElasticJobsViaWorkloadSlicesForProvisioningRequests",
+        "ElasticJobsViaWorkloadSlicesWithPartialReplicaScaleUp",
+        "ElasticJobsViaWorkloadSlicesWithTAS",
+        "FailureRecoveryPolicy",
+        "FairSharingRefill",
+        "FastQuotaReleaseInPodIntegration",
+        "KubeRayEvictOnInconsistentTopologyRequest",
+        "KueueDRADeviceFeasibility",
+        "KueueDRAIntegrationDeviceTaints",
+        "KueueDRAIntegrationPrioritizedList",
+        "MetricsAccessControl",
+        "MultiKueueBatchJobClearingTTLSecondsAfterFinishedOnWorkerCluster",
+        "MultiKueueClusterProfile",
+        "MultiKueueManagerQuotaAutomation",
+        "MultiKueueRayInTreeAutoscaling",
+        "PrioritizePreemptorWorkloads",
+        "PriorityBoost",
+        "SchedulerLibraryDeepIntegration",
+        "SchedulerLibraryIntegration",
+        "ShortWorkloadNames",
+        "SkipChildJobSuspension",
+        "SparkApplicationIntegration",
+        "TASBalancedPlacement",
+        "TASRejectFalseUnconstrainedTopology",
+        "TASReplaceMultipleFailedNodes",
+        "TASRespectNodeAffinityPreferred",
+        "TASTopologySpreading",
+        "UnadmittedWorkloadsExplicitStatus",
+        "WaitForPodsReadyMaxNotReady",
+        "WaitForPodsReadyUnscheduledTimeout",
+        "WorkloadLevelWaitForPodsReady",
+        "WorkloadRequestUseMergePatch",
+    }
+)
+
+KUEUE_FEATURE_GATE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "AdmissionFairSharingAnchorAtQuotaReservation": ("AdmissionFairSharing",),
+    "ElasticJobsViaWorkloadSlicesFlavorChangeFromZero": ("ElasticJobsViaWorkloadSlices",),
+    "ElasticJobsViaWorkloadSlicesForProvisioningRequests": ("ElasticJobsViaWorkloadSlices",),
+    "ElasticJobsViaWorkloadSlicesWithTAS": ("ElasticJobsViaWorkloadSlices", "TopologyAwareScheduling"),
+    "FlavorFungibilityPreserveScanProgress": ("FlavorFungibility",),
+    "KueueDRADeviceFeasibility": ("KueueDRAIntegration", "TopologyAwareScheduling", "TASNodeFeasibilityForAllLevels"),
+    "KueueDRAIntegrationConsumableCapacity": ("KueueDRAIntegration",),
+    "KueueDRAIntegrationDeviceTaints": ("KueueDRADeviceFeasibility",),
+    "KueueDRAIntegrationExtendedResource": ("KueueDRAIntegration",),
+    "KueueDRAIntegrationPartitionableDevices": ("KueueDRAIntegration",),
+    "KueueDRAIntegrationPrioritizedList": ("KueueDRAIntegration",),
+    "MultiKueueRayInTreeAutoscaling": ("MultiKueue", "ElasticJobsViaWorkloadSlices", "SkipChildJobSuspension"),
+    "MultiKueueReuseClientConnectionConfigForWorkers": ("MultiKueue",),
+    "SchedulerLibraryDeepIntegration": ("SchedulerLibraryIntegration",),
+    "SchedulerLibraryIntegration": ("TopologyAwareScheduling",),
+    "SchedulingEquivalenceHashingIgnorePodSetName": ("SchedulingEquivalenceHashing",),
+    "TASBalancedPlacement": ("TopologyAwareScheduling",),
+    "TASFailedNodeReplacement": ("TopologyAwareScheduling",),
+    "TASFailedNodeReplacementFailFast": ("TopologyAwareScheduling", "TASFailedNodeReplacement"),
+    "TASGroupedPodSetSlicing": ("TopologyAwareScheduling",),
+    "TASHandleOverlappingFlavors": ("TopologyAwareScheduling",),
+    "TASLeaderPodSetFeasibility": ("TopologyAwareScheduling",),
+    "TASMultiLayerTopology": ("TopologyAwareScheduling",),
+    "TASNodeFeasibilityForAllLevels": ("TopologyAwareScheduling",),
+    "TASPartialSlices": ("TopologyAwareScheduling",),
+    "TASProfileMixed": ("TopologyAwareScheduling",),
+    "TASRecomputeAssignmentWithinSchedulingCycle": ("TopologyAwareScheduling",),
+    "TASRejectFalseUnconstrainedTopology": ("TopologyAwareScheduling",),
+    "TASReplaceMultipleFailedNodes": ("TopologyAwareScheduling", "TASFailedNodeReplacement"),
+    "TASReplaceNodeOnNodeTaints": ("TopologyAwareScheduling",),
+    "TASReplaceNodeOnPodTermination": ("TopologyAwareScheduling", "TASFailedNodeReplacement"),
+    "TASRespectNodeAffinityPreferred": ("TopologyAwareScheduling",),
+    "TASTopologySpreading": ("TopologyAwareScheduling",),
+    "UnadmittedWorkloadsExplicitStatus": ("UnadmittedWorkloadsObservability",),
+}
+
+
+def format_go_duration_seconds(seconds: float) -> str:
+    """Format a non-negative duration in seconds as a Go time.ParseDuration string ('0s', '10s', '2500ms')."""
+    if seconds <= 0:
+        return "0s"
+    if abs(seconds - round(seconds)) < 1e-3:
+        return f"{int(round(seconds))}s"
+    return f"{max(100, int(round(seconds * 1000)))}ms"
+
+
+@dataclass
+class WaitForPodsReadyConfig:
+    """Resolved Kueue waitForPodsReady configuration adjusted for --speedup and --duration.
+
+    In Kueue > v0.19, `waitForPodsReady` is enabled by default (`timeout: 30m`) when the
+    `waitForPodsReady` YAML section is omitted (`enabled=True, configured=False`), and can only
+    be disabled globally via `featureGates.DisableWaitForPodsReady=true` (`enabled=False`).
+    """
+
+    enabled: bool = True
+    configured: bool = False
+    raw_timeout_sec: float = DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC
+    effective_timeout_sec: float = DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC
+    clamped_timeout_to_duration: bool = False
+    floored_timeout_to_min: bool = False
+    raw_recovery_timeout_sec: float | None = None
+    effective_recovery_timeout_sec: float | None = None
+    clamped_recovery_to_duration: bool = False
+    raw_unscheduled_timeout_sec: float | None = None
+    effective_unscheduled_timeout_sec: float | None = None
+    clamped_unscheduled_to_duration: bool = False
+    clamped_unscheduled_to_timeout: bool = False
+    block_admission: bool | None = None
+    requeuing_timestamp: str = "Eviction"
+    backoff_limit_count: int | None = None
+    raw_backoff_base_sec: float | None = None
+    effective_backoff_base_sec: int | None = None
+    raw_backoff_max_sec: float | None = None
+    effective_backoff_max_sec: int | None = None
+
+    def required_feature_gates(self) -> dict[str, bool]:
+        """Return Kueue feature gates required to realize this waitForPodsReady configuration."""
+        if not self.enabled:
+            return {"DisableWaitForPodsReady": True}
+        if self.configured and self.effective_unscheduled_timeout_sec is not None:
+            return {"WaitForPodsReadyUnscheduledTimeout": True}
+        return {}
+
+    def summary_str(self) -> str:
+        if not self.enabled:
+            return "disabled (DisableWaitForPodsReady=true)"
+        if not self.configured:
+            return "default (enabled in Kueue, timeout=30m)"
+        notes: list[str] = [
+            f"timeout={format_go_duration_seconds(self.effective_timeout_sec)} "
+            f"(raw {format_go_duration_seconds(self.raw_timeout_sec)})"
+        ]
+        if self.clamped_timeout_to_duration:
+            notes.append("clamped-to-duration")
+        elif self.floored_timeout_to_min:
+            notes.append("floored-to-min")
+        if self.effective_recovery_timeout_sec is not None:
+            notes.append(
+                f"recoveryTimeout={format_go_duration_seconds(self.effective_recovery_timeout_sec)}"
+                + (
+                    f" (raw {format_go_duration_seconds(self.raw_recovery_timeout_sec)})"
+                    if self.raw_recovery_timeout_sec is not None
+                    else ""
+                )
+            )
+        if self.effective_unscheduled_timeout_sec is not None:
+            unsch_note = (
+                f"unscheduledTimeout={format_go_duration_seconds(self.effective_unscheduled_timeout_sec)}"
+                + (
+                    f" (raw {format_go_duration_seconds(self.raw_unscheduled_timeout_sec)})"
+                    if self.raw_unscheduled_timeout_sec is not None
+                    else ""
+                )
+            )
+            if self.clamped_unscheduled_to_timeout:
+                unsch_note += " [clamped-to-timeout]"
+            elif self.clamped_unscheduled_to_duration:
+                unsch_note += " [clamped-to-duration]"
+            notes.append(unsch_note)
+        if self.block_admission is not None:
+            notes.append(f"blockAdmission={str(self.block_admission).lower()}")
+        if self.effective_backoff_base_sec is not None:
+            notes.append(f"backoffBase={self.effective_backoff_base_sec}s")
+        if self.effective_backoff_max_sec is not None:
+            notes.append(f"backoffMax={self.effective_backoff_max_sec}s")
+        if self.backoff_limit_count is not None:
+            notes.append(f"backoffLimit={self.backoff_limit_count}")
+        return ", ".join(notes)
+
+
+def resolve_wait_for_pods_ready_config(
+    *,
+    enabled: bool | None = None,
+    raw_timeout: str | float | None = None,
+    raw_recovery_timeout: str | float | None = None,
+    raw_unscheduled_timeout: str | float | None = None,
+    block_admission: bool | None = None,
+    requeuing_timestamp: str | None = None,
+    backoff_limit_count: int | None = None,
+    raw_backoff_base: str | float | None = None,
+    raw_backoff_max: str | float | None = None,
+    speedup: float = 1.0,
+    max_run_seconds: float | None = None,
+    min_wall_timeout: str | float | None = DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC,
+    cap_to_duration: bool = True,
+    max_duration_fraction: float = DEFAULT_WAIT_FOR_PODS_READY_MAX_DURATION_FRACTION,
+) -> WaitForPodsReadyConfig:
+    """Adjust Kueue waitForPodsReady timeouts and backoffs to --speedup and --duration."""
+    has_explicit_subflag = any(
+        x is not None
+        for x in (
+            raw_timeout,
+            raw_recovery_timeout,
+            raw_unscheduled_timeout,
+            block_admission,
+            backoff_limit_count,
+            raw_backoff_base,
+            raw_backoff_max,
+        )
+    ) or (requeuing_timestamp is not None and str(requeuing_timestamp).strip() not in ("", "Eviction"))
+
+    if enabled is False:
+        if has_explicit_subflag:
+            raise ValueError(
+                "Cannot combine --no-wait-for-pods-ready / DisableWaitForPodsReady with "
+                "waitForPodsReady timeout, unscheduledTimeout, recoveryTimeout, or backoff settings"
+            )
+        return WaitForPodsReadyConfig(enabled=False, configured=False)
+
+    if enabled is None and not has_explicit_subflag:
+        return WaitForPodsReadyConfig(enabled=True, configured=False)
+
+    eff_speedup = max(1e-6, float(speedup))
+    min_floor = (
+        float(min_wall_timeout)
+        if isinstance(min_wall_timeout, (int, float))
+        else (parse_duration_seconds(str(min_wall_timeout)) or DEFAULT_WAIT_FOR_PODS_READY_MIN_WALL_SEC)
+    )
+    min_floor = max(0.5, min_floor)
+
+    raw_t = (
+        float(raw_timeout)
+        if isinstance(raw_timeout, (int, float))
+        else (
+            parse_duration_seconds(str(raw_timeout))
+            if raw_timeout is not None and str(raw_timeout).strip()
+            else DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC
+        )
+    )
+    if raw_t is None or raw_t <= 0:
+        raise ValueError(f"--wait-for-pods-ready-timeout must be > 0 (got {raw_timeout!r})")
+
+    scaled_t = raw_t / eff_speedup
+    floored_t = False
+    if scaled_t < min_floor:
+        scaled_t = min_floor
+        floored_t = True
+
+    clamped_t = False
+    duration_cap: float | None = None
+    if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+        frac = max(0.1, min(0.9, float(max_duration_fraction)))
+        duration_cap = max(min(min_floor, max_run_seconds * 0.8), max_run_seconds * frac)
+        if scaled_t > duration_cap:
+            scaled_t = duration_cap
+            clamped_t = True
+            floored_t = False
+
+    raw_rec_sec: float | None = None
+    eff_rec_sec: float | None = None
+    clamped_rec = False
+    if raw_recovery_timeout is not None and str(raw_recovery_timeout).strip() != "":
+        raw_rec_sec = (
+            float(raw_recovery_timeout)
+            if isinstance(raw_recovery_timeout, (int, float))
+            else parse_duration_seconds(str(raw_recovery_timeout))
+        )
+        if raw_rec_sec is None or raw_rec_sec < 0:
+            raise ValueError(
+                f"--wait-for-pods-ready-recovery-timeout must be >= 0 (got {raw_recovery_timeout!r})"
+            )
+        if raw_rec_sec == 0:
+            eff_rec_sec = 0.0
+        else:
+            eff_rec_sec = max(min_floor, raw_rec_sec / eff_speedup)
+            if duration_cap is not None and eff_rec_sec > duration_cap:
+                eff_rec_sec = duration_cap
+                clamped_rec = True
+
+    raw_unsch_sec: float | None = None
+    eff_unsch_sec: float | None = None
+    clamped_unsch_dur = False
+    clamped_unsch_timeout = False
+    if raw_unscheduled_timeout is not None and str(raw_unscheduled_timeout).strip() != "":
+        raw_unsch_sec = (
+            float(raw_unscheduled_timeout)
+            if isinstance(raw_unscheduled_timeout, (int, float))
+            else parse_duration_seconds(str(raw_unscheduled_timeout))
+        )
+        if raw_unsch_sec is None or raw_unsch_sec < 0:
+            raise ValueError(
+                f"--wait-for-pods-ready-unscheduled-timeout must be >= 0 (got {raw_unscheduled_timeout!r})"
+            )
+        if raw_unsch_sec > raw_t + 1e-6:
+            raise ValueError(
+                f"waitForPodsReady.unscheduledTimeout ({raw_unscheduled_timeout!r}) must not exceed "
+                f"waitForPodsReady.timeout ({format_go_duration_seconds(raw_t)})"
+            )
+        if raw_unsch_sec == 0:
+            eff_unsch_sec = 0.0
+        else:
+            eff_unsch_sec = max(min_floor, raw_unsch_sec / eff_speedup)
+            if duration_cap is not None and eff_unsch_sec > duration_cap:
+                eff_unsch_sec = duration_cap
+                clamped_unsch_dur = True
+            if eff_unsch_sec > scaled_t:
+                eff_unsch_sec = scaled_t
+                clamped_unsch_timeout = True
+
+    raw_bb_sec: float | None = None
+    eff_bb_sec: int | None = None
+    if raw_backoff_base is not None and str(raw_backoff_base).strip() != "":
+        raw_bb_sec = (
+            float(raw_backoff_base)
+            if isinstance(raw_backoff_base, (int, float))
+            else parse_duration_seconds(str(raw_backoff_base))
+        )
+        if raw_bb_sec is not None and raw_bb_sec > 0:
+            scaled_bb = max(1, int(round(raw_bb_sec / eff_speedup)))
+            if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+                scaled_bb = min(scaled_bb, max(1, int(max_run_seconds * 0.25)))
+            eff_bb_sec = scaled_bb
+
+    raw_bm_sec: float | None = None
+    eff_bm_sec: int | None = None
+    if raw_backoff_max is not None and str(raw_backoff_max).strip() != "":
+        raw_bm_sec = (
+            float(raw_backoff_max)
+            if isinstance(raw_backoff_max, (int, float))
+            else parse_duration_seconds(str(raw_backoff_max))
+        )
+        if raw_bm_sec is not None and raw_bm_sec > 0:
+            scaled_bm = max(1, int(round(raw_bm_sec / eff_speedup)))
+            if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+                scaled_bm = min(scaled_bm, max(1, int(max_run_seconds * 0.5)))
+            if eff_bb_sec is not None and scaled_bm < eff_bb_sec:
+                scaled_bm = eff_bb_sec
+            eff_bm_sec = scaled_bm
+    elif eff_bb_sec is not None:
+        default_bm = max(eff_bb_sec, int(round(3600.0 / eff_speedup)))
+        if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+            default_bm = max(eff_bb_sec, min(default_bm, max(1, int(max_run_seconds * 0.5))))
+        eff_bm_sec = default_bm
+
+    req_ts = (requeuing_timestamp or "Eviction").strip()
+    if req_ts not in ("Eviction", "Creation"):
+        raise ValueError(
+            f"--wait-for-pods-ready-requeue-timestamp must be 'Eviction' or 'Creation' (got {requeuing_timestamp!r})"
+        )
+
+    return WaitForPodsReadyConfig(
+        enabled=True,
+        configured=True,
+        raw_timeout_sec=raw_t,
+        effective_timeout_sec=scaled_t,
+        clamped_timeout_to_duration=clamped_t,
+        floored_timeout_to_min=floored_t,
+        raw_recovery_timeout_sec=raw_rec_sec,
+        effective_recovery_timeout_sec=eff_rec_sec,
+        clamped_recovery_to_duration=clamped_rec,
+        raw_unscheduled_timeout_sec=raw_unsch_sec,
+        effective_unscheduled_timeout_sec=eff_unsch_sec,
+        clamped_unscheduled_to_duration=clamped_unsch_dur,
+        clamped_unscheduled_to_timeout=clamped_unsch_timeout,
+        block_admission=block_admission,
+        requeuing_timestamp=req_ts,
+        backoff_limit_count=backoff_limit_count,
+        raw_backoff_base_sec=raw_bb_sec,
+        effective_backoff_base_sec=eff_bb_sec,
+        raw_backoff_max_sec=raw_bm_sec,
+        effective_backoff_max_sec=eff_bm_sec,
+    )
+
+
+def reconcile_wait_for_pods_ready_feature_gates(
+    wfpr_cfg: WaitForPodsReadyConfig | None,
+    feature_gates: dict[str, bool] | None,
+    *,
+    cli_wfpr_override: bool | None = None,
+    cli_feature_gates: dict[str, bool] | None = None,
+) -> tuple[WaitForPodsReadyConfig | None, dict[str, bool]]:
+    """Synchronize WaitForPodsReadyConfig with DisableWaitForPodsReady / WaitForPodsReadyUnscheduledTimeout gates."""
+    fg = dict(feature_gates or {})
+    cli_fg = dict(cli_feature_gates or {})
+
+    if cli_wfpr_override is True:
+        if cli_fg.get("DisableWaitForPodsReady") is True:
+            raise ValueError(
+                "Cannot combine --wait-for-pods-ready with featureGates.DisableWaitForPodsReady=true"
+            )
+        if fg.get("DisableWaitForPodsReady") is True:
+            fg.pop("DisableWaitForPodsReady", None)
+
+    if fg.get("DisableWaitForPodsReady") is True:
+        if wfpr_cfg is not None and wfpr_cfg.configured:
+            raise ValueError(
+                "Cannot combine waitForPodsReady configuration with featureGates.DisableWaitForPodsReady=true"
+            )
+        if fg.get("WaitForPodsReadyUnscheduledTimeout") is True:
+            raise ValueError(
+                "Enabling WaitForPodsReadyUnscheduledTimeout together with DisableWaitForPodsReady is rejected by Kueue"
+            )
+        wfpr_cfg = WaitForPodsReadyConfig(enabled=False, configured=False)
+
+    if wfpr_cfg is not None:
+        if not wfpr_cfg.enabled:
+            if cli_fg.get("DisableWaitForPodsReady") is False:
+                raise ValueError(
+                    "Cannot combine --no-wait-for-pods-ready with featureGates.DisableWaitForPodsReady=false"
+                )
+            if fg.get("WaitForPodsReadyUnscheduledTimeout") is True:
+                raise ValueError(
+                    "Enabling WaitForPodsReadyUnscheduledTimeout together with DisableWaitForPodsReady is rejected by Kueue"
+                )
+            fg["DisableWaitForPodsReady"] = True
+        elif wfpr_cfg.configured and wfpr_cfg.effective_unscheduled_timeout_sec is not None:
+            if fg.get("WaitForPodsReadyUnscheduledTimeout") is False:
+                raise ValueError(
+                    "waitForPodsReady.unscheduledTimeout requires featureGates.WaitForPodsReadyUnscheduledTimeout=true"
+                )
+            fg["WaitForPodsReadyUnscheduledTimeout"] = True
+
+    return wfpr_cfg, fg
+
+
+def discover_kueue_feature_gates_from_source(
+    kueue_build_dir: Path | str | None,
+) -> tuple[frozenset[str], dict[str, bool], dict[str, bool], frozenset[str]] | None:
+    """Inspect `<kueue_build_dir>/pkg/features/kube_features.go` when building a custom Kueue checkout."""
+    if not kueue_build_dir:
+        return None
+    fg_go = Path(kueue_build_dir) / "pkg" / "features" / "kube_features.go"
+    if not fg_go.is_file():
+        return None
+    try:
+        text = fg_go.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    consts = dict(re.findall(r"^\t(\w+)\s+featuregate\.Feature\s*=\s*\"(\w+)\"", text, re.M))
+    if not consts:
+        return None
+    known = set(consts.values())
+    locked: dict[str, bool] = {}
+    deprecated: dict[str, bool] = {}
+    default_off: set[str] = set()
+    if "var defaultVersionedFeatureGates =" in text:
+        vblock = text.split("var defaultVersionedFeatureGates =", 1)[1].split("\n}\n", 1)[0]
+        for cname, body in re.findall(r"^\t(\w+):\s*\{(.*?)^\t\},", vblock, re.M | re.S):
+            gname = consts.get(cname, cname)
+            known.add(gname)
+            specs = re.findall(
+                r"Default:\s*(true|false),\s*PreRelease:\s*featuregate\.(\w+)(?:,\s*LockToDefault:\s*(true|false))?",
+                body,
+            )
+            if specs:
+                last_def, last_pre, last_lock = specs[-1]
+                def_bool = last_def == "true"
+                if last_lock == "true" or last_pre == "GA":
+                    locked[gname] = def_bool
+                elif last_pre == "Deprecated":
+                    deprecated[gname] = def_bool
+                elif not def_bool:
+                    default_off.add(gname)
+    return frozenset(known), locked, deprecated, frozenset(default_off)
+
+
+def sanitize_kueue_feature_gates(
+    feature_gates: dict[str, bool] | None,
+    *,
+    kueue_build_dir: Path | str | None = None,
+    allow_unknown: bool = False,
+) -> tuple[dict[str, bool], list[str]]:
+    """Filter unrecognized/graduated, GA-locked, deprecated, or dependency-conflicting Kueue featureGates.
+
+    Prevents scraped `Configuration.featureGates` from older clusters (or deprecated/graduated flags)
+    from crashing `kueue-controller-manager` startup in `kueue-optimizer` chambers running newer Kueue.
+    """
+    if not feature_gates:
+        return {}, []
+
+    discovered = discover_kueue_feature_gates_from_source(kueue_build_dir)
+    if discovered is not None:
+        known_gates, locked_gates, deprecated_gates, default_off_gates = discovered
+    else:
+        known_gates = KNOWN_KUEUE_FEATURE_GATES
+        locked_gates = LOCKED_GA_KUEUE_FEATURE_GATES
+        deprecated_gates = DEPRECATED_KUEUE_FEATURE_GATES
+        default_off_gates = DEFAULT_OFF_KUEUE_FEATURE_GATES
+
+    cleaned: dict[str, bool] = {}
+    warnings: list[str] = []
+
+    for raw_k in sorted(feature_gates):
+        k = str(raw_k).strip()
+        if not k:
+            continue
+        v = bool(feature_gates[raw_k])
+        if k in locked_gates:
+            locked_val = locked_gates[k]
+            if v != locked_val:
+                warnings.append(
+                    f"Dropping GA-locked Kueue featureGate '{k}={str(v).lower()}' "
+                    f"(locked to {str(locked_val).lower()} in Kueue)"
+                )
+            else:
+                warnings.append(
+                    f"Omitting graduated GA Kueue featureGate '{k}={str(v).lower()}' "
+                    f"(already locked to {str(locked_val).lower()} by default)"
+                )
+            continue
+        if k in deprecated_gates:
+            dep_val = deprecated_gates[k]
+            warnings.append(
+                f"Dropping deprecated Kueue featureGate '{k}={str(v).lower()}' "
+                f"(sunset default={str(dep_val).lower()}) for forward compatibility"
+            )
+            continue
+        if not allow_unknown and k not in known_gates:
+            warnings.append(
+                f"Dropping unrecognized or graduated Kueue featureGate '{k}={str(v).lower()}' "
+                "not supported by chamber Kueue"
+            )
+            continue
+        cleaned[k] = v
+
+    # Enforce parent feature-gate dependencies (matching Kueue SetFromMap / LoadAndValidateFeatureGates).
+    def _all_ancestors(gate: str) -> list[str]:
+        seen: list[str] = []
+        stack = list(KUEUE_FEATURE_GATE_DEPENDENCIES.get(gate, ()))
+        while stack:
+            parent = stack.pop(0)
+            if parent not in seen:
+                seen.append(parent)
+                stack.extend(KUEUE_FEATURE_GATE_DEPENDENCIES.get(parent, ()))
+        return seen
+
+    for gate in sorted(list(cleaned.keys())):
+        if not cleaned.get(gate):
+            continue
+        ancestors = _all_ancestors(gate)
+        disabled_anc = [anc for anc in ancestors if cleaned.get(anc) is False]
+        if disabled_anc:
+            cleaned.pop(gate, None)
+            warnings.append(
+                f"Dropping Kueue featureGate '{gate}=true' because parent dependency "
+                f"{disabled_anc[0]}=false is disabled"
+            )
+            continue
+        for anc in ancestors:
+            if anc not in cleaned and anc in default_off_gates and (allow_unknown or anc in known_gates):
+                cleaned[anc] = True
+
+    return cleaned, warnings
+
+
+def parse_feature_gates_arg(raw: str | dict[str, bool] | None) -> dict[str, bool]:
+    """Parse comma-separated 'GateA=true,GateB=false' overrides into a dict[str, bool]."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): bool(v) for k, v in raw.items() if str(k).strip()}
+    out: dict[str, bool] = {}
+    for item in str(raw).split(","):
+        tok = item.strip()
+        if not tok:
+            continue
+        if "=" not in tok:
+            raise ValueError(f"Invalid --kueue-feature-gates entry {tok!r}: expected FeatureName=true|false")
+        k, v = tok.split("=", 1)
+        k_clean = k.strip()
+        v_clean = v.strip().lower()
+        if v_clean in ("true", "1", "yes"):
+            out[k_clean] = True
+        elif v_clean in ("false", "0", "no"):
+            out[k_clean] = False
+        else:
+            raise ValueError(f"Invalid boolean in --kueue-feature-gates entry {tok!r}: expected true|false")
+    return out
+
+
+def parse_fair_sharing_strategies(
+    raw: str | list[str] | tuple[str, ...] | None,
+    *,
+    field_desc: str = "fairSharing.preemptionStrategies",
+) -> tuple[str, ...]:
+    """Validate and normalize Kueue FairSharing preemptionStrategies against Kueue's legal sets."""
+    if raw is None:
+        return DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+    if isinstance(raw, str):
+        items = tuple(tok.strip() for tok in raw.split(",") if tok.strip())
+    elif isinstance(raw, (list, tuple)):
+        items = tuple(str(tok).strip() for tok in raw if str(tok).strip())
+    else:
+        raise ValueError(f"Invalid {field_desc} {raw!r}: expected list of strategy names")
+    if not items:
+        raise ValueError(f"{field_desc}: must specify at least one PreemptionStrategy when fairSharing is enabled")
+    if items not in VALID_FAIR_SHARING_STRATEGY_SETS:
+        allowed_str = " | ".join("[" + ", ".join(s) + "]" for s in VALID_FAIR_SHARING_STRATEGY_SETS)
+        raise ValueError(f"Unsupported {field_desc} {list(items)!r}; Kueue only supports: {allowed_str}")
+    return items
+
+
+def parse_afs_resource_weights(
+    raw: str | dict[str, Any] | None,
+    *,
+    field_desc: str = "admissionFairSharing.resourceWeights",
+) -> dict[str, float]:
+    """Parse 'resA=1,resB=0' or dict[str, float] into validated non-negative resource weights."""
+    if raw is None:
+        return {}
+    out: dict[str, float] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            rk = str(k).strip()
+            if not rk:
+                continue
+            try:
+                val = float(v)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid numeric weight in {field_desc}[{rk!r}]={v!r}") from exc
+            if val < 0:
+                raise ValueError(f"Negative weight in {field_desc}[{rk!r}]={val}: must be >= 0")
+            out[rk] = val
+        return out
+    for tok in str(raw).split(","):
+        item = tok.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid {field_desc} entry {item!r}: expected <resource>=<non-negative-float>")
+        rk, rv = item.split("=", 1)
+        rk_clean = rk.strip()
+        try:
+            val = float(rv.strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid numeric weight in {field_desc} entry {item!r}") from exc
+        if val < 0:
+            raise ValueError(f"Negative weight in {field_desc} entry {item!r}: must be >= 0")
+        out[rk_clean] = val
+    return out
+
+
+@dataclass
+class AdmissionFairSharingConfig:
+    """Resolved Kueue admissionFairSharing configuration adjusted for --speedup and --duration."""
+
+    enabled: bool = False
+    raw_usage_half_life_sec: float = 0.0
+    effective_usage_half_life_sec: float = 0.0
+    raw_usage_sampling_interval_sec: float = DEFAULT_AFS_SAMPLING_INTERVAL_SEC
+    effective_usage_sampling_interval_sec: float = DEFAULT_AFS_SAMPLING_INTERVAL_SEC
+    resource_weights: dict[str, float] = field(default_factory=dict)
+
+    def summary_str(self) -> str:
+        if not self.enabled:
+            return "disabled"
+        parts = [
+            f"usageHalfLifeTime={format_go_duration_seconds(self.effective_usage_half_life_sec)} "
+            f"(raw {format_go_duration_seconds(self.raw_usage_half_life_sec)})",
+            f"usageSamplingInterval={format_go_duration_seconds(self.effective_usage_sampling_interval_sec)} "
+            f"(raw {format_go_duration_seconds(self.raw_usage_sampling_interval_sec)})",
+        ]
+        if self.resource_weights:
+            rw_str = ", ".join(f"{k}={v:g}" for k, v in sorted(self.resource_weights.items()))
+            parts.append(f"resourceWeights={{{rw_str}}}")
+        return ", ".join(parts)
+
+
+def resolve_admission_fair_sharing_config(
+    *,
+    enabled: bool | None = None,
+    raw_usage_half_life: str | float | None = None,
+    raw_usage_sampling_interval: str | float | None = None,
+    resource_weights: str | dict[str, Any] | None = None,
+    scenario_afs: dict[str, Any] | None = None,
+    speedup: float = 1.0,
+    max_run_seconds: float | None = None,
+) -> AdmissionFairSharingConfig:
+    """Resolve Kueue admissionFairSharing configuration (CLI overrides > scenario Configuration > disabled)."""
+    has_cli_subflag = any(
+        x is not None for x in (raw_usage_half_life, raw_usage_sampling_interval, resource_weights)
+    )
+    if enabled is not None:
+        eff_enabled = bool(enabled)
+    elif has_cli_subflag:
+        eff_enabled = True
+    elif scenario_afs is not None:
+        eff_enabled = True
+    else:
+        return AdmissionFairSharingConfig(enabled=False)
+
+    if not eff_enabled:
+        return AdmissionFairSharingConfig(enabled=False)
+
+    base_afs = scenario_afs or {}
+    hl_src = raw_usage_half_life if raw_usage_half_life is not None else base_afs.get("usageHalfLifeTime", "0s")
+    si_src = (
+        raw_usage_sampling_interval
+        if raw_usage_sampling_interval is not None
+        else base_afs.get("usageSamplingInterval", "5m")
+    )
+    rw_src = resource_weights if resource_weights is not None else base_afs.get("resourceWeights")
+
+    if isinstance(hl_src, (int, float)):
+        raw_hl = float(hl_src)
+    elif str(hl_src).strip() in ("0", "0s", "0ms", ""):
+        raw_hl = 0.0
+    else:
+        parsed_hl = parse_duration_seconds(str(hl_src))
+        if parsed_hl is None:
+            raise ValueError(f"Invalid admissionFairSharing.usageHalfLifeTime {hl_src!r}")
+        raw_hl = parsed_hl
+    if raw_hl < 0:
+        raise ValueError(f"admissionFairSharing.usageHalfLifeTime must be >= 0 (got {hl_src!r})")
+
+    if isinstance(si_src, (int, float)):
+        raw_si = float(si_src)
+    else:
+        parsed_si = parse_duration_seconds(str(si_src))
+        if parsed_si is None:
+            raise ValueError(f"Invalid admissionFairSharing.usageSamplingInterval {si_src!r}")
+        raw_si = parsed_si
+    if raw_si <= 0:
+        raise ValueError(f"admissionFairSharing.usageSamplingInterval must be > 0 (got {si_src!r})")
+
+    parsed_weights = parse_afs_resource_weights(rw_src)
+    eff_speedup = max(1e-6, float(speedup))
+    eff_hl = 0.0 if raw_hl == 0.0 else max(DEFAULT_AFS_MIN_SAMPLING_WALL_SEC, raw_hl / eff_speedup)
+    eff_si = max(DEFAULT_AFS_MIN_SAMPLING_WALL_SEC, raw_si / eff_speedup)
+    if max_run_seconds is not None and max_run_seconds > 0:
+        eff_si = min(eff_si, max(DEFAULT_AFS_MIN_SAMPLING_WALL_SEC, max_run_seconds * 0.25))
+
+    return AdmissionFairSharingConfig(
+        enabled=True,
+        raw_usage_half_life_sec=raw_hl,
+        effective_usage_half_life_sec=eff_hl,
+        raw_usage_sampling_interval_sec=raw_si,
+        effective_usage_sampling_interval_sec=eff_si,
+        resource_weights=parsed_weights,
+    )
+
+
+@dataclass
+class KueueScenarioConfiguration:
+    """Validated Kueue `Configuration` statement extracted from a test scenario (`infra.json` or `kueue-config.json`)."""
+
+    fair_sharing_enabled: bool = False
+    fair_sharing_strategies: tuple[str, ...] = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+    afs_raw: dict[str, Any] | None = None
+    wfpr_raw: dict[str, Any] | None = None
+    feature_gates: dict[str, bool] = field(default_factory=dict)
+    raw_feature_gates: dict[str, bool] = field(default_factory=dict)
+    feature_gate_warnings: tuple[str, ...] = ()
+    resources_block: dict[str, Any] | None = None
+    manage_jobs_without_queue_name: bool | None = None
+    raw_doc: dict[str, Any] = field(default_factory=dict)
+
+
+def parse_kueue_configuration_payload(
+    doc: dict[str, Any],
+    *,
+    source_desc: str = "Configuration",
+) -> KueueScenarioConfiguration:
+    """Validate and parse a Kueue `config.kueue.x-k8s.io/v1beta2` (or `v1beta1`) `Configuration` payload."""
+    if not isinstance(doc, dict):
+        raise ValueError(f"{source_desc}: expected object dict for Kueue Configuration")
+    api_ver = str(doc.get("apiVersion") or "")
+    kind = str(doc.get("kind") or "")
+    if kind != "Configuration" or api_ver not in (
+        "config.kueue.x-k8s.io/v1beta2",
+        "config.kueue.x-k8s.io/v1beta1",
+    ):
+        raise ValueError(
+            f"{source_desc}: expected apiVersion 'config.kueue.x-k8s.io/v1beta2' (or v1beta1) and kind 'Configuration', "
+            f"got ({api_ver!r}, {kind!r})"
+        )
+
+    fs_raw = doc.get("fairSharing")
+    if fs_raw is None:
+        fs_enabled = False
+        fs_strategies = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+    elif isinstance(fs_raw, dict):
+        if fs_raw.get("enable") is False:
+            fs_enabled = False
+            fs_strategies = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+        else:
+            fs_enabled = True
+            if "preemptionStrategies" in fs_raw:
+                fs_strategies = parse_fair_sharing_strategies(
+                    fs_raw["preemptionStrategies"],
+                    field_desc=f"{source_desc} fairSharing.preemptionStrategies",
+                )
+            else:
+                fs_strategies = DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+    else:
+        raise ValueError(f"{source_desc}: fairSharing must be a mapping or null, got {type(fs_raw).__name__}")
+
+    afs_raw = doc.get("admissionFairSharing")
+    if afs_raw is not None:
+        if not isinstance(afs_raw, dict):
+            raise ValueError(
+                f"{source_desc}: admissionFairSharing must be a mapping or null, got {type(afs_raw).__name__}"
+            )
+        # Validate values immediately via resolve_admission_fair_sharing_config.
+        resolve_admission_fair_sharing_config(scenario_afs=afs_raw, speedup=1.0)
+
+    fg_raw = doc.get("featureGates")
+    fg_parsed: dict[str, bool] = {}
+    if fg_raw is not None:
+        if not isinstance(fg_raw, dict):
+            raise ValueError(f"{source_desc}: featureGates must be a mapping of bools")
+        for k, v in fg_raw.items():
+            if not isinstance(v, bool):
+                raise ValueError(f"{source_desc}: featureGates[{k!r}] must be a boolean, got {v!r}")
+            fg_parsed[str(k)] = v
+
+    wfpr_raw = doc.get("waitForPodsReady")
+    wfpr_clean: dict[str, Any] | None = None
+    if wfpr_raw is not None:
+        if not isinstance(wfpr_raw, dict):
+            raise ValueError(
+                f"{source_desc}: waitForPodsReady must be a mapping or null, got {type(wfpr_raw).__name__}"
+            )
+        # Normalize legacy v1beta1 `waitForPodsReady.enable: false` into DisableWaitForPodsReady=true.
+        if wfpr_raw.get("enable") is False:
+            if fg_parsed.get("DisableWaitForPodsReady") is False:
+                raise ValueError(
+                    f"{source_desc}: waitForPodsReady.enable=false conflicts with featureGates.DisableWaitForPodsReady=false"
+                )
+            fg_parsed["DisableWaitForPodsReady"] = True
+            wfpr_clean = None
+        else:
+            wfpr_clean = {k: v for k, v in wfpr_raw.items() if k != "enable"}
+            req_strat = wfpr_clean.get("requeuingStrategy") or {}
+            if not isinstance(req_strat, dict):
+                raise ValueError(f"{source_desc}: waitForPodsReady.requeuingStrategy must be a mapping")
+            validated_wfpr = resolve_wait_for_pods_ready_config(
+                enabled=True,
+                raw_timeout=wfpr_clean.get("timeout"),
+                raw_recovery_timeout=wfpr_clean.get("recoveryTimeout"),
+                raw_unscheduled_timeout=wfpr_clean.get("unscheduledTimeout"),
+                block_admission=wfpr_clean.get("blockAdmission"),
+                requeuing_timestamp=req_strat.get("timestamp"),
+                backoff_limit_count=req_strat.get("backoffLimitCount"),
+                raw_backoff_base=req_strat.get("backoffBaseSeconds"),
+                raw_backoff_max=req_strat.get("backoffMaxSeconds"),
+                speedup=1.0,
+            )
+            _, fg_parsed = reconcile_wait_for_pods_ready_feature_gates(validated_wfpr, fg_parsed)
+    else:
+        _, fg_parsed = reconcile_wait_for_pods_ready_feature_gates(None, fg_parsed)
+
+    raw_fg_copy = dict(fg_parsed)
+    fg_sanitized, fg_warnings = sanitize_kueue_feature_gates(fg_parsed)
+
+    res_raw = doc.get("resources")
+    if res_raw is not None and not isinstance(res_raw, dict):
+        raise ValueError(f"{source_desc}: resources must be a mapping or null")
+
+    mjwqn_raw = doc.get("manageJobsWithoutQueueName")
+    if mjwqn_raw is not None and not isinstance(mjwqn_raw, bool):
+        raise ValueError(f"{source_desc}: manageJobsWithoutQueueName must be a boolean")
+
+    return KueueScenarioConfiguration(
+        fair_sharing_enabled=fs_enabled,
+        fair_sharing_strategies=fs_strategies,
+        afs_raw=dict(afs_raw) if isinstance(afs_raw, dict) and afs_raw else None,
+        wfpr_raw=wfpr_clean,
+        feature_gates=fg_sanitized,
+        raw_feature_gates=raw_fg_copy,
+        feature_gate_warnings=tuple(fg_warnings),
+        resources_block=dict(res_raw) if isinstance(res_raw, dict) and res_raw else None,
+        manage_jobs_without_queue_name=mjwqn_raw,
+        raw_doc=dict(doc),
+    )
 
 
 def build_kwok_node_manifest(
@@ -273,13 +1304,29 @@ def patch_registry_manifest(base_dst: Path, node_port: int, memory_limit: str) -
     reg_yaml.write_text(reg_text, encoding="utf-8")
 
 
-def patch_kueue_fair_sharing_config(base_dst: Path, enable_fair_sharing: bool) -> None:
-    """Enable or disable Preemption-Based Fair Sharing in controller_manager_config.yaml."""
+def _insert_top_level_kueue_config_block(cfg_text: str, block_lines: list[str]) -> str:
+    block = "\n".join(block_lines) + "\n"
+    if re.search(r"^internalCertManagement:", cfg_text, flags=re.MULTILINE):
+        return re.sub(
+            r"^internalCertManagement:",
+            f"{block}internalCertManagement:",
+            cfg_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    return cfg_text.rstrip("\n") + "\n" + block
+
+
+def patch_kueue_fair_sharing_config(
+    base_dst: Path,
+    enable_fair_sharing: bool,
+    strategies: tuple[str, ...] | list[str] | None = None,
+) -> None:
+    """Enable (with configurable preemptionStrategies) or disable global FairSharing in controller_manager_config.yaml."""
     cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
     if not cfg_yaml.exists():
         return
     cfg_text = cfg_yaml.read_text(encoding="utf-8")
-    # Strip any existing top-level fairSharing block cleanly
     cfg_text = re.sub(
         r"^fairSharing:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
         "",
@@ -287,23 +1334,163 @@ def patch_kueue_fair_sharing_config(base_dst: Path, enable_fair_sharing: bool) -
         flags=re.MULTILINE,
     )
     if enable_fair_sharing:
+        resolved_strats = parse_fair_sharing_strategies(strategies)
         fs_lines = [
             "fairSharing:",
             "  preemptionStrategies:",
-            *[f"  - {s}" for s in DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES],
+            *[f"  - {s}" for s in resolved_strats],
         ]
-        fs_block = "\n".join(fs_lines) + "\n"
-        if re.search(r"^internalCertManagement:", cfg_text, flags=re.MULTILINE):
-            cfg_text = re.sub(
-                r"^internalCertManagement:",
-                f"{fs_block}internalCertManagement:",
-                cfg_text,
-                count=1,
-                flags=re.MULTILINE,
-            )
-        else:
-            cfg_text = cfg_text.rstrip("\n") + "\n" + fs_block
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, fs_lines)
     cfg_yaml.write_text(cfg_text, encoding="utf-8")
+
+
+def patch_kueue_admission_fair_sharing_config(
+    base_dst: Path,
+    afs_cfg: AdmissionFairSharingConfig | None,
+) -> None:
+    """Configure or remove admissionFairSharing in controller_manager_config.yaml."""
+    cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
+    if not cfg_yaml.exists():
+        return
+    cfg_text = cfg_yaml.read_text(encoding="utf-8")
+    cfg_text = re.sub(
+        r"^admissionFairSharing:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    if afs_cfg is not None and afs_cfg.enabled:
+        afs_lines = [
+            "admissionFairSharing:",
+            f"  usageHalfLifeTime: {format_go_duration_seconds(afs_cfg.effective_usage_half_life_sec)}",
+            f"  usageSamplingInterval: {format_go_duration_seconds(afs_cfg.effective_usage_sampling_interval_sec)}",
+        ]
+        if afs_cfg.resource_weights:
+            afs_lines.append("  resourceWeights:")
+            for rk, rv in sorted(afs_cfg.resource_weights.items()):
+                val_str = str(int(rv)) if abs(rv - round(rv)) < 1e-9 else f"{rv:g}"
+                afs_lines.append(f"    {rk}: {val_str}")
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, afs_lines)
+    cfg_yaml.write_text(cfg_text, encoding="utf-8")
+
+
+def patch_kueue_extra_configuration_fields(
+    base_dst: Path,
+    *,
+    resources_block: dict[str, Any] | None = None,
+    manage_jobs_without_queue_name: bool | None = None,
+) -> None:
+    """Apply optional `resources` and `manageJobsWithoutQueueName` fields into controller_manager_config.yaml."""
+    cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
+    if not cfg_yaml.exists():
+        return
+    cfg_text = cfg_yaml.read_text(encoding="utf-8")
+    cfg_text = re.sub(
+        r"^resources:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    cfg_text = re.sub(
+        r"^manageJobsWithoutQueueName:[ \t]*[^\n]*\n",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    if resources_block:
+        res_yaml = to_clean_yaml({"resources": resources_block})
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, res_yaml.splitlines())
+    if manage_jobs_without_queue_name is not None:
+        cfg_text = _insert_top_level_kueue_config_block(
+            cfg_text,
+            [f"manageJobsWithoutQueueName: {str(bool(manage_jobs_without_queue_name)).lower()}"],
+        )
+    cfg_yaml.write_text(cfg_text, encoding="utf-8")
+
+
+def patch_kueue_wait_for_pods_ready_config(
+    base_dst: Path,
+    wfpr_cfg: WaitForPodsReadyConfig | None,
+) -> None:
+    """Configure or remove waitForPodsReady in controller_manager_config.yaml."""
+    cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
+    if not cfg_yaml.exists():
+        return
+    cfg_text = cfg_yaml.read_text(encoding="utf-8")
+    cfg_text = re.sub(
+        r"^waitForPodsReady:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    if wfpr_cfg is not None and wfpr_cfg.enabled and wfpr_cfg.configured:
+        lines = [
+            "waitForPodsReady:",
+            f"  timeout: {format_go_duration_seconds(wfpr_cfg.effective_timeout_sec)}",
+        ]
+        if wfpr_cfg.effective_recovery_timeout_sec is not None:
+            lines.append(
+                f"  recoveryTimeout: {format_go_duration_seconds(wfpr_cfg.effective_recovery_timeout_sec)}"
+            )
+        if wfpr_cfg.effective_unscheduled_timeout_sec is not None:
+            lines.append(
+                f"  unscheduledTimeout: {format_go_duration_seconds(wfpr_cfg.effective_unscheduled_timeout_sec)}"
+            )
+        if wfpr_cfg.block_admission is not None:
+            lines.append(f"  blockAdmission: {str(bool(wfpr_cfg.block_admission)).lower()}")
+        has_req = (
+            wfpr_cfg.requeuing_timestamp != "Eviction"
+            or wfpr_cfg.backoff_limit_count is not None
+            or wfpr_cfg.effective_backoff_base_sec is not None
+            or wfpr_cfg.effective_backoff_max_sec is not None
+        )
+        if has_req:
+            lines.append("  requeuingStrategy:")
+            lines.append(f"    timestamp: {wfpr_cfg.requeuing_timestamp}")
+            if wfpr_cfg.backoff_limit_count is not None:
+                lines.append(f"    backoffLimitCount: {int(wfpr_cfg.backoff_limit_count)}")
+            if wfpr_cfg.effective_backoff_base_sec is not None:
+                lines.append(f"    backoffBaseSeconds: {int(wfpr_cfg.effective_backoff_base_sec)}")
+            if wfpr_cfg.effective_backoff_max_sec is not None:
+                lines.append(f"    backoffMaxSeconds: {int(wfpr_cfg.effective_backoff_max_sec)}")
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, lines)
+    cfg_yaml.write_text(cfg_text, encoding="utf-8")
+
+
+def patch_kueue_feature_gates_config(
+    base_dst: Path,
+    feature_gates: dict[str, bool] | None,
+    *,
+    kueue_build_dir: Path | str | None = None,
+    allow_unknown: bool = False,
+    emit_warnings: bool = True,
+) -> dict[str, bool]:
+    """Validate, sanitize, and write (or remove) featureGates in controller_manager_config.yaml."""
+    sanitized_fg, fg_warnings = sanitize_kueue_feature_gates(
+        feature_gates,
+        kueue_build_dir=kueue_build_dir,
+        allow_unknown=allow_unknown,
+    )
+    if emit_warnings:
+        for warn_msg in fg_warnings:
+            print(f"WARN: {warn_msg}", flush=True)
+    cfg_yaml = base_dst / "config" / "controller_manager_config.yaml"
+    if not cfg_yaml.exists():
+        return sanitized_fg
+    cfg_text = cfg_yaml.read_text(encoding="utf-8")
+    cfg_text = re.sub(
+        r"^featureGates:[ \t]*(?:#[^\n]*)?\n(?:[ \t]+[^\n]*\n|-+[ \t]*[^\n]*\n)*",
+        "",
+        cfg_text,
+        flags=re.MULTILINE,
+    )
+    if sanitized_fg:
+        lines = ["featureGates:"]
+        for k in sorted(sanitized_fg):
+            lines.append(f"  {k}: {str(bool(sanitized_fg[k])).lower()}")
+        cfg_text = _insert_top_level_kueue_config_block(cfg_text, lines)
+    cfg_yaml.write_text(cfg_text, encoding="utf-8")
+    return sanitized_fg
 
 
 def patch_kustomize_kueue_image(base_dst: Path, image_ref: str) -> None:

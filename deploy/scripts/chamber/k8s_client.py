@@ -156,9 +156,12 @@ class ChamberK8sClientMixin:
         path: str,
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
+        content_type: str | None = None,
     ) -> tuple[int, bytes]:
         """Perform a direct keep-alive HTTPS request against the KWOK kube-apiserver with auto-reconnect."""
         hdrs = {"Accept": "application/json", "Connection": "keep-alive"}
+        if content_type:
+            hdrs["Content-Type"] = content_type
         if headers:
             hdrs.update(headers)
         max_attempts = 6
@@ -385,25 +388,100 @@ class ChamberK8sClientMixin:
 
     def _get_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=12)
+            self._executor = ThreadPoolExecutor(max_workers=24)
         return self._executor
 
     def apply_manifests_parallel(
         self,
         docs: list[dict[str, Any]],
-        max_workers: int = 12,
+        max_workers: int = 24,
     ) -> None:
-        """Apply manifests concurrently over persistent keep-alive TLS sockets."""
+        """Apply manifests concurrently over persistent keep-alive TLS sockets (or sequentially when max_workers <= 1)."""
         if not docs:
             return
-        if len(docs) == 1:
-            self.ssa_apply_doc(docs[0])
+        if len(docs) == 1 or max_workers <= 1:
+            for d in docs:
+                self.ssa_apply_doc(d)
             return
 
         pool = self._get_executor()
         futures = [pool.submit(self.ssa_apply_doc, d) for d in docs]
         for fut in as_completed(futures):
             fut.result()
+
+    def apply_pre_admitted_workload(
+        self,
+        workload_doc: dict[str, Any],
+        status_body: dict[str, Any],
+    ) -> None:
+        """Create/apply a Kueue Workload CR and immediately patch its `/status` subresource."""
+        self.ssa_apply_doc(workload_doc)
+        meta = workload_doc.get("metadata") or {}
+        ns = str(meta.get("namespace") or "default")
+        name = str(meta.get("name") or "")
+        api_version = str(workload_doc.get("apiVersion") or "kueue.x-k8s.io/v1beta2")
+        status_path = f"/apis/{api_version}/namespaces/{ns}/workloads/{name}/status"
+        merge_payload = {"status": status_body}
+        st_code, raw = self.api_request(
+            "PATCH",
+            status_path,
+            body=json.dumps(merge_payload).encode("utf-8"),
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+        if st_code < 200 or st_code >= 300:
+            raise RuntimeError(
+                self._format_k8s_api_error(
+                    "MERGE PATCH",
+                    status_path,
+                    st_code,
+                    raw,
+                    obj={**workload_doc, "status": status_body},
+                )
+            )
+
+    def apply_pre_admitted_workloads_parallel(
+        self,
+        items: list[tuple[dict[str, Any], dict[str, Any]]],
+    ) -> None:
+        """Apply multiple pre-admitted Kueue Workloads + `/status` subresources concurrently."""
+        if not items:
+            return
+        if len(items) == 1:
+            self.apply_pre_admitted_workload(*items[0])
+            return
+        pool = self._get_executor()
+        futures = [pool.submit(self.apply_pre_admitted_workload, wl_doc, st_doc) for wl_doc, st_doc in items]
+        for fut in as_completed(futures):
+            fut.result()
+
+    def wait_for_pods_running(
+        self,
+        pod_keys: list[tuple[str, str]],
+        timeout_sec: float = 90.0,
+    ) -> None:
+        """Wait until all specified `(namespace, pod_name)` pods reach Running or Succeeded phase."""
+        if not pod_keys:
+            return
+        target = set(pod_keys)
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            st, raw = self.api_request("GET", "/api/v1/pods")
+            if st == 200 and raw:
+                ready_keys: set[tuple[str, str]] = set()
+                for it in json.loads(raw.decode("utf-8")).get("items", []):
+                    meta = it.get("metadata") or {}
+                    p_key = (str(meta.get("namespace") or "default"), str(meta.get("name") or ""))
+                    if p_key not in target:
+                        continue
+                    phase = str((it.get("status") or {}).get("phase") or "")
+                    if phase in ("Running", "Succeeded"):
+                        ready_keys.add(p_key)
+                if target.issubset(ready_keys):
+                    return
+            time.sleep(0.25)
+        raise RuntimeError(
+            f"Timed out waiting for {len(target)} initial pod(s) to reach Running phase on KWOK nodes"
+        )
 
     @staticmethod
     def _run_kubectl(
@@ -562,6 +640,21 @@ class ChamberK8sClientMixin:
                         }
                     )
                     changed = True
+                if kind == "MutatingWebhookConfiguration" and wh.get("name") == "mpod.kb.io":
+                    obj_sel = wh.setdefault("objectSelector", {})
+                    obj_exprs = obj_sel.setdefault("matchExpressions", [])
+                    if not any(
+                        ex.get("key") == "kueue-optimizer.gke.io/initial-pod" and ex.get("operator") == "NotIn"
+                        for ex in obj_exprs
+                    ):
+                        obj_exprs.append(
+                            {
+                                "key": "kueue-optimizer.gke.io/initial-pod",
+                                "operator": "NotIn",
+                                "values": ["true"],
+                            }
+                        )
+                        changed = True
             if changed:
                 patch_doc = {
                     "apiVersion": "admissionregistration.k8s.io/v1",
@@ -584,13 +677,66 @@ class ChamberK8sClientMixin:
         remove_stale: bool = True,
         timeout_sec: float = 180.0,
     ) -> None:
-        """Apply simulated KWOK nodes concurrently, remove stale nodes, and wait until Ready."""
-        nodes_by_name = {n["metadata"]["name"]: n for n in nodes}
+        """Apply simulated KWOK nodes concurrently, remove stale nodes, and wait until healthy nodes are Ready."""
+        nodes_by_name: dict[str, dict[str, Any]] = {}
+        unhealthy_t0_names: set[str] = set()
+        prepared_nodes: list[dict[str, Any]] = []
+        for raw_nd in nodes:
+            nd = json.loads(json.dumps(raw_nd))
+            nname = nd["metadata"]["name"]
+            ann = (nd.get("metadata") or {}).get("annotations") or {}
+            if str(ann.get("kueue-optimizer.gke.io/node-failed") or "").lower() == "true":
+                unhealthy_t0_names.add(nname)
+                spec_blk = nd.setdefault("spec", {})
+                taints = list(spec_blk.get("taints") or [])
+                if not any(isinstance(t, dict) and t.get("key") == "node.kubernetes.io/not-ready" for t in taints):
+                    taints.append({"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"})
+                spec_blk["taints"] = taints
+            nodes_by_name[nname] = nd
+            prepared_nodes.append(nd)
+
+        healthy_t0_names = set(nodes_by_name.keys()) - unhealthy_t0_names
+
         t_start = time.monotonic()
-        self.apply_manifests_parallel(nodes, max_workers=24)
+        self.apply_manifests_parallel(prepared_nodes, max_workers=24)
         elapsed = time.monotonic() - t_start
-        if len(nodes) > 20:
-            print(f"    Applied {len(nodes)} KWOK nodes in {elapsed:.1f}s. Waiting for nodes Ready...", flush=True)
+        if len(prepared_nodes) > 20:
+            print(
+                f"    Applied {len(prepared_nodes)} KWOK nodes in {elapsed:.1f}s "
+                f"({len(healthy_t0_names)} healthy, {len(unhealthy_t0_names)} NotReady at t0). Waiting for nodes...",
+                flush=True,
+            )
+
+        # Immediately stamp Ready=False + full allocatable/capacity onto t0 NotReady nodes (skipped by node-initialize).
+        if unhealthy_t0_names:
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            for u_name in sorted(unhealthy_t0_names):
+                u_doc = nodes_by_name[u_name]
+                u_st = u_doc.get("status") or {}
+                status_patch = {
+                    "status": {
+                        "allocatable": u_st.get("allocatable") or {},
+                        "capacity": u_st.get("capacity") or u_st.get("allocatable") or {},
+                        "nodeInfo": u_st.get("nodeInfo") or {},
+                        "phase": "Running",
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "False",
+                                "reason": "KubeletNotReady",
+                                "message": "Node was NotReady at scenario start (t0)",
+                                "lastHeartbeatTime": now_iso,
+                                "lastTransitionTime": now_iso,
+                            }
+                        ],
+                    }
+                }
+                self.api_request(
+                    "PATCH",
+                    f"/api/v1/nodes/{u_name}/status",
+                    body=json.dumps(status_patch).encode("utf-8"),
+                    headers={"Content-Type": "application/merge-patch+json"},
+                )
 
         stale_deleted = not remove_stale
         deadline = time.monotonic() + timeout_sec
@@ -611,7 +757,8 @@ class ChamberK8sClientMixin:
                         self.api_delete(f"/api/v1/nodes/{sname}", obj=s_it)
                     stale_deleted = True
 
-                ready_count = 0
+                ready_healthy_count = 0
+                present_unhealthy_count = 0
                 nodes_needing_status_patch.clear()
                 for it in items:
                     nname = it.get("metadata", {}).get("name", "")
@@ -619,18 +766,27 @@ class ChamberK8sClientMixin:
                         continue
                     st_obj = it.get("status", {}) or {}
                     conds = {c.get("type"): c.get("status") for c in (st_obj.get("conditions") or [])}
-                    if conds.get("Ready") == "True":
-                        ready_count += 1
+                    if nname in unhealthy_t0_names:
+                        present_unhealthy_count += 1
+                        alloc = st_obj.get("allocatable") or {}
+                        expected_alloc = nodes_by_name[nname]["status"]["allocatable"]
+                        if any(str(alloc.get(k)) != str(v) for k, v in expected_alloc.items()):
+                            nodes_needing_status_patch.append(nodes_by_name[nname])
+                    elif conds.get("Ready") == "True":
+                        ready_healthy_count += 1
                         alloc = st_obj.get("allocatable") or {}
                         expected_alloc = nodes_by_name[nname]["status"]["allocatable"]
                         if any(str(alloc.get(k)) != str(v) for k, v in expected_alloc.items()):
                             nodes_needing_status_patch.append(nodes_by_name[nname])
 
-                if ready_count >= len(nodes_by_name):
+                if ready_healthy_count >= len(healthy_t0_names) and present_unhealthy_count >= len(unhealthy_t0_names):
                     break
             time.sleep(0.5)
         else:
-            raise RuntimeError(f"Timed out waiting for {len(nodes_by_name)} KWOK nodes to become Ready")
+            raise RuntimeError(
+                f"Timed out waiting for {len(healthy_t0_names)} healthy KWOK node(s) to become Ready "
+                f"(and {len(unhealthy_t0_names)} t0-NotReady node(s) to sync)"
+            )
 
         if nodes_needing_status_patch:
             pool = self._get_executor()

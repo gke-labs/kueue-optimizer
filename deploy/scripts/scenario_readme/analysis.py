@@ -276,6 +276,7 @@ class ScenarioAnalysis:
     cqs_by_name: dict[str, dict[str, Any]]
     lqs_by_key: dict[tuple[str, str], dict[str, Any]]
     namespaces_by_name: dict[str, dict[str, Any]]
+    kueue_configuration: dict[str, Any] | None
 
     all_nodes: list[dict[str, Any]]
     total_node_count: int
@@ -380,6 +381,7 @@ def _parse_infra_events(infra_events: list[dict[str, Any]]) -> dict[str, Any]:
     cqs_by_name: dict[str, dict[str, Any]] = {}
     lqs_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     namespaces_by_name: dict[str, dict[str, Any]] = {}
+    kueue_configuration: dict[str, Any] | None = None
     pod_new_events: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
     pod_delete_epochs: dict[tuple[str, str], float] = {}
     infra_timestamps: list[float] = []
@@ -398,7 +400,7 @@ def _parse_infra_events(infra_events: list[dict[str, Any]]) -> dict[str, Any]:
         ns = str(meta.get("namespace") or pl.get("namespace") or "default")
 
         if kind == "Node" and ev_type in ("New", "Update"):
-            if name:
+            if name and name not in nodes_by_name:
                 nodes_by_name[name] = pl
         elif kind == "Topology" and ev_type in ("New", "Update"):
             if name:
@@ -421,6 +423,11 @@ def _parse_infra_events(infra_events: list[dict[str, Any]]) -> dict[str, Any]:
         elif kind == "Namespace" and ev_type in ("New", "Update"):
             if name:
                 namespaces_by_name[name] = pl
+        elif kind == "Configuration":
+            if ev_type == "Deleted":
+                kueue_configuration = None
+            elif ev_type in ("New", "Update", ""):
+                kueue_configuration = pl
         elif kind == "Pod":
             if ev_type == "New" and name and (ns, name) not in pod_new_events:
                 pod_new_events[(ns, name)] = (ep if ep is not None else 0.0, pl)
@@ -438,6 +445,7 @@ def _parse_infra_events(infra_events: list[dict[str, Any]]) -> dict[str, Any]:
         "cqs_by_name": cqs_by_name,
         "lqs_by_key": lqs_by_key,
         "namespaces_by_name": namespaces_by_name,
+        "kueue_configuration": kueue_configuration,
         "pod_new_events": pod_new_events,
         "pod_delete_epochs": pod_delete_epochs,
         "infra_timestamps": infra_timestamps,
@@ -521,6 +529,7 @@ def _parse_workflows(
     admitted_at_start_wfs: list[ParsedWorkload] = []
     unadmitted_wfs: list[ParsedWorkload] = []
     seen_top_workflows: set[tuple[str, str, str]] = set()
+    podgroups_by_key: dict[tuple[str, str], ParsedWorkload] = {}
 
     for ev in workflow_events:
         ev_type = str(ev.get("eventType") or "")
@@ -549,6 +558,7 @@ def _parse_workflows(
 
         labels = dict(meta.get("labels") or {})
         annotations = dict(meta.get("annotations") or {})
+        pg_name = str(labels.get("kueue.x-k8s.io/pod-group-name") or "").strip() if kind == "Pod" else ""
 
         arr_ep = (
             parse_rfc3339_epoch(ev.get("timestamp"))
@@ -597,13 +607,73 @@ def _parse_workflows(
             "kueue-optimizer.gke.io/pod-execution-time-seconds",
             "kueue-optimizer.gke.io/real-duration-sec",
         )
+        wf_true_dur = parse_positive_duration_annotation(
+            annotations,
+            "kueue-optimizer.gke.io/true-execution-time-seconds",
+            "kueue-optimizer.gke.io/expected-execution-time-seconds",
+        )
+        wf_mult: float | None = None
+        if annotations.get("kueue-optimizer.gke.io/missing-duration-multiplier") is not None:
+            try:
+                cand_m = float(str(annotations["kueue-optimizer.gke.io/missing-duration-multiplier"]).strip())
+                if cand_m > 1.0:
+                    wf_mult = cand_m
+            except (TypeError, ValueError):
+                pass
         fallback_dur = ann_dur if ann_dur is not None else 10.0
+
+        if pg_name:
+            pg_key = (wf_ns, pg_name)
+            existing_pg = podgroups_by_key.get(pg_key)
+            if existing_pg is not None:
+                existing_pg.total_pods += total_pods
+                for rk, rv in total_reqs.items():
+                    existing_pg.total_requests[rk] = existing_pg.total_requests.get(rk, 0.0) + rv
+                if arr_ep < existing_pg.arrival_epoch:
+                    existing_pg.arrival_epoch = arr_ep
+                continue
+
+            dur_sec, found_in_idx = exec_index.resolve_duration_sec(
+                namespace=wf_ns,
+                object_kind="PodGroup",
+                name=pg_name,
+                fallback_sec=fallback_dur,
+                workflow_true_duration_sec=wf_true_dur,
+                workflow_missing_multiplier=wf_mult,
+            )
+            found_dur = found_in_idx or (ann_dur is not None)
+            parsed_pg = ParsedWorkload(
+                name=pg_name,
+                namespace=wf_ns,
+                kind="PodGroup",
+                workload_state=wl_state,
+                arrival_epoch=arr_ep,
+                local_queue=lq_name,
+                priority_class=pc_name,
+                priority_value=pc_val,
+                total_pods=total_pods,
+                total_requests=dict(total_reqs),
+                per_pod_requests=dict(per_pod_reqs),
+                duration_sec=dur_sec,
+                found_duration=found_dur,
+                annotations=annotations,
+                labels=labels,
+            )
+            podgroups_by_key[pg_key] = parsed_pg
+            if wl_state == "Admitted":
+                admitted_at_start_wfs.append(parsed_pg)
+            else:
+                unadmitted_wfs.append(parsed_pg)
+            continue
+
         dur_sec, found_in_idx = exec_index.resolve_duration_sec(
             namespace=wf_ns,
             object_kind=kind,
             name=wf_name,
             fallback_sec=fallback_dur,
             parent_jobset_name=parent_js,
+            workflow_true_duration_sec=wf_true_dur,
+            workflow_missing_multiplier=wf_mult,
         )
         found_dur = found_in_idx or (ann_dur is not None)
 
@@ -777,6 +847,7 @@ def analyze_scenario(scenario_dir: Path) -> ScenarioAnalysis:
         cqs_by_name=infra["cqs_by_name"],
         lqs_by_key=infra["lqs_by_key"],
         namespaces_by_name=infra["namespaces_by_name"],
+        kueue_configuration=infra["kueue_configuration"],
         all_nodes=nodes_info["all_nodes"],
         total_node_count=nodes_info["total_node_count"],
         label_val_sets=nodes_info["label_val_sets"],

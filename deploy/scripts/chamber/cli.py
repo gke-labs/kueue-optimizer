@@ -91,10 +91,43 @@ def add_common_chamber_args(
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Enable Preemption-Based Fair Sharing (fairSharing.preemptionStrategies: "
-            "[LessThanOrEqualToFinalShare, LessThanInitialShare]) in Kueue controller configuration "
-            "(default: enabled; pass --no-fair-sharing for Classical Preemption; incompatible with --skip-chamber-deploy)"
+            "Enable Preemption-Based Fair Sharing in Kueue controller configuration "
+            "(default: follows scenario Configuration if present, else enabled; pass --no-fair-sharing for Classical Preemption)"
         ),
+    )
+    parser.add_argument(
+        "--fair-sharing-strategies",
+        default=os.environ.get("FAIR_SHARING_STRATEGIES"),
+        help=(
+            "Comma-separated Kueue fairSharing.preemptionStrategies override "
+            "(e.g. 'LessThanOrEqualToFinalShare', 'LessThanInitialShare', or "
+            "'LessThanOrEqualToFinalShare,LessThanInitialShare')"
+        ),
+    )
+    parser.add_argument(
+        "--admission-fair-sharing",
+        dest="admission_fair_sharing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable or disable Kueue admissionFairSharing in controller_manager_config.yaml "
+            "(auto-enabled when scenario Configuration sets admissionFairSharing or any --afs-* flag is passed)"
+        ),
+    )
+    parser.add_argument(
+        "--afs-usage-half-life",
+        default=os.environ.get("AFS_USAGE_HALF_LIFE"),
+        help="Kueue admissionFairSharing.usageHalfLifeTime (e.g. '20s', '5m', '0s'; scaled by 1/--speedup)",
+    )
+    parser.add_argument(
+        "--afs-sampling-interval",
+        default=os.environ.get("AFS_SAMPLING_INTERVAL"),
+        help="Kueue admissionFairSharing.usageSamplingInterval (e.g. '1s', '5m'; scaled by 1/--speedup)",
+    )
+    parser.add_argument(
+        "--afs-resource-weights",
+        default=os.environ.get("AFS_RESOURCE_WEIGHTS"),
+        help="Comma-separated admissionFairSharing.resourceWeights (e.g. 'google.com/tpu=1,cpu=0,memory=0')",
     )
     parser.add_argument(
         "--pause-image",
@@ -153,6 +186,14 @@ def add_common_chamber_args(
         ),
     )
     parser.add_argument(
+        "--kueue-feature-gates",
+        default=os.environ.get("KUEUE_FEATURE_GATES"),
+        help=(
+            "Optional comma-separated Kueue feature gate overrides rendered into controller_manager_config.yaml "
+            "(e.g. 'TASReplaceMultipleFailedNodes=true')"
+        ),
+    )
+    parser.add_argument(
         "--skip-chamber-deploy",
         "--reuse-chamber",
         action="store_true",
@@ -185,8 +226,10 @@ def resolve_fair_sharing_arg(
     cli_fair_sharing: bool | None,
     skip_chamber_deploy: bool,
     parser: argparse.ArgumentParser,
+    *,
+    scenario_default: bool | None = None,
 ) -> bool:
-    """Resolve effective --fair-sharing boolean and reject overriding it alongside --skip-chamber-deploy."""
+    """Resolve effective --fair-sharing boolean (CLI > FAIR_SHARING env > scenario Configuration > True)."""
     if skip_chamber_deploy and cli_fair_sharing is not None:
         parser.error(
             "--fair-sharing / --no-fair-sharing cannot be combined with --skip-chamber-deploy "
@@ -194,7 +237,11 @@ def resolve_fair_sharing_arg(
         )
     if cli_fair_sharing is not None:
         return bool(cli_fair_sharing)
-    return env_bool("FAIR_SHARING", True)
+    if os.environ.get("FAIR_SHARING") is not None:
+        return env_bool("FAIR_SHARING", True)
+    if scenario_default is not None:
+        return bool(scenario_default)
+    return True
 
 
 @contextmanager

@@ -10,9 +10,9 @@ This document specifies the exact JSON Lines (NDJSON) file format, event envelop
 
 | File | Default Flag | Purpose |
 | :--- | :--- | :--- |
-| `infra.json` | `--infra-file` | Periodic state & changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es (without status, with annotations filtered), and scheduled/running `Pod` placements, resource requests, and lifecycle timestamps. |
-| `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of `Job`s, `JobSet`s, `LeaderWorkerSet`s, Kueue-managed `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s, with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
-| `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), preempted runs (`PartialExecution`), and non-preempted completions (`FullExecution`), with top-level `workloadState` metadata. |
+| `infra.json` | `--infra-file` | Periodic state & real-time watch changes of sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, `PriorityClass`es (`scheduling.k8s.io/v1`), Kueue controller `Configuration` (`ConfigMap/kueue-manager-config` + `Deployment/kueue-controller-manager` `--feature-gates` CLI overrides), `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, `WorkloadPriorityClass`es, and scheduled/running `Pod` placements, resource requests, and real-time lifecycle timestamps. |
+| `workflows.json` | `--workflows-file` | Watch-driven creation, update, and deletion events of Kueue-managed `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, and standalone Kueue-managed `Pod`s (sorted by `creationTime` at `t0` and retaining watch `ResourceVersion`s across reconnects), with top-level `workloadState` admission metadata (`"NotAdmitted"`, `"AdmissionInProgress"`, `"Admitted"`) and payloads sanitized of all business-specific details. |
+| `execution-time.json` | `--execution-time-file` | Watch-driven Kueue `Workload` admission timestamps (`Admitted`), interrupted/deleted runs (`PartialExecution`), and non-interrupted completions (`FullExecution`), with top-level `workloadState` metadata. |
 
 ### On-Disk File Format (One Event Per Line / JSON Lines)
 Each output file is written in **JSON Lines (NDJSON)** format:
@@ -92,15 +92,15 @@ flowchart LR
 
 ## 3. `infra.json` Schema
 
-`infra.json` records periodic snapshots (every `--interval`, default `60s`) of cluster infrastructure resources and combines periodic scraping with a real-time `v1/Pod` watch to track scheduled and running pods and their exact deletion timestamps.
+`infra.json` records periodic snapshots (every `--interval`, default `60s`) of cluster infrastructure resources and combines periodic scraping with real-time `v1/Node` and `v1/Pod` watches to capture exact mid-scenario node failures/recoveries/additions/deletions as well as scheduled/running pods and their exact termination/deletion timestamps.
 
 ### 3.1 Allowed `eventType` Values in `infra.json`
 
 | `eventType` | Emission Trigger |
 | :--- | :--- |
-| `"New"` | Emitted the first time an object (`Node`, `Namespace`, `RuntimeClass`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, `WorkloadPriorityClass`, or scheduled/running `Pod`) is observed by the scraper. |
-| `"Update"` | Emitted on a periodic scrape tick when a tracked object's canonical SHA-256 digest (ignoring volatile `metadata.resourceVersion`) changes compared to its previously recorded state. |
-| `"Deleted"` | Emitted when a previously observed infrastructure object disappears between periodic scrapes, or immediately when a tracked `Pod` receives a `DELETED` watch event. |
+| `"New"` | Emitted the first time an object (`Node`, `Namespace`, `RuntimeClass`, `ClusterQueue`, `Cohort`, `LocalQueue`, `ResourceFlavor`, `Topology`, `WorkloadPriorityClass`, or scheduled/running `Pod`) is observed by the scraper (including post-`t0` replacement/scale-up `Node`s via the real-time `Node` watch). |
+| `"Update"` | Emitted immediately via the real-time `Node` watch or on a periodic scrape tick when a tracked object's canonical SHA-256 digest (ignoring volatile `metadata.resourceVersion`, `metadata.generation`, and `status.conditions[].lastHeartbeatTime` so periodic kubelet heartbeats do not produce spurious diffs) changes compared to its previously recorded state (e.g., `Ready: True -> False` node failure, `NoExecute`/`NoSchedule` taints, `spec.unschedulable: true`, or `Ready: False -> True` node recovery). |
+| `"Deleted"` | Emitted immediately when a tracked `Node` or `Pod` receives a `DELETED` watch event (or transitions to terminal `Succeeded`/`Failed` for Pods), or when a previously observed infrastructure object disappears between periodic scrapes. |
 
 ### 3.2 Discriminating Payload Types in `infra.json`
 
@@ -111,12 +111,14 @@ Every `payload` object in `infra.json` contains top-level `"apiVersion"` and `"k
 | `"Node"` | `"v1"` | **Yes** (scheduling-only: `capacity`, `allocatable`, `conditions`, `phase`) | **No** (plain name) |
 | `"Namespace"` | `"v1"` | **No** (status omitted) | **No** (plain name) |
 | `"RuntimeClass"` | `"node.k8s.io/v1"` | **No** (status omitted) | **No** (plain name) |
+| `"PriorityClass"` | `"scheduling.k8s.io/v1"` | **No** (status & description omitted) | **No** (plain name) |
 | `"ClusterQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"Cohort"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"LocalQueue"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"ResourceFlavor"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"Topology"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status omitted) | **No** (plain name) |
 | `"WorkloadPriorityClass"` | `"kueue.x-k8s.io/v1beta2"` | **No** (status & description omitted) | **No** (plain name) |
+| `"Configuration"` | `"config.kueue.x-k8s.io/v1beta2"` (or `"v1beta1"`) | **No** (sanitized scheduling policy fields only) | **No** (cluster-singleton policy) |
 | `"Pod"` | `"v1"` | **No** (`ScrapedPodPayload` only) | **Yes** (SHA-256 hex when `--hash-names` is set) |
 
 ---
@@ -149,11 +151,16 @@ On disk (single line in `infra.json` for `Cohort`):
 {"timestamp":"2026-10-30T12:05:53.450112904Z","eventType":"New","payload":{"apiVersion":"kueue.x-k8s.io/v1beta2","kind":"Cohort","metadata":{"creationTimestamp":"2026-10-30T12:05:14Z","generation":1,"name":"main-cohort","resourceVersion":"245","uid":"9f2b1b24-1b7d-4e54-8f31-18e62f9a3d10"},"spec":{"fairSharing":{"weight":"2"},"parentName":"root-cohort","resourceGroups":[{"coveredResources":["cpu"],"flavors":[{"name":"default-flavor","resources":[{"borrowingLimit":"8","lendingLimit":"4","name":"cpu","nominalQuota":"16"}]}]}]}}}
 ```
 
+On disk (single line in `infra.json` for sanitized Kueue controller `Configuration`, scraped from `ConfigMap/kueue-manager-config` in `--kueue-namespace` `kueue-system` retaining strictly scheduling-policy fields `fairSharing`, `admissionFairSharing`, `waitForPodsReady`, `featureGates`, `resources`, and `manageJobsWithoutQueueName` while stripping all internal TLS/webhook/metrics/leaderElection/clientConnection fields; omitting `fairSharing` signifies global Fair Sharing disabled / Classical Preemption):
+```json
+{"timestamp":"2026-10-30T12:05:53.455000000Z","eventType":"New","payload":{"admissionFairSharing":{"resourceWeights":{"cpu":0,"google.com/tpu":1,"memory":0},"usageHalfLifeTime":"20s","usageSamplingInterval":"1s"},"apiVersion":"config.kueue.x-k8s.io/v1beta2","fairSharing":{"preemptionStrategies":["LessThanOrEqualToFinalShare","LessThanInitialShare"]},"kind":"Configuration"}}
+```
+
 ---
 
-### 3.5 Scheduled & Running `Pod` Payload (`ScrapedPodPayload`, `payload.kind == "Pod"`)
+### 3.5 Scheduled & Active `Pod` Payload (`ScrapedPodPayload`, `payload.kind == "Pod"`)
 
-Only pods that have been scheduled onto a node (`spec.nodeName != ""`) and reached `status.phase == "Running"` are recorded in `infra.json`.
+Pods that have been scheduled onto a node (`spec.nodeName != ""`), have not yet terminated (`status.phase` in `"Running"` or `"Pending"`, e.g. `ContainerCreating` at $t_0$ in vanilla Kubernetes), and have no `metadata.deletionTimestamp` emit `"New"`/`"Update"` events in `infra.json`. When a tracked pod transitions to a terminal phase (`"Succeeded"` or `"Failed"`) or is deleted (`watch.Deleted` / missing on reconciliation), `cluster-scraper` emits at-most-once `"Deleted"` with `deletionTime` set to the maximum container `terminated.finishedAt` timestamp (falling back to `metadata.deletionTimestamp` or observation time).
 
 To guarantee strict data hygiene, **no other pod fields are ever written to `infra.json`**. Specifically, container specs, container statuses, images, execution arguments, commands, environment variables, secrets, volumes, annotations, and labels are completely omitted.
 
@@ -170,6 +177,11 @@ To guarantee strict data hygiene, **no other pod fields are ever written to `inf
 | `schedulingTime` | `string` (RFC3339 UTC) | Optional | Timestamp when the pod was scheduled onto its node, extracted from the `PodScheduled` condition's `lastTransitionTime` (falling back to `status.startTime` or `metadata.creationTimestamp`). Preserved across later pod status updates. |
 | `firstNoticeTime` | `string` (RFC3339 UTC) | **Yes** | Timestamp when the scraper first observed the scheduled pod (via watch or periodic scrape). |
 | `deletionTime` | `string` (RFC3339 UTC) | Optional | Present on `"Deleted"` events. Timestamp when the pod was deleted (`metadata.deletionTimestamp` if set on the watch event, or watch `DELETED` arrival time). |
+| `workloadName` | `string` | Optional | Kueue `Workload` object name backing this pod (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). Present only for pods belonging to a Kueue-managed workflow or `PodGroup`; omitted for non-Kueue system/DaemonSet/unmanaged pods so `testrunner.py` separates $t_0$ Kueue `PodGroup` workloads from `infra-pods`. |
+| `ownerKind` | `string` | Optional | Top-level Kueue workflow owner kind (`"JobSet"`, `"Job"`, `"LeaderWorkerSet"`, `"Deployment"`, `"RayJob"`, `"RayCluster"`, `"Pod"`, or `"PodGroup"`). Omitted for non-Kueue pods. |
+| `ownerName` | `string` | Optional | Top-level Kueue workflow owner name (or `h-<32-hex>` HMAC-SHA256 hash when `--hash-names` is enabled). Omitted for non-Kueue pods. |
+| `podSetName` | `string` | Optional | Kueue `PodSet` / `replicatedJob` / `role-hash` identifier within the parent workflow or `PodGroup`. |
+| `isTAS` | `boolean` | Optional | `true` when the pod or its backing Kueue `Workload` uses Topology-Aware Scheduling (`TAS`); omitted when `false`. |
 
 #### On-Disk Single-Line Examples (`New` and `Deleted` Pod Events in `infra.json`):
 ```json
@@ -269,23 +281,24 @@ Every workflow object in `workflows.json` is sanitized before being hashed for c
 
 ## 5. `execution-time.json` Schema
 
-`execution-time.json` watches `kueue.x-k8s.io/v1beta2` `Workload` objects and records when each workload is admitted by Kueue and whether its execution ends in preemption (`PartialExecution`) or completion without preemption (`FullExecution`).
+`execution-time.json` watches `kueue.x-k8s.io/v1beta2` `Workload` objects and records when each workload is admitted by Kueue and whether its execution ends in an interruption (`PartialExecution` — preemption, node failure, `waitForPodsReady` timeout, other eviction/failure, or scrape-end cutoff) or uninterrupted completion (`FullExecution`).
 
 ### 5.1 Allowed `eventType` and `workloadState` Values in `execution-time.json`
 
 | `eventType` | `workloadState` | `payload.executionType` | Emission Trigger |
 | :--- | :--- | :--- | :--- |
-| `"Admitted"` | `"Admitted"` | *(omitted)* | Emitted when a Kueue `Workload`'s `Admitted` status condition transitions to `True` (including re-admission after a prior preemption). |
-| `"PartialExecution"` | `"NotAdmitted"` | `"Partial"` | Emitted when an admitted `Workload` is preempted (`Preempted=True` condition or `Evicted=True` condition with `Preempted` reason). Records the partial execution duration from `admittedTime` to preemption `endTime`, and transitions `workloadState` back to `"NotAdmitted"`. |
-| `"FullExecution"` | `"Admitted"` | `"Full"` | Emitted when an admitted `Workload` reaches `Finished=True` without being preempted during that admission cycle (including when clean completion such as `Reason: Succeeded` wins a race against an in-flight preemption whose `Preempted=True` condition remained latched). Records the full execution duration from `admittedTime` to completion `endTime`. |
+| `"Admitted"` | `"Admitted"` | *(omitted)* | Emitted when a Kueue `Workload`'s `Admitted` status condition transitions to `True` (including re-admission after a prior preemption, node-failure eviction, or `PodsReadyTimeout` eviction). Note: in-place TAS failed-node hot-swap (`TASFailedNodeReplacement`) replaces unhealthy nodes without evicting the `Workload`, so `Admitted` remains continuous and `FullExecution` captures `unhealthyNodes`. |
+| `"PartialExecution"` | `"NotAdmitted"` (`"Admitted"` for `"ScrapeEnded"`) | `"Partial"` | Emitted whenever an admitted `Workload` is interrupted before clean completion:<ul><li>`interruptionReason: "Preempted"` (`preempted: true`) — Kueue preemption (`Preempted=True` or `Evicted` with `Preempt*` reason).</li><li>`interruptionReason: "NodeFailure"` (`preempted: false`) — Kueue TAS node-failure eviction (`Evicted` with `NodeFailures` / `FailedNodeReplacement`).</li><li>`interruptionReason: "PodsReadyTimeout"` (`preempted: false`) — Kueue `waitForPodsReady` timeout / recoveryTimeout / `RequeuingLimitExceeded` eviction.</li><li>`interruptionReason: "Evicted"` (`preempted: false`) — Other non-preemption Kueue eviction.</li><li>`interruptionReason: "Failed"` (`preempted: false`) — Admitted workload terminated with `Finished=True` and non-succeeded reason (`Failed`, `OwnerNotFound`, `OutOfSync`).</li><li>`interruptionReason: "ScrapeEnded"` (`preempted: false`, `workloadState: "Admitted"`) — Flushed on graceful `cluster-scraper` shutdown for workloads still `Admitted` and executing when scraping stopped.</li></ul> |
+| `"FullExecution"` | `"Admitted"` | `"Full"` | Emitted when an admitted `Workload` reaches `Finished=True` cleanly (`Reason: Succeeded`, including when clean completion wins a race against an in-flight preemption whose `Preempted=True` condition remained latched). Records the full execution duration from `admittedTime` to completion `endTime`. |
 
 ```mermaid
 stateDiagram-v2
     [*] --> Pending: Workload Created (workloadState="NotAdmitted")
     Pending --> Admitted: Condition Admitted=True\n(Emits eventType="Admitted", workloadState="Admitted")
-    Admitted --> Preempted: Condition Preempted=True\n(Emits eventType="PartialExecution",\nworkloadState="NotAdmitted", executionType="Partial", preempted=true)
-    Preempted --> Admitted: Re-admitted (Admitted=True)\n(Emits eventType="Admitted", workloadState="Admitted")
-    Admitted --> Finished: Condition Finished=True\n(Emits eventType="FullExecution",\nworkloadState="Admitted", executionType="Full", preempted=false)
+    Admitted --> Interrupted: Preempted / NodeFailures / PodsReadyTimeout / Failed\n(Emits eventType="PartialExecution", executionType="Partial",\ninterruptionReason="Preempted|NodeFailure|PodsReadyTimeout|Evicted|Failed")
+    Interrupted --> Admitted: Re-admitted (Admitted=True)\n(Emits eventType="Admitted", workloadState="Admitted")
+    Admitted --> ScrapeEnded: Scraper Shutdown While Still Admitted\n(Emits eventType="PartialExecution", workloadState="Admitted",\ninterruptionReason="ScrapeEnded")
+    Admitted --> Finished: Condition Finished=True (Succeeded)\n(Emits eventType="FullExecution",\nworkloadState="Admitted", executionType="Full")
     Finished --> [*]
 ```
 
@@ -301,17 +314,37 @@ stateDiagram-v2
 | `ownerAPIVersion` | `string` | Optional | API group/version of the owning workflow object (e.g., `"jobset.x-k8s.io/v1alpha2"`). |
 | `localQueueName` | `string` | Optional | Plain (unhashed) `LocalQueue` name (`workload.spec.queueName`). |
 | `clusterQueueName` | `string` | Optional | Plain (unhashed) `ClusterQueue` name (`workload.status.admission.clusterQueue`). |
+| `priorityClassName` | `string` | Optional | Plain (unhashed) `WorkloadPriorityClass` / `PriorityClass` name (`workload.spec.priorityClassRef.name` or `kueue.x-k8s.io/priority-class`). |
+| `priority` | `integer` (`int32`) | Optional | Effective integer priority (`workload.spec.priority`). |
+| `podSetAssignments` | `array<PodSetAssignment>` | Optional | Kueue `status.admission.podSetAssignments` (flavors, exact `resourceUsage`, and sanitized `topologyAssignment` with sensitive topology label values hashed when `--hash-names` is enabled). |
+| `unhealthyNodes` | `array<string>` | Optional | Node names observed in `workload.status.unhealthyNodes` during Kueue TAS failed-node replacement or eviction. |
 | `creationTime` | `string` (RFC3339 UTC) | **Yes** | `metadata.creationTimestamp` of the Kueue `Workload`. |
 | `admittedTime` | `string` (RFC3339 UTC) | **Yes** | Timestamp when the `Workload` was admitted (`Admitted` condition `lastTransitionTime`). |
-| `endTime` | `string` (RFC3339 UTC) | On `PartialExecution` / `FullExecution` | Preemption timestamp (for `PartialExecution`) or completion timestamp (for `FullExecution`). Omitted on `Admitted` events. |
+| `endTime` | `string` (RFC3339 UTC) | On `PartialExecution` / `FullExecution` | Interruption/cutoff timestamp (for `PartialExecution`) or completion timestamp (for `FullExecution`). Omitted on `Admitted` events. |
 | `executionDurationSeconds` | `number` (`float64`) | On `PartialExecution` / `FullExecution` | Elapsed execution time in seconds (`endTime - admittedTime`). Omitted on `Admitted` events. |
 | `executionDuration` | `string` | On `PartialExecution` / `FullExecution` | Human-readable Go duration string (e.g., `"11s"`, `"1m30s"`). Omitted on `Admitted` events. |
-| `preempted` | `boolean` | **Yes** | `true` for `"PartialExecution"`; `false` for `"Admitted"` and `"FullExecution"`. |
+| `preempted` | `boolean` | **Yes** | `true` strictly when interrupted by preemption (`interruptionReason == "Preempted"`); `false` on `Admitted`, `FullExecution`, and non-preemption `PartialExecution` events (`NodeFailure`, `PodsReadyTimeout`, `Evicted`, `Failed`, `Deleted`, `ScrapeEnded`). |
 | `preemptionCount` | `integer` | Optional | Cumulative number of times this workload has been preempted so far (omitted when `0`). |
-| `reason` | `string` | Optional | Kubernetes condition `reason` (e.g., `"Admitted"`, `"InClusterQueue"`, `"Succeeded"`). |
+| `interruptionReason` | `string` | On `PartialExecution` | Categorized interruption cause: `"Preempted"`, `"NodeFailure"`, `"PodsReadyTimeout"`, `"Evicted"`, `"Failed"`, `"Deleted"`, or `"ScrapeEnded"`. |
+| `interruptionCount` | `integer` | Optional | Cumulative number of interrupted execution slices observed for this workload (omitted when `0`). |
+| `trueDurationSeconds` | `number` (`float64`) | Optional | Explicit true uninterrupted execution duration in seconds (populated from `kueue-optimizer.gke.io/true-execution-time-seconds` or trace post-processing). Used by `testrunner.py` when replaying workloads that only recorded `PartialExecution` (`trueDurationSeconds > observed partial duration`). |
+| `missingDurationMultiplier` | `number` (`float64`) | Optional | Per-workload multiplier (`> 1.0`, populated from `kueue-optimizer.gke.io/missing-duration-multiplier` or trace post-processing) applied to `max(partial_durations_sec)` when `FullExecution` and `trueDurationSeconds` are absent. |
+| `reason` | `string` | Optional | Kubernetes condition `reason` (e.g., `"Admitted"`, `"InClusterQueue"`, `"NodeFailures"`, `"PodsReadyTimeout"`, `"ScrapeEnded"`, `"Succeeded"`). |
 | `message` | `string` | Optional | Human-readable Kubernetes condition `message`. |
 
-### 5.3 On-Disk Single-Line Examples (`Admitted`, `PartialExecution`, and `FullExecution` in `execution-time.json`)
+### 5.3 Replay Duration Resolution for Interrupted (`PartialExecution`-Only) Workloads
+
+When a workload was scraped from admission until preemption, node failure, `PodsReadyTimeout`, or scrape cutoff without completing a `FullExecution`, replaying its raw `PartialExecution` duration verbatim would terminate it prematurely if it is **not** interrupted during replay. `deploy/scripts/testrunner.py` resolves interrupted-only workload durations in strict precedence order so the replay duration is always **strictly longer** than the interrupted recording:
+
+1. **CLI True-Length Override (`--interrupted-duration-override`)**: Scalar duration (`45s`), inline `name=duration` map (`job-a=40s,job-b=60s`), or `@file.json` map (`> observed_partial`).
+2. **Schema / Annotation True Length (`trueDurationSeconds` or `kueue-optimizer.gke.io/true-execution-time-seconds`)**: Explicit true uninterrupted length (`> observed_partial`).
+3. **CLI Multiplier (`--interrupted-duration-multiplier <M>`, `M > 1.0`)**: `max(partial_durations_sec) * M`.
+4. **Schema / Annotation Multiplier (`missingDurationMultiplier` or `kueue-optimizer.gke.io/missing-duration-multiplier`, `> 1.0`)**: `max(partial_durations_sec) * missingDurationMultiplier`.
+5. **Default Interrupted Multiplier (`1.5x` for external interruptions; `1.0x` for `Failed` / `Deleted`)**: `max(partial_durations_sec) * 1.5` for external cluster interruptions (`Preempted`, `NodeFailure`, `PodsReadyTimeout`, `Evicted`, `ScrapeEnded`), or `1.0x` (`max(partial_durations_sec)`) when the workload exited on its own (`Failed`) or was explicitly deleted (`Deleted`) without an explicit multiplier/override.
+
+Workloads that recorded a `FullExecution` always use `FullExecution` (`full_duration_sec`) and are unaffected by interrupted-workload multipliers or overrides.
+
+### 5.4 On-Disk Single-Line Examples (`Admitted`, `PartialExecution`, and `FullExecution` in `execution-time.json`)
 
 ```json
 {"timestamp":"2026-10-30T12:06:01.494857597Z","eventType":"Admitted","workloadState":"Admitted","payload":{"workloadName":"jobset-jobset-01-3165a","namespace":"ai-lab","ownerKind":"JobSet","ownerName":"jobset-01","ownerAPIVersion":"jobset.x-k8s.io/v1alpha2","localQueueName":"ai-lab-lq","clusterQueueName":"ai-lab-cq","creationTime":"2026-10-30T12:06:01Z","admittedTime":"2026-10-30T12:06:01Z","preempted":false,"reason":"Admitted","message":"The workload is admitted"}}

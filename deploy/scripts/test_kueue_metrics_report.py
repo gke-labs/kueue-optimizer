@@ -1135,6 +1135,78 @@ class TestRegressionFixesForDiscrepanciesD1ToD10(unittest.TestCase):
             finally:
                 tmp_planted.unlink(missing_ok=True)
 
+    def test_report_gauge_and_section_5_1_clip_post_end_epoch_zero_scrapes_with_short_run_fallback(self) -> None:
+        """Gauge & Sec 5.1 exclude post-end_epoch 0% flush scrapes, with fallback if [start, end] had 0 scrapes."""
+        gauge_series = [
+            {
+                "metric": {"cluster_queue": "cq-full"},
+                "values": [[1000.0, "8"], [1010.0, "8"], [1020.0, "8"], [1030.0, "8"], [1040.0, "0"]],
+            }
+        ]
+        clipped_g = kmr.report_gauge(gauge_series, start=1000.0, end=1032.0)
+        self.assertEqual(clipped_g[0][4], "8.00")
+
+        # Ultra-short <10s run where only post-end scrape at 1008 exists for [1000, 1004]: falls back instead of empty
+        short_g = kmr.report_gauge(
+            [{"metric": {"cluster_queue": "cq-short"}, "values": [[1008.0, "4"]]}],
+            start=1000.0,
+            end=1004.0,
+        )
+        self.assertEqual(short_g[0][4], "4.00")
+
+        range_by_name = {
+            "kueue_cluster_queue_nominal_quota": [
+                {
+                    "metric": {"cluster_queue": "cq-full", "flavor": "tpu-pool", "resource": "google.com/tpu"},
+                    "values": [[1000.0, "32"], [1010.0, "32"], [1020.0, "32"], [1030.0, "32"], [1040.0, "32"]],
+                }
+            ],
+            "kueue_cluster_queue_resource_usage": [
+                {
+                    "metric": {"cluster_queue": "cq-full", "flavor": "tpu-pool", "resource": "google.com/tpu"},
+                    "values": [[1000.0, "32"], [1010.0, "32"], [1020.0, "32"], [1030.0, "32"], [1040.0, "0"]],
+                }
+            ],
+        }
+        rows = kmr.report_aggregated_quota_utilization(range_by_name, start=1000.0, end=1032.0)
+        by_scope = _rows_by_key(rows, 0)
+        self.assertEqual(by_scope["ClusterQueue: cq-full"][5], "100.00%")
+        self.assertEqual(by_scope["ClusterQueue: cq-full"][6], "32.00 / 32.00")
+
+    def test_section_5_4_preempted_t0_resubmitted_pending_workload_classified_as_excluded(self) -> None:
+        """Pending Workload from a preempted-and-resubmitted t0 PodGroup counts as Excluded rather than Unadmitted."""
+        t0 = 1700000000.0
+        t1 = t0 + 38.0
+        snap = {
+            "nodes": _make_nodes_2x4_tpu(),
+            "workloads": [
+                {
+                    "metadata": {"name": "jobset-t0-batch-0-abcde", "namespace": "st-workloads"},
+                    "spec": {
+                        "podSets": [
+                            {
+                                "count": 2,
+                                "template": {
+                                    "metadata": {
+                                        "annotations": {
+                                            "kueue-optimizer.gke.io/pod-execution-time-seconds": "32",
+                                            "kueue-optimizer.gke.io/preempted-t0-resubmit": "true",
+                                        }
+                                    },
+                                    "spec": {"containers": [{"name": "c", "resources": {"limits": {"google.com/tpu": "4"}}}]},
+                                },
+                            }
+                        ]
+                    },
+                    "status": {"conditions": [{"type": "QuotaReserved", "status": "False", "reason": "Pending"}]},
+                }
+            ],
+            "pods": [],
+        }
+        _rows, subtitle = kmr.report_effective_uninterrupted_saturation(snap, t0, t1)
+        self.assertIn("Excluded (preempted/reclaimed/failed): 1 [2 pods]", subtitle)
+        self.assertIn("Unadmitted: 0", subtitle)
+
 
 if __name__ == "__main__":
     unittest.main()

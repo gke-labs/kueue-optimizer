@@ -31,6 +31,7 @@ from metrics.prometheus import (
 def report_gauge(
     series_list: list[dict],
     start: float,
+    end: float | None = None,
 ) -> list[tuple[str, str, str, str, str]]:
     rows: list[tuple[str, str, str, str, str]] = []
     for series in series_list:
@@ -38,13 +39,20 @@ def report_gauge(
         lbl_str = format_labels(m)
         res_label = str(m.get("resource") or "").strip()
         is_bytes = res_label in ("memory", "ephemeral-storage")
-        raw_vals = []
+        raw_vals: list[float] = []
+        fallback_vals: list[float] = []
         for ts, v_str in series.get("values", []):
             try:
-                if float(ts) >= start:
-                    raw_vals.append(float(v_str))
+                ts_val = float(ts)
+                if ts_val >= start:
+                    v_val = float(v_str)
+                    fallback_vals.append(v_val)
+                    if end is None or ts_val <= end + 1e-9:
+                        raw_vals.append(v_val)
             except ValueError:
                 pass
+        if not raw_vals and fallback_vals:
+            raw_vals = fallback_vals
         if not raw_vals:
             continue
         if all(math.isinf(v) for v in raw_vals):
@@ -259,6 +267,7 @@ def _index_quota_series_by_resource(
     start: float,
     primary_label: str,
     *,
+    end: float | None = None,
     secondary_from_cq_flavor: bool = False,
     record_cq_cohort: dict[str, str] | None = None,
     overwrite_cq_cohort: bool = True,
@@ -285,7 +294,12 @@ def _index_quota_series_by_resource(
             try:
                 ts = float(ts_raw)
                 val = float(v_str)
-                if ts >= start and not math.isnan(val) and not math.isinf(val):
+                if (
+                    ts >= start
+                    and (end is None or ts <= end + 1e-9)
+                    and not math.isnan(val)
+                    and not math.isinf(val)
+                ):
                     _put_max_sample(res_ts_map.setdefault(ts, {}), (entity, sub_key), val)
             except ValueError:
                 pass
@@ -565,6 +579,7 @@ def _build_cohort_quota_rows(
 def report_aggregated_quota_utilization(
     range_by_name: dict[str, list[dict]],
     start: float,
+    end: float | None = None,
 ) -> list[list[str]]:
     """Computes P50, P90, P99, and AVG utilization (%) of ClusterQueue and Cohort quotas per resource type."""
     cq_quota_series = range_by_name.get("kueue_cluster_queue_nominal_quota", [])
@@ -572,13 +587,42 @@ def report_aggregated_quota_utilization(
     if not cq_usage_series:
         cq_usage_series = range_by_name.get("kueue_cluster_queue_resource_reservation", [])
 
-    cq_cohort_by_name: dict[str, str] = {}
-    cq_quota_map, _ = _index_quota_series_by_resource(
-        cq_quota_series, start, "cluster_queue", record_cq_cohort=cq_cohort_by_name, overwrite_cq_cohort=True
-    )
-    cq_usage_map, _ = _index_quota_series_by_resource(
-        cq_usage_series, start, "cluster_queue", record_cq_cohort=cq_cohort_by_name, overwrite_cq_cohort=False
-    )
+    cohort_quota_series = range_by_name.get("kueue_cohort_subtree_quota", [])
+    cohort_usage_series = range_by_name.get("kueue_cohort_subtree_resource_reservations", [])
+
+    def _index_all(upper_end: float | None):
+        cohort_by_name: dict[str, str] = {}
+        cqq, _ = _index_quota_series_by_resource(
+            cq_quota_series,
+            start,
+            "cluster_queue",
+            end=upper_end,
+            record_cq_cohort=cohort_by_name,
+            overwrite_cq_cohort=True,
+        )
+        cqu, _ = _index_quota_series_by_resource(
+            cq_usage_series,
+            start,
+            "cluster_queue",
+            end=upper_end,
+            record_cq_cohort=cohort_by_name,
+            overwrite_cq_cohort=False,
+        )
+        if cohort_quota_series:
+            cohq, cohs_q = _index_quota_series_by_resource(cohort_quota_series, start, "cohort", end=upper_end)
+            cohu, cohs_u = _index_quota_series_by_resource(cohort_usage_series, start, "cohort", end=upper_end)
+        else:
+            cohq, cohs_q = _index_quota_series_by_resource(
+                cq_quota_series, start, "cohort", end=upper_end, secondary_from_cq_flavor=True
+            )
+            cohu, cohs_u = _index_quota_series_by_resource(
+                cq_usage_series, start, "cohort", end=upper_end, secondary_from_cq_flavor=True
+            )
+        return cohort_by_name, cqq, cqu, cohq, cohu, cohs_q, cohs_u
+
+    cq_cohort_by_name, cq_quota_map, cq_usage_map, cohort_quota_map, cohort_usage_map, all_cohorts_q, all_cohorts_u = _index_all(end)
+    if end is not None and not any(cq_quota_map.values()) and not any(cohort_quota_map.values()):
+        cq_cohort_by_name, cq_quota_map, cq_usage_map, cohort_quota_map, cohort_usage_map, all_cohorts_q, all_cohorts_u = _index_all(None)
 
     # Determine cohort hierarchy from kueue_cohort_info so hierarchical parent/child
     # cohorts are not double-counted when aggregating total cohort quota at timestamp t.
@@ -589,19 +633,6 @@ def report_aggregated_quota_utilization(
         p_name = m.get("parent_cohort", "").strip()
         if c_name:
             cohort_parent_map[c_name] = p_name
-
-    cohort_quota_series = range_by_name.get("kueue_cohort_subtree_quota", [])
-    cohort_usage_series = range_by_name.get("kueue_cohort_subtree_resource_reservations", [])
-    if cohort_quota_series:
-        cohort_quota_map, all_cohorts_q = _index_quota_series_by_resource(cohort_quota_series, start, "cohort")
-        cohort_usage_map, all_cohorts_u = _index_quota_series_by_resource(cohort_usage_series, start, "cohort")
-    else:
-        cohort_quota_map, all_cohorts_q = _index_quota_series_by_resource(
-            cq_quota_series, start, "cohort", secondary_from_cq_flavor=True
-        )
-        cohort_usage_map, all_cohorts_u = _index_quota_series_by_resource(
-            cq_usage_series, start, "cohort", secondary_from_cq_flavor=True
-        )
 
     all_cohorts_by_res: dict[str, set[str]] = {}
     for res, names in all_cohorts_q.items():

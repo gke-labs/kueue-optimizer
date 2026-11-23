@@ -101,6 +101,28 @@ def _render_overview_section(
         f"**{len(a.lqs_by_key)}** `LocalQueue`(s) · "
         f"**{len(a.wpc_by_name)}** `WorkloadPriorityClass`(es) |"
     )
+    if a.kueue_configuration is not None:
+        fs_blk = a.kueue_configuration.get("fairSharing")
+        if isinstance(fs_blk, dict) and fs_blk.get("enable") is not False:
+            fs_strats = fs_blk.get("preemptionStrategies") or [
+                "LessThanOrEqualToFinalShare",
+                "LessThanInitialShare",
+            ]
+            fs_summary = f"enabled (`[{', '.join(str(x) for x in fs_strats)}]`)"
+        else:
+            fs_summary = "**disabled globally** (`Classical Preemption`)"
+        afs_blk = a.kueue_configuration.get("admissionFairSharing")
+        if isinstance(afs_blk, dict):
+            afs_summary = (
+                f"enabled (`usageHalfLifeTime={afs_blk.get('usageHalfLifeTime', '0s')}`, "
+                f"`usageSamplingInterval={afs_blk.get('usageSamplingInterval', '5m')}`)"
+            )
+        else:
+            afs_summary = "disabled"
+        md.append(
+            f"| **Kueue Controller `Configuration`** | `fairSharing`: {fs_summary} · "
+            f"`admissionFairSharing`: {afs_summary} |"
+        )
     md.append(
         f"| **Test Arrival Window ($T_{{\\text{{test}}}}$)** | **{format_duration_human(a.test_length_sec)}** "
         f"(`{format_epoch_iso(a.t_first_unadmitted)}` $\\rightarrow$ `{format_epoch_iso(a.t_last_unadmitted)}`) |"
@@ -476,9 +498,27 @@ def _render_kueue_setup_section(a: ScenarioAnalysis) -> list[str]:
         "",
         "## 5. Kueue Setup: ResourceFlavors, Cohorts, ClusterQueues, Namespaces & LocalQueues",
         "",
-        "### 5.1 ResourceFlavors (`ResourceFlavor`) & Topology Binding",
-        "",
     ]
+    if a.kueue_configuration is not None:
+        md.extend(
+            [
+                "### 5.0 Kueue Controller `Configuration` (`infra.json`)",
+                "",
+                "When replaying this scenario, `testrunner.py` applies the following declarative Kueue `Configuration` "
+                "statement into `ConfigMap/kueue-manager-config` when deploying the `kueue-optimizer` chamber:",
+                "",
+                "```yaml",
+                to_clean_yaml(a.kueue_configuration),
+                "```",
+                "",
+            ]
+        )
+    md.extend(
+        [
+            "### 5.1 ResourceFlavors (`ResourceFlavor`) & Topology Binding",
+            "",
+        ]
+    )
 
     if a.flavors_by_name:
         md.append("| ResourceFlavor Name | Bound `topologyName` | Node Selector Labels (`spec.nodeLabels`) | Node Taints / Tolerations |")
