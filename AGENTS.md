@@ -88,6 +88,19 @@ Every isolated evaluation chamber (`--namespace kueue-optimizer-chamber-<id>`) r
 
 ---
 
+## Keep Repository Documentation & Project Structure in Sync (`README.md`, `TESTRUNNER.md`, `scraper/`)
+
+**Mandatory rule:** Whenever you add, move, rename, or remove files, directories, packages, Make targets, CLI flags, chamber components, or test scenario suites, you MUST update the repository documentation — **especially `README.md` and its `Directory Structure` / project layout sections** — in the same change/commit so documentation never drifts from the codebase:
+
+1. **`README.md` (`Directory Structure`, `Architecture`, `Prerequisites`, `Quick Start`):**
+   - Always update the `Directory Structure` tree whenever top-level files, packages under `deploy/scripts/`, `scraper/` source/doc files, `testscenarios/` suites or generators, `skills/`, or `docs/` entries are added, moved, renamed, or deleted.
+   - Keep the chamber `Architecture` table, image versions, `Prerequisites` (including `scraper/.go-version`), and `Quick Start` / test commands aligned with `deploy/base/`, `Makefile`, and `deploy/scripts/`.
+   - Before committing, cross-check the `Directory Structure` tree in `README.md` against tracked files (`git ls-files`) to confirm nothing new is omitted and no removed paths remain listed.
+2. **`TESTRUNNER.md`:** Update CLI flags, replay mechanics, or output section descriptions (`1`–`4`, `5.1`–`5.4`) whenever `deploy/scripts/testrunner.py`, `deploy/scripts/runner/`, `deploy/scripts/kueue_metrics_report.py`, or `deploy/scripts/metrics/` change user-facing behavior.
+3. **`scraper/README.md` & `scraper/SCRAPER-SCHEMA.md`:** Update CLI flags, RBAC permissions, sanitization rules, and JSON Lines payload schemas whenever `scraper/` changes.
+
+---
+
 ## Keep Repository Agent Skills (`skills/*/SKILL.md`) in Sync
 
 **Mandatory rule:** Whenever you make significant changes to chamber orchestration, scenario schemas, scenario generation/README tooling, or metrics evaluation, you MUST review and update both `skills/chamber-evaluation/SKILL.md` and `skills/generate-testscenario/SKILL.md` in the same change/commit so all repository skills stay 100% accurate and current:

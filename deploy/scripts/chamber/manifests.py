@@ -503,6 +503,13 @@ def resolve_wait_for_pods_ready_config(
             if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
                 scaled_bb = min(scaled_bb, max(1, int(max_run_seconds * 0.25)))
             eff_bb_sec = scaled_bb
+    elif eff_speedup > 1.0 or (cap_to_duration and max_run_seconds is not None and max_run_seconds > 0):
+        # Scale Kueue's default 60s backoffBaseSeconds under --speedup / --duration so retry delays stay
+        # proportional to the scaled waitForPodsReady timeout instead of remaining 60s/3600s wall-clock.
+        scaled_bb = max(1, int(round(60.0 / eff_speedup)))
+        if cap_to_duration and max_run_seconds is not None and max_run_seconds > 0:
+            scaled_bb = min(scaled_bb, max(1, int(max_run_seconds * 0.25)))
+        eff_bb_sec = scaled_bb
 
     raw_bm_sec: float | None = None
     eff_bm_sec: int | None = None

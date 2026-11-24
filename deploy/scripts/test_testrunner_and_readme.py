@@ -3978,6 +3978,604 @@ class FidelityReviewRegressionTests(unittest.TestCase):
             finally:
                 mgr.close()
 
+    def test_pod_group_annotations_take_precedence_over_labels(self) -> None:
+        """Verify pod-group-name & pod-group-total-count are read from annotations before labels (Kueue v0.18+)."""
+        from runner.loader import ScheduledWorkflowDeletion, _get_pod_meta_annotation_or_label, load_scenario_bundle
+        from runner.replay import _pod_belongs_to_workflow
+
+        self.assertEqual(
+            _get_pod_meta_annotation_or_label(
+                {
+                    "annotations": {"kueue.x-k8s.io/pod-group-name": "pg-ann"},
+                    "labels": {"kueue.x-k8s.io/pod-group-name": "pg-lbl"},
+                },
+                "kueue.x-k8s.io/pod-group-name",
+            ),
+            "pg-ann",
+        )
+        self.assertEqual(
+            _get_pod_meta_annotation_or_label(
+                {"labels": {"kueue.x-k8s.io/pod-group-total-count": "4"}},
+                "kueue.x-k8s.io/pod-group-total-count",
+            ),
+            "4",
+        )
+
+        # Pod belonging to PodGroup via annotation only must match _pod_belongs_to_workflow.
+        del_ev = ScheduledWorkflowDeletion(
+            target_wall_offset_sec=1.0,
+            seq=1,
+            raw_offset_sec=1.0,
+            raw_offset_from_t0_sec=1.0,
+            event_timestamp="2026-01-01T00:00:01Z",
+            object_kind="PodGroup",
+            manifest_api_version="v1",
+            manifest_kind="Pod",
+            name="pg-ann",
+            applied_name="pg-ann",
+            namespace="ai-lab",
+            delete_reason="cancelled",
+        )
+        pod_ann = {"metadata": {"name": "worker-0", "annotations": {"kueue.x-k8s.io/pod-group-name": "pg-ann"}}}
+        pod_other = {"metadata": {"name": "worker-1", "annotations": {"kueue.x-k8s.io/pod-group-name": "pg-other"}}}
+        self.assertTrue(_pod_belongs_to_workflow(pod_ann, del_ev))
+        self.assertFalse(_pod_belongs_to_workflow(pod_other, del_ev))
+
+        # Scenario loader coalesces annotation-based PodGroup pods and reads pod-group-total-count annotation.
+        with tempfile.TemporaryDirectory() as tmp:
+            sc_dir = Path(tmp)
+            infra_events = [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "n0", "labels": {"type": "kwok"}},
+                        "status": {"capacity": {"cpu": "16", "memory": "64Gi", "pods": "110"}, "allocatable": {"cpu": "16", "memory": "64Gi", "pods": "110"}},
+                    },
+                },
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "payload": {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ai-lab"}}},
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "payload": {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ResourceFlavor", "metadata": {"name": "rf"}, "spec": {"nodeLabels": {"type": "kwok"}}}},
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "cq"},
+                        "spec": {
+                            "namespaceSelector": {},
+                            "resourceGroups": [{"coveredResources": ["cpu", "memory"], "flavors": [{"name": "rf", "resources": [{"name": "cpu", "nominalQuota": "16"}, {"name": "memory", "nominalQuota": "64Gi"}]}]}],
+                        },
+                    },
+                },
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "payload": {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "LocalQueue", "metadata": {"name": "lq", "namespace": "ai-lab"}, "spec": {"clusterQueue": "cq"}}},
+            ]
+            wf_events = [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Pod",
+                        "name": "pg-w-0",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-01-01T00:00:00Z",
+                        "localQueueName": "lq",
+                        "object": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                "name": "pg-w-0",
+                                "namespace": "ai-lab",
+                                "labels": {"kueue.x-k8s.io/queue-name": "lq"},
+                                "annotations": {
+                                    "kueue.x-k8s.io/pod-group-name": "ann-group",
+                                    "kueue.x-k8s.io/pod-group-total-count": "3",
+                                },
+                            },
+                            "spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "pause", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}}]},
+                        },
+                    },
+                },
+            ]
+            exec_events = [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "Admitted",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "workloadName": "ann-group",
+                        "namespace": "ai-lab",
+                        "ownerKind": "PodGroup",
+                        "ownerName": "ann-group",
+                        "localQueueName": "lq",
+                        "clusterQueueName": "cq",
+                        "creationTime": "2026-01-01T00:00:00Z",
+                        "admittedTime": "2026-01-01T00:00:00Z",
+                    },
+                },
+            ]
+            (sc_dir / "infra.json").write_text("\n".join(json.dumps(x) for x in infra_events) + "\n", encoding="utf-8")
+            (sc_dir / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf_events) + "\n", encoding="utf-8")
+            (sc_dir / "execution-time.json").write_text("\n".join(json.dumps(x) for x in exec_events) + "\n", encoding="utf-8")
+
+            bundle = load_scenario_bundle(sc_dir, speedup=1.0)
+            self.assertEqual(len(bundle.initial_workloads), 1)
+            self.assertEqual(len(bundle.initial_workloads[0].pods), 3)
+
+    def test_resolve_podset_assignment_preserves_per_podset_flavors(self) -> None:
+        """Multi-PodSet workloads must keep distinct flavors per PodSet instead of overwriting with the last flavor."""
+        from runner.loader import _ParsedInfra, _resolve_podset_assignment_for_group
+
+        cpu_node = {"metadata": {"name": "cpu-n0", "labels": {"pool": "cpu"}}}
+        gpu_node = {"metadata": {"name": "gpu-n0", "labels": {"pool": "gpu"}}}
+        cpu_flv = {"metadata": {"name": "cpu-flv"}, "spec": {"nodeLabels": {"pool": "cpu"}}}
+        gpu_flv = {"metadata": {"name": "gpu-flv"}, "spec": {"nodeLabels": {"pool": "gpu"}}}
+        cq_doc = {
+            "metadata": {"name": "cq-mixed"},
+            "spec": {
+                "resourceGroups": [
+                    {
+                        "coveredResources": ["cpu", "memory", "nvidia.com/gpu"],
+                        "flavors": [
+                            {"name": "cpu-flv", "resources": [{"name": "cpu", "nominalQuota": "32"}, {"name": "memory", "nominalQuota": "64Gi"}, {"name": "nvidia.com/gpu", "nominalQuota": "0"}]},
+                            {"name": "gpu-flv", "resources": [{"name": "cpu", "nominalQuota": "32"}, {"name": "memory", "nominalQuota": "64Gi"}, {"name": "nvidia.com/gpu", "nominalQuota": "8"}]},
+                        ],
+                    }
+                ]
+            },
+        }
+        parsed = _ParsedInfra(
+            nodes_by_name={"cpu-n0": cpu_node, "gpu-n0": gpu_node},
+            namespaces_by_name={},
+            runtime_classes_by_name={},
+            topologies_by_name={},
+            flavors_by_name={"cpu-flv": cpu_flv, "gpu-flv": gpu_flv},
+            cohorts_by_name={},
+            priority_classes_by_name={},
+            cqs_by_name={"cq-mixed": cq_doc},
+            lqs_by_key={},
+            pod_new_events={},
+            pod_delete_epochs={},
+            scheduled_infra_events=[],
+            kueue_configuration=None,
+        )
+        scraped_psas = [
+            {"name": "driver", "count": 1, "flavors": {"cpu": "cpu-flv", "memory": "cpu-flv"}},
+            {"name": "worker", "count": 2, "flavors": {"cpu": "gpu-flv", "memory": "gpu-flv", "nvidia.com/gpu": "gpu-flv"}},
+        ]
+        driver_psa, _ = _resolve_podset_assignment_for_group(
+            role_hash="drv00001",
+            count=1,
+            reqs={"cpu": "2", "memory": "4Gi"},
+            placements=["cpu-n0"],
+            cq_doc=cq_doc,
+            parsed_infra=parsed,
+            scraped_psas=scraped_psas,
+            ps_hint="driver",
+            group_index=0,
+            total_groups=2,
+        )
+        worker_psa, _ = _resolve_podset_assignment_for_group(
+            role_hash="wrk00002",
+            count=2,
+            reqs={"cpu": "4", "memory": "8Gi", "nvidia.com/gpu": "1"},
+            placements=["gpu-n0"],
+            cq_doc=cq_doc,
+            parsed_infra=parsed,
+            scraped_psas=scraped_psas,
+            ps_hint="worker",
+            group_index=1,
+            total_groups=2,
+        )
+        self.assertEqual(driver_psa["flavors"], {"cpu": "cpu-flv", "memory": "cpu-flv"})
+        self.assertEqual(worker_psa["flavors"], {"cpu": "gpu-flv", "memory": "gpu-flv", "nvidia.com/gpu": "gpu-flv"})
+
+        # When no scraped assignment can be tied to a pod group (names differ, counts tie, group count differs),
+        # keep the flavor that all scraped assignments agree on instead of picking the first flavor that fits the node.
+        shared_node = {"metadata": {"name": "n0", "labels": {"pool": "a"}}}
+        spot_flv = {"metadata": {"name": "spot"}, "spec": {"nodeLabels": {"pool": "a"}}}
+        on_demand_flv = {"metadata": {"name": "on-demand"}, "spec": {"nodeLabels": {"pool": "a"}}}
+        cq_two = {
+            "metadata": {"name": "cq-two"},
+            "spec": {
+                "resourceGroups": [
+                    {
+                        "coveredResources": ["cpu", "memory"],
+                        "flavors": [
+                            {"name": "spot", "resources": [{"name": "cpu", "nominalQuota": "32"}, {"name": "memory", "nominalQuota": "64Gi"}]},
+                            {"name": "on-demand", "resources": [{"name": "cpu", "nominalQuota": "32"}, {"name": "memory", "nominalQuota": "64Gi"}]},
+                        ],
+                    }
+                ]
+            },
+        }
+        parsed_two = _ParsedInfra(
+            nodes_by_name={"n0": shared_node},
+            namespaces_by_name={},
+            runtime_classes_by_name={},
+            topologies_by_name={},
+            flavors_by_name={"spot": spot_flv, "on-demand": on_demand_flv},
+            cohorts_by_name={},
+            priority_classes_by_name={},
+            cqs_by_name={"cq-two": cq_two},
+            lqs_by_key={},
+            pod_new_events={},
+            pod_delete_epochs={},
+        )
+        agreeing_psas = [
+            {"name": "driver", "count": 2, "flavors": {"cpu": "on-demand", "memory": "on-demand"}},
+            {"name": "worker", "count": 2, "flavors": {"cpu": "on-demand", "memory": "on-demand"}},
+        ]
+        disagreeing_psas = [
+            {"name": "driver", "count": 2, "flavors": {"cpu": "on-demand", "memory": "on-demand"}},
+            {"name": "worker", "count": 2, "flavors": {"cpu": "spot", "memory": "on-demand"}},
+        ]
+        for g_idx in range(3):
+            common = dict(
+                role_hash=f"hash{g_idx}",
+                count=2,
+                reqs={"cpu": "2", "memory": "4Gi"},
+                placements=["n0"],
+                cq_doc=cq_two,
+                parsed_infra=parsed_two,
+                ps_hint=f"unmatched-{g_idx}",
+                group_index=g_idx,
+                total_groups=3,
+            )
+            agreed_psa, _ = _resolve_podset_assignment_for_group(scraped_psas=agreeing_psas, **common)
+            self.assertEqual(agreed_psa["flavors"], {"cpu": "on-demand", "memory": "on-demand"})
+            # cpu is disputed -> first flavor that fits the node ('spot'); memory is agreed -> 'on-demand'.
+            disputed_psa, _ = _resolve_podset_assignment_for_group(scraped_psas=disagreeing_psas, **common)
+            self.assertEqual(disputed_psa["flavors"], {"cpu": "spot", "memory": "on-demand"})
+
+    def test_two_pass_initial_jump_rebuilds_t0_lifetimes_on_early_partial_execution(self) -> None:
+        """An early t0 PartialExecution before the first NotAdmitted arrival must not truncate other t0 lifetimes."""
+        from runner.loader import load_scenario_bundle
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sc_dir = Path(tmp)
+            infra_events = [
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "n0", "labels": {"type": "kwok"}},
+                        "status": {"capacity": {"cpu": "32", "memory": "128Gi", "pods": "110"}, "allocatable": {"cpu": "32", "memory": "128Gi", "pods": "110"}},
+                    },
+                },
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "payload": {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ai-lab"}}},
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "payload": {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ResourceFlavor", "metadata": {"name": "rf"}, "spec": {"nodeLabels": {"type": "kwok"}}}},
+                {
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "cq"},
+                        "spec": {
+                            "namespaceSelector": {},
+                            "resourceGroups": [{"coveredResources": ["cpu", "memory"], "flavors": [{"name": "rf", "resources": [{"name": "cpu", "nominalQuota": "32"}, {"name": "memory", "nominalQuota": "128Gi"}]}]}],
+                        },
+                    },
+                },
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "payload": {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "LocalQueue", "metadata": {"name": "lq", "namespace": "ai-lab"}, "spec": {"clusterQueue": "cq"}}},
+                # Steady t0 pod running until +50s
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "payload": {"apiVersion": "v1", "kind": "Pod", "name": "steady-0", "namespace": "ai-lab", "placement": "n0", "schedulingTime": "2026-01-01T00:00:00Z", "firstNoticeTime": "2026-01-01T00:00:00Z", "resourceRequest": {"cpu": "2", "memory": "4Gi"}, "workloadName": "job-steady-1", "ownerKind": "Job", "ownerName": "steady"}},
+                {"timestamp": "2026-01-01T00:00:50Z", "eventType": "Deleted", "payload": {"apiVersion": "v1", "kind": "Pod", "name": "steady-0", "namespace": "ai-lab", "deletionTime": "2026-01-01T00:00:50Z"}},
+                # Non-Kueue infra pod ending at +25s (must NOT be dropped when jump converges to +10s!)
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "payload": {"apiVersion": "v1", "kind": "Pod", "name": "sys-agent-0", "namespace": "kube-system", "placement": "n0", "schedulingTime": "2026-01-01T00:00:00Z", "firstNoticeTime": "2026-01-01T00:00:00Z", "resourceRequest": {"cpu": "1", "memory": "1Gi"}}},
+                {"timestamp": "2026-01-01T00:00:25Z", "eventType": "Deleted", "payload": {"apiVersion": "v1", "kind": "Pod", "name": "sys-agent-0", "namespace": "kube-system", "deletionTime": "2026-01-01T00:00:25Z"}},
+                # Non-Kueue pod that appears after every candidate start (+45s) and must be scheduled exactly once.
+                {"timestamp": "2026-01-01T00:00:45Z", "eventType": "New", "payload": {"apiVersion": "v1", "kind": "Pod", "name": "late-sys-0", "namespace": "kube-system", "placement": "n0", "schedulingTime": "2026-01-01T00:00:45Z", "firstNoticeTime": "2026-01-01T00:00:45Z", "resourceRequest": {"cpu": "1", "memory": "1Gi"}}},
+                {"timestamp": "2026-01-01T00:00:48Z", "eventType": "Deleted", "payload": {"apiVersion": "v1", "kind": "Pod", "name": "late-sys-0", "namespace": "kube-system", "deletionTime": "2026-01-01T00:00:48Z"}},
+            ]
+
+            def _make_job(name: str, ctime: str) -> dict:
+                return {
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "metadata": {"name": name, "namespace": "ai-lab", "creationTimestamp": ctime, "labels": {"kueue.x-k8s.io/queue-name": "lq"}},
+                    "spec": {"parallelism": 1, "completions": 1, "template": {"spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "pause", "resources": {"requests": {"cpu": "2", "memory": "4Gi"}}}]}}},
+                }
+
+            wf_events = [
+                # t0 job interrupted at +10s
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "workloadState": "Admitted", "payload": {"objectKind": "Job", "name": "preempted-t0", "namespace": "ai-lab", "creationTime": "2026-01-01T00:00:00Z", "localQueueName": "lq", "object": _make_job("preempted-t0", "2026-01-01T00:00:00Z")}},
+                {"timestamp": "2026-01-01T00:00:10Z", "eventType": "Update", "workloadState": "NotAdmitted", "payload": {"objectKind": "Job", "name": "preempted-t0", "namespace": "ai-lab", "creationTime": "2026-01-01T00:00:00Z", "localQueueName": "lq", "object": _make_job("preempted-t0", "2026-01-01T00:00:00Z")}},
+                # t0 steady job running until +50s
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "New", "workloadState": "Admitted", "payload": {"objectKind": "Job", "name": "steady", "namespace": "ai-lab", "creationTime": "2026-01-01T00:00:00Z", "localQueueName": "lq", "object": _make_job("steady", "2026-01-01T00:00:00Z")}},
+                # First new NotAdmitted arrival at +40s
+                {"timestamp": "2026-01-01T00:00:40Z", "eventType": "New", "workloadState": "NotAdmitted", "payload": {"objectKind": "Job", "name": "new-arrival", "namespace": "ai-lab", "creationTime": "2026-01-01T00:00:40Z", "localQueueName": "lq", "object": _make_job("new-arrival", "2026-01-01T00:00:40Z")}},
+            ]
+            exec_events = [
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "Admitted", "workloadState": "Admitted", "payload": {"workloadName": "job-preempted-1", "namespace": "ai-lab", "ownerKind": "Job", "ownerName": "preempted-t0", "localQueueName": "lq", "clusterQueueName": "cq", "creationTime": "2026-01-01T00:00:00Z", "admittedTime": "2026-01-01T00:00:00Z"}},
+                {"timestamp": "2026-01-01T00:00:10Z", "eventType": "PartialExecution", "workloadState": "NotAdmitted", "payload": {"executionType": "Partial", "workloadName": "job-preempted-1", "namespace": "ai-lab", "ownerKind": "Job", "ownerName": "preempted-t0", "localQueueName": "lq", "clusterQueueName": "cq", "creationTime": "2026-01-01T00:00:00Z", "admittedTime": "2026-01-01T00:00:00Z", "endTime": "2026-01-01T00:00:10Z", "executionDurationSeconds": 10.0, "preempted": True}},
+                {"timestamp": "2026-01-01T00:00:00Z", "eventType": "Admitted", "workloadState": "Admitted", "payload": {"workloadName": "job-steady-1", "namespace": "ai-lab", "ownerKind": "Job", "ownerName": "steady", "localQueueName": "lq", "clusterQueueName": "cq", "creationTime": "2026-01-01T00:00:00Z", "admittedTime": "2026-01-01T00:00:00Z"}},
+                {"timestamp": "2026-01-01T00:00:50Z", "eventType": "FullExecution", "workloadState": "Admitted", "payload": {"executionType": "Full", "workloadName": "job-steady-1", "namespace": "ai-lab", "ownerKind": "Job", "ownerName": "steady", "localQueueName": "lq", "clusterQueueName": "cq", "creationTime": "2026-01-01T00:00:00Z", "admittedTime": "2026-01-01T00:00:00Z", "endTime": "2026-01-01T00:00:50Z", "executionDurationSeconds": 50.0}},
+                {"timestamp": "2026-01-01T00:00:50Z", "eventType": "FullExecution", "workloadState": "Admitted", "payload": {"executionType": "Full", "workloadName": "job-new-1", "namespace": "ai-lab", "ownerKind": "Job", "ownerName": "new-arrival", "localQueueName": "lq", "clusterQueueName": "cq", "creationTime": "2026-01-01T00:00:40Z", "admittedTime": "2026-01-01T00:00:40Z", "endTime": "2026-01-01T00:00:50Z", "executionDurationSeconds": 10.0}},
+            ]
+            (sc_dir / "infra.json").write_text("\n".join(json.dumps(x) for x in infra_events) + "\n", encoding="utf-8")
+            (sc_dir / "workflows.json").write_text("\n".join(json.dumps(x) for x in wf_events) + "\n", encoding="utf-8")
+            (sc_dir / "execution-time.json").write_text("\n".join(json.dumps(x) for x in exec_events) + "\n", encoding="utf-8")
+
+            bundle = load_scenario_bundle(sc_dir, speedup=1.0, skip_initial_offset=True)
+            self.assertAlmostEqual(bundle.initial_jump_raw_sec, 10.0, places=3)
+            # steady-0 runs until +50s, so from effective_start (+10s) remaining must be 40s (NOT 10s!).
+            self.assertEqual(len(bundle.initial_workloads), 1)
+            self.assertAlmostEqual(bundle.initial_workloads[0].pods[0].remaining_duration_sec, 40.0, places=2)
+            # sys-agent-0 ends at +25s (> +10s), so it must NOT be dropped and has 15s remaining!
+            self.assertEqual(len(bundle.initial_pods), 1)
+            self.assertAlmostEqual(bundle.initial_pods[0].remaining_duration_sec, 15.0, places=2)
+            # The jump shift builds the initial state twice. The post-t0 non-Kueue pod must still be scheduled once.
+            pod_events = [
+                (ie.event_type, ie.name) for ie in bundle.scheduled_infra_events if ie.object_kind == "Pod"
+            ]
+            self.assertEqual(pod_events, [("New", "late-sys-0")])
+
+    def test_wfpr_requeue_timestamp_default_and_backoff_scaling(self) -> None:
+        """CLI requeue-timestamp must default to None (preserving scenario Creation) and default backoffs must scale."""
+        from chamber.manifests import patch_kueue_wait_for_pods_ready_config, resolve_wait_for_pods_ready_config
+
+        args = testrunner.build_arg_parser().parse_args(["testscenarios/demo"])
+        self.assertIsNone(args.wait_for_pods_ready_requeue_timestamp)
+
+        cfg = resolve_wait_for_pods_ready_config(
+            enabled=True,
+            raw_timeout="10m",
+            requeuing_timestamp="Creation",
+            speedup=60.0,
+        )
+        self.assertEqual(cfg.requeuing_timestamp, "Creation")
+        self.assertEqual(cfg.effective_timeout_sec, 10.0)
+        self.assertEqual(cfg.effective_backoff_base_sec, 1)
+        self.assertEqual(cfg.effective_backoff_max_sec, 60)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir = Path(tmp) / "config"
+            cfg_dir.mkdir(parents=True)
+            cfg_file = cfg_dir / "controller_manager_config.yaml"
+            cfg_file.write_text("apiVersion: config.kueue.x-k8s.io/v1beta2\nkind: Configuration\n", encoding="utf-8")
+            patch_kueue_wait_for_pods_ready_config(Path(tmp), cfg)
+            rendered = cfg_file.read_text(encoding="utf-8")
+            self.assertIn("timestamp: Creation", rendered)
+            self.assertIn("backoffBaseSeconds: 1", rendered)
+            self.assertIn("backoffMaxSeconds: 60", rendered)
+
+    def test_scrape_output_dir_terminates_scraper_on_t0_barrier_failure(self) -> None:
+        """If _wait_for_scraper_t0_barrier fails, cluster-scraper subprocess must be terminated cleanly."""
+        import contextlib
+        import signal
+
+        demo_dir = REPO_ROOT / "testscenarios" / "demo"
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "scraped"
+            fake_bin = Path(tmp) / "cluster-scraper"
+            fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            fake_proc = mock.MagicMock()
+            fake_proc.poll.return_value = None
+            fake_proc.wait.return_value = 0
+
+            fake_mgr = mock.MagicMock()
+            fake_mgr.kubeconfig_path = Path(tmp) / "kwok.kubeconfig"
+
+            @contextlib.contextmanager
+            def _fake_managed_chamber(*_a, **_kw):
+                yield fake_mgr
+
+            with (
+                mock.patch.object(testrunner, "ChamberManager", return_value=fake_mgr),
+                mock.patch.object(testrunner, "managed_chamber", side_effect=_fake_managed_chamber),
+                mock.patch.object(testrunner, "apply_scenario_queues_and_wait"),
+                mock.patch("subprocess.Popen", return_value=fake_proc),
+                mock.patch.object(
+                    testrunner,
+                    "_wait_for_scraper_t0_barrier",
+                    side_effect=RuntimeError("t0 barrier timed out"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "t0 barrier timed out"):
+                    testrunner.main(
+                        [
+                            str(demo_dir),
+                            "--scrape-output-dir",
+                            str(out_dir),
+                            "--scraper-bin",
+                            str(fake_bin),
+                            "--no-metrics-report",
+                        ]
+                    )
+
+            fake_proc.send_signal.assert_called_once_with(signal.SIGTERM)
+            fake_proc.wait.assert_called_once()
+
+    def test_fifo_creation_epoch_tier_spacing_stays_responsive_and_ordered(self) -> None:
+        """Later creation-time tiers wait in event_heap: infra events run between tiers and creation order is kept."""
+        import dataclasses
+
+        from chamber_common import ExecutionTimeIndex
+        from runner.loader import ScenarioBundle, ScheduledInfraEvent, ScheduledWorkflowItem
+        from runner.replay import run_scenario_replay
+
+        event_log: list[str] = []
+
+        def _mk_wf(idx: int) -> ScheduledWorkflowItem:
+            return ScheduledWorkflowItem(
+                target_wall_offset_sec=0.0,
+                seq=idx,
+                raw_offset_sec=0.0,
+                raw_offset_from_t0_sec=0.0,
+                event_timestamp="2026-01-01T00:00:00Z",
+                object_kind="Job",
+                name=f"tier-job-{idx}",
+                namespace="ai-lab",
+                local_queue_name="lq",
+                workload_state="NotAdmitted",
+                trigger_reason="initial_not_admitted",
+                execution_duration_sec=1.0,
+                compressed_duration_sec=1.0,
+                indexed_from_execution_time=True,
+                pod_count=1,
+                manifest={"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": f"tier-job-{idx}", "namespace": "ai-lab"}},
+                creation_epoch=1700000000.0 + idx * 5.0,
+            )
+
+        bundle = ScenarioBundle(
+            scenario_dir=Path("."),
+            infra_path=Path("infra.json"),
+            workflows_path=Path("workflows.json"),
+            execution_time_path=Path("execution-time.json"),
+            exec_index=ExecutionTimeIndex(),
+            t0_epoch=1767225600.0,
+            t0_iso="2026-01-01T00:00:00Z",
+            effective_start_epoch=1767225600.0,
+            effective_start_iso="2026-01-01T00:00:00Z",
+            initial_jump_raw_sec=0.0,
+            initial_jump_wall_sec=0.0,
+            expired_initial_pods_count=0,
+            t_end_epoch=1767225610.0,
+            t_end_iso="2026-01-01T00:00:10Z",
+            infra_event_count=0,
+            workflow_event_count=3,
+            nodes=[],
+            namespaces=[],
+            prereq_and_queue_docs=[],
+            initial_pods=[],
+            scheduled_workflows=[_mk_wf(0), _mk_wf(1), _mk_wf(2)],
+            skipped_already_admitted_workflows=[],
+            skipped_child_workflows=0,
+            workload_namespaces=["ai-lab"],
+            primary_workload_namespace="ai-lab",
+            infra_pods_namespace="infra-pods",
+            cluster_queue_names=["cq-mid"],
+            queueing_strategy="StrictFIFO",
+            initial_workloads=[],
+            scheduled_infra_events=[
+                ScheduledInfraEvent(
+                    target_wall_offset_sec=0.3,
+                    seq=10,
+                    raw_offset_sec=0.3,
+                    raw_offset_from_t0_sec=0.3,
+                    event_timestamp="2026-01-01T00:00:00.3Z",
+                    event_type="Update",
+                    object_kind="ClusterQueue",
+                    name="cq-mid",
+                    namespace="",
+                    manifest={"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ClusterQueue", "metadata": {"name": "cq-mid"}},
+                )
+            ],
+            scheduled_workflow_deletions=[],
+        )
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-ut-tiers", apiserver_port=16497)
+        try:
+            def fake_apply(docs, max_workers=16):
+                for d in docs:
+                    event_log.append(f"wf:{d['metadata']['name']}")
+
+            def fake_ssa(doc):
+                event_log.append(f"infra:{doc['metadata']['name']}")
+
+            fake_now = [1000.0]
+
+            def fake_mono() -> float:
+                return fake_now[0]
+
+            def fake_wall_time() -> float:
+                return fake_now[0]
+
+            def fake_sleep(sec: float) -> None:
+                fake_now[0] += max(0.0, float(sec))
+
+            def fake_query_status(*_a, **_kw):
+                return ClusterStatusSnapshot(
+                    workloads_admitted=0,
+                    workloads_pending=0,
+                    workloads_finished=0,
+                    pods_running=0,
+                    pods_pending=0,
+                    pods_succeeded=0,
+                    pods_failed=0,
+                    jobsets_completed=0,
+                    jobsets_failed=0,
+                    cq_summary=[],
+                )
+
+            with (
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply),
+                mock.patch.object(mgr, "ssa_apply_doc", side_effect=fake_ssa),
+                mock.patch("runner.replay.query_cluster_status", side_effect=fake_query_status),
+                mock.patch("runner.replay.time.monotonic", side_effect=fake_mono),
+                mock.patch("runner.replay.time.time", side_effect=fake_wall_time),
+                mock.patch("runner.replay.time.sleep", side_effect=fake_sleep),
+            ):
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle,
+                    speedup=1.0,
+                    max_run_seconds=10.0,
+                    status_interval_sec=5.0,
+                    wait_for_completion=False,
+                    initial_state_already_bootstrapped=True,
+                )
+
+            # Tier 0 fires at t=0, infra event fires at t=0.3 BEFORE tier 1 (t>=1.02) and tier 2 (t>=2.04)!
+            self.assertEqual(event_log, ["wf:tier-job-0", "infra:cq-mid", "wf:tier-job-1", "wf:tier-job-2"])
+
+            # Phase 2: a status poll that takes 1.0s and a workflow that becomes due at +0.5s while tiers
+            # are still waiting. Every tier must be created in a later whole second than the previous one
+            # (creationTimestamp has 1s resolution), and the late arrival must not pass the waiting tiers.
+            late_wf = dataclasses.replace(
+                _mk_wf(3), target_wall_offset_sec=0.5, raw_offset_sec=0.5, raw_offset_from_t0_sec=0.5
+            )
+            bundle_slow = dataclasses.replace(
+                bundle,
+                scheduled_workflows=[_mk_wf(0), _mk_wf(1), _mk_wf(2), late_wf],
+                scheduled_infra_events=[],
+            )
+            fake_now[0] = 1000.0
+            creates: list[tuple[str, int]] = []
+            poll_calls = [0]
+
+            def fake_apply_timed(docs, max_workers=16):
+                for d in docs:
+                    creates.append((d["metadata"]["name"], int(fake_now[0])))
+
+            def fake_slow_status(*_a, **_kw):
+                poll_calls[0] += 1
+                if poll_calls[0] == 2:
+                    fake_now[0] += 1.0
+                return fake_query_status()
+
+            with (
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply_timed),
+                mock.patch("runner.replay.query_cluster_status", side_effect=fake_slow_status),
+                mock.patch("runner.replay.time.monotonic", side_effect=fake_mono),
+                mock.patch("runner.replay.time.time", side_effect=fake_wall_time),
+                mock.patch("runner.replay.time.sleep", side_effect=fake_sleep),
+            ):
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle_slow,
+                    speedup=1.0,
+                    max_run_seconds=30.0,
+                    status_interval_sec=1.0,
+                    wait_for_completion=False,
+                    initial_state_already_bootstrapped=True,
+                )
+
+            self.assertGreaterEqual(poll_calls[0], 2)
+            self.assertEqual([c[0] for c in creates], ["tier-job-0", "tier-job-1", "tier-job-2", "tier-job-3"])
+            create_seconds = [c[1] for c in creates]
+            self.assertEqual(create_seconds, sorted(set(create_seconds)), f"tiers share a wall second: {creates}")
+        finally:
+            mgr.close()
+
 
 class DeploymentScrapingAndReplayTests(unittest.TestCase):
     """Unit tests covering Deployment manifest sanitization, st81-st90 bundle loading, updates, and saturation."""

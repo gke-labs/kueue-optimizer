@@ -5196,3 +5196,184 @@ func TestStandalonePodWorkloadDeletionCleansOwnerStatesOnRecreate(t *testing.T) 
 		t.Fatalf("expected both standalone Pod incarnations to start as NotAdmitted, got %v", newStates)
 	}
 }
+
+func TestSanitizeKueueConfigurationV1Beta1OmittedEnableDefaults(t *testing.T) {
+	// 1. v1beta1 with omitted enable on both fairSharing and waitForPodsReady -> both disabled.
+	omittedEnableYAML := `apiVersion: config.kueue.x-k8s.io/v1beta1
+kind: Configuration
+fairSharing:
+  preemptionStrategies:
+  - LessThanOrEqualToFinalShare
+waitForPodsReady:
+  timeout: 5m
+`
+	san, ok := SanitizeKueueConfigurationYAML(omittedEnableYAML)
+	if !ok {
+		t.Fatalf("expected v1beta1 Configuration to parse")
+	}
+	if _, hasFS := san["fairSharing"]; hasFS {
+		t.Errorf("expected v1beta1 fairSharing without enable=true to be omitted, got %+v", san)
+	}
+	if _, hasWFPR := san["waitForPodsReady"]; hasWFPR {
+		t.Errorf("expected v1beta1 waitForPodsReady without enable=true to be omitted, got %+v", san)
+	}
+	fg, _ := san["featureGates"].(map[string]any)
+	if fg["DisableWaitForPodsReady"] != true {
+		t.Errorf("expected v1beta1 waitForPodsReady without enable=true to set DisableWaitForPodsReady=true, got %+v", san)
+	}
+
+	// 2. v1beta1 with no waitForPodsReady block at all -> DisableWaitForPodsReady=true.
+	minimalV1Beta1 := `apiVersion: config.kueue.x-k8s.io/v1beta1
+kind: Configuration
+`
+	sanMin, ok := SanitizeKueueConfigurationYAML(minimalV1Beta1)
+	if !ok {
+		t.Fatalf("expected minimal v1beta1 Configuration to parse")
+	}
+	fgMin, _ := sanMin["featureGates"].(map[string]any)
+	if fgMin["DisableWaitForPodsReady"] != true {
+		t.Errorf("expected minimal v1beta1 Configuration to set DisableWaitForPodsReady=true, got %+v", sanMin)
+	}
+
+	// 3. v1beta1 with explicit enable: true -> both retained cleanly and DisableWaitForPodsReady not set.
+	enabledV1Beta1 := `apiVersion: config.kueue.x-k8s.io/v1beta1
+kind: Configuration
+fairSharing:
+  enable: true
+waitForPodsReady:
+  enable: true
+  timeout: 5m
+`
+	sanEn, ok := SanitizeKueueConfigurationYAML(enabledV1Beta1)
+	if !ok {
+		t.Fatalf("expected enabled v1beta1 Configuration to parse")
+	}
+	if _, hasFS := sanEn["fairSharing"]; !hasFS {
+		t.Errorf("expected fairSharing.enable=true to retain fairSharing, got %+v", sanEn)
+	}
+	wfprEn, _ := sanEn["waitForPodsReady"].(map[string]any)
+	if wfprEn["timeout"] != "5m" {
+		t.Errorf("expected waitForPodsReady.enable=true to retain timeout=5m, got %+v", sanEn)
+	}
+	if _, hasEnableKey := wfprEn["enable"]; hasEnableKey {
+		t.Errorf("expected deprecated enable key stripped from v1beta2 output, got %+v", wfprEn)
+	}
+	if fgEn, _ := sanEn["featureGates"].(map[string]any); fgEn["DisableWaitForPodsReady"] == true {
+		t.Errorf("did not expect DisableWaitForPodsReady=true when enable=true, got %+v", sanEn)
+	}
+}
+
+func TestSyncInitialWorkloadsSkipsPreFinishedWorkloads(t *testing.T) {
+	t0 := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	preFinTime := metav1.NewTime(t0.Add(-10 * time.Minute))
+	admitTime := metav1.NewTime(t0.Add(-1 * time.Minute))
+	ctrlTrue := true
+
+	preFinishedWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "job-old-failed-11111",
+			Namespace:         "ai-lab",
+			UID:               "uid-old-finished",
+			CreationTimestamp: metav1.NewTime(t0.Add(-20 * time.Minute)),
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "batch/v1", Kind: "Job", Name: "old-failed", Controller: &ctrlTrue},
+			},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-a"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-a"},
+			Conditions: []metav1.Condition{
+				{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(t0.Add(-19 * time.Minute))},
+				{Type: kueuev1beta2.WorkloadFinished, Status: metav1.ConditionTrue, Reason: kueuev1beta2.WorkloadFinishedReasonFailed, LastTransitionTime: preFinTime},
+			},
+		},
+	}
+	activeWl := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "job-active-22222",
+			Namespace:         "ai-lab",
+			UID:               "uid-active",
+			CreationTimestamp: admitTime,
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "batch/v1", Kind: "Job", Name: "active-job", Controller: &ctrlTrue},
+			},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-a"},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-a"},
+			Conditions: []metav1.Condition{
+				{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, LastTransitionTime: admitTime},
+			},
+		},
+	}
+
+	kueueClient := kueuefake.NewSimpleClientset(preFinishedWl, activeWl)
+	s := newTestScraper(t, Config{}, nil, kueueClient, nil)
+	s.syncInitialWorkloads(context.Background(), t0)
+
+	// Subsequent Modified and Deleted events for the same pre-finished UID must also be ignored.
+	s.handleWorkloadWatchEventAt(watch.Modified, preFinishedWl, t0.Add(5*time.Second))
+	s.handleWorkloadWatchEventAt(watch.Deleted, preFinishedWl, t0.Add(10*time.Second))
+
+	rawExec, err := os.ReadFile(s.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	events := readJSONLines[ExecutionTimeEvent](t, rawExec)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 execution-time event (only active workload), got %d: %+v", len(events), events)
+	}
+	if events[0].Payload.WorkloadName != "job-active-22222" {
+		t.Fatalf("expected active workload event, got %q", events[0].Payload.WorkloadName)
+	}
+
+	// Recreating the same Workload name with a new UID must resume tracking normally.
+	recreatedWl := activeWl.DeepCopy()
+	recreatedWl.Name = preFinishedWl.Name
+	recreatedWl.UID = "uid-recreated-new"
+	s.handleWorkloadWatchEventAt(watch.Added, recreatedWl, t0.Add(15*time.Second))
+
+	rawExec, err = os.ReadFile(s.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("re-read execution-time.json: %v", err)
+	}
+	events = readJSONLines[ExecutionTimeEvent](t, rawExec)
+	if len(events) != 2 || events[1].Payload.WorkloadName != preFinishedWl.Name {
+		t.Fatalf("expected recreated workload with new UID to be tracked, got %+v", events)
+	}
+}
+
+func TestResolvePodWorkloadLinkagePodGroupNameAnnotation(t *testing.T) {
+	s := newTestScraper(t, Config{}, nil, nil, nil)
+
+	// Annotation-only pod-group-name (Kueue v0.18+ standard).
+	podAnn := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pg-pod-0",
+			Namespace: "ai-lab",
+			Labels: map[string]string{
+				KueueQueueLabel:   "lq-a",
+				KueueManagedLabel: "true",
+			},
+			Annotations: map[string]string{
+				KueuePodGroupNameLabel: "pg-from-annotation",
+			},
+		},
+	}
+	s.mu.Lock()
+	link := s.resolvePodWorkloadLinkageLocked(podAnn)
+	s.mu.Unlock()
+	if link.RawWorkloadName != "pg-from-annotation" || link.OwnerKind != "PodGroup" || link.RawOwnerName != "pg-from-annotation" {
+		t.Fatalf("expected PodGroup/pg-from-annotation from annotation, got %+v", link)
+	}
+
+	// Annotation takes precedence over legacy label when both are present.
+	podBoth := podAnn.DeepCopy()
+	podBoth.Labels[KueuePodGroupNameLabel] = "pg-from-label"
+	s.mu.Lock()
+	linkBoth := s.resolvePodWorkloadLinkageLocked(podBoth)
+	s.mu.Unlock()
+	if linkBoth.RawWorkloadName != "pg-from-annotation" || linkBoth.RawOwnerName != "pg-from-annotation" {
+		t.Fatalf("expected annotation pod-group-name to take precedence over label, got %+v", linkBoth)
+	}
+}
