@@ -502,6 +502,30 @@ class TestSection54EffectiveUninterruptedSaturation(unittest.TestCase):
         self.assertAlmostEqual(per_pod["google.com/tpu"], 4.0)
         self.assertAlmostEqual(per_pod["cpu"], 130.0)
 
+    def test_pod_level_limit_estimate_reconciles_partial_admission(self) -> None:
+        # Each Pod requests 1 CPU, but Kueue reserves the pod-level limit of 4 for the one admitted Pod
+        # (kubernetes-sigs/kueue#15702), so the admitted resourceUsage exceeds the template total of 2.
+        wl = {
+            "spec": {
+                "podSets": [
+                    {
+                        "name": "main",
+                        "count": 2,
+                        "minCount": 1,
+                        "template": {
+                            "spec": {
+                                "resources": {"limits": {"cpu": "4"}},
+                                "containers": [{"name": "main", "resources": {"requests": {"cpu": "1"}}}],
+                            }
+                        },
+                    }
+                ]
+            },
+            "status": {"admission": {"podSetAssignments": [{"name": "main", "count": 1, "resourceUsage": {"cpu": "4"}}]}},
+        }
+        totals, _ = kmr._extract_workload_resource_size_and_cfg_duration(wl)
+        self.assertEqual(totals["cpu"], 4.0)
+
     def test_active_at_end_partial_vs_full_duration_and_interrupted_exclusion(self) -> None:
         # 1h eval window [T0, T0+3600]:
         # - wl-active: 8 TPUs admitted at T0 + 1800s (halfway through), configured for 3600s, still running at T1

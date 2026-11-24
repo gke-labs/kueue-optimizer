@@ -519,6 +519,28 @@ def index_execution_times(
     return idx
 
 
+def _pod_level_requests(p_spec: dict[str, Any], container_reqs: dict[str, float]) -> dict[str, float]:
+    """Return the pod-level requests that replace entries of container_reqs in a Pod created from p_spec.
+
+    A missing request comes from the pod-level limit, except where the API server takes the
+    containers' total: cpu or memory the containers request, even zero, and hugepages without
+    a pod-level limit. That total is already in container_reqs. Other resources are invalid at
+    pod level and are ignored.
+    """
+    pod_res = p_spec.get("resources")
+    if not isinstance(pod_res, dict):
+        return {}
+    pod_reqs = dict(pod_res.get("requests") or {})
+    for rk, rv in (pod_res.get("limits") or {}).items():
+        if not (rk in ("cpu", "memory") and rk in container_reqs):
+            pod_reqs.setdefault(rk, rv)
+    return {
+        rk: parse_k8s_quantity(rv, rk)
+        for rk, rv in pod_reqs.items()
+        if rk in ("cpu", "memory") or rk.startswith("hugepages-")
+    }
+
+
 def extract_pod_spec_resources(
     p_spec: dict[str, Any] | None,
     *,
@@ -526,12 +548,12 @@ def extract_pod_spec_resources(
 ) -> dict[str, float]:
     """Compute effective per-pod resource requests from a Kubernetes PodSpec.
 
-    Follows exact Kubernetes (`resource.PodRequests`) / Kueue resource semantics:
+    Follows `resource.PodRequests` for a Pod created from the spec:
       - Each container resource defaults to limits[rk] when omitted from requests[rk] ({**limits, **requests}).
       - Native sidecar initContainers (`restartPolicy == "Always"`, KEP-753) remain running once started:
         they accumulate across subsequent initContainers AND sum alongside all regular containers.
       - Sequential initContainers take max(peak, running_sidecars + init_req).
-      - Pod-level `spec.resources` (KEP-2837), if present, sets the pod-level request for each specified resource.
+      - Pod-level requests (KEP-2837) replace the total for the resources they set; see _pod_level_requests.
       - Non-zero pod overhead (`spec.overhead`), if present, is added once per pod.
     """
     if not isinstance(p_spec, dict):
@@ -574,13 +596,7 @@ def extract_pod_spec_resources(
     for rk in set(app_containers) | set(init_peak):
         per_pod[rk] = max(app_containers.get(rk, 0.0), init_peak.get(rk, 0.0))
 
-    pod_res_block = p_spec.get("resources")
-    if isinstance(pod_res_block, dict):
-        pod_eff = {**(pod_res_block.get("limits") or {}), **(pod_res_block.get("requests") or {})}
-        for rk, rv in pod_eff.items():
-            if not include_ephemeral_storage and rk == "ephemeral-storage":
-                continue
-            per_pod[rk] = parse_k8s_quantity(rv, rk)
+    per_pod.update(_pod_level_requests(p_spec, per_pod))
 
     overhead = p_spec.get("overhead") or {}
     if isinstance(overhead, dict):
