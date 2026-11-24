@@ -6147,6 +6147,120 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
         finally:
             mgr.close()
 
+    def test_st91_to_st95_hashing_anonymization_scenarios_load_and_validate_cleanly(self) -> None:
+        import re
+
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+        h_name_re = re.compile(r"^h-[0-9a-f]{32}$")
+        th_re = re.compile(r"^th-[0-9a-f]{16}$")
+
+        # 1. st91 (anonymized) vs st92 (plaintext control) exact structural & timing parity.
+        b91 = testrunner.load_scenario_bundle(
+            suite_dir / "st91-hash-names-jobset-batch-anonymized-replay",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        b92 = testrunner.load_scenario_bundle(
+            suite_dir / "st92-hash-names-jobset-batch-plaintext-control",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b91.scheduled_workflows), 8)
+        self.assertEqual(len(b92.scheduled_workflows), 8)
+        self.assertTrue(all(h_name_re.match(w.name) for w in b91.scheduled_workflows))
+        self.assertTrue(all(w.name.startswith("batch-train-") for w in b92.scheduled_workflows))
+        self.assertEqual(
+            [
+                (w.object_kind, w.pod_count, round(w.target_wall_offset_sec, 3), round(w.execution_duration_sec, 3))
+                for w in b91.scheduled_workflows
+            ],
+            [
+                (w.object_kind, w.pod_count, round(w.target_wall_offset_sec, 3), round(w.execution_duration_sec, 3))
+                for w in b92.scheduled_workflows
+            ],
+        )
+
+        # 2. st93: hashed t0 JobSet pods separated from hashed non-Kueue infra-pods.
+        b93 = testrunner.load_scenario_bundle(
+            suite_dir / "st93-hash-names-t0-mixed-workloads-and-infra-pods",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b93.initial_workloads), 2)
+        self.assertEqual(len(b93.initial_pods), 2)
+        self.assertEqual(len(b93.scheduled_workflows), 2)
+        self.assertTrue(all(h_name_re.match(w.owner_name) for w in b93.initial_workloads))
+        self.assertTrue(all(h_name_re.match(p.name) for p in b93.initial_pods))
+        self.assertEqual([p.placement for p in b93.initial_pods], ["st-node-02", "st-node-02"])
+
+        # 3. st94: hashed Deployment salted Upgrade + ScaleDown 4 -> 2 -> 0 + hashed batch Job.
+        b94 = testrunner.load_scenario_bundle(
+            suite_dir / "st94-hash-names-deployment-salted-upgrade-and-scale",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b94.scheduled_workflows), 2)
+        self.assertEqual([w.object_kind for w in b94.scheduled_workflows], ["Deployment", "Job"])
+        self.assertTrue(all(h_name_re.match(w.name) for w in b94.scheduled_workflows))
+        dep_doc = b94.scheduled_workflows[0].manifest
+        sel_app = dep_doc["spec"]["selector"]["matchLabels"]["app"]
+        tpl_app = dep_doc["spec"]["template"]["metadata"]["labels"]["app"]
+        self.assertEqual(sel_app, tpl_app)
+        self.assertRegex(sel_app, h_name_re)
+        v1_hash = dep_doc["spec"]["template"]["metadata"]["annotations"]["kueue-optimizer.gke.io/template-hash"]
+        self.assertRegex(v1_hash, th_re)
+        self.assertEqual(len(b94.scheduled_workflow_updates), 3)
+        self.assertEqual(
+            [u.update_types for u in b94.scheduled_workflow_updates],
+            [("Upgrade",), ("ScaleDown",), ("ScaleDown",)],
+        )
+        self.assertEqual([u.replicas for u in b94.scheduled_workflow_updates], [4, 2, 0])
+        v2_hash = b94.scheduled_workflow_updates[0].template_hash
+        self.assertRegex(v2_hash, th_re)
+        self.assertNotEqual(v1_hash, v2_hash)
+
+        # 4. st95: hashed 7-level TAS + annotation-only t0 PodGroups + LowerPriority preemption.
+        b95 = testrunner.load_scenario_bundle(
+            suite_dir / "st95-hash-names-tas-podgroup-annotation-and-preemption",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b95.initial_workloads), 2)
+        self.assertEqual(len(b95.initial_pods), 0)
+        self.assertEqual(len(b95.scheduled_workflows), 3)
+        self.assertTrue(all(w.is_tas and w.owner_kind == "PodGroup" for w in b95.initial_workloads))
+        self.assertTrue(all(h_name_re.match(w.owner_name) for w in b95.initial_workloads))
+        self.assertTrue(all(h_name_re.match(w.name) for w in b95.scheduled_workflows))
+
+        # 5. Zero raw sensitive strings leaked into any JSONL trace of st91, st93, st94, st95.
+        forbidden_tokens = [
+            "alice-researcher",
+            "ml-core",
+            "secret-llm-v4",
+            "cc-999",
+            "serving-sre",
+            "llm-serving-prod",
+            "batch-train-",
+            "t0-train-",
+            "unmanaged-daemon-",
+            "infer-gateway",
+            "offline-eval-",
+            "t0-tas-pg-",
+            "tas-low-job-",
+            "tas-high-urgent-",
+            "API_KEY",
+        ]
+        for slug in (
+            "st91-hash-names-jobset-batch-anonymized-replay",
+            "st93-hash-names-t0-mixed-workloads-and-infra-pods",
+            "st94-hash-names-deployment-salted-upgrade-and-scale",
+            "st95-hash-names-tas-podgroup-annotation-and-preemption",
+        ):
+            for fname in ("infra.json", "workflows.json", "execution-time.json"):
+                raw = (suite_dir / slug / fname).read_text(encoding="utf-8")
+                for tok in forbidden_tokens:
+                    self.assertNotIn(tok, raw, f"Sensitive token {tok!r} leaked into {slug}/{fname}")
+
 
 if __name__ == "__main__":
     unittest.main()

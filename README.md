@@ -57,15 +57,16 @@ Every **`kueue-optimizer` chamber** runs a complete, isolated virtual cluster co
 │       └── test_testrunner_and_readme.py          # Unit tests for testrunner, generate_scenario_readme & shared helpers
 ├── testscenarios/
 │   ├── demo/                                      # Baseline 3-file scenario bundle (infra.json, workflows.json, execution-time.json, README.md, AGENTS.md)
-│   └── self-tests/                                # 90-scenario deterministic self-test suite (st01–st90) & generators
-│       ├── AGENTS.md                              # Paired cross-examination instructions for st01–st90
-│       ├── README.md                              # Catalog & pairing matrix for all 90 self-test scenarios
+│   └── self-tests/                                # 95-scenario deterministic self-test suite (st01–st95) & generators
+│       ├── AGENTS.md                              # Paired cross-examination instructions for st01–st95
+│       ├── README.md                              # Catalog & pairing matrix for all 95 self-test scenarios
 │       ├── generate_self_test_suite.py            # Main generator & --check drift verifier (make self-tests / make self-tests-check)
 │       ├── scale_scenarios.py                     # Scale & live-scraper scenario definitions (st46–st60)
 │       ├── failure_preemption_scenarios.py        # Node failure, waitForPodsReady & partial-execution definitions (st61–st75)
 │       ├── kueue_config_scenarios.py              # Declarative Kueue Configuration scenario definitions (st76–st80)
 │       ├── deployment_scenarios.py                # Deployment lifecycle scraping/replay scenario definitions (st81–st90)
-│       └── st01-... .. st90-.../                  # Generated 3-file bundles + README.md + AGENTS.md per scenario
+│       ├── hashing_scenarios.py                   # Anonymization & sensitive-data hashing (--hash-names) definitions (st91–st95)
+│       └── st01-... .. st95-.../                  # Generated 3-file bundles + README.md + AGENTS.md per scenario
 ├── scraper/                                       # Live Kubernetes & Kueue cluster trace scraper & sanitizer (Go)
 │   ├── main.go                                    # CLI flags & entrypoint for cluster-scraper
 │   ├── scraper.go                                 # Periodic + watch recorder, t0 barrier & workload/Deployment tracking
@@ -158,7 +159,7 @@ python3 deploy/scripts/generate_scenario_readme.py ./testscenarios/captured-run
 # Run all Python and Go unit tests:
 make test
 
-# Verify the 90-scenario self-test suite (testscenarios/self-tests/) is in sync:
+# Verify the 95-scenario self-test suite (testscenarios/self-tests/) is in sync:
 make self-tests-check
 ```
 
