@@ -526,14 +526,40 @@ def extract_pod_spec_resources(
 ) -> dict[str, float]:
     """Compute effective per-pod resource requests from a Kubernetes PodSpec.
 
-    Follows exact Kubernetes / Kueue resource semantics:
+    Follows exact Kubernetes (`resource.PodRequests`) / Kueue resource semantics:
       - Each container resource defaults to limits[rk] when omitted from requests[rk] ({**limits, **requests}).
-      - Regular containers are summed across the pod; each initContainer takes max(current, init_req).
-      - Pod overhead (spec.overhead), if present, is added once per pod.
+      - Native sidecar initContainers (`restartPolicy == "Always"`, KEP-753) remain running once started:
+        they accumulate across subsequent initContainers AND sum alongside all regular containers.
+      - Sequential initContainers take max(peak, running_sidecars + init_req).
+      - Pod-level `spec.resources` (KEP-2837), if present, sets the pod-level request for each specified resource.
+      - Non-zero pod overhead (`spec.overhead`), if present, is added once per pod.
     """
     if not isinstance(p_spec, dict):
         return {}
-    per_pod: dict[str, float] = {}
+
+    running_sidecars: dict[str, float] = {}
+    init_peak: dict[str, float] = {}
+    for ic in p_spec.get("initContainers") or []:
+        if not isinstance(ic, dict):
+            continue
+        res_block = ic.get("resources") or {}
+        eff_reqs = {**(res_block.get("limits") or {}), **(res_block.get("requests") or {})}
+        ic_parsed: dict[str, float] = {}
+        for rk, rv in eff_reqs.items():
+            if not include_ephemeral_storage and rk == "ephemeral-storage":
+                continue
+            ic_parsed[rk] = parse_k8s_quantity(rv, rk)
+        if str(ic.get("restartPolicy") or "") == "Always":
+            for rk, q in ic_parsed.items():
+                running_sidecars[rk] = running_sidecars.get(rk, 0.0) + q
+            for rk, sq in running_sidecars.items():
+                init_peak[rk] = max(init_peak.get(rk, 0.0), sq)
+        else:
+            for rk in set(running_sidecars) | set(ic_parsed):
+                concurrent = running_sidecars.get(rk, 0.0) + ic_parsed.get(rk, 0.0)
+                init_peak[rk] = max(init_peak.get(rk, 0.0), concurrent)
+
+    app_containers: dict[str, float] = dict(running_sidecars)
     for c in p_spec.get("containers") or []:
         if not isinstance(c, dict):
             continue
@@ -542,24 +568,28 @@ def extract_pod_spec_resources(
         for rk, rv in eff_reqs.items():
             if not include_ephemeral_storage and rk == "ephemeral-storage":
                 continue
-            per_pod[rk] = per_pod.get(rk, 0.0) + parse_k8s_quantity(rv, rk)
+            app_containers[rk] = app_containers.get(rk, 0.0) + parse_k8s_quantity(rv, rk)
 
-    for ic in p_spec.get("initContainers") or []:
-        if not isinstance(ic, dict):
-            continue
-        res_block = ic.get("resources") or {}
-        eff_reqs = {**(res_block.get("limits") or {}), **(res_block.get("requests") or {})}
-        for rk, rv in eff_reqs.items():
+    per_pod: dict[str, float] = {}
+    for rk in set(app_containers) | set(init_peak):
+        per_pod[rk] = max(app_containers.get(rk, 0.0), init_peak.get(rk, 0.0))
+
+    pod_res_block = p_spec.get("resources")
+    if isinstance(pod_res_block, dict):
+        pod_eff = {**(pod_res_block.get("limits") or {}), **(pod_res_block.get("requests") or {})}
+        for rk, rv in pod_eff.items():
             if not include_ephemeral_storage and rk == "ephemeral-storage":
                 continue
-            per_pod[rk] = max(per_pod.get(rk, 0.0), parse_k8s_quantity(rv, rk))
+            per_pod[rk] = parse_k8s_quantity(rv, rk)
 
     overhead = p_spec.get("overhead") or {}
     if isinstance(overhead, dict):
         for rk, rv in overhead.items():
             if not include_ephemeral_storage and rk == "ephemeral-storage":
                 continue
-            per_pod[rk] = per_pod.get(rk, 0.0) + parse_k8s_quantity(rv, rk)
+            q_ov = parse_k8s_quantity(rv, rk)
+            if q_ov > 0.0:
+                per_pod[rk] = per_pod.get(rk, 0.0) + q_ov
 
     return per_pod
 

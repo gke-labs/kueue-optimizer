@@ -1284,8 +1284,17 @@ func ComputePodTemplateRevisionHash(tpl *corev1.PodTemplateSpec, hasher Sensitiv
 	if err != nil {
 		return ""
 	}
-	if hm, ok := hasher.(*hmacSensitiveDataHasher); ok && len(hm.salt) > 0 {
-		mac := hmac.New(sha256.New, hm.salt)
+	var salt []byte
+	switch hm := hasher.(type) {
+	case hmacSensitiveDataHasher:
+		salt = hm.effectiveSalt()
+	case *hmacSensitiveDataHasher:
+		if hm != nil {
+			salt = hm.effectiveSalt()
+		}
+	}
+	if len(salt) > 0 {
+		mac := hmac.New(sha256.New, salt)
 		_, _ = mac.Write([]byte("deployment-template:"))
 		_, _ = mac.Write(rawBytes)
 		sum := mac.Sum(nil)

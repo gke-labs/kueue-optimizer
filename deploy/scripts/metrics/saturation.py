@@ -397,7 +397,10 @@ def _accumulate_kueue_workloads(
         is_finished_true = bool(c_finished and str(c_finished.get("status")) == "True")
         fin_reason = str((c_finished or {}).get("reason") or "").lower()
         fin_msg = str((c_finished or {}).get("message") or "").lower()
-        is_failed_finish = any(tok in fin_reason or tok in fin_msg for tok in ("fail", "error", "timeout"))
+        is_failed_finish = any(
+            tok in fin_reason or tok in fin_msg
+            for tok in ("fail", "error", "timeout", "ownernotfound", "outofsync")
+        )
         has_failed_pods = any(ph == "Failed" for ph in pod_phases) and not all(
             ph == "Succeeded" for ph in pod_phases if ph
         )
@@ -429,8 +432,18 @@ def _accumulate_kueue_workloads(
 
         # Case 1: Fully completed (succeeded) during the evaluation window
         all_pods_succeeded = bool(pod_phases) and all(ph == "Succeeded" for ph in pod_phases)
-        if (is_finished_true and not is_failed_finish and not has_failed_pods and t_finish <= eval_end_with_tol) or (
-            all_pods_succeeded and not is_evicted_true and not is_failed_finish
+        if (
+            is_finished_true
+            and not is_evicted_true
+            and not is_preempted_true
+            and not is_failed_finish
+            and not has_failed_pods
+            and t_finish <= eval_end_with_tol
+        ) or (
+            all_pods_succeeded
+            and not is_evicted_true
+            and not is_preempted_true
+            and not is_failed_finish
         ):
             if t_finish <= float(start_epoch) or t_admit >= float(end_epoch):
                 continue

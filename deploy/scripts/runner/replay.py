@@ -27,7 +27,7 @@ import urllib.parse
 
 from chamber.constants import validate_dns_label
 from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot, query_cluster_status
-from chamber.parsers import format_duration_hms, multiply_k8s_quantity_exact
+from chamber.parsers import format_duration_hms, multiply_k8s_quantity_exact, parse_rfc3339_epoch
 from chamber.scenario import build_topology_assignment
 from runner.loader import (
     InitialDeploymentBootstrap,
@@ -655,11 +655,6 @@ def _build_single_pod_deployment_workload_status(
     ps_name = str(ps_doc.get("name") or "main")
 
     reqs = dict(idep.per_pod_requests)
-    tpl_containers = ((((ps_doc.get("template") or {}).get("spec")) or {}).get("containers")) or []
-    if tpl_containers and isinstance(tpl_containers[0], dict):
-        c_reqs = ((tpl_containers[0].get("resources") or {}).get("requests")) or {}
-        if c_reqs:
-            reqs = {str(k): str(v) for k, v in c_reqs.items() if str(k) != "ephemeral-storage"}
 
     cq_rgs = ((idep.cq_doc.get("spec") or {}).get("resourceGroups")) or []
     covered_to_flavors: dict[str, list[str]] = {}
@@ -1133,6 +1128,10 @@ def run_scenario_replay(
     known_deploy_names_by_ns: dict[str, set[str]] = {}
     active_deployment_replicas: dict[tuple[str, str], int] = {}
     expected_clean_retirements: dict[tuple[str, str], int] = {}
+    retire_eligible_wls: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    upgrade_active_deps: set[tuple[str, str]] = set()
+    deployment_paused_state: dict[tuple[str, str], bool] = {}
+    deferred_paused_upgrade: set[tuple[str, str]] = set()
     live_serving_wls: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
     serving_wl_keys: set[tuple[str, str]] = set()
     scale_zero_drain_deadline: float | None = None
@@ -1140,6 +1139,7 @@ def run_scenario_replay(
     for idep in bundle.initial_deployments:
         known_deploy_names_by_ns.setdefault(idep.namespace, set()).add(idep.applied_name)
         active_deployment_replicas[(idep.namespace, idep.applied_name)] = idep.desired_replicas
+        deployment_paused_state[(idep.namespace, idep.applied_name)] = bool(idep.paused)
     for sw_d in bundle.scheduled_workflows:
         if sw_d.object_kind == "Deployment":
             ap_n = str((sw_d.manifest.get("metadata") or {}).get("name") or sw_d.name)
@@ -1147,6 +1147,23 @@ def run_scenario_replay(
     for su_d in bundle.scheduled_workflow_updates:
         if su_d.object_kind == "Deployment":
             known_deploy_names_by_ns.setdefault(su_d.namespace, set()).add(su_d.applied_name)
+
+    def _is_currently_admitted_serving_wl(wl_doc: dict[str, Any]) -> bool:
+        st_obj = wl_doc.get("status") or {}
+        conds = st_obj.get("conditions") or []
+        if any(
+            isinstance(c, dict)
+            and c.get("type") in ("Evicted", "Preempted")
+            and c.get("status") == "True"
+            for c in conds
+        ):
+            return False
+        return bool((st_obj.get("admission") or {}).get("clusterQueue")) or any(
+            isinstance(c, dict)
+            and c.get("type") == "Admitted"
+            and c.get("status") == "True"
+            for c in conds
+        )
 
     def _match_deploy_for_serving_wl(ns_val: str, wl_doc: dict[str, Any]) -> str:
         owners = (wl_doc.get("metadata") or {}).get("ownerReferences") or []
@@ -1202,8 +1219,10 @@ def run_scenario_replay(
     def _sync_serving_workloads(mark_deleted_deploy: tuple[str, str] | None = None) -> None:
         if not known_deploy_names_by_ns:
             return
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_dt_sync = datetime.now(timezone.utc)
+        now_iso = now_dt_sync.strftime("%Y-%m-%dT%H:%M:%SZ")
         cur_wls: dict[tuple[str, str], dict[str, Any]] = {}
+        cur_dep_total_counts: dict[tuple[str, str], int] = {}
         owner_gone_ts: dict[tuple[str, str], str] = {}
         query_all_ok = True
         for ns_q in bundle.workload_namespaces:
@@ -1228,7 +1247,8 @@ def run_scenario_replay(
                 serving_wl_keys.add(wk)
                 if wk in mgr._retired_serving_workloads:
                     continue
-                conds = ((wl_it.get("status") or {}).get("conditions")) or []
+                st_obj = wl_it.get("status") or {}
+                conds = st_obj.get("conditions") or []
                 owner_gone_c = next(
                     (
                         c
@@ -1246,29 +1266,81 @@ def run_scenario_replay(
                     and c.get("status") == "True"
                     for c in conds
                 )
-                has_adm_hist = bool(((wl_it.get("status") or {}).get("admission") or {}).get("clusterQueue")) or any(
+                is_preempted_true = any(
                     isinstance(c, dict)
-                    and c.get("type") == "Admitted"
-                    and (c.get("status") == "True" or bool(c.get("lastTransitionTime")))
+                    and c.get("type") == "Preempted"
+                    and c.get("status") == "True"
                     for c in conds
                 )
-                if owner_gone_c is not None and not was_ev_or_pre:
-                    owner_gone_ts[wk] = str(owner_gone_c.get("lastTransitionTime") or now_iso)
-                    if wk not in live_serving_wls and has_adm_hist:
-                        live_serving_wls[wk] = (dep_n, wl_it)
+                accum_past_sec = float(st_obj.get("accumulatedPastExecutionTimeSeconds") or 0.0)
+                has_adm_hist = (
+                    bool((st_obj.get("admission") or {}).get("clusterQueue"))
+                    or accum_past_sec > 0.0
+                    or any(
+                        isinstance(c, dict)
+                        and c.get("type") == "Admitted"
+                        and c.get("status") == "True"
+                        for c in conds
+                    )
+                )
+                if owner_gone_c is not None:
+                    ret_ts_str = str(owner_gone_c.get("lastTransitionTime") or now_iso)
+                    owner_gone_ts[wk] = ret_ts_str
+                    if wk in live_serving_wls:
+                        if was_ev_or_pre:
+                            prev_dep, prev_doc = live_serving_wls[wk]
+                            merged_doc = json.loads(json.dumps(wl_it))
+                            prev_adm = (prev_doc.get("status") or {}).get("admission")
+                            if prev_adm and not ((merged_doc.get("status") or {}).get("admission")):
+                                merged_doc.setdefault("status", {})["admission"] = prev_adm
+                            live_serving_wls[wk] = (dep_n or prev_dep, merged_doc)
+                    elif has_adm_hist or is_preempted_true:
+                        seed_doc = json.loads(json.dumps(wl_it))
+                        if (
+                            not was_ev_or_pre
+                            and accum_past_sec > 0.0
+                            and not any(
+                                isinstance(c, dict)
+                                and c.get("type") == "Admitted"
+                                and c.get("status") == "True"
+                                for c in conds
+                            )
+                        ):
+                            ret_ep = parse_rfc3339_epoch(ret_ts_str) or now_dt_sync.timestamp()
+                            est_adm_iso = datetime.fromtimestamp(
+                                ret_ep - accum_past_sec, tz=timezone.utc
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            s_conds = [
+                                c
+                                for c in (seed_doc.setdefault("status", {}).get("conditions") or [])
+                                if not (isinstance(c, dict) and c.get("type") == "Admitted")
+                            ]
+                            s_conds.append(
+                                {
+                                    "type": "Admitted",
+                                    "status": "True",
+                                    "reason": "Admitted",
+                                    "lastTransitionTime": est_adm_iso,
+                                }
+                            )
+                            seed_doc["status"]["conditions"] = s_conds
+                        live_serving_wls[wk] = (dep_n, seed_doc)
                     continue
 
                 cur_wls[wk] = wl_it
-                if has_adm_hist or was_ev_or_pre:
-                    if wk in live_serving_wls:
+                if dep_n:
+                    dk_cnt = (actual_ns, dep_n)
+                    cur_dep_total_counts[dk_cnt] = cur_dep_total_counts.get(dk_cnt, 0) + 1
+                if wk in live_serving_wls:
+                    if _is_currently_admitted_serving_wl(wl_it) or was_ev_or_pre:
                         prev_dep, prev_doc = live_serving_wls[wk]
                         merged_doc = json.loads(json.dumps(wl_it))
                         prev_adm = (prev_doc.get("status") or {}).get("admission")
                         if prev_adm and not ((merged_doc.get("status") or {}).get("admission")):
                             merged_doc.setdefault("status", {})["admission"] = prev_adm
                         live_serving_wls[wk] = (dep_n or prev_dep, merged_doc)
-                    else:
-                        live_serving_wls[wk] = (dep_n, wl_it)
+                elif has_adm_hist or is_preempted_true:
+                    live_serving_wls[wk] = (dep_n, wl_it)
 
         to_retire: list[tuple[str, str]] = []
         for wk, (dep_n, _doc) in list(live_serving_wls.items()):
@@ -1294,11 +1366,18 @@ def run_scenario_replay(
                 for c in conds
             )
             dep_key = (wk[0], dep_n)
+            elig_set = retire_eligible_wls.get(dep_key)
+            if elig_set is not None:
+                elig_set.discard(wk)
             if was_evicted_or_preempted:
+                conds = [
+                    c for c in conds if not (isinstance(c, dict) and c.get("type") == "Finished")
+                ]
+                st_blk["conditions"] = conds
                 mgr._retired_serving_workloads[wk] = doc_cp
-            elif (
-                mark_deleted_deploy == dep_key
-                or expected_clean_retirements.get(dep_key, 0) > 0
+            elif mark_deleted_deploy == dep_key or (
+                expected_clean_retirements.get(dep_key, 0) > 0
+                and elig_set is not None
             ):
                 if mark_deleted_deploy != dep_key and expected_clean_retirements.get(dep_key, 0) > 0:
                     expected_clean_retirements[dep_key] -= 1
@@ -1318,6 +1397,9 @@ def run_scenario_replay(
                 st_blk["conditions"] = conds
                 mgr._retired_serving_workloads[wk] = doc_cp
             else:
+                conds = [
+                    c for c in conds if not (isinstance(c, dict) and c.get("type") == "Finished")
+                ]
                 for c in conds:
                     if isinstance(c, dict) and c.get("type") == "Admitted":
                         c["status"] = "False"
@@ -1333,7 +1415,34 @@ def run_scenario_replay(
                         "observedGeneration": 1,
                     }
                 )
+                st_blk["conditions"] = conds
                 mgr._retired_serving_workloads[wk] = doc_cp
+
+        if query_all_ok:
+            live_wk_set = set(live_serving_wls.keys())
+            for dep_key in list(expected_clean_retirements.keys()):
+                rem_elig = retire_eligible_wls.get(dep_key, set()) & live_wk_set
+                retire_eligible_wls[dep_key] = rem_elig
+                cur_live_adm = sum(
+                    1
+                    for wk_i, (dn_i, d_i) in live_serving_wls.items()
+                    if (wk_i[0], dn_i) == dep_key and _is_currently_admitted_serving_wl(d_i)
+                )
+                cur_tot = cur_dep_total_counts.get(dep_key, 0)
+                desired_rep = active_deployment_replicas.get(dep_key, 0)
+                scaledown_converged = (
+                    dep_key not in upgrade_active_deps
+                    and cur_tot <= desired_rep
+                    and cur_live_adm <= desired_rep
+                )
+                if (
+                    expected_clean_retirements.get(dep_key, 0) <= 0
+                    or not rem_elig
+                    or scaledown_converged
+                ):
+                    expected_clean_retirements.pop(dep_key, None)
+                    retire_eligible_wls.pop(dep_key, None)
+                    upgrade_active_deps.discard(dep_key)
 
     total_planned = len(bundle.scheduled_workflows)
     submitted_count = 0
@@ -1613,9 +1722,14 @@ def run_scenario_replay(
                 pass
 
         if del_ev.object_kind == "Deployment" or del_ev.manifest_kind == "Deployment":
-            _sync_serving_workloads(mark_deleted_deploy=(del_ev.namespace, del_ev.applied_name))
-            active_deployment_replicas.pop((del_ev.namespace, del_ev.applied_name), None)
-            expected_clean_retirements.pop((del_ev.namespace, del_ev.applied_name), None)
+            dep_del_key = (del_ev.namespace, del_ev.applied_name)
+            _sync_serving_workloads(mark_deleted_deploy=dep_del_key)
+            active_deployment_replicas.pop(dep_del_key, None)
+            deployment_paused_state.pop(dep_del_key, None)
+            deferred_paused_upgrade.discard(dep_del_key)
+            expected_clean_retirements.pop(dep_del_key, None)
+            retire_eligible_wls.pop(dep_del_key, None)
+            upgrade_active_deps.discard(dep_del_key)
 
         submitted_non_cancelled.pop((del_ev.namespace, del_ev.applied_name), None)
         has_future_same_name = any(
@@ -1641,13 +1755,40 @@ def run_scenario_replay(
         dep_key = (upd.namespace, upd.applied_name)
         known_deploy_names_by_ns.setdefault(upd.namespace, set()).add(upd.applied_name)
         prev_rep = active_deployment_replicas.get(dep_key, upd.replicas)
-        if "Upgrade" in upd.update_types:
-            expected_clean_retirements[dep_key] = expected_clean_retirements.get(dep_key, 0) + max(prev_rep, upd.replicas)
-        if upd.replicas < prev_rep:
-            expected_clean_retirements[dep_key] = expected_clean_retirements.get(dep_key, 0) + (prev_rep - upd.replicas)
-        elif upd.replicas > prev_rep:
+
+        pre_admitted_wls = {
+            wk
+            for wk, (dn, wdoc) in live_serving_wls.items()
+            if (wk[0], dn) == dep_key and _is_currently_admitted_serving_wl(wdoc)
+        }
+        live_admitted = len(pre_admitted_wls)
+
+        if "Upgrade" in upd.update_types and upd.paused:
+            deferred_paused_upgrade.add(dep_key)
+
+        effective_upgrade = (not upd.paused) and (
+            "Upgrade" in upd.update_types or dep_key in deferred_paused_upgrade
+        )
+        if effective_upgrade:
+            deferred_paused_upgrade.discard(dep_key)
+
+        scale_down_budget = max(0, live_admitted - upd.replicas) if upd.replicas < prev_rep else 0
+        added_budget = live_admitted if effective_upgrade else scale_down_budget
+        if added_budget > 0:
+            expected_clean_retirements[dep_key] = min(
+                live_admitted,
+                expected_clean_retirements.get(dep_key, 0) + added_budget,
+            )
+            retire_eligible_wls.setdefault(dep_key, set()).update(pre_admitted_wls)
+            if effective_upgrade:
+                upgrade_active_deps.add(dep_key)
+        elif not effective_upgrade and upd.replicas < prev_rep and expected_clean_retirements.get(dep_key, 0) == 0:
+            expected_clean_retirements.pop(dep_key, None)
+
+        if upd.replicas > prev_rep:
             total_pods_submitted += upd.replicas - prev_rep
         active_deployment_replicas[dep_key] = upd.replicas
+        deployment_paused_state[dep_key] = bool(upd.paused)
         if upd.replicas > 0:
             submitted_non_cancelled[dep_key] = (upd.namespace, upd.local_queue_name, upd.applied_name)
         else:
@@ -1825,11 +1966,19 @@ def run_scenario_replay(
                 for item in due_batch:
                     it_applied = str((item.manifest.get("metadata") or {}).get("name") or item.name)
                     if item.object_kind == "Deployment":
-                        it_rep = int((item.manifest.get("spec") or {}).get("replicas", 1))
+                        it_spec = item.manifest.get("spec") or {}
+                        it_rep = int(it_spec.get("replicas", 1))
+                        it_paused = bool(it_spec.get("paused", False))
+                        dep_k = (item.namespace, it_applied)
                         known_deploy_names_by_ns.setdefault(item.namespace, set()).add(it_applied)
-                        active_deployment_replicas[(item.namespace, it_applied)] = it_rep
+                        active_deployment_replicas[dep_k] = it_rep
+                        deployment_paused_state[dep_k] = it_paused
+                        deferred_paused_upgrade.discard(dep_k)
+                        expected_clean_retirements.pop(dep_k, None)
+                        retire_eligible_wls.pop(dep_k, None)
+                        upgrade_active_deps.discard(dep_k)
                         if it_rep > 0:
-                            submitted_non_cancelled[(item.namespace, it_applied)] = (
+                            submitted_non_cancelled[dep_k] = (
                                 item.namespace,
                                 item.local_queue_name,
                                 it_applied,

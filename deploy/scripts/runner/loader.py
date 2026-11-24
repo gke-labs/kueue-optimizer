@@ -1388,7 +1388,19 @@ def _extract_workflow_podset_templates(
             for rk, rv in eff.items():
                 if rk != "ephemeral-storage" and rk not in raw_reqs:
                     raw_reqs[str(rk)] = str(rv)
-        if len((p_spec or {}).get("containers") or []) > 1 or (p_spec or {}).get("initContainers") or (p_spec or {}).get("overhead"):
+        if (
+            len((p_spec or {}).get("containers") or []) > 1
+            or (p_spec or {}).get("initContainers")
+            or (p_spec or {}).get("overhead")
+            or (p_spec or {}).get("resources")
+            or any(
+                isinstance(c, dict)
+                and bool(((c.get("resources") or {}).get("limits") or {}))
+                and set(((c.get("resources") or {}).get("limits") or {}).keys())
+                != set(((c.get("resources") or {}).get("requests") or {}).keys())
+                for c in ((p_spec or {}).get("containers") or [])
+            )
+        ):
             raw_reqs = {}
             for rk, val in parsed.items():
                 if rk == "cpu":

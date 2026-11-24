@@ -5054,3 +5054,145 @@ func TestDeploymentOwnerNotFoundNonTASAndReplicaSetRace(t *testing.T) {
 		t.Fatalf("expected OwnerNotFound to classify as InterruptionReasonDeleted, got %+v", execEvents[1].Payload)
 	}
 }
+
+func TestComputePodTemplateRevisionHashUsesPerRunSalt(t *testing.T) {
+	tpl := &corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{"app": "infer-srv"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "srv",
+					Image: "registry.corp.internal/secret-model:v1",
+					Env:   []corev1.EnvVar{{Name: "API_TOKEN", Value: "secret-123"}},
+				},
+			},
+		},
+	}
+
+	saltA := []byte("0123456789abcdef0123456789abcdef")
+	saltB := []byte("fedcba9876543210fedcba9876543210")
+
+	hashNoop := ComputePodTemplateRevisionHash(tpl, NewNoopHasher())
+	hashSaltA1 := ComputePodTemplateRevisionHash(tpl, NewSensitiveDataHasher(nil, saltA))
+	hashSaltA2 := ComputePodTemplateRevisionHash(tpl, NewSensitiveDataHasher(nil, saltA))
+	hashSaltB := ComputePodTemplateRevisionHash(tpl, NewSensitiveDataHasher(nil, saltB))
+
+	if !strings.HasPrefix(hashNoop, "th-") || !strings.HasPrefix(hashSaltA1, "th-") || !strings.HasPrefix(hashSaltB, "th-") {
+		t.Fatalf("expected th- prefixed revision hashes, got noop=%q saltA=%q saltB=%q", hashNoop, hashSaltA1, hashSaltB)
+	}
+	if hashSaltA1 != hashSaltA2 {
+		t.Fatalf("expected deterministic hash for identical salt, got %q vs %q", hashSaltA1, hashSaltA2)
+	}
+	if hashSaltA1 == hashNoop {
+		t.Fatalf("expected salted templateHash %q to differ from unsalted NoopHasher %q", hashSaltA1, hashNoop)
+	}
+	if hashSaltA1 == hashSaltB {
+		t.Fatalf("expected distinct salts to produce distinct templateHashes, both produced %q", hashSaltA1)
+	}
+
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "infer-srv", Namespace: "ai-lab"},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "infer-srv"}},
+			Template: *tpl.DeepCopy(),
+		},
+	}
+	sanA := SanitizeDeployment(deploy, "pause:3.9", NewSensitiveDataHasher(nil, saltA))
+	sanB := SanitizeDeployment(deploy, "pause:3.9", NewSensitiveDataHasher(nil, saltB))
+	gotAnnA := sanA["spec"].(map[string]any)["template"].(map[string]any)["metadata"].(map[string]any)["annotations"].(map[string]any)[KueueOptimizerTemplateHashAnnot]
+	gotAnnB := sanB["spec"].(map[string]any)["template"].(map[string]any)["metadata"].(map[string]any)["annotations"].(map[string]any)[KueueOptimizerTemplateHashAnnot]
+	if gotAnnA != hashSaltA1 || gotAnnB != hashSaltB || gotAnnA == gotAnnB {
+		t.Fatalf("expected SanitizeDeployment to stamp distinct salted templateHashes, got A=%v B=%v", gotAnnA, gotAnnB)
+	}
+}
+
+func TestStandalonePodWorkloadDeletionCleansOwnerStatesOnRecreate(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+
+	mkStandalonePod := func(ts time.Time, gated bool) *corev1.Pod {
+		var gates []corev1.PodSchedulingGate
+		if gated {
+			gates = []corev1.PodSchedulingGate{{Name: KueueAdmissionGateName}}
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "solo-worker",
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(ts),
+				Labels: map[string]string{
+					KueueQueueLabel:   "lq-main",
+					KueueManagedLabel: "true",
+				},
+			},
+			Spec: corev1.PodSpec{
+				SchedulingGates: gates,
+				Containers:      []corev1.Container{{Name: "c", Image: "pause:3.9"}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodPending},
+		}
+	}
+
+	wlInc0 := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pod-solo-worker-inc0",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "v1", Kind: "Pod", Name: "solo-worker"},
+			},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{
+			QueueName: "lq-main",
+			PodSets:   []kueuev1beta2.PodSet{{Name: "main", Count: 1}},
+		},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Admitted",
+					LastTransitionTime: metav1.NewTime(t0.Add(time.Second)),
+				},
+			},
+		},
+	}
+
+	// Incarnation 0: Pod created gated -> Workload admitted -> Pod deleted -> Workload deleted.
+	scraper.handlePodWatchEventAt(watch.Added, mkStandalonePod(t0, true), t0, false)
+	scraper.handleWorkloadWatchEventAt(watch.Added, wlInc0, t0.Add(time.Second))
+	if _, exists := scraper.ownerStates["Pod/ai-lab/solo-worker"]; !exists {
+		t.Fatalf("expected Pod/ai-lab/solo-worker in ownerStates while Workload is admitted")
+	}
+	scraper.handlePodWatchEventAt(watch.Deleted, mkStandalonePod(t0, false), t0.Add(5*time.Second), false)
+	scraper.handleWorkloadWatchEventAt(watch.Deleted, wlInc0, t0.Add(5*time.Second))
+
+	if st, leaked := scraper.ownerStates["Pod/ai-lab/solo-worker"]; leaked {
+		t.Fatalf("expected ownerStates[Pod/ai-lab/solo-worker] to be deleted on Workload deletion, got leaked state %q", st)
+	}
+	if wl, leaked := scraper.ownerToWorkload["Pod/ai-lab/solo-worker"]; leaked {
+		t.Fatalf("expected ownerToWorkload[Pod/ai-lab/solo-worker] to be deleted, got %q", wl)
+	}
+
+	// Incarnation 1: Same-name standalone Kueue Pod re-created gated -> must emit EventNew with WorkloadStateNotAdmitted!
+	scraper.handlePodWatchEventAt(watch.Added, mkStandalonePod(t0.Add(8*time.Second), true), t0.Add(8*time.Second), false)
+
+	rawWf, err := os.ReadFile(scraper.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	wfEvents := readJSONLines[WorkflowEvent](t, rawWf)
+	var newStates []WorkloadState
+	for _, ev := range wfEvents {
+		if ev.EventType == EventNew && ev.Payload.ObjectKind == "Pod" && ev.Payload.Name == "solo-worker" {
+			newStates = append(newStates, ev.WorkloadState)
+		}
+	}
+	wantNewStates := []WorkloadState{WorkloadStateNotAdmitted, WorkloadStateNotAdmitted}
+	if !slices.Equal(newStates, wantNewStates) {
+		t.Fatalf("expected both standalone Pod incarnations to start as NotAdmitted, got %v", newStates)
+	}
+}

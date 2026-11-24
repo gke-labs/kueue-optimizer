@@ -2755,6 +2755,7 @@ func (s *Scraper) handleDeletedWorkloadKeyLocked(key string, deletionTime *metav
 		if len(parts) == 2 {
 			ns, rawWlName := parts[0], parts[1]
 			oKey := ownerRef.kind + "/" + ns + "/" + ownerRef.name
+			ownerMatchedWl := s.ownerToWorkload[oKey] == rawWlName
 			if ownerRef.podName != "" {
 				pKey := ns + "/" + ownerRef.podName
 				if s.ownerToWorkload["Pod/"+pKey] == rawWlName {
@@ -2769,14 +2770,14 @@ func (s *Scraper) handleDeletedWorkloadKeyLocked(key string, deletionTime *metav
 					delete(wlMap, rawWlName)
 					s.recomputeDeploymentOwnerStateLocked(oKey)
 				}
-				if s.ownerToWorkload[oKey] == rawWlName {
+				if ownerMatchedWl {
 					delete(s.ownerToWorkload, oKey)
 					for remWl := range s.deploymentWlStates[oKey] {
 						s.ownerToWorkload[oKey] = remWl
 						break
 					}
 				}
-			} else if s.ownerToWorkload[oKey] == rawWlName {
+			} else if ownerMatchedWl {
 				delete(s.ownerToWorkload, oKey)
 				delete(s.ownerStates, oKey)
 			}
