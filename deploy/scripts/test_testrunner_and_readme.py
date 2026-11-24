@@ -6359,6 +6359,196 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
         finally:
             mgr.close()
 
+    def test_fast_exiting_standalone_pod_sharing_deployment_prefix_is_never_classified_as_serving(self) -> None:
+        """A standalone Pod whose name starts with '<deploy>-' must stay non-serving even if deleted before Pod list or finished before _sync_serving_workloads."""
+        from dataclasses import replace as dc_replace
+        from datetime import datetime, timezone
+        import time
+
+        from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot
+        from runner.loader import (
+            ScheduledWorkflowDeletion,
+            ScheduledWorkflowItem,
+            load_scenario_bundle,
+        )
+        from runner.replay import run_scenario_replay
+
+        st83_dir = REPO_ROOT / "testscenarios/self-tests/st83-deployment-scale-down-unblocks-batch-and-zero"
+        base_b83 = load_scenario_bundle(st83_dir, speedup=100.0)
+        base_ep = time.time() - 10.0
+        base_iso = datetime.fromtimestamp(base_ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        dep_manifest = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "ephemeral", "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+            "spec": {
+                "replicas": 1,
+                "paused": False,
+                "template": {
+                    "metadata": {"annotations": {"kueue-optimizer.gke.io/deployment-name": "ephemeral"}},
+                    "spec": {"containers": [{"name": "c", "image": "pause:3.9"}]},
+                },
+            },
+        }
+        pod_manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "ephemeral-fast-exit",
+                "namespace": "ai-lab",
+                "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                "annotations": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "1"},
+            },
+            "spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "pause:3.9"}]},
+        }
+        fast_pod_wl = {
+            "metadata": {
+                "name": "pod-ephemeral-fast-exit-abcde",
+                "namespace": "ai-lab",
+                "ownerReferences": [{"kind": "Pod", "name": "ephemeral-fast-exit"}],
+            },
+            "spec": {"podSets": [{"name": "main", "count": 1, "template": {"metadata": {}, "spec": {"containers": []}}}]},
+            "status": {
+                "admission": {"clusterQueue": "cq-main"},
+                "conditions": [
+                    {"type": "Admitted", "status": "True", "lastTransitionTime": base_iso},
+                    {"type": "Finished", "status": "True", "reason": "Succeeded", "lastTransitionTime": base_iso},
+                ],
+            },
+        }
+
+        bundle = dc_replace(
+            base_b83,
+            t0_epoch=base_ep,
+            t0_iso=base_iso,
+            effective_start_epoch=base_ep,
+            effective_start_iso=base_iso,
+            t_end_epoch=base_ep + 10.0,
+            t_end_iso=base_iso,
+            nodes=[],
+            initial_pods=[],
+            initial_workloads=[],
+            initial_deployments=[],
+            scheduled_infra_events=[],
+            workload_namespaces=["ai-lab"],
+            infra_pods_namespace="infra-pods",
+            scheduled_workflows=[
+                ScheduledWorkflowItem(
+                    target_wall_offset_sec=0.0,
+                    seq=1,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name="ephemeral",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    workload_state="NotAdmitted",
+                    trigger_reason="initial_not_admitted",
+                    execution_duration_sec=10.0,
+                    compressed_duration_sec=10.0,
+                    indexed_from_execution_time=False,
+                    pod_count=1,
+                    manifest=dep_manifest,
+                    creation_epoch=base_ep,
+                    incarnation_index=0,
+                ),
+                ScheduledWorkflowItem(
+                    target_wall_offset_sec=0.0,
+                    seq=2,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=base_iso,
+                    object_kind="Pod",
+                    name="ephemeral-fast-exit",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    workload_state="NotAdmitted",
+                    trigger_reason="initial_not_admitted",
+                    execution_duration_sec=1.0,
+                    compressed_duration_sec=0.1,
+                    indexed_from_execution_time=True,
+                    pod_count=1,
+                    manifest=pod_manifest,
+                    creation_epoch=base_ep,
+                    incarnation_index=0,
+                ),
+            ],
+            scheduled_workflow_updates=[],
+            scheduled_workflow_deletions=[
+                # Fires right after creation: _execute_workflow_deletion calls query_cluster_status ->
+                # _non_serving_finished_keys BEFORE _sync_serving_workloads has ever seen fast_pod_wl.
+                ScheduledWorkflowDeletion(
+                    target_wall_offset_sec=0.01,
+                    seq=3,
+                    raw_offset_sec=1.0,
+                    raw_offset_from_t0_sec=1.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    manifest_kind="Deployment",
+                    manifest_api_version="apps/v1",
+                    name="ephemeral",
+                    applied_name="ephemeral",
+                    namespace="ai-lab",
+                    delete_reason="cancelled",
+                    incarnation_index=0,
+                ),
+            ],
+        )
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-test-fastpod", apiserver_port=16495)
+        try:
+            def fake_api(method: str, path: str, body: bytes | None = None, headers: dict | None = None):
+                if method == "GET" and path.endswith("/workloads"):
+                    return 200, json.dumps({"items": [fast_pod_wl]}).encode("utf-8")
+                if method == "GET" and path.endswith("/pods"):
+                    # Simulate fast-exiting Pod already gone before the first Pod list!
+                    return 200, json.dumps({"items": []}).encode("utf-8")
+                return 200, b"{}"
+
+            def fake_q_status(*_a, **_kw):
+                return ClusterStatusSnapshot(
+                    workloads_admitted=0,
+                    workloads_pending=0,
+                    workloads_finished=1,
+                    pods_running=0,
+                    pods_pending=0,
+                    pods_succeeded=1,
+                    pods_failed=0,
+                    jobsets_completed=0,
+                    jobsets_failed=0,
+                    cq_summary=[],
+                    finished_workload_keys={("ai-lab", "pod-ephemeral-fast-exit-abcde")},
+                    present_workload_keys={("ai-lab", "pod-ephemeral-fast-exit-abcde")},
+                    workloads_query_ok=True,
+                )
+
+            t_start = time.monotonic()
+            with (
+                mock.patch.object(mgr, "ensure_kwok_connection"),
+                mock.patch.object(mgr, "apply_manifests_parallel"),
+                mock.patch.object(mgr, "api_request", side_effect=fake_api),
+                mock.patch("runner.replay.query_cluster_status", side_effect=fake_q_status),
+            ):
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle,
+                    speedup=100.0,
+                    max_run_seconds=3.0,
+                    status_interval_sec=0.05,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+            elapsed = time.monotonic() - t_start
+
+            # Must NOT be misclassified as a retired serving Deployment workload, and replay must exit
+            # promptly upon completion rather than stalling until max_run_seconds=3.0s.
+            self.assertNotIn(("ai-lab", "pod-ephemeral-fast-exit-abcde"), mgr._retired_serving_workloads)
+            self.assertLess(elapsed, 2.0, f"Replay stalled instead of counting standalone Pod as finished ({elapsed:.2f}s)")
+        finally:
+            mgr.close()
+
     def test_st91_to_st95_hashing_anonymization_scenarios_load_and_validate_cleanly(self) -> None:
         import re
         import shutil

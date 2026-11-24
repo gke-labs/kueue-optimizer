@@ -1175,6 +1175,7 @@ def run_scenario_replay(
     fifo_gate_wall_sec = 0.0
 
     known_deploy_names_by_ns: dict[str, set[str]] = {}
+    known_standalone_pod_names_by_ns: dict[str, set[str]] = {}
     active_deployment_replicas: dict[tuple[str, str], int] = {}
     expected_clean_retirements: dict[tuple[str, str], int] = {}
     retire_eligible_wls: dict[tuple[str, str], set[tuple[str, str]]] = {}
@@ -1199,9 +1200,36 @@ def run_scenario_replay(
         if sw_d.object_kind == "Deployment":
             ap_n = str((sw_d.manifest.get("metadata") or {}).get("name") or sw_d.name)
             known_deploy_names_by_ns.setdefault(sw_d.namespace, set()).add(ap_n)
+        elif sw_d.object_kind == "Pod":
+            ap_p = str((sw_d.manifest.get("metadata") or {}).get("name") or sw_d.name)
+            known_standalone_pod_names_by_ns.setdefault(sw_d.namespace, set()).update({sw_d.name, ap_p})
+    for ip_s in bundle.initial_pods:
+        ap_ip = str((ip_s.manifest.get("metadata") or {}).get("name") or ip_s.name)
+        known_standalone_pod_names_by_ns.setdefault(ip_s.namespace, set()).update({ip_s.name, ap_ip})
+    for iwl_p in bundle.initial_workloads:
+        if iwl_p.owner_kind == "Pod":
+            known_standalone_pod_names_by_ns.setdefault(iwl_p.namespace, set()).add(iwl_p.owner_name)
+            for p_s in iwl_p.pods:
+                ap_ps = str((p_s.manifest.get("metadata") or {}).get("name") or p_s.name)
+                known_standalone_pod_names_by_ns.setdefault(iwl_p.namespace, set()).update({p_s.name, ap_ps})
     for su_d in bundle.scheduled_workflow_updates:
         if su_d.object_kind == "Deployment":
             known_deploy_names_by_ns.setdefault(su_d.namespace, set()).add(su_d.applied_name)
+
+    def _is_known_standalone_pod(ns_val: str, pod_name: str) -> bool:
+        return bool(pod_name) and pod_name in known_standalone_pod_names_by_ns.get(ns_val, set())
+
+    def _is_known_standalone_pod_wl_name(ns_val: str, wl_name: str) -> bool:
+        if not wl_name.startswith("pod-"):
+            return False
+        for sp in known_standalone_pod_names_by_ns.get(ns_val, set()):
+            if (
+                wl_name == f"pod-{sp}"
+                or wl_name.startswith(f"pod-{sp}-")
+                or (len(sp) > 53 and wl_name.startswith(f"pod-{sp[:53]}-"))
+            ):
+                return True
+        return False
 
     def _is_currently_admitted_serving_wl(wl_doc: dict[str, Any]) -> bool:
         st_obj = wl_doc.get("status") or {}
@@ -1266,6 +1294,8 @@ def run_scenario_replay(
                 ps_ann = (((ps.get("template") or {}).get("metadata")) or {}).get("annotations") or {}
                 has_serving_marker = has_serving_marker or _has_serving_marker(ps_ann)
 
+        owner_pod = _owner_pod_name(wl_doc)
+        is_known_standalone = _is_known_standalone_pod(ns_val, owner_pod)
         result: tuple[bool, str] | None = None
         if owner_pod_ann is not None:
             dep_ann = str(owner_pod_ann.get("kueue-optimizer.gke.io/deployment-name") or "").strip()
@@ -1275,15 +1305,19 @@ def run_scenario_replay(
             )
             if dep_ann:
                 result = (True, dep_ann)
-            elif has_finite_pod_exec and not has_serving_marker:
+            elif (has_finite_pod_exec or is_known_standalone) and not has_serving_marker:
                 result = (False, "")
+        elif is_known_standalone and not has_serving_marker:
+            # Fast-exiting standalone Pod disappeared before the first Pod list: never fall back to
+            # Deployment prefix matching.
+            result = (False, "")
         if result is None:
             dep_n = _match_deploy_for_serving_wl(ns_val, wl_doc)
             if dep_n:
                 result = (True, dep_n)
             else:
                 result = (has_serving_marker, "")
-        if owner_pod_ann is not None and wk_c[1]:
+        if (owner_pod_ann is not None or is_known_standalone) and wk_c[1]:
             serving_class_by_wl[wk_c] = result
         return result
 
@@ -1295,6 +1329,10 @@ def run_scenario_replay(
             if (ns_k, wn_k) in serving_wl_keys:
                 continue
             if (ns_k, wn_k) in non_serving_wl_keys:
+                out.add((ns_k, wn_k))
+                continue
+            if _is_known_standalone_pod_wl_name(ns_k, wn_k):
+                non_serving_wl_keys.add((ns_k, wn_k))
                 out.add((ns_k, wn_k))
                 continue
             if wn_k.startswith("pod-") and any(
