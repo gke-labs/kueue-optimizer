@@ -15,9 +15,9 @@ Every **`kueue-optimizer` chamber** runs a complete, isolated virtual cluster co
 | `Deployment/kwok-registry` & `Service/kwok-registry` (`Service/registry`) | `mirror.gcr.io/library/registry:2` | Ephemeral per-chamber OCI Distribution v2 registry backed by kernel `tmpfs` RAM (`emptyDir: { medium: Memory, sizeLimit: 4Gi }`) on `NodePort 30500 + (port - 16443)` for isolated ad-hoc Kueue builds |
 | `Deployment/kwok-etcd` & `Service/kwok-etcd` | `registry.k8s.io/etcd:3.6.10-0` | Backing datastore for `kwok-kube-apiserver` |
 | `Deployment/kwok-kube-apiserver` & `Service/kwok-kube-apiserver` | `registry.k8s.io/kube-apiserver:v1.36.4` | Virtual cluster API server (`:6443`) |
-| `Deployment/kwok-kube-controller-manager` | `registry.k8s.io/kube-controller-manager:v1.36.4` | Reconciles Jobs, Pods, Namespaces, ServiceAccounts, and garbage collection inside the chamber |
+| `Deployment/kwok-kube-controller-manager` | `registry.k8s.io/kube-controller-manager:v1.36.4` | Reconciles Deployments, ReplicaSets, Jobs, Pods, Namespaces, ServiceAccounts, and garbage collection inside the chamber |
 | `Deployment/kwok-kube-scheduler` | `registry.k8s.io/kube-scheduler:v1.36.4` | Schedules Pods onto simulated KWOK `Node`s inside the chamber |
-| `Deployment/kwok-controller` & `Service/kwok-controller` | `registry.k8s.io/kwok/kwok:v0.8.0` | Bootstraps KWOK CRDs, Node/Pod `Stage` rules (pods run for `kueue-optimizer.gke.io/pod-execution-time-seconds` and exit with code `0`), and simulated `Node`s |
+| `Deployment/kwok-controller` & `Service/kwok-controller` | `registry.k8s.io/kwok/kwok:v0.8.0` | Bootstraps KWOK CRDs, Node/Pod `Stage` rules (finite pods run for `kueue-optimizer.gke.io/pod-execution-time-seconds` and exit with code `0`; serving pods carrying `kueue-optimizer.gke.io/long-running-pod: "true"` stay running until scaled down, upgraded, preempted, or deleted), and simulated `Node`s |
 | `Deployment/jobset-controller-manager` & `Service/kwok-jobset` | `us-central1-docker.pkg.dev/k8s-staging-images/jobset/jobset:main` | Bootstraps JobSet CRDs and webhooks into `kwok-kube-apiserver`, then runs JobSet `/manager` |
 | `Deployment/kueue-controller-manager` & `Service/kwok-kueue` | `us-central1-docker.pkg.dev/k8s-staging-images/kueue/kueue:main` | Bootstraps Kueue CRDs, visibility `APIService`, and webhooks into `kwok-kube-apiserver`, then runs Kueue `/manager` with Preemption-Based Fair Sharing enabled by default (`--no-fair-sharing` to switch to Classical Preemption, or any custom image pushed into the chamber's `kwok-registry`) |
 | `Deployment/prometheus` & `Service/prometheus` (`Service/kwok-prometheus`) | `quay.io/prometheus/prometheus:v3.15.1` | Scrapes Kueue metrics (`https://kwok-kueue:8443/metrics`) every `10s` into an in-memory TSDB and exposes an HTTP query API (`:9090`) |
@@ -31,14 +31,16 @@ Every **`kueue-optimizer` chamber** runs a complete, isolated virtual cluster co
 ├── AGENTS.md                                      # Repository engineering & AI agent instructions
 ├── README.md                                      # Architecture overview, directory map & quick-start guide
 ├── TESTRUNNER.md                                  # Reference guide for testrunner.py & kueue_metrics_report.py (Sections 5.1–5.4)
-├── Makefile                                       # Chamber deployment, scenario replay, demo & test targets
+├── Makefile                                       # Chamber deployment, scenario replay, demo, scraper & test targets
+├── LICENSE                                        # Apache 2.0 license
+├── go.work                                        # Go workspace configuration (scraper/)
 ├── pyproject.toml                                 # Ruff lint & Python 3.12+ configuration
 ├── deploy/                                        # Chamber Kustomize manifests & Python orchestration tooling
 │   ├── kustomization.yaml                         # Default entrypoint (namespace: kueue-optimizer-chamber-01 + sample queues)
 │   ├── base/                                      # Core per-chamber control-plane manifests, configs & bootstrap CRDs
 │   ├── overlays/with-sample-queues/               # Sample Namespace, ResourceFlavor, ClusterQueue & LocalQueue
 │   └── scripts/
-│       ├── chamber/                               # Shared chamber package (constants, parsers, YAML, PKI, manifests, k8s client, registry, lifecycle, CLI)
+│       ├── chamber/                               # Shared chamber package (constants, parsers, YAML, PKI, manifests, k8s client, registry, lifecycle, scenario helpers, CLI)
 │       ├── metrics/                               # Prometheus client, catalog, table formatting, Sections 5.1–5.3 aggregations & Section 5.4 saturation
 │       ├── runner/                                # Scenario validation, loader, terminal outline & timed replay engine
 │       ├── scenario_readme/                       # Scenario analysis, histograms & Markdown README section renderers
@@ -54,8 +56,24 @@ Every **`kueue-optimizer` chamber** runs a complete, isolated virtual cluster co
 │       ├── test_refactor_packages.py              # Unit tests for chamber, metrics, runner & scenario_readme package boundaries
 │       └── test_testrunner_and_readme.py          # Unit tests for testrunner, generate_scenario_readme & shared helpers
 ├── testscenarios/
-│   └── demo/                                      # Baseline 3-file scenario bundle (infra.json, workflows.json, execution-time.json)
+│   ├── demo/                                      # Baseline 3-file scenario bundle (infra.json, workflows.json, execution-time.json, README.md, AGENTS.md)
+│   └── self-tests/                                # 90-scenario deterministic self-test suite (st01–st90) & generators
+│       ├── AGENTS.md                              # Paired cross-examination instructions for st01–st90
+│       ├── README.md                              # Catalog & pairing matrix for all 90 self-test scenarios
+│       ├── generate_self_test_suite.py            # Main generator & --check drift verifier (make self-tests / make self-tests-check)
+│       ├── scale_scenarios.py                     # Scale & live-scraper scenario definitions (st46–st60)
+│       ├── failure_preemption_scenarios.py        # Node failure, waitForPodsReady & partial-execution definitions (st61–st75)
+│       ├── kueue_config_scenarios.py              # Declarative Kueue Configuration scenario definitions (st76–st80)
+│       ├── deployment_scenarios.py                # Deployment lifecycle scraping/replay scenario definitions (st81–st90)
+│       └── st01-... .. st90-.../                  # Generated 3-file bundles + README.md + AGENTS.md per scenario
 ├── scraper/                                       # Live Kubernetes & Kueue cluster trace scraper & sanitizer (Go)
+│   ├── main.go                                    # CLI flags & entrypoint for cluster-scraper
+│   ├── scraper.go                                 # Periodic + watch recorder, t0 barrier & workload/Deployment tracking
+│   ├── sanitize.go                                # Spec/config sanitization & per-run HMAC-SHA256 anonymization
+│   ├── types.go                                   # NDJSON event envelopes & payload types
+│   ├── scraper_test.go                            # Go unit tests for scraping, sanitization & anonymization
+│   ├── README.md                                  # Scraper usage, CLI flags & read-only RBAC guide
+│   └── SCRAPER-SCHEMA.md                          # Field-by-field JSON Lines schema specification
 ├── skills/                                        # Repository agent skills
 │   ├── chamber-evaluation/SKILL.md                # Chamber execution, per-chamber registry & controlled A/B testing protocol
 │   └── generate-testscenario/SKILL.md             # Parametric scenario authoring & validation workflow
@@ -134,10 +152,14 @@ make scraper-build
 python3 deploy/scripts/generate_scenario_readme.py ./testscenarios/captured-run
 ```
 
-### 5. Run Unit Tests
+### 5. Run Unit Tests & Self-Test Checks
 
 ```bash
+# Run all Python and Go unit tests:
 make test
+
+# Verify the 90-scenario self-test suite (testscenarios/self-tests/) is in sync:
+make self-tests-check
 ```
 
 ---
