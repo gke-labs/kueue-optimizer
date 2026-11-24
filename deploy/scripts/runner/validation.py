@@ -626,9 +626,14 @@ def _inject_pod_execution_time_and_sanitize_workflow(
     ann = dict(meta.get("annotations") or {})
     if meta.get("name") != orig_name:
         ann["kueue-optimizer.gke.io/original-name"] = orig_name
-    ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = exec_str
-    ann["kueue-optimizer.gke.io/real-duration-sec"] = f"{raw_duration_sec:.2f}"
-    ann["kueue-optimizer.gke.io/compressed-duration-sec"] = f"{compressed_duration_sec:.3f}"
+    if kind == "Deployment":
+        ann.pop("kueue-optimizer.gke.io/pod-execution-time-seconds", None)
+        ann["kueue-optimizer.gke.io/long-running-pod"] = "true"
+        ann["kueue-optimizer.gke.io/infinite-duration"] = "true"
+    else:
+        ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = exec_str
+        ann["kueue-optimizer.gke.io/real-duration-sec"] = f"{raw_duration_sec:.2f}"
+        ann["kueue-optimizer.gke.io/compressed-duration-sec"] = f"{compressed_duration_sec:.3f}"
 
     def _scale_startup_delay(src_ann: dict[str, Any]) -> str | None:
         raw_delay = parse_positive_duration_annotation(src_ann, "kueue-optimizer.gke.io/pod-startup-delay-seconds")
@@ -765,16 +770,35 @@ def _inject_pod_execution_time_and_sanitize_workflow(
         _patch_pod_template(spec.setdefault("template", {}), override_exec_str=job_exec_str)
 
     elif kind == "Deployment":
-        replicas = max(1, int(spec.get("replicas") or 1))
+        raw_replicas = spec.get("replicas")
+        replicas = max(0, int(raw_replicas)) if raw_replicas is not None else 1
+        spec["replicas"] = replicas
+        spec["paused"] = bool(spec.get("paused", False))
         total_pods += replicas
         tpl = spec.setdefault("template", {})
         t_meta = tpl.setdefault("metadata", {})
         t_ann = dict(t_meta.get("annotations") or {})
-        t_ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = exec_str
+        t_ann.pop("kueue-optimizer.gke.io/pod-execution-time-seconds", None)
+        t_ann["kueue-optimizer.gke.io/long-running-pod"] = "true"
+        t_ann["kueue-optimizer.gke.io/infinite-duration"] = "true"
+        tpl_scaled_delay = _scale_startup_delay(t_ann) or top_scaled_startup
+        if tpl_scaled_delay is not None:
+            t_ann["kueue-optimizer.gke.io/pod-startup-delay-seconds"] = tpl_scaled_delay
+        if top_never_ready:
+            t_ann["kueue-optimizer.gke.io/pod-never-ready"] = "true"
         if extra_pod_annotations:
             t_ann.update({str(k): str(v) for k, v in extra_pod_annotations.items()})
         t_meta["annotations"] = t_ann
-        _patch_pod_spec(tpl.setdefault("spec", {}))
+        t_labels = dict(t_meta.get("labels") or {})
+        for r_lbl in RESERVED_POD_LABELS:
+            t_labels.pop(r_lbl, None)
+        if t_labels:
+            t_meta["labels"] = t_labels
+        elif "labels" in t_meta:
+            t_meta.pop("labels", None)
+        tpl_spec = tpl.setdefault("spec", {})
+        _patch_pod_spec(tpl_spec)
+        tpl_spec["restartPolicy"] = "Always"
 
     elif kind == "LeaderWorkerSet":
         replicas = max(1, int(spec.get("replicas") or 1))
@@ -816,4 +840,4 @@ def _inject_pod_execution_time_and_sanitize_workflow(
         spec.pop("nodeName", None)
         _patch_pod_spec(spec)
 
-    return obj, max(1, total_pods)
+    return obj, (total_pods if kind == "Deployment" else max(1, total_pods))

@@ -857,6 +857,37 @@ class ChamberK8sClientMixin:
             if st_w == 200 and raw_w:
                 snapshot["workloads"] = (json.loads(raw_w.decode("utf-8")) or {}).get("items") or []
 
+            retired_wls: dict[tuple[str, str], dict[str, Any]] = getattr(self, "_retired_serving_workloads", None) or {}
+            if retired_wls:
+                merged_wls: list[dict[str, Any]] = []
+                replaced_keys: set[tuple[str, str]] = set()
+                for w in snapshot["workloads"]:
+                    if not isinstance(w, dict):
+                        continue
+                    wk = (
+                        str(((w.get("metadata") or {}).get("namespace")) or "default"),
+                        str(((w.get("metadata") or {}).get("name")) or ""),
+                    )
+                    if wk in retired_wls:
+                        w_conds = ((w.get("status") or {}).get("conditions")) or []
+                        is_pre_gc_owner_gone = any(
+                            isinstance(c, dict)
+                            and c.get("type") == "Finished"
+                            and c.get("status") == "True"
+                            and c.get("reason") == "OwnerNotFound"
+                            for c in w_conds
+                        )
+                        if is_pre_gc_owner_gone:
+                            merged_wls.append(retired_wls[wk])
+                            replaced_keys.add(wk)
+                            continue
+                        replaced_keys.add(wk)
+                    merged_wls.append(w)
+                for rw_key in sorted(retired_wls.keys()):
+                    if rw_key not in replaced_keys:
+                        merged_wls.append(retired_wls[rw_key])
+                snapshot["workloads"] = merged_wls
+
             st_p, raw_p = self.api_request("GET", "/api/v1/pods")
             if st_p == 200 and raw_p:
                 snapshot["pods"] = (json.loads(raw_p.decode("utf-8")) or {}).get("items") or []

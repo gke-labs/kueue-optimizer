@@ -4672,3 +4672,527 @@ func TestResolveWorkloadOwnerPreservesLWSAndStatefulSetOverGroupAnnotation(t *te
 		t.Fatalf("expected PodGroup/my-pod-group/v1 for plain pod group, got %q/%q/%q", kind, name, apiVer)
 	}
 }
+
+func TestDeploymentLifecycleScrapingAndOwnership(t *testing.T) {
+	t0 := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	createMeta := metav1.NewTime(t0)
+
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+
+	// 1. Index ReplicaSet -> Deployment and 2 running Pods -> ReplicaSet, then emit 2 per-Pod Kueue Workloads.
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "infer-srv-7f8d9c",
+			Namespace: "ai-lab",
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "Deployment", Name: "infer-srv", Controller: ptr.To(true)},
+			},
+		},
+	}
+	scraper.handleReplicaSetWatchEvent(watch.Added, rs)
+
+	mkPod := func(podName, nodeName string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              podName,
+				Namespace:         "ai-lab",
+				CreationTimestamp: createMeta,
+				Labels: map[string]string{
+					KueueQueueLabel:   "serving-lq",
+					KueueManagedLabel: "true",
+				},
+				Annotations: map[string]string{
+					KueueSuspendedByParentAnnot: "deployment",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "infer-srv-7f8d9c", Controller: ptr.To(true)},
+				},
+			},
+			Spec: corev1.PodSpec{
+				NodeName: nodeName,
+				Containers: []corev1.Container{
+					{
+						Name:  "srv",
+						Image: "registry.corp.internal/secret-model:v1",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("2"),
+								corev1.ResourceMemory: resource.MustParse("8Gi"),
+							},
+						},
+					},
+				},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+			},
+		}
+	}
+
+	mkPodWl := func(wlName, podName string, admitted bool, preempted bool, ts time.Time) *kueuev1beta2.Workload {
+		var conds []metav1.Condition
+		if admitted {
+			conds = append(conds, metav1.Condition{
+				Type:               kueuev1beta2.WorkloadAdmitted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Admitted",
+				LastTransitionTime: metav1.NewTime(ts),
+			})
+		}
+		if preempted {
+			conds = append(conds, metav1.Condition{
+				Type:               kueuev1beta2.WorkloadPreempted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "InClusterQueue",
+				LastTransitionTime: metav1.NewTime(ts),
+			})
+		}
+		return &kueuev1beta2.Workload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              wlName,
+				Namespace:         "ai-lab",
+				CreationTimestamp: createMeta,
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "v1", Kind: "Pod", Name: podName, Controller: ptr.To(true)},
+				},
+			},
+			Spec: kueuev1beta2.WorkloadSpec{
+				QueueName: "serving-lq",
+				PodSets: []kueuev1beta2.PodSet{
+					{Name: "main", Count: 1},
+				},
+			},
+			Status: kueuev1beta2.WorkloadStatus{
+				Admission: &kueuev1beta2.Admission{
+					ClusterQueue: "serving-cq",
+				},
+				Conditions: conds,
+			},
+		}
+	}
+
+	scraper.handleWorkloadWatchEventAt(watch.Added, mkPodWl("pod-infer-srv-7f8d9c-aa111-w1", "infer-srv-7f8d9c-aa111", true, false, t0), t0)
+	scraper.handleWorkloadWatchEventAt(watch.Added, mkPodWl("pod-infer-srv-7f8d9c-bb222-w2", "infer-srv-7f8d9c-bb222", true, false, t0), t0)
+	scraper.handlePodWatchEventAt(watch.Added, mkPod("infer-srv-7f8d9c-aa111", "node-0"), t0, false)
+	scraper.handlePodWatchEventAt(watch.Added, mkPod("infer-srv-7f8d9c-bb222", "node-1"), t0, false)
+
+	// 2. Emit t0 Deployment with partial readiness (replicas=4, readyReplicas=2) -> ScaleUp -> Upgrade (image-only!) -> Paused -> Resumed -> ScaleDown(0) -> Deleted.
+	mkDeploy := func(replicas, ready int32, paused bool, image, secretEnv string) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "infer-srv",
+				Namespace:         "ai-lab",
+				UID:               "uid-infer-srv-0",
+				CreationTimestamp: createMeta,
+				Labels:            map[string]string{KueueQueueLabel: "serving-lq"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To(replicas),
+				Paused:   paused,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "infer-srv"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{"app": "infer-srv", KueueManagedLabel: "true"},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name:  "srv",
+								Image: image,
+								Env:   []corev1.EnvVar{{Name: "API_SECRET", Value: secretEnv}},
+							},
+						},
+					},
+				},
+			},
+			Status: appsv1.DeploymentStatus{
+				Replicas:      replicas,
+				ReadyReplicas: ready,
+			},
+		}
+	}
+
+	scraper.handleDeploymentWatchEventAt(watch.Added, mkDeploy(4, 2, false, "registry.corp.internal/model:v1", "SUPER_SECRET_V1"), t0)
+	// Status-only ReadyReplicas change (2 -> 3) must NOT emit a spurious workflows.json Update!
+	scraper.handleDeploymentWatchEventAt(watch.Modified, mkDeploy(4, 3, false, "registry.corp.internal/model:v1", "SUPER_SECRET_V1"), t0.Add(2*time.Second))
+	// ScaleUp 4 -> 6
+	scraper.handleDeploymentWatchEventAt(watch.Modified, mkDeploy(6, 4, false, "registry.corp.internal/model:v1", "SUPER_SECRET_V1"), t0.Add(5*time.Second))
+	// Rolling Upgrade (image/env only — must change templateHash without leaking image or secret!)
+	scraper.handleDeploymentWatchEventAt(watch.Modified, mkDeploy(6, 6, false, "registry.corp.internal/model:v2", "SUPER_SECRET_V2"), t0.Add(10*time.Second))
+	// Paused -> Resumed -> ScaleDown to 0 -> Deleted
+	scraper.handleDeploymentWatchEventAt(watch.Modified, mkDeploy(6, 6, true, "registry.corp.internal/model:v2", "SUPER_SECRET_V2"), t0.Add(15*time.Second))
+	scraper.handleDeploymentWatchEventAt(watch.Modified, mkDeploy(6, 6, false, "registry.corp.internal/model:v2", "SUPER_SECRET_V2"), t0.Add(20*time.Second))
+	scraper.handleDeploymentWatchEventAt(watch.Modified, mkDeploy(0, 0, false, "registry.corp.internal/model:v2", "SUPER_SECRET_V2"), t0.Add(25*time.Second))
+
+	// Preempting 1 of the 2 replica Workloads keeps aggregate ownerStates["Deployment/ai-lab/infer-srv"] == Admitted!
+	scraper.handleWorkloadWatchEventAt(watch.Modified, mkPodWl("pod-infer-srv-7f8d9c-aa111-w1", "infer-srv-7f8d9c-aa111", false, true, t0.Add(26*time.Second)), t0.Add(26*time.Second))
+	if gotOwnerSt := scraper.ownerStates["Deployment/ai-lab/infer-srv"]; gotOwnerSt != WorkloadStateAdmitted {
+		t.Fatalf("expected Deployment ownerState to remain Admitted while 2nd replica is Admitted, got %q", gotOwnerSt)
+	}
+	scraper.handleWorkloadWatchEventAt(watch.Modified, mkPodWl("pod-infer-srv-7f8d9c-bb222-w2", "infer-srv-7f8d9c-bb222", false, true, t0.Add(27*time.Second)), t0.Add(27*time.Second))
+	if gotOwnerSt := scraper.ownerStates["Deployment/ai-lab/infer-srv"]; gotOwnerSt != WorkloadStateNotAdmitted {
+		t.Fatalf("expected Deployment ownerState to flip to NotAdmitted when all replicas are preempted, got %q", gotOwnerSt)
+	}
+
+	scraper.handleDeploymentWatchEventAt(watch.Deleted, mkDeploy(0, 0, false, "registry.corp.internal/model:v2", "SUPER_SECRET_V2"), t0.Add(30*time.Second))
+
+	rawWf, err := os.ReadFile(scraper.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	if strings.Contains(string(rawWf), "SUPER_SECRET") || strings.Contains(string(rawWf), "registry.corp.internal") {
+		t.Fatalf("workflows.json leaked unsanitized container image or env: %s", string(rawWf))
+	}
+	wfEvents := readJSONLines[WorkflowEvent](t, rawWf)
+	if len(wfEvents) != 7 {
+		t.Fatalf("expected 7 Deployment workflow events (New, ScaleUp, Upgrade, Paused, Resumed, ScaleDown, Deleted), got %d", len(wfEvents))
+	}
+	if wfEvents[0].EventType != EventNew || *wfEvents[0].Payload.Replicas != 4 || *wfEvents[0].Payload.ReadyReplicas != 2 {
+		t.Fatalf("unexpected t0 New event payload: %+v", wfEvents[0].Payload)
+	}
+	if !slices.Equal(wfEvents[1].Payload.UpdateTypes, []string{DeploymentUpdateScaleUp}) || *wfEvents[1].Payload.Replicas != 6 {
+		t.Fatalf("expected ScaleUp to 6, got %+v", wfEvents[1].Payload)
+	}
+	if !slices.Equal(wfEvents[2].Payload.UpdateTypes, []string{DeploymentUpdateUpgrade}) ||
+		wfEvents[2].Payload.TemplateHash == "" ||
+		wfEvents[2].Payload.TemplateHash == wfEvents[1].Payload.TemplateHash {
+		t.Fatalf("expected Upgrade with changed TemplateHash, got prev=%q new=%+v", wfEvents[1].Payload.TemplateHash, wfEvents[2].Payload)
+	}
+	if !slices.Equal(wfEvents[3].Payload.UpdateTypes, []string{DeploymentUpdatePaused}) || !*wfEvents[3].Payload.Paused {
+		t.Fatalf("expected Paused=true update, got %+v", wfEvents[3].Payload)
+	}
+	if !slices.Equal(wfEvents[4].Payload.UpdateTypes, []string{DeploymentUpdateResumed}) || *wfEvents[4].Payload.Paused {
+		t.Fatalf("expected Resumed (Paused=false) update, got %+v", wfEvents[4].Payload)
+	}
+	if !slices.Contains(wfEvents[5].Payload.UpdateTypes, DeploymentUpdateScaleDown) || *wfEvents[5].Payload.Replicas != 0 {
+		t.Fatalf("expected ScaleDown to 0, got %+v", wfEvents[5].Payload)
+	}
+	if wfEvents[6].EventType != EventDeleted {
+		t.Fatalf("expected final Deleted event, got %+v", wfEvents[6])
+	}
+
+	// Verify execution-time.json resolved ownerKind="Deployment" and ownerName="infer-srv" for both per-Pod Workloads.
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	execEvents := readJSONLines[ExecutionTimeEvent](t, rawExec)
+	if len(execEvents) != 4 {
+		t.Fatalf("expected 4 execution-time events (2 Admitted + 2 Preempted Partial), got %d", len(execEvents))
+	}
+	for _, ex := range execEvents {
+		if ex.Payload.OwnerKind != "Deployment" || ex.Payload.OwnerName != "infer-srv" || ex.Payload.OwnerAPIVersion != "apps/v1" {
+			t.Fatalf("expected Deployment/infer-srv/apps/v1 on Workload %s, got %+v", ex.Payload.WorkloadName, ex.Payload)
+		}
+	}
+
+	// Verify infra.json kept distinct per-Pod Workload names on the 2 Deployment pods!
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read infra.json: %v", err)
+	}
+	infraEvents := readJSONLines[InfraEvent](t, rawInfra)
+	var podWlNames []string
+	for _, ie := range infraEvents {
+		pm, ok := ie.Payload.(map[string]any)
+		if ok && pm["kind"] == "Pod" {
+			if pm["ownerKind"] != "Deployment" || pm["ownerName"] != "infer-srv" {
+				t.Fatalf("expected Pod linkage owner Deployment/infer-srv, got %+v", pm)
+			}
+			podWlNames = append(podWlNames, pm["workloadName"].(string))
+		}
+	}
+	slices.Sort(podWlNames)
+	wantWlNames := []string{"pod-infer-srv-7f8d9c-aa111-w1", "pod-infer-srv-7f8d9c-bb222-w2"}
+	if !slices.Equal(podWlNames, wantWlNames) {
+		t.Fatalf("expected distinct per-pod workloadNames %v, got %v", wantWlNames, podWlNames)
+	}
+}
+
+func TestDeploymentOwnerNotFoundNonTASAndReplicaSetRace(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+
+	t0 := time.Date(2026, 6, 1, 13, 0, 0, 0, time.UTC)
+	createMeta := metav1.NewTime(t0)
+
+	// 1. Deployment arrives BEFORE ReplicaSet informer has seen new ReplicaSet "srv-pool-5bbdc7598f".
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "srv-pool",
+			Namespace:         "ai-lab",
+			UID:               "uid-srv-pool",
+			CreationTimestamp: createMeta,
+			Labels:            map[string]string{KueueQueueLabel: "serving-lq"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To(int32(1)),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "srv-pool"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "srv-pool", KueueManagedLabel: "true"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "srv", Image: "pause:3.9"}},
+				},
+			},
+		},
+	}
+	scraper.handleDeploymentWatchEventAt(watch.Added, dep, t0)
+
+	// 2. Pod arrives BEFORE ReplicaSet and Workload watch events; pod-template-hash fallback must link Deployment on EventNew!
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "srv-pool-5bbdc7598f-x9k2p",
+			Namespace:         "ai-lab",
+			CreationTimestamp: createMeta,
+			Labels: map[string]string{
+				"app":               "srv-pool",
+				"pod-template-hash": "5bbdc7598f",
+				KueueQueueLabel:     "serving-lq",
+				KueueManagedLabel:   "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "srv-pool-5bbdc7598f", Controller: ptr.To(true)},
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-0",
+			Containers: []corev1.Container{{Name: "srv", Image: "pause:3.9"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	scraper.handlePodWatchEventAt(watch.Added, pod, t0.Add(time.Second), false)
+
+	// 3. Workload has PodIndexLabel-only TopologyRequest (non-TAS!) and later finishes with OwnerNotFound on scale-down.
+	mkWl := func(ownerNotFound bool, ts time.Time) *kueuev1beta2.Workload {
+		conds := []metav1.Condition{
+			{
+				Type:               kueuev1beta2.WorkloadAdmitted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Admitted",
+				LastTransitionTime: metav1.NewTime(t0.Add(time.Second)),
+			},
+		}
+		if ownerNotFound {
+			conds = append(conds, metav1.Condition{
+				Type:               kueuev1beta2.WorkloadFinished,
+				Status:             metav1.ConditionTrue,
+				Reason:             kueuev1beta2.WorkloadFinishedReasonOwnerNotFound,
+				Message:            "The workload's owner no longer exists",
+				LastTransitionTime: metav1.NewTime(ts),
+			})
+		}
+		return &kueuev1beta2.Workload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "pod-srv-pool-5bbdc7598f-x9k2p-11111",
+				Namespace:         "ai-lab",
+				CreationTimestamp: createMeta,
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "v1", Kind: "Pod", Name: "srv-pool-5bbdc7598f-x9k2p"},
+				},
+			},
+			Spec: kueuev1beta2.WorkloadSpec{
+				QueueName: "serving-lq",
+				PodSets: []kueuev1beta2.PodSet{
+					{
+						Name:  "main",
+						Count: 1,
+						TopologyRequest: &kueuev1beta2.PodSetTopologyRequest{
+							PodIndexLabel: ptr.To("batch.kubernetes.io/job-completion-index"),
+						},
+					},
+				},
+			},
+			Status: kueuev1beta2.WorkloadStatus{
+				Admission:  &kueuev1beta2.Admission{ClusterQueue: "serving-cq"},
+				Conditions: conds,
+			},
+		}
+	}
+	scraper.handleWorkloadWatchEventAt(watch.Added, mkWl(false, t0.Add(time.Second)), t0.Add(time.Second))
+	scraper.handlePodWatchEventAt(watch.Modified, pod, t0.Add(2*time.Second), false)
+	scraper.handleWorkloadWatchEventAt(watch.Modified, mkWl(true, t0.Add(11*time.Second)), t0.Add(11*time.Second))
+	// Subsequent GC watch.Deleted must NOT emit a duplicate PartialExecution event.
+	scraper.handleWorkloadWatchEventAt(watch.Deleted, mkWl(true, t0.Add(11*time.Second)), t0.Add(12*time.Second))
+
+	rawInfra, err := os.ReadFile(scraper.cfg.InfraFile)
+	if err != nil {
+		t.Fatalf("read infra.json: %v", err)
+	}
+	infraEvents := readJSONLines[InfraEvent](t, rawInfra)
+	var sawPodNew bool
+	for _, ie := range infraEvents {
+		pm, ok := ie.Payload.(map[string]any)
+		if !ok || pm["kind"] != "Pod" {
+			continue
+		}
+		if ie.EventType == EventNew {
+			sawPodNew = true
+			if pm["ownerKind"] != "Deployment" || pm["ownerName"] != "srv-pool" {
+				t.Fatalf("expected immediate Deployment/srv-pool linkage on Pod EventNew before ReplicaSet informer, got %+v", pm)
+			}
+		}
+		if _, hasTAS := pm["isTAS"]; hasTAS && pm["isTAS"] == true {
+			t.Fatalf("expected non-TAS PodIndexLabel-only Workload to keep isTAS=false, got %+v", pm)
+		}
+	}
+	if !sawPodNew {
+		t.Fatalf("expected Pod EventNew in infra.json")
+	}
+
+	rawExec, err := os.ReadFile(scraper.cfg.ExecutionTimeFile)
+	if err != nil {
+		t.Fatalf("read execution-time.json: %v", err)
+	}
+	execEvents := readJSONLines[ExecutionTimeEvent](t, rawExec)
+	if len(execEvents) != 2 {
+		t.Fatalf("expected 2 execution-time events (Admitted + single Deleted PartialExecution), got %d", len(execEvents))
+	}
+	if execEvents[1].EventType != ExecutionEventPartial ||
+		execEvents[1].Payload.InterruptionReason != InterruptionReasonDeleted ||
+		execEvents[1].Payload.Reason != kueuev1beta2.WorkloadFinishedReasonOwnerNotFound {
+		t.Fatalf("expected OwnerNotFound to classify as InterruptionReasonDeleted, got %+v", execEvents[1].Payload)
+	}
+}
+
+func TestComputePodTemplateRevisionHashUsesPerRunSalt(t *testing.T) {
+	tpl := &corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{"app": "infer-srv"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "srv",
+					Image: "registry.corp.internal/secret-model:v1",
+					Env:   []corev1.EnvVar{{Name: "API_TOKEN", Value: "secret-123"}},
+				},
+			},
+		},
+	}
+
+	saltA := []byte("0123456789abcdef0123456789abcdef")
+	saltB := []byte("fedcba9876543210fedcba9876543210")
+
+	hashNoop := ComputePodTemplateRevisionHash(tpl, NewNoopHasher())
+	hashSaltA1 := ComputePodTemplateRevisionHash(tpl, NewSensitiveDataHasher(nil, saltA))
+	hashSaltA2 := ComputePodTemplateRevisionHash(tpl, NewSensitiveDataHasher(nil, saltA))
+	hashSaltB := ComputePodTemplateRevisionHash(tpl, NewSensitiveDataHasher(nil, saltB))
+
+	if !strings.HasPrefix(hashNoop, "th-") || !strings.HasPrefix(hashSaltA1, "th-") || !strings.HasPrefix(hashSaltB, "th-") {
+		t.Fatalf("expected th- prefixed revision hashes, got noop=%q saltA=%q saltB=%q", hashNoop, hashSaltA1, hashSaltB)
+	}
+	if hashSaltA1 != hashSaltA2 {
+		t.Fatalf("expected deterministic hash for identical salt, got %q vs %q", hashSaltA1, hashSaltA2)
+	}
+	if hashSaltA1 == hashNoop {
+		t.Fatalf("expected salted templateHash %q to differ from unsalted NoopHasher %q", hashSaltA1, hashNoop)
+	}
+	if hashSaltA1 == hashSaltB {
+		t.Fatalf("expected distinct salts to produce distinct templateHashes, both produced %q", hashSaltA1)
+	}
+
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "infer-srv", Namespace: "ai-lab"},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "infer-srv"}},
+			Template: *tpl.DeepCopy(),
+		},
+	}
+	sanA := SanitizeDeployment(deploy, "pause:3.9", NewSensitiveDataHasher(nil, saltA))
+	sanB := SanitizeDeployment(deploy, "pause:3.9", NewSensitiveDataHasher(nil, saltB))
+	gotAnnA := sanA["spec"].(map[string]any)["template"].(map[string]any)["metadata"].(map[string]any)["annotations"].(map[string]any)[KueueOptimizerTemplateHashAnnot]
+	gotAnnB := sanB["spec"].(map[string]any)["template"].(map[string]any)["metadata"].(map[string]any)["annotations"].(map[string]any)[KueueOptimizerTemplateHashAnnot]
+	if gotAnnA != hashSaltA1 || gotAnnB != hashSaltB || gotAnnA == gotAnnB {
+		t.Fatalf("expected SanitizeDeployment to stamp distinct salted templateHashes, got A=%v B=%v", gotAnnA, gotAnnB)
+	}
+}
+
+func TestStandalonePodWorkloadDeletionCleansOwnerStatesOnRecreate(t *testing.T) {
+	scraper := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+
+	mkStandalonePod := func(ts time.Time, gated bool) *corev1.Pod {
+		var gates []corev1.PodSchedulingGate
+		if gated {
+			gates = []corev1.PodSchedulingGate{{Name: KueueAdmissionGateName}}
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "solo-worker",
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(ts),
+				Labels: map[string]string{
+					KueueQueueLabel:   "lq-main",
+					KueueManagedLabel: "true",
+				},
+			},
+			Spec: corev1.PodSpec{
+				SchedulingGates: gates,
+				Containers:      []corev1.Container{{Name: "c", Image: "pause:3.9"}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodPending},
+		}
+	}
+
+	wlInc0 := &kueuev1beta2.Workload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pod-solo-worker-inc0",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "v1", Kind: "Pod", Name: "solo-worker"},
+			},
+		},
+		Spec: kueuev1beta2.WorkloadSpec{
+			QueueName: "lq-main",
+			PodSets:   []kueuev1beta2.PodSet{{Name: "main", Count: 1}},
+		},
+		Status: kueuev1beta2.WorkloadStatus{
+			Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+			Conditions: []metav1.Condition{
+				{
+					Type:               kueuev1beta2.WorkloadAdmitted,
+					Status:             metav1.ConditionTrue,
+					Reason:             "Admitted",
+					LastTransitionTime: metav1.NewTime(t0.Add(time.Second)),
+				},
+			},
+		},
+	}
+
+	// Incarnation 0: Pod created gated -> Workload admitted -> Pod deleted -> Workload deleted.
+	scraper.handlePodWatchEventAt(watch.Added, mkStandalonePod(t0, true), t0, false)
+	scraper.handleWorkloadWatchEventAt(watch.Added, wlInc0, t0.Add(time.Second))
+	if _, exists := scraper.ownerStates["Pod/ai-lab/solo-worker"]; !exists {
+		t.Fatalf("expected Pod/ai-lab/solo-worker in ownerStates while Workload is admitted")
+	}
+	scraper.handlePodWatchEventAt(watch.Deleted, mkStandalonePod(t0, false), t0.Add(5*time.Second), false)
+	scraper.handleWorkloadWatchEventAt(watch.Deleted, wlInc0, t0.Add(5*time.Second))
+
+	if st, leaked := scraper.ownerStates["Pod/ai-lab/solo-worker"]; leaked {
+		t.Fatalf("expected ownerStates[Pod/ai-lab/solo-worker] to be deleted on Workload deletion, got leaked state %q", st)
+	}
+	if wl, leaked := scraper.ownerToWorkload["Pod/ai-lab/solo-worker"]; leaked {
+		t.Fatalf("expected ownerToWorkload[Pod/ai-lab/solo-worker] to be deleted, got %q", wl)
+	}
+
+	// Incarnation 1: Same-name standalone Kueue Pod re-created gated -> must emit EventNew with WorkloadStateNotAdmitted!
+	scraper.handlePodWatchEventAt(watch.Added, mkStandalonePod(t0.Add(8*time.Second), true), t0.Add(8*time.Second), false)
+
+	rawWf, err := os.ReadFile(scraper.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	wfEvents := readJSONLines[WorkflowEvent](t, rawWf)
+	var newStates []WorkloadState
+	for _, ev := range wfEvents {
+		if ev.EventType == EventNew && ev.Payload.ObjectKind == "Pod" && ev.Payload.Name == "solo-worker" {
+			newStates = append(newStates, ev.WorkloadState)
+		}
+	}
+	wantNewStates := []WorkloadState{WorkloadStateNotAdmitted, WorkloadStateNotAdmitted}
+	if !slices.Equal(newStates, wantNewStates) {
+		t.Fatalf("expected both standalone Pod incarnations to start as NotAdmitted, got %v", newStates)
+	}
+}

@@ -613,6 +613,8 @@ def _print_workflows_section(bundle: ScenarioBundle, queue_load: _QueueLoadSumma
     )
     print(f"      By Resource Kind      : {kinds_str}")
     print(f"      By Trigger Reason     : {reasons_str}")
+    if bundle.scheduled_workflow_updates:
+        print(f"      Scheduled Updates     : {len(bundle.scheduled_workflow_updates)} Deployment spec update event(s)")
     if bundle.scheduled_workflow_deletions:
         print(f"      Scheduled Deletions   : {len(bundle.scheduled_workflow_deletions)} workflow deletion event(s)")
     print(
@@ -642,7 +644,26 @@ def print_scenario_outline(
     topo_docs = [d for d in bundle.prereq_and_queue_docs if d.get("kind") == "Topology"]
     cohort_docs = [d for d in bundle.prereq_and_queue_docs if d.get("kind") == "Cohort"]
 
-    all_init_pods = [p for w in bundle.initial_workloads for p in w.pods] + list(bundle.initial_pods)
+    dep_init_pods: list[InitialPodSpec] = []
+    for idep in bundle.initial_deployments:
+        for idx_p in range(idep.admitted_replicas):
+            plc = idep.placements[idx_p] if idx_p < len(idep.placements) else ""
+            dep_init_pods.append(
+                InitialPodSpec(
+                    name=f"{idep.applied_name}-{idx_p}",
+                    namespace=idep.namespace,
+                    placement=plc,
+                    resource_request=dict(idep.per_pod_requests),
+                    remaining_duration_sec=864000.0,
+                    is_infinite=True,
+                    manifest={},
+                )
+            )
+    all_init_pods = (
+        [p for w in bundle.initial_workloads for p in w.pods]
+        + dep_init_pods
+        + list(bundle.initial_pods)
+    )
     node_summary = _summarize_node_groups(bundle.nodes)
     init_usage = _summarize_initial_pod_usage(all_init_pods)
     queue_load = _summarize_queue_load(lq_docs, bundle.scheduled_workflows)

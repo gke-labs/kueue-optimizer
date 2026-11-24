@@ -718,6 +718,13 @@ def main(argv: list[str] | None = None) -> int:
         print(docs_to_pretty_yaml(sample_nodes), end="")
         print("---\n# === Namespaces, ResourceFlavors, Topologies, ClusterQueues, LocalQueues ===")
         print(docs_to_pretty_yaml(bundle.prereq_and_queue_docs), end="")
+        if bundle.initial_deployments:
+            sample_ideps = bundle.initial_deployments[:limit] if limit > 0 else bundle.initial_deployments
+            print(
+                f"---\n# === Initial Pre-Admitted Deployments at t0 "
+                f"(showing {len(sample_ideps)} of {len(bundle.initial_deployments)}) ==="
+            )
+            print(docs_to_pretty_yaml([d.manifest for d in sample_ideps]), end="")
         if bundle.initial_workloads:
             sample_iwls = bundle.initial_workloads[:limit] if limit > 0 else bundle.initial_workloads
             print(
@@ -802,6 +809,7 @@ def main(argv: list[str] | None = None) -> int:
             mgr,
             bundle.prereq_and_queue_docs,
             initial_workloads=bundle.initial_workloads,
+            initial_deployments=bundle.initial_deployments,
             initial_pods=bundle.initial_pods,
         )
 
@@ -905,10 +913,18 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  Wall-Clock Duration     : {end_epoch - start_epoch:.1f}s ({format_duration_hms(end_epoch - start_epoch)})"
         )
+        if bundle.initial_deployments:
+            adm_dep_pods = sum(d.admitted_replicas for d in bundle.initial_deployments)
+            des_dep_pods = sum(d.desired_replicas for d in bundle.initial_deployments)
+            print(
+                f"  Initial Deployments     : {len(bundle.initial_deployments)} Deployment(s) "
+                f"({adm_dep_pods}/{des_dep_pods} replica(s) ready at t0)"
+            )
         if bundle.initial_workloads:
+            pg_pods = sum(len(w.pods) for w in bundle.initial_workloads)
             print(
                 f"  Initial Kueue Workloads : {len(bundle.initial_workloads)} PodGroup(s) "
-                f"({bundle.initial_workload_pods_count} pod(s))"
+                f"({pg_pods} pod(s))"
             )
         print(f"  Initial Infra Pods      : {len(bundle.initial_pods)}")
         planned_denom = max(len(bundle.scheduled_workflows), submitted_count)
