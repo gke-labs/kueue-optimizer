@@ -39,6 +39,7 @@ from chamber_common import (
     ClusterStatusSnapshot,
     build_cluster_queue_manifest,
     build_topology_assignment,
+    extract_pod_spec_resources,
     extract_workflow_pods_and_requests,
     format_pod_execution_seconds,
     index_execution_times,
@@ -144,6 +145,89 @@ class SharedHelpersAndFormattingTests(unittest.TestCase):
         self.assertAlmostEqual(total_reqs["memory"], 50.0)
         # 6 pods * 4 TPUs (from limits) = 24 TPUs
         self.assertAlmostEqual(total_reqs["google.com/tpu"], 24.0)
+
+    def test_extract_pod_spec_resources_uses_pod_level_request_defaults(self) -> None:
+        def ctr(**reqs: str) -> dict:
+            return {"resources": {"requests": reqs}}
+
+        cases = [
+            (
+                "a pod-level limit sets the request when no container requests it",
+                {"resources": {"limits": {"cpu": "4"}}, "containers": [ctr(memory="1Gi")]},
+                {"cpu": 4.0, "memory": 1.0},
+            ),
+            (
+                "a pod-level cpu limit does not replace the container cpu request",
+                {"resources": {"limits": {"cpu": "4"}}, "containers": [ctr(cpu="1")]},
+                {"cpu": 1.0},
+            ),
+            (
+                "a pod-level memory limit does not replace the container memory request",
+                {"resources": {"limits": {"memory": "8Gi"}}, "containers": [ctr(cpu="1", memory="1Gi")]},
+                {"cpu": 1.0, "memory": 1.0},
+            ),
+            (
+                "a container limit counts as its request, so the pod-level limit is not used",
+                {"resources": {"limits": {"cpu": "4"}}, "containers": [{"resources": {"limits": {"cpu": "2"}}}]},
+                {"cpu": 2.0},
+            ),
+            (
+                "a pod-level limit does not replace a cpu request made only by an init container",
+                {"resources": {"limits": {"cpu": "4"}}, "initContainers": [ctr(cpu="2")], "containers": [ctr(memory="1Gi")]},
+                {"cpu": 2.0, "memory": 1.0},
+            ),
+            (
+                "a zero container request takes precedence over the pod-level limit",
+                {"resources": {"limits": {"cpu": "4"}}, "containers": [ctr(cpu="0")]},
+                {"cpu": 0.0},
+            ),
+            (
+                "explicit pod-level requests win over their limits",
+                {
+                    "resources": {"requests": {"cpu": "2", "memory": "2Gi"}, "limits": {"cpu": "4", "memory": "4Gi"}},
+                    "containers": [ctr(memory="1Gi")],
+                },
+                {"cpu": 2.0, "memory": 2.0},
+            ),
+            (
+                "a pod-level hugepages limit sets the request even when containers request hugepages",
+                {
+                    "resources": {"limits": {"cpu": "1", "hugepages-2Mi": "4Mi"}},
+                    "containers": [
+                        {
+                            "resources": {
+                                "requests": {"cpu": "1", "hugepages-2Mi": "2Mi"},
+                                "limits": {"cpu": "1", "hugepages-2Mi": "2Mi"},
+                            }
+                        }
+                    ],
+                },
+                {"cpu": 1.0, "hugepages-2Mi": 4.0 * 1024**2},
+            ),
+            (
+                "overhead is added to pod-level requests",
+                {"resources": {"requests": {"cpu": "4"}}, "overhead": {"cpu": "500m"}, "containers": [ctr(cpu="1")]},
+                {"cpu": 4.5},
+            ),
+            (
+                "pod-level resources other than cpu, memory and hugepages are ignored",
+                {
+                    "resources": {"requests": {"example.com/gpu": "8"}},
+                    "containers": [{"resources": {"limits": {"example.com/gpu": "2"}}}],
+                },
+                {"example.com/gpu": 2.0},
+            ),
+        ]
+        for name, spec, want in cases:
+            with self.subTest(name):
+                self.assertEqual(extract_pod_spec_resources(spec), want)
+
+    def test_extract_pod_spec_resources_ignores_non_mapping_pod_resources(self) -> None:
+        # Not a valid PodSpec, but hand-written traces are not validated.
+        for resources in ([], "invalid"):
+            with self.subTest(resources=resources):
+                spec = {"containers": [{"resources": {"requests": {"cpu": "1"}}}], "resources": resources}
+                self.assertEqual(extract_pod_spec_resources(spec), {"cpu": 1.0})
 
     def test_execution_time_index_preserves_namespace_and_annotation_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
