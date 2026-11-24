@@ -44,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
@@ -5375,5 +5376,216 @@ func TestResolvePodWorkloadLinkagePodGroupNameAnnotation(t *testing.T) {
 	s.mu.Unlock()
 	if linkBoth.RawWorkloadName != "pg-from-annotation" || linkBoth.RawOwnerName != "pg-from-annotation" {
 		t.Fatalf("expected annotation pod-group-name to take precedence over label, got %+v", linkBoth)
+	}
+}
+
+func TestDeploymentDeleteAndRelistClearsStaleOwnershipAndAllowsCleanRecreate(t *testing.T) {
+	s := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+
+	mkDep := func(uid string, ts time.Time, ready int32) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "web",
+				Namespace:         "ai-lab",
+				UID:               k8stypes.UID("uid-" + uid),
+				CreationTimestamp: metav1.NewTime(ts),
+				Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To[int32](2),
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "web"}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "app:v1"}}},
+				},
+			},
+			Status: appsv1.DeploymentStatus{Replicas: 2, ReadyReplicas: ready},
+		}
+	}
+
+	dep0 := mkDep("inc0", t0, 2)
+	s.handleDeploymentWatchEventAt(watch.Added, dep0, t0)
+	s.mu.Lock()
+	s.deploymentWlStates["Deployment/ai-lab/web"] = map[string]WorkloadState{"pod-web-rs0-aaa": WorkloadStateAdmitted}
+	s.ownerStates["Deployment/ai-lab/web"] = WorkloadStateAdmitted
+	s.ownerToWorkload["Deployment/ai-lab/web"] = "pod-web-rs0-aaa"
+	s.mu.Unlock()
+
+	// Delete Deployment while old replica Workload has not yet been GC'd.
+	s.handleDeploymentWatchEventAt(watch.Deleted, dep0, t0.Add(10*time.Second))
+
+	s.mu.Lock()
+	if _, ok := s.deploymentWlStates["Deployment/ai-lab/web"]; ok {
+		s.mu.Unlock()
+		t.Fatalf("expected deploymentWlStates to be cleared on Deployment deletion")
+	}
+	if _, ok := s.ownerStates["Deployment/ai-lab/web"]; ok {
+		s.mu.Unlock()
+		t.Fatalf("expected ownerStates to be cleared on Deployment deletion")
+	}
+	s.mu.Unlock()
+
+	// Recreate same-name Deployment with 0 ready replicas -> must emit New NotAdmitted, not stale Admitted.
+	dep1 := mkDep("inc1", t0.Add(10*time.Second+100*time.Millisecond), 0)
+	s.handleDeploymentWatchEventAt(watch.Added, dep1, t0.Add(10*time.Second+100*time.Millisecond))
+
+	rawWf, err := os.ReadFile(s.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	evs := readJSONLines[WorkflowEvent](t, rawWf)
+	var newStates []WorkloadState
+	for _, ev := range evs {
+		if ev.EventType == EventNew && ev.Payload.ObjectKind == "Deployment" && ev.Payload.Name == "web" {
+			newStates = append(newStates, ev.WorkloadState)
+		}
+	}
+	if len(newStates) != 2 || newStates[1] != WorkloadStateNotAdmitted {
+		t.Fatalf("expected recreated Deployment to start as NotAdmitted, got newStates=%v", newStates)
+	}
+
+	// Relist deletion must also clean deploymentUIDToKey, deploymentWlStates, ownerStates, and ownerToWorkload.
+	s.mu.Lock()
+	s.deploymentWlStates["Deployment/ai-lab/web"] = map[string]WorkloadState{"pod-web-rs1-bbb": WorkloadStateAdmitted}
+	s.ownerStates["Deployment/ai-lab/web"] = WorkloadStateAdmitted
+	s.ownerToWorkload["Deployment/ai-lab/web"] = "pod-web-rs1-bbb"
+	s.mu.Unlock()
+	s.reconcileWorkflowDeletionsOnRelist("Deployment", map[string]bool{}, t0.Add(20*time.Second))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.deploymentUIDToKey["uid-inc1"]; ok {
+		t.Fatalf("expected relist deletion to clear deploymentUIDToKey")
+	}
+	if _, ok := s.deploymentWlStates["Deployment/ai-lab/web"]; ok {
+		t.Fatalf("expected relist deletion to clear deploymentWlStates")
+	}
+	if _, ok := s.ownerStates["Deployment/ai-lab/web"]; ok {
+		t.Fatalf("expected relist deletion to clear ownerStates")
+	}
+}
+
+func TestDeploymentOwnershipNoPoisonOnTransientRSGetErrorAndPodTemplateHashFallback(t *testing.T) {
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-5bbdc7598f-ccccc",
+			Namespace: "ai-lab",
+			Labels:    map[string]string{"pod-template-hash": "5bbdc7598f"},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-5bbdc7598f"},
+			},
+		},
+	}
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-5bbdc7598f",
+			Namespace: "ai-lab",
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "Deployment", Name: "web"},
+			},
+		},
+	}
+	kubeClient := kubefake.NewSimpleClientset(pod, rs)
+	var rsGetCalls int
+	kubeClient.PrependReactor("get", "replicasets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		rsGetCalls++
+		if rsGetCalls == 1 {
+			return true, nil, errors.New("transient apiserver timeout")
+		}
+		return false, nil, nil
+	})
+	s := newTestScraper(t, Config{}, kubeClient, nil, nil)
+
+	// First call hits transient ReplicaSets.Get error -> must NOT poison nonDeploymentPods.
+	if got := s.resolveDeploymentOwnerForPodWorkload("ai-lab", pod.Name, nil); got != "" {
+		t.Fatalf("expected empty owner on transient RS error, got %q", got)
+	}
+	s.mu.Lock()
+	poisoned := s.nonDeploymentPods["ai-lab/"+pod.Name]
+	s.mu.Unlock()
+	if poisoned {
+		t.Fatalf("expected transient RS Get error NOT to poison nonDeploymentPods")
+	}
+
+	// Second call retries ReplicaSets.Get after API recovers and resolves Deployment/web.
+	if got := s.resolveDeploymentOwnerForPodWorkload("ai-lab", pod.Name, nil); got != "web" {
+		t.Fatalf("expected retry to resolve Deployment 'web', got %q (rsGetCalls=%d)", got, rsGetCalls)
+	}
+	if rsGetCalls != 2 {
+		t.Fatalf("expected 2 ReplicaSets.Get calls across transient error + retry, got %d", rsGetCalls)
+	}
+
+	// Already-deleted RS (NotFound) falls back to pod-template-hash against tracked Deployment.
+	podGoneRS := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api-7f8b9c-ddddd",
+			Namespace: "ai-lab",
+			Labels:    map[string]string{"pod-template-hash": "7f8b9c"},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "api-7f8b9c"},
+			},
+		},
+	}
+	kubeClient2 := kubefake.NewSimpleClientset(podGoneRS)
+	s2 := newTestScraper(t, Config{}, kubeClient2, nil, nil)
+	s2.handleDeploymentWatchEventAt(watch.Added, &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "api",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "pause:3.9"}}}},
+		},
+	}, t0)
+	if got := s2.resolveDeploymentOwnerForPodWorkload("ai-lab", podGoneRS.Name, nil); got != "api" {
+		t.Fatalf("expected pod-template-hash fallback to resolve Deployment 'api' when RS is NotFound, got %q", got)
+	}
+}
+
+func TestSanitizeDeploymentStripsRevisionAnnotationAndManageWithoutQueueName(t *testing.T) {
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web",
+			Namespace: "ai-lab",
+			Annotations: map[string]string{
+				"deployment.kubernetes.io/revision": "3",
+				"kueue.x-k8s.io/custom":             "keep",
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "pause:3.9"}}},
+			},
+		},
+	}
+	san := SanitizeDeployment(deploy, "pause:3.9", NoopHasher{})
+	meta, _ := san["metadata"].(map[string]any)
+	anns, _ := meta["annotations"].(map[string]any)
+	if _, hasRev := anns["deployment.kubernetes.io/revision"]; hasRev {
+		t.Fatalf("expected deployment.kubernetes.io/revision to be stripped, got annotations=%+v", anns)
+	}
+	if anns["kueue.x-k8s.io/custom"] != "keep" {
+		t.Fatalf("expected non-denied kueue annotation to be preserved, got %+v", anns)
+	}
+
+	s := newTestScraper(t, Config{}, nil, nil, nil)
+	if !s.shouldSkipDeployment(deploy) {
+		t.Fatalf("expected Deployment without queue label to be skipped when manageJobsWithoutQueueName=false")
+	}
+	s.mu.Lock()
+	s.manageJobsWithoutQueueName = true
+	s.mu.Unlock()
+	if s.shouldSkipDeployment(deploy) {
+		t.Fatalf("expected non-system Deployment without queue label to be tracked when manageJobsWithoutQueueName=true")
+	}
+	sysDeploy := deploy.DeepCopy()
+	sysDeploy.Namespace = "kube-system"
+	if !s.shouldSkipDeployment(sysDeploy) {
+		t.Fatalf("expected kube-system Deployment to stay skipped even when manageJobsWithoutQueueName=true")
 	}
 }

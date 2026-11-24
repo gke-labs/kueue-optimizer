@@ -1565,7 +1565,7 @@ DEPLOYMENT_SCENARIO_PAIRINGS: dict[str, list[dict[str, str]]] = {
             "peer_id": "st84",
             "relationship": "Exact `Deployment` Scale-Down A/B Twin (`ScaleDown 8 -> 4 -> 0` `st83` vs. Unscaled `8`-Replica Blocker `st84`)",
             "knob_changed": "Replaying post-`t0` `ScaleDown` updates (`8 -> 4` at `t=+10s`, `4 -> 0` at `t=+26s` in `st83`) vs. omitting `ScaleDown` updates (`st84`) on identical `srv-pool` + `2` `4`-TPU batch `Job`s.",
-            "cross_check": "`st83` unblocks both `batch-0` and `batch-1` at `t=+10s` (`pods succeeded=2`, `Unadmitted=0`) and scales cleanly to `0` at `t=+26s` (`completed=10, active_at_end=0`), whereas `st84` starves both batch `Job`s (`pods succeeded=0`, `Unadmitted=2`, `active_at_end=8`).",
+            "cross_check": "`st83` unblocks both `batch-0` and `batch-1` at `t=+10s` (`pods succeeded=4`, `Unadmitted=0`) and scales cleanly to `0` at `t=+26s` (`completed=10, active_at_end=0`), whereas `st84` starves both batch `Job`s (`pods succeeded=0`, `Unadmitted=2`, `active_at_end=8`).",
         },
     ],
     "st84": [

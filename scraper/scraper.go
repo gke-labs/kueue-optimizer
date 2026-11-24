@@ -1186,7 +1186,8 @@ func (s *Scraper) ensurePodDeploymentOwnership(pod *corev1.Pod) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if rs, err := s.kubeClient.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, rsOwner, metav1.GetOptions{}); err == nil && rs != nil {
+	rs, rsErr := s.kubeClient.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, rsOwner, metav1.GetOptions{})
+	if rsErr == nil && rs != nil {
 		for _, ref := range rs.OwnerReferences {
 			if ref.Kind == "Deployment" && ref.Name != "" {
 				depOwner = ref.Name
@@ -1195,6 +1196,15 @@ func (s *Scraper) ensurePodDeploymentOwnership(pod *corev1.Pod) {
 		}
 	}
 	s.mu.Lock()
+	if depOwner == "" && rsOwner != "" && pod.Labels != nil {
+		if pth := pod.Labels["pod-template-hash"]; pth != "" && strings.HasSuffix(rsOwner, "-"+pth) {
+			candDep := strings.TrimSuffix(rsOwner, "-"+pth)
+			wfKey := "Deployment/" + pod.Namespace + "/" + candDep
+			if _, tracked := s.workflowStates[wfKey]; tracked || s.deploymentWlStates[wfKey] != nil {
+				depOwner = candDep
+			}
+		}
+	}
 	if rsOwner != "" {
 		s.podToReplicaSet[podKey] = rsOwner
 	}
@@ -1203,7 +1213,7 @@ func (s *Scraper) ensurePodDeploymentOwnership(pod *corev1.Pod) {
 			s.replicaSetToDeployment[pod.Namespace+"/"+rsOwner] = depOwner
 		}
 		s.podToDeployment[podKey] = depOwner
-	} else {
+	} else if rsOwner == "" || rsErr == nil {
 		s.nonDeploymentPods[podKey] = true
 	}
 	s.mu.Unlock()
@@ -2212,7 +2222,11 @@ func (s *Scraper) shouldSkipDeployment(deploy *appsv1.Deployment) bool {
 	s.mu.Lock()
 	_, alreadyTracked := s.workflowStates[wfKey]
 	_, hasOwnerState := s.ownerStates[wfKey]
+	manageWithoutQueue := s.manageJobsWithoutQueueName
 	s.mu.Unlock()
+	if manageWithoutQueue && !isSystemNamespaceName(deploy.Namespace) {
+		return false
+	}
 	return !alreadyTracked && !hasOwnerState
 }
 
@@ -2238,6 +2252,7 @@ func (s *Scraper) handleDeploymentWatchEventAt(eventType watch.EventType, deploy
 	if deploy.Spec.Replicas != nil {
 		replicas = *deploy.Spec.Replicas
 	}
+	oKey := "Deployment/" + deploy.Namespace + "/" + deploy.Name
 	s.mu.Lock()
 	if deploy.UID != "" {
 		if eventType == watch.Deleted {
@@ -2248,9 +2263,14 @@ func (s *Scraper) handleDeploymentWatchEventAt(eventType watch.EventType, deploy
 	}
 	wlState := s.determineGroupWorkloadStateLocked("Deployment", deploy.Namespace, deploy.Name, deploy.Status.ReadyReplicas, deploy.Status.Replicas)
 	if lq != "" && wlState == WorkloadStateAdmissionInProgress && deploy.Status.ReadyReplicas == 0 {
-		if _, hasOwnerWl := s.ownerStates["Deployment/"+deploy.Namespace+"/"+deploy.Name]; !hasOwnerWl {
+		if _, hasOwnerWl := s.ownerStates[oKey]; !hasOwnerWl {
 			wlState = WorkloadStateNotAdmitted
 		}
+	}
+	if eventType == watch.Deleted {
+		delete(s.deploymentWlStates, oKey)
+		delete(s.ownerStates, oKey)
+		delete(s.ownerToWorkload, oKey)
 	}
 	s.mu.Unlock()
 
@@ -2683,12 +2703,17 @@ func (s *Scraper) resolveDeploymentOwnerForPodWorkload(ns, rawPodName string, wl
 			rsOwner = ref.Name
 		}
 	}
+	var rsGetErr error
+	rsQueried := false
 	if depOwner == "" && rsOwner != "" {
 		s.mu.Lock()
 		depOwner = s.replicaSetToDeployment[ns+"/"+rsOwner]
 		s.mu.Unlock()
 		if depOwner == "" {
-			if rs, rsErr := kubeClient.AppsV1().ReplicaSets(ns).Get(ctx, rsOwner, metav1.GetOptions{}); rsErr == nil && rs != nil {
+			rsQueried = true
+			var rs *appsv1.ReplicaSet
+			rs, rsGetErr = kubeClient.AppsV1().ReplicaSets(ns).Get(ctx, rsOwner, metav1.GetOptions{})
+			if rsGetErr == nil && rs != nil {
 				for _, ref := range rs.OwnerReferences {
 					if ref.Kind == "Deployment" && ref.Name != "" {
 						depOwner = ref.Name
@@ -2700,6 +2725,15 @@ func (s *Scraper) resolveDeploymentOwnerForPodWorkload(ns, rawPodName string, wl
 	}
 
 	s.mu.Lock()
+	if depOwner == "" && rsOwner != "" && pod.Labels != nil {
+		if pth := pod.Labels["pod-template-hash"]; pth != "" && strings.HasSuffix(rsOwner, "-"+pth) {
+			candDep := strings.TrimSuffix(rsOwner, "-"+pth)
+			wfKey := "Deployment/" + ns + "/" + candDep
+			if _, tracked := s.workflowStates[wfKey]; tracked || s.deploymentWlStates[wfKey] != nil {
+				depOwner = candDep
+			}
+		}
+	}
 	if rsOwner != "" {
 		s.podToReplicaSet[podKey] = rsOwner
 	}
@@ -2708,7 +2742,7 @@ func (s *Scraper) resolveDeploymentOwnerForPodWorkload(ns, rawPodName string, wl
 			s.replicaSetToDeployment[ns+"/"+rsOwner] = depOwner
 		}
 		s.podToDeployment[podKey] = depOwner
-	} else {
+	} else if rsOwner == "" || (rsQueried && rsGetErr == nil) {
 		s.nonDeploymentPods[podKey] = true
 	}
 	s.mu.Unlock()
@@ -3732,6 +3766,17 @@ func (s *Scraper) reconcileWorkflowDeletionsOnRelist(kind string, presentRawKeys
 	for _, k := range keys {
 		st := s.workflowStates[k]
 		delete(s.workflowStates, k)
+		if st.kind == "Deployment" {
+			delete(s.deploymentWlStates, k)
+			delete(s.ownerStates, k)
+			delete(s.ownerToWorkload, k)
+			depNSName := st.namespace + "/" + st.name
+			for uid, v := range s.deploymentUIDToKey {
+				if v == depNSName {
+					delete(s.deploymentUIDToKey, uid)
+				}
+			}
+		}
 		wlState := st.workloadState
 		if wlState == "" {
 			wlState = WorkloadStateNotAdmitted

@@ -781,6 +781,9 @@ def _inject_pod_execution_time_and_sanitize_workflow(
         t_ann.pop("kueue-optimizer.gke.io/pod-execution-time-seconds", None)
         t_ann["kueue-optimizer.gke.io/long-running-pod"] = "true"
         t_ann["kueue-optimizer.gke.io/infinite-duration"] = "true"
+        dep_applied_name = str(meta.get("name") or "")
+        if dep_applied_name:
+            t_ann["kueue-optimizer.gke.io/deployment-name"] = dep_applied_name
         tpl_scaled_delay = _scale_startup_delay(t_ann) or top_scaled_startup
         if tpl_scaled_delay is not None:
             t_ann["kueue-optimizer.gke.io/pod-startup-delay-seconds"] = tpl_scaled_delay
@@ -790,6 +793,10 @@ def _inject_pod_execution_time_and_sanitize_workflow(
             t_ann.update({str(k): str(v) for k, v in extra_pod_annotations.items()})
         t_meta["annotations"] = t_ann
         t_labels = dict(t_meta.get("labels") or {})
+        tpl_lq = str(t_labels.get("kueue.x-k8s.io/queue-name") or "").strip()
+        if tpl_lq and not labels.get("kueue.x-k8s.io/queue-name"):
+            labels["kueue.x-k8s.io/queue-name"] = tpl_lq
+            meta["labels"] = labels
         for r_lbl in RESERVED_POD_LABELS:
             t_labels.pop(r_lbl, None)
         if t_labels:

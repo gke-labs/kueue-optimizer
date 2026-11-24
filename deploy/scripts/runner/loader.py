@@ -165,6 +165,7 @@ class InitialDeploymentBootstrap:
     topologies_by_name: dict[str, dict[str, Any]] = field(default_factory=dict)
     nodes_by_name: dict[str, dict[str, Any]] = field(default_factory=dict)
     scraped_pod_set_assignments: list[dict[str, Any]] = field(default_factory=list)
+    incarnation_index: int = 0
 
 
 @dataclass(order=True)
@@ -440,7 +441,8 @@ def _deployment_spec_digest(manifest: dict[str, Any]) -> str:
     anns = {
         str(k): str(v)
         for k, v in (meta.get("annotations") or {}).items()
-        if str(k)
+        if not str(k).startswith("deployment.kubernetes.io/")
+        and str(k)
         not in (
             "kueue-optimizer.gke.io/pod-execution-time-seconds",
             "kueue-optimizer.gke.io/real-duration-sec",
@@ -673,6 +675,12 @@ def _schedule_workflows(
                     speedup=speedup,
                     min_pod_duration_sec=min_pod_duration_sec,
                 )
+                if cur_inc.lq_name:
+                    init_meta = init_dep_doc.setdefault("metadata", {})
+                    init_labels = dict(init_meta.get("labels") or {})
+                    if not init_labels.get("kueue.x-k8s.io/queue-name"):
+                        init_labels["kueue.x-k8s.io/queue-name"] = cur_inc.lq_name
+                        init_meta["labels"] = init_labels
                 cur_inc.last_prepared_manifest = init_dep_doc
                 cur_inc.last_spec_digest = _deployment_spec_digest(init_dep_doc)
             inc_list.append(cur_inc)
@@ -692,6 +700,12 @@ def _schedule_workflows(
                     speedup=speedup,
                     min_pod_duration_sec=min_pod_duration_sec,
                 )
+                if cur_inc.lq_name:
+                    upd_meta = upd_doc.setdefault("metadata", {})
+                    upd_labels = dict(upd_meta.get("labels") or {})
+                    if not upd_labels.get("kueue.x-k8s.io/queue-name"):
+                        upd_labels["kueue.x-k8s.io/queue-name"] = cur_inc.lq_name
+                        upd_meta["labels"] = upd_labels
                 upd_digest = _deployment_spec_digest(upd_doc)
                 if ev_epoch <= t0_epoch + 1e-6 and cur_inc.scheduled_item is None:
                     cur_inc.raw_obj = raw_obj
@@ -1744,10 +1758,17 @@ def _build_initial_workloads_and_pods(
     next_post_t0_seq = (max((w.seq for w in scheduled_workflows), default=0) + 1)
 
     for cand in admitted_candidates:
-        admitted_by_t0 = cand.first_seen_epoch <= (effective_start_epoch + initial_window_sec + 1e-6) or bool(
-            cand.exec_info
-            and cand.exec_info.admitted_epochs
-            and min(cand.exec_info.admitted_epochs) <= (effective_start_epoch + initial_window_sec + 1e-6)
+        created_after_eff_start = (
+            cand.creation_epoch is not None and cand.creation_epoch > (effective_start_epoch + 1e-6)
+        )
+        admitted_by_t0 = not created_after_eff_start and (
+            cand.first_seen_epoch <= (effective_start_epoch + initial_window_sec + 1e-6)
+            or bool(
+                cand.incarnation_index == 0
+                and cand.exec_info
+                and cand.exec_info.admitted_epochs
+                and min(cand.exec_info.admitted_epochs) <= (effective_start_epoch + initial_window_sec + 1e-6)
+            )
         )
         if not admitted_by_t0:
             if (
@@ -2056,6 +2077,10 @@ def _build_initial_workloads_and_pods(
                 k_admitted = desired_replicas
 
             ps_groups_dep = _extract_workflow_podset_templates(cand.raw_obj, "Deployment")
+            if not ps_groups_dep and desired_replicas == 0 and isinstance(cand.raw_obj, dict):
+                raw_dep_one = dict(cand.raw_obj)
+                raw_dep_one["spec"] = {**(cand.raw_obj.get("spec") or {}), "replicas": 1}
+                ps_groups_dep = _extract_workflow_podset_templates(raw_dep_one, "Deployment")
             dep_per_pod_reqs: dict[str, str] = (
                 dict(ps_groups_dep[0][2]) if ps_groups_dep else {"cpu": "1", "memory": "1Gi"}
             )
@@ -2171,6 +2196,7 @@ def _build_initial_workloads_and_pods(
                     scraped_pod_set_assignments=list(
                         cand.exec_info.pod_set_assignments if cand.exec_info else []
                     ),
+                    incarnation_index=cand.incarnation_index,
                 )
             )
             if cand.preempt_item is not None:
@@ -3587,6 +3613,7 @@ def load_scenario_bundle(
     )
 
     base_scheduled_workflows = [dc_replace(w) for w in scheduled_workflows]
+    base_scheduled_updates = [dc_replace(u) for u in scheduled_updates]
     base_scheduled_deletions = [dc_replace(d) for d in scheduled_deletions]
     base_infra_events = list(parsed_infra.scheduled_infra_events)
     base_lqs_by_key = dict(parsed_infra.lqs_by_key)
@@ -3620,6 +3647,20 @@ def load_scenario_bundle(
             interrupted_duration_override=parsed_override,
             manage_jobs_without_queue_name=manage_without_queue,
         )
+        live_dep_incarnations = {
+            (w.namespace, w.name, w.incarnation_index)
+            for w in sched_wfs_out
+            if w.object_kind == "Deployment"
+        } | {
+            (d.namespace, d.name, d.incarnation_index)
+            for d in init_deps
+        }
+        sched_upds_out = [
+            dc_replace(u)
+            for u in base_scheduled_updates
+            if u.object_kind != "Deployment"
+            or (u.namespace, u.name, u.incarnation_index) in live_dep_incarnations
+        ]
         miss_warns, imp_cnt = _apply_missing_duration_policy(
             sched_wfs_out,
             exec_index,
@@ -3649,13 +3690,24 @@ def load_scenario_bundle(
                 item.seq,
             )
         )
-        return init_wls, init_deps, init_pods, sched_wfs_out, sched_dels_in, expired_cnt, miss_warns, imp_cnt
+        return (
+            init_wls,
+            init_deps,
+            init_pods,
+            sched_wfs_out,
+            sched_upds_out,
+            sched_dels_in,
+            expired_cnt,
+            miss_warns,
+            imp_cnt,
+        )
 
     (
         initial_workloads,
         initial_deployments,
         initial_pods,
         scheduled_workflows,
+        scheduled_updates,
         scheduled_deletions,
         expired_initial_pods_count,
         missing_warnings,
@@ -3704,6 +3756,7 @@ def load_scenario_bundle(
                 initial_deployments,
                 initial_pods,
                 scheduled_workflows,
+                scheduled_updates,
                 scheduled_deletions,
                 expired_initial_pods_count,
                 missing_warnings,
