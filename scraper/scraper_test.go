@@ -44,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
@@ -5375,5 +5376,444 @@ func TestResolvePodWorkloadLinkagePodGroupNameAnnotation(t *testing.T) {
 	s.mu.Unlock()
 	if linkBoth.RawWorkloadName != "pg-from-annotation" || linkBoth.RawOwnerName != "pg-from-annotation" {
 		t.Fatalf("expected annotation pod-group-name to take precedence over label, got %+v", linkBoth)
+	}
+}
+
+func TestDeploymentDeleteAndRelistClearsStaleOwnershipAndAllowsCleanRecreate(t *testing.T) {
+	s := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+
+	mkDep := func(uid string, ts time.Time, ready int32) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "web",
+				Namespace:         "ai-lab",
+				UID:               k8stypes.UID("uid-" + uid),
+				CreationTimestamp: metav1.NewTime(ts),
+				Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To[int32](2),
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "web"}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "app:v1"}}},
+				},
+			},
+			Status: appsv1.DeploymentStatus{Replicas: 2, ReadyReplicas: ready},
+		}
+	}
+
+	dep0 := mkDep("inc0", t0, 2)
+	s.handleDeploymentWatchEventAt(watch.Added, dep0, t0)
+	s.mu.Lock()
+	s.deploymentWlStates["Deployment/ai-lab/web"] = map[string]WorkloadState{"pod-web-rs0-aaa": WorkloadStateAdmitted}
+	s.ownerStates["Deployment/ai-lab/web"] = WorkloadStateAdmitted
+	s.ownerToWorkload["Deployment/ai-lab/web"] = "pod-web-rs0-aaa"
+	s.mu.Unlock()
+
+	// Delete Deployment while old replica Workload has not yet been GC'd.
+	s.handleDeploymentWatchEventAt(watch.Deleted, dep0, t0.Add(10*time.Second))
+
+	s.mu.Lock()
+	if _, ok := s.deploymentWlStates["Deployment/ai-lab/web"]; ok {
+		s.mu.Unlock()
+		t.Fatalf("expected deploymentWlStates to be cleared on Deployment deletion")
+	}
+	if _, ok := s.ownerStates["Deployment/ai-lab/web"]; ok {
+		s.mu.Unlock()
+		t.Fatalf("expected ownerStates to be cleared on Deployment deletion")
+	}
+	s.mu.Unlock()
+
+	// Recreate same-name Deployment with 0 ready replicas -> must emit New NotAdmitted, not stale Admitted.
+	dep1 := mkDep("inc1", t0.Add(10*time.Second+100*time.Millisecond), 0)
+	s.handleDeploymentWatchEventAt(watch.Added, dep1, t0.Add(10*time.Second+100*time.Millisecond))
+
+	rawWf, err := os.ReadFile(s.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	evs := readJSONLines[WorkflowEvent](t, rawWf)
+	var newStates []WorkloadState
+	for _, ev := range evs {
+		if ev.EventType == EventNew && ev.Payload.ObjectKind == "Deployment" && ev.Payload.Name == "web" {
+			newStates = append(newStates, ev.WorkloadState)
+		}
+	}
+	if len(newStates) != 2 || newStates[1] != WorkloadStateNotAdmitted {
+		t.Fatalf("expected recreated Deployment to start as NotAdmitted, got newStates=%v", newStates)
+	}
+
+	// Relist deletion must also clean deploymentUIDToKey, deploymentWlStates, ownerStates, and ownerToWorkload.
+	s.mu.Lock()
+	s.deploymentWlStates["Deployment/ai-lab/web"] = map[string]WorkloadState{"pod-web-rs1-bbb": WorkloadStateAdmitted}
+	s.ownerStates["Deployment/ai-lab/web"] = WorkloadStateAdmitted
+	s.ownerToWorkload["Deployment/ai-lab/web"] = "pod-web-rs1-bbb"
+	s.mu.Unlock()
+	s.reconcileWorkflowDeletionsOnRelist("Deployment", map[string]bool{}, t0.Add(20*time.Second))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.deploymentUIDToKey["uid-inc1"]; ok {
+		t.Fatalf("expected relist deletion to clear deploymentUIDToKey")
+	}
+	if _, ok := s.deploymentWlStates["Deployment/ai-lab/web"]; ok {
+		t.Fatalf("expected relist deletion to clear deploymentWlStates")
+	}
+	if _, ok := s.ownerStates["Deployment/ai-lab/web"]; ok {
+		t.Fatalf("expected relist deletion to clear ownerStates")
+	}
+}
+
+func TestDeploymentOwnershipNoPoisonOnTransientRSGetErrorAndPodTemplateHashFallback(t *testing.T) {
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-5bbdc7598f-ccccc",
+			Namespace: "ai-lab",
+			Labels:    map[string]string{"pod-template-hash": "5bbdc7598f"},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-5bbdc7598f"},
+			},
+		},
+	}
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web-5bbdc7598f",
+			Namespace: "ai-lab",
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "Deployment", Name: "web"},
+			},
+		},
+	}
+	kubeClient := kubefake.NewSimpleClientset(pod, rs)
+	var rsGetCalls int
+	kubeClient.PrependReactor("get", "replicasets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		rsGetCalls++
+		if rsGetCalls == 1 {
+			return true, nil, errors.New("transient apiserver timeout")
+		}
+		return false, nil, nil
+	})
+	s := newTestScraper(t, Config{}, kubeClient, nil, nil)
+
+	// First call hits transient ReplicaSets.Get error -> must NOT poison nonDeploymentPods.
+	if got, _ := s.resolveDeploymentOwnerForPodWorkload("ai-lab", pod.Name, nil); got != "" {
+		t.Fatalf("expected empty owner on transient RS error, got %q", got)
+	}
+	s.mu.Lock()
+	poisoned := s.nonDeploymentPods["ai-lab/"+pod.Name]
+	s.mu.Unlock()
+	if poisoned {
+		t.Fatalf("expected transient RS Get error NOT to poison nonDeploymentPods")
+	}
+
+	// Second call retries ReplicaSets.Get after API recovers and resolves Deployment/web.
+	if got, _ := s.resolveDeploymentOwnerForPodWorkload("ai-lab", pod.Name, nil); got != "web" {
+		t.Fatalf("expected retry to resolve Deployment 'web', got %q (rsGetCalls=%d)", got, rsGetCalls)
+	}
+	if rsGetCalls != 2 {
+		t.Fatalf("expected 2 ReplicaSets.Get calls across transient error + retry, got %d", rsGetCalls)
+	}
+
+	// Already-deleted RS (NotFound) falls back to pod-template-hash against tracked Deployment.
+	podGoneRS := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api-7f8b9c-ddddd",
+			Namespace: "ai-lab",
+			Labels:    map[string]string{"pod-template-hash": "7f8b9c"},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "api-7f8b9c"},
+			},
+		},
+	}
+	kubeClient2 := kubefake.NewSimpleClientset(podGoneRS)
+	s2 := newTestScraper(t, Config{}, kubeClient2, nil, nil)
+	s2.handleDeploymentWatchEventAt(watch.Added, &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "api",
+			Namespace:         "ai-lab",
+			CreationTimestamp: metav1.NewTime(t0),
+			Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "pause:3.9"}}}},
+		},
+	}, t0)
+	if got, _ := s2.resolveDeploymentOwnerForPodWorkload("ai-lab", podGoneRS.Name, nil); got != "api" {
+		t.Fatalf("expected pod-template-hash fallback to resolve Deployment 'api' when RS is NotFound, got %q", got)
+	}
+}
+
+func TestSanitizeDeploymentStripsRevisionAnnotationAndManageWithoutQueueName(t *testing.T) {
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "web",
+			Namespace: "ai-lab",
+			Annotations: map[string]string{
+				"deployment.kubernetes.io/revision": "3",
+				"kueue.x-k8s.io/custom":             "keep",
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "pause:3.9"}}},
+			},
+		},
+	}
+	san := SanitizeDeployment(deploy, "pause:3.9", NoopHasher{})
+	meta, _ := san["metadata"].(map[string]any)
+	anns, _ := meta["annotations"].(map[string]any)
+	if _, hasRev := anns["deployment.kubernetes.io/revision"]; hasRev {
+		t.Fatalf("expected deployment.kubernetes.io/revision to be stripped, got annotations=%+v", anns)
+	}
+	if anns["kueue.x-k8s.io/custom"] != "keep" {
+		t.Fatalf("expected non-denied kueue annotation to be preserved, got %+v", anns)
+	}
+
+	s := newTestScraper(t, Config{}, nil, nil, nil)
+	if !s.shouldSkipDeployment(deploy) {
+		t.Fatalf("expected Deployment without queue label to be skipped when manageJobsWithoutQueueName=false")
+	}
+	s.mu.Lock()
+	s.manageJobsWithoutQueueName = true
+	s.mu.Unlock()
+	if s.shouldSkipDeployment(deploy) {
+		t.Fatalf("expected non-system Deployment without queue label to be tracked when manageJobsWithoutQueueName=true")
+	}
+	sysDeploy := deploy.DeepCopy()
+	sysDeploy.Namespace = "kube-system"
+	if !s.shouldSkipDeployment(sysDeploy) {
+		t.Fatalf("expected kube-system Deployment to stay skipped even when manageJobsWithoutQueueName=true")
+	}
+}
+
+func TestDeploymentTrailingWorkloadEventsDoNotReviveDeletedIncarnationState(t *testing.T) {
+	s := newTestScraper(t, Config{}, nil, nil, nil)
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	const oKey = "Deployment/ai-lab/web"
+
+	mkDep := func(uid string, created time.Time, ready int32) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "web",
+				Namespace:         "ai-lab",
+				UID:               k8stypes.UID(uid),
+				CreationTimestamp: metav1.NewTime(created),
+				Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To[int32](1),
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "web"}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "app:v1"}}},
+				},
+			},
+			Status: appsv1.DeploymentStatus{Replicas: 1, ReadyReplicas: ready},
+		}
+	}
+	// Both incarnations use the same pod template, so both get the ReplicaSet name "web-7d9f".
+	mkWl := func(podSuffix, jobUID string, created time.Time, ownerNotFound bool) *kueuev1beta2.Workload {
+		conds := []metav1.Condition{{
+			Type:               kueuev1beta2.WorkloadAdmitted,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Admitted",
+			LastTransitionTime: metav1.NewTime(created),
+		}}
+		if ownerNotFound {
+			conds = append(conds, metav1.Condition{
+				Type:               kueuev1beta2.WorkloadFinished,
+				Status:             metav1.ConditionTrue,
+				Reason:             kueuev1beta2.WorkloadFinishedReasonOwnerNotFound,
+				LastTransitionTime: metav1.NewTime(created.Add(11 * time.Second)),
+			})
+		}
+		return &kueuev1beta2.Workload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "pod-web-7d9f-" + podSuffix,
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(created),
+				Labels:            map[string]string{KueueJobUIDLabel: jobUID},
+				OwnerReferences:   []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: "web-7d9f-" + podSuffix}},
+			},
+			Spec: kueuev1beta2.WorkloadSpec{
+				QueueName: "lq-main",
+				PodSets:   []kueuev1beta2.PodSet{{Name: "main", Count: 1}},
+			},
+			Status: kueuev1beta2.WorkloadStatus{
+				Admission:  &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+				Conditions: conds,
+			},
+		}
+	}
+	mkRS := func(depUID string) *appsv1.ReplicaSet {
+		return &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "web-7d9f",
+				Namespace: "ai-lab",
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "apps/v1", Kind: "Deployment", Name: "web", UID: k8stypes.UID(depUID)},
+				},
+			},
+		}
+	}
+	ownerState := func() (WorkloadState, bool) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		st, ok := s.ownerStates[oKey]
+		return st, ok
+	}
+
+	// Incarnation 0 runs one admitted replica, created at t0 (same 1s bucket as delete+recreate below!).
+	s.handleDeploymentWatchEventAt(watch.Added, mkDep("uid-inc0", t0, 1), t0)
+	s.handleReplicaSetWatchEvent(watch.Added, mkRS("uid-inc0"))
+	s.handleWorkloadWatchEventAt(watch.Added, mkWl("aaaaa", "uid-inc0", t0, false), t0)
+	if st, ok := ownerState(); !ok || st != WorkloadStateAdmitted {
+		t.Fatalf("expected incarnation 0 owner state Admitted, got %q (present=%v)", st, ok)
+	}
+
+	// Kubernetes deletes the Deployment at t0+200ms (same 1s RFC3339 second as t0!) before RS/Pod/Workload.
+	delAt := t0.Add(200 * time.Millisecond)
+	s.handleDeploymentWatchEventAt(watch.Deleted, mkDep("uid-inc0", t0, 1), delAt)
+
+	// Verify RS and Pod caches were pruned atomically on Deployment deletion.
+	s.mu.Lock()
+	_, rsStillCached := s.replicaSetToDeployment["ai-lab/web-7d9f"]
+	_, podStillCached := s.podToDeployment["ai-lab/web-7d9f-aaaaa"]
+	s.mu.Unlock()
+	if rsStillCached || podStillCached {
+		t.Fatalf("expected RS/Pod deployment caches to be pruned on delete, got rs=%v pod=%v", rsStillCached, podStillCached)
+	}
+
+	// 1. A trailing event of the old Workload (same 1s CreationTimestamp t0, still Admitted=True) must not revive state.
+	s.handleWorkloadWatchEventAt(watch.Modified, mkWl("aaaaa", "uid-inc0", t0, false), delAt.Add(100*time.Millisecond))
+	if st, ok := ownerState(); ok {
+		t.Fatalf("trailing Workload event revived ownerStates[%s]=%q after Deployment deletion", oKey, st)
+	}
+	s.mu.Lock()
+	_, wlMapRevived := s.deploymentWlStates[oKey]
+	_, ownerWlRevived := s.ownerToWorkload[oKey]
+	s.mu.Unlock()
+	if wlMapRevived || ownerWlRevived {
+		t.Fatalf("trailing Workload event revived state: deploymentWlStates=%v ownerToWorkload=%v", wlMapRevived, ownerWlRevived)
+	}
+
+	// 2. Same-second recreate (CreationTimestamp == t0!): Deployment starts with 0 ready replicas -> NotAdmitted.
+	recreatedAt := t0.Add(500 * time.Millisecond)
+	s.handleDeploymentWatchEventAt(watch.Added, mkDep("uid-inc1", t0, 0), recreatedAt)
+
+	// 3. Dying incarnation-0 Workload (same 1s CreationTimestamp t0!) reports Admitted=True then OwnerNotFound.
+	//    Neither event may leak into incarnation 1.
+	s.handleWorkloadWatchEventAt(watch.Modified, mkWl("aaaaa", "uid-inc0", t0, false), recreatedAt.Add(50*time.Millisecond))
+	s.handleWorkloadWatchEventAt(watch.Modified, mkWl("aaaaa", "uid-inc0", t0, true), recreatedAt.Add(100*time.Millisecond))
+	if st, ok := ownerState(); ok {
+		t.Fatalf("incarnation-0 Workload leaked into incarnation 1: ownerStates[%s]=%q", oKey, st)
+	}
+
+	// 4. Incarnation 1's own Workload sets owner state even with same-second CreationTimestamp t0.
+	s.handleReplicaSetWatchEvent(watch.Added, mkRS("uid-inc1"))
+	s.handleWorkloadWatchEventAt(watch.Added, mkWl("bbbbb", "uid-inc1", t0, false), recreatedAt.Add(150*time.Millisecond))
+	if st, ok := ownerState(); !ok || st != WorkloadStateAdmitted {
+		t.Fatalf("expected incarnation 1 owner state Admitted from its own Workload, got %q (present=%v)", st, ok)
+	}
+	s.mu.Lock()
+	wlMap := s.deploymentWlStates[oKey]
+	s.mu.Unlock()
+	if len(wlMap) != 1 || wlMap["pod-web-7d9f-bbbbb"] != WorkloadStateAdmitted {
+		t.Fatalf("expected only the incarnation-1 Workload in deploymentWlStates, got %v", wlMap)
+	}
+
+	// 5. Same-second delete + out-of-order recreate where Incarnation 2's RS+Workload arrive BEFORE
+	//    Deployment watch delivers Incarnation 2: brand-new Workload must NOT be falsely dropped!
+	delAt2 := t0.Add(700 * time.Millisecond)
+	s.handleDeploymentWatchEventAt(watch.Deleted, mkDep("uid-inc1", t0, 1), delAt2)
+	s.handleReplicaSetWatchEvent(watch.Added, mkRS("uid-inc2"))
+	s.handleWorkloadWatchEventAt(watch.Added, mkWl("ccccc", "uid-inc2", t0, false), delAt2.Add(50*time.Millisecond))
+	if st, ok := ownerState(); !ok || st != WorkloadStateAdmitted {
+		t.Fatalf("expected out-of-order brand-new incarnation-2 Workload NOT to be dropped, got %q (present=%v)", st, ok)
+	}
+
+	rawWf, err := os.ReadFile(s.cfg.WorkflowsFile)
+	if err != nil {
+		t.Fatalf("read workflows.json: %v", err)
+	}
+	var newStates []WorkloadState
+	for _, ev := range readJSONLines[WorkflowEvent](t, rawWf) {
+		if ev.EventType == EventNew && ev.Payload.ObjectKind == "Deployment" && ev.Payload.Name == "web" {
+			newStates = append(newStates, ev.WorkloadState)
+		}
+	}
+	if len(newStates) != 2 || newStates[1] != WorkloadStateNotAdmitted {
+		t.Fatalf("expected recreated Deployment to start as NotAdmitted, got New states %v", newStates)
+	}
+}
+
+func TestUnlabeledDeploymentPendingStateWithManageJobsWithoutQueueName(t *testing.T) {
+	t0 := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	mkDep := func(ns string) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: ns, UID: "uid-web", CreationTimestamp: metav1.NewTime(t0)},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To[int32](2),
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "app:v1"}}},
+				},
+			},
+			// The gated pods exist but none is ready, and no Workload was seen yet.
+			Status: appsv1.DeploymentStatus{Replicas: 2, ReadyReplicas: 0},
+		}
+	}
+	newState := func(s *Scraper) WorkloadState {
+		t.Helper()
+		rawWf, err := os.ReadFile(s.cfg.WorkflowsFile)
+		if err != nil {
+			t.Fatalf("read workflows.json: %v", err)
+		}
+		evs := readJSONLines[WorkflowEvent](t, rawWf)
+		if len(evs) != 1 || evs[0].EventType != EventNew {
+			t.Fatalf("expected exactly one New Deployment event, got %+v", evs)
+		}
+		return evs[0].WorkloadState
+	}
+
+	s := newTestScraper(t, Config{}, nil, nil, nil)
+	s.mu.Lock()
+	s.manageJobsWithoutQueueName = true
+	s.mu.Unlock()
+	s.handleDeploymentWatchEventAt(watch.Added, mkDep("ai-lab"), t0)
+	if got := newState(s); got != WorkloadStateNotAdmitted {
+		t.Fatalf("expected unlabeled pending Deployment under manageJobsWithoutQueueName to be NotAdmitted, got %q", got)
+	}
+
+	// infra-pods must stay excluded even when manageJobsWithoutQueueName=true.
+	if !s.shouldSkipDeployment(mkDep("infra-pods")) {
+		t.Fatalf("expected infra-pods Deployment to be skipped when manageJobsWithoutQueueName=true")
+	}
+
+	// managedJobsNamespaceSelector from Kueue Configuration scopes unlabeled Deployments accurately.
+	sel := parseManagedJobsNamespaceSelectorYAML(`
+apiVersion: config.kueue.x-k8s.io/v1beta2
+kind: Configuration
+manageJobsWithoutQueueName: true
+managedJobsNamespaceSelector:
+  matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values: [monitoring, cert-manager]
+`)
+	if sel == nil {
+		t.Fatalf("expected managedJobsNamespaceSelector to parse cleanly")
+	}
+	s.mu.Lock()
+	s.managedJobsNamespaceSelector = sel
+	s.mu.Unlock()
+	if !s.shouldSkipDeployment(mkDep("monitoring")) {
+		t.Fatalf("expected Deployment in namespace excluded by managedJobsNamespaceSelector to be skipped")
+	}
+	if s.shouldSkipDeployment(mkDep("team-ml")) {
+		t.Fatalf("expected Deployment in namespace matched by managedJobsNamespaceSelector to be tracked")
 	}
 }

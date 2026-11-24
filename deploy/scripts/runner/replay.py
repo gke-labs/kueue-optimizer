@@ -690,11 +690,25 @@ def _build_single_pod_deployment_workload_status(
                 return fn
         return candidates[0] if candidates else "default-flavor"
 
-    scraped_flavors: dict[str, str] = {}
+    scraped_flavors_by_rk: dict[str, set[str]] = {}
     for s_psa in idep.scraped_pod_set_assignments:
         for rk, fn in (s_psa.get("flavors") or {}).items():
-            if str(fn) in idep.flavors_by_name:
-                scraped_flavors[str(rk)] = str(fn)
+            fn_s = str(fn)
+            if fn_s in idep.flavors_by_name:
+                scraped_flavors_by_rk.setdefault(str(rk), set()).add(fn_s)
+
+    def _pick_scraped_flv(rk: str) -> str:
+        cands = scraped_flavors_by_rk.get(rk)
+        if not cands:
+            return ""
+        if node_doc is not None:
+            for fn in sorted(cands):
+                if _matches_flv(node_doc, idep.flavors_by_name.get(fn)):
+                    return fn
+            return ""
+        if len(cands) == 1:
+            return next(iter(cands))
+        return ""
 
     target_resources = [rk for rk in reqs if rk in covered_to_flavors]
     if not target_resources:
@@ -704,7 +718,7 @@ def _build_single_pod_deployment_workload_status(
     resource_usage: dict[str, str] = {}
     assigned_tas_topology = ""
     for rk in sorted(target_resources):
-        flv_name = scraped_flavors.get(rk) or _pick_flv(covered_to_flavors.get(rk) or all_cq_flavors)
+        flv_name = _pick_scraped_flv(rk) or _pick_flv(covered_to_flavors.get(rk) or all_cq_flavors)
         flavors_map[rk] = flv_name
         resource_usage[rk] = multiply_k8s_quantity_exact(reqs.get(rk, "0"), 1, rk)
         flv_doc = idep.flavors_by_name.get(flv_name) or {}
@@ -779,7 +793,19 @@ def _bootstrap_initial_deployments(
         f"({total_admitted}/{total_desired} replica(s) pre-admitted) before queue activation...",
         flush=True,
     )
-    mgr.apply_manifests_parallel([d.manifest for d in initial_deployments], max_workers=16)
+    # Kubernetes Deployment controller does not create the first ReplicaSet while `spec.paused` is True.
+    # Bootstrap paused t0 Deployments with `paused: false` first, then restore `paused: true` after pre-admission.
+    initial_apply_docs: list[dict[str, Any]] = []
+    paused_to_restore: list[dict[str, Any]] = []
+    for d in initial_deployments:
+        if d.admitted_replicas > 0 and bool((d.manifest.get("spec") or {}).get("paused", False)):
+            unpaused_doc = json.loads(json.dumps(d.manifest))
+            unpaused_doc.setdefault("spec", {})["paused"] = False
+            initial_apply_docs.append(unpaused_doc)
+            paused_to_restore.append(d.manifest)
+        else:
+            initial_apply_docs.append(d.manifest)
+    mgr.apply_manifests_parallel(initial_apply_docs, max_workers=16)
 
     for idep in initial_deployments[:8]:
         tas_tag = " [TAS]" if idep.is_tas else ""
@@ -864,7 +890,9 @@ def _bootstrap_initial_deployments(
             )
 
     ref_now = datetime.now(timezone.utc)
-    patch_tasks: list[tuple[str, str, dict[str, Any]]] = []
+    now_ts = ref_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    initial_patch_tasks: list[tuple[str, str, dict[str, Any]]] = []
+    final_patch_tasks: list[tuple[str, str, dict[str, Any]]] = []
     admitted_pod_keys: list[tuple[str, str]] = []
     for idx_d, idep in active_ideps:
         age_offset = max(0.0, float(idep.original_age_sec or 0.0))
@@ -876,27 +904,40 @@ def _bootstrap_initial_deployments(
         for idx_p, (pod_name, wl_doc) in enumerate(matched_by_idx[idx_d]):
             wl_name = str((wl_doc.get("metadata") or {}).get("name") or "")
             plc = idep.placements[idx_p] if idx_p < len(idep.placements) else ""
-            st_doc = _build_single_pod_deployment_workload_status(idep, wl_doc, plc, wl_ts)
-            patch_tasks.append((idep.namespace, wl_name, st_doc))
+            # Stamp `now_ts` on the first patch so WaitForPodsReady does not evict aged t0 pods before they become Ready.
+            initial_patch_tasks.append(
+                (idep.namespace, wl_name, _build_single_pod_deployment_workload_status(idep, wl_doc, plc, now_ts))
+            )
+            final_patch_tasks.append(
+                (idep.namespace, wl_name, _build_single_pod_deployment_workload_status(idep, wl_doc, plc, wl_ts))
+            )
             admitted_pod_keys.append((idep.namespace, pod_name))
 
     def _patch_one(task: tuple[str, str, dict[str, Any]]) -> None:
         ns_t, wl_n_t, st_t = task
-        mgr.api_request(
+        st_code, raw_resp = mgr.api_request(
             "PATCH",
             f"/apis/kueue.x-k8s.io/v1beta2/namespaces/{ns_t}/workloads/{wl_n_t}/status",
             body=json.dumps({"status": st_t}).encode("utf-8"),
             headers={"Content-Type": "application/merge-patch+json"},
         )
+        if not (200 <= st_code < 300):
+            resp_txt = raw_resp.decode("utf-8", errors="replace")[:300] if raw_resp else ""
+            raise RuntimeError(
+                f"Failed to patch t0 Deployment Workload status '{ns_t}/{wl_n_t}' (HTTP {st_code}): {resp_txt}"
+            )
 
-    with ThreadPoolExecutor(max_workers=min(16, max(1, len(patch_tasks)))) as pool:
-        list(pool.map(_patch_one, patch_tasks))
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(initial_patch_tasks)))) as pool:
+        list(pool.map(_patch_one, initial_patch_tasks))
 
-    mgr.wait_for_pods_running(admitted_pod_keys)
+    mgr.wait_for_pods_running(admitted_pod_keys, require_ready=True)
 
-    # Ensure PodsReady=True (Started) and back-dated Admitted seniority remain intact once pods are Ready.
-    with ThreadPoolExecutor(max_workers=min(16, max(1, len(patch_tasks)))) as pool:
-        list(pool.map(_patch_one, patch_tasks))
+    # Restore PodsReady=True (Started) and apply back-dated Admitted seniority once all pods are Ready.
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(final_patch_tasks)))) as pool:
+        list(pool.map(_patch_one, final_patch_tasks))
+
+    if paused_to_restore:
+        mgr.apply_manifests_parallel(paused_to_restore, max_workers=16)
 
 
 def apply_scenario_queues_and_wait(
@@ -924,11 +965,9 @@ def apply_scenario_queues_and_wait(
     mgr.apply_manifests_parallel(ns_docs, max_workers=16)
     mgr.apply_manifests_parallel(other_prereq_docs, max_workers=16)
 
-    if initial_deployments:
-        _bootstrap_initial_deployments(mgr, initial_deployments)
-
-    # Bootstrap pre-admitted t0 Kueue PodGroup Workloads + member Pods + non-Kueue infra-pods BEFORE
-    # ClusterQueues/LocalQueues exist so Cache.AddClusterQueue loads quota, FairSharing, and TAS usage atomically.
+    # Bootstrap pre-admitted t0 Kueue PodGroup Workloads + member Pods + non-Kueue infra-pods FIRST
+    # so pinned `spec.nodeName` pods occupy their recorded nodes before kube-scheduler places unpinned
+    # t0 Deployment pods, and both finish BEFORE ClusterQueues/LocalQueues activate.
     if initial_workloads:
         wl_pod_total = sum(len(w.pods) for w in initial_workloads)
         print(
@@ -972,6 +1011,9 @@ def apply_scenario_queues_and_wait(
         mgr.wait_for_pods_running(
             [(p.namespace, str((p.manifest.get("metadata") or {}).get("name") or p.name)) for p in all_bootstrap_pods]
         )
+
+    if initial_deployments:
+        _bootstrap_initial_deployments(mgr, initial_deployments)
 
     mgr.apply_manifests_parallel(cq_lq_docs, max_workers=16)
 
@@ -1057,8 +1099,6 @@ def run_scenario_replay(
         )
 
     if not initial_state_already_bootstrapped:
-        if bundle.initial_deployments:
-            _bootstrap_initial_deployments(mgr, bundle.initial_deployments)
         if bundle.initial_workloads:
             mgr.apply_pre_admitted_workloads_parallel(
                 _stamp_initial_workloads_for_bootstrap(bundle.initial_workloads)
@@ -1078,6 +1118,8 @@ def run_scenario_replay(
             mgr.wait_for_pods_running(
                 [(p.namespace, str((p.manifest.get("metadata") or {}).get("name") or p.name)) for p in bundle.initial_pods]
             )
+        if bundle.initial_deployments:
+            _bootstrap_initial_deployments(mgr, bundle.initial_deployments)
 
     mgr._retired_serving_workloads = {}
     event_heap: list[ScheduledWorkflowItem] = list(bundle.scheduled_workflows)
@@ -1133,6 +1175,7 @@ def run_scenario_replay(
     fifo_gate_wall_sec = 0.0
 
     known_deploy_names_by_ns: dict[str, set[str]] = {}
+    known_standalone_pod_names_by_ns: dict[str, set[str]] = {}
     active_deployment_replicas: dict[tuple[str, str], int] = {}
     expected_clean_retirements: dict[tuple[str, str], int] = {}
     retire_eligible_wls: dict[tuple[str, str], set[tuple[str, str]]] = {}
@@ -1141,6 +1184,12 @@ def run_scenario_replay(
     deferred_paused_upgrade: set[tuple[str, str]] = set()
     live_serving_wls: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
     serving_wl_keys: set[tuple[str, str]] = set()
+    non_serving_wl_keys: set[tuple[str, str]] = set()
+    # (namespace, workload) -> (is_serving, deployment_name), confirmed from the owning Pod's annotations.
+    serving_class_by_wl: dict[tuple[str, str], tuple[bool, str]] = {}
+    # Pod-owned Workloads whose owning Pod was already gone when first looked up.
+    owner_pod_missing_wls: set[tuple[str, str]] = set()
+    terminated_incarnations: set[tuple[str, str, str, int]] = set()
     scale_zero_drain_deadline: float | None = None
 
     for idep in bundle.initial_deployments:
@@ -1151,9 +1200,36 @@ def run_scenario_replay(
         if sw_d.object_kind == "Deployment":
             ap_n = str((sw_d.manifest.get("metadata") or {}).get("name") or sw_d.name)
             known_deploy_names_by_ns.setdefault(sw_d.namespace, set()).add(ap_n)
+        elif sw_d.object_kind == "Pod":
+            ap_p = str((sw_d.manifest.get("metadata") or {}).get("name") or sw_d.name)
+            known_standalone_pod_names_by_ns.setdefault(sw_d.namespace, set()).update({sw_d.name, ap_p})
+    for ip_s in bundle.initial_pods:
+        ap_ip = str((ip_s.manifest.get("metadata") or {}).get("name") or ip_s.name)
+        known_standalone_pod_names_by_ns.setdefault(ip_s.namespace, set()).update({ip_s.name, ap_ip})
+    for iwl_p in bundle.initial_workloads:
+        if iwl_p.owner_kind == "Pod":
+            known_standalone_pod_names_by_ns.setdefault(iwl_p.namespace, set()).add(iwl_p.owner_name)
+            for p_s in iwl_p.pods:
+                ap_ps = str((p_s.manifest.get("metadata") or {}).get("name") or p_s.name)
+                known_standalone_pod_names_by_ns.setdefault(iwl_p.namespace, set()).update({p_s.name, ap_ps})
     for su_d in bundle.scheduled_workflow_updates:
         if su_d.object_kind == "Deployment":
             known_deploy_names_by_ns.setdefault(su_d.namespace, set()).add(su_d.applied_name)
+
+    def _is_known_standalone_pod(ns_val: str, pod_name: str) -> bool:
+        return bool(pod_name) and pod_name in known_standalone_pod_names_by_ns.get(ns_val, set())
+
+    def _is_known_standalone_pod_wl_name(ns_val: str, wl_name: str) -> bool:
+        if not wl_name.startswith("pod-"):
+            return False
+        for sp in known_standalone_pod_names_by_ns.get(ns_val, set()):
+            if (
+                wl_name == f"pod-{sp}"
+                or wl_name.startswith(f"pod-{sp}-")
+                or (len(sp) > 53 and wl_name.startswith(f"pod-{sp[:53]}-"))
+            ):
+                return True
+        return False
 
     def _is_currently_admitted_serving_wl(wl_doc: dict[str, Any]) -> bool:
         st_obj = wl_doc.get("status") or {}
@@ -1172,13 +1248,14 @@ def run_scenario_replay(
             for c in conds
         )
 
-    def _match_deploy_for_serving_wl(ns_val: str, wl_doc: dict[str, Any]) -> str:
-        owners = (wl_doc.get("metadata") or {}).get("ownerReferences") or []
-        pod_ref = ""
-        for o in owners:
+    def _owner_pod_name(wl_doc: dict[str, Any]) -> str:
+        for o in (wl_doc.get("metadata") or {}).get("ownerReferences") or []:
             if isinstance(o, dict) and o.get("kind") == "Pod" and o.get("name"):
-                pod_ref = str(o["name"])
-                break
+                return str(o["name"])
+        return ""
+
+    def _match_deploy_for_serving_wl(ns_val: str, wl_doc: dict[str, Any]) -> str:
+        pod_ref = _owner_pod_name(wl_doc)
         if not pod_ref:
             return ""
         best = ""
@@ -1187,26 +1264,62 @@ def run_scenario_replay(
                 best = cand_dep
         return best
 
-    def _classify_serving_workload_doc(ns_val: str, wl_doc: dict[str, Any]) -> tuple[bool, str]:
-        dep_n = _match_deploy_for_serving_wl(ns_val, wl_doc)
-        if dep_n:
-            return True, dep_n
+    def _has_serving_marker(ann: dict[str, Any]) -> bool:
+        return (
+            str(ann.get("kueue-optimizer.gke.io/long-running-pod") or "").lower() == "true"
+            or str(ann.get("kueue.x-k8s.io/pod-suspending-parent") or "").lower() == "deployment"
+        )
+
+    def _classify_serving_workload_doc(
+        ns_val: str,
+        wl_doc: dict[str, Any],
+        owner_pod_ann: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Return `(is_serving, deployment_name)` for a Workload.
+
+        Kueue's pod integration builds `spec.podSets[].template` from `Pod.spec` only and copies no
+        `kueue-optimizer.gke.io/*` annotation onto the Workload. So the Deployment name and the finite
+        pod marker come from the annotations of the owning Pod (`owner_pod_ann`, `None` when the Pod is
+        unknown). A result that the owning Pod confirmed is cached, because the Pod can be gone on a
+        later poll while its Workload is still listed.
+        """
+        wk_c = (ns_val, str((wl_doc.get("metadata") or {}).get("name") or ""))
+        cached = serving_class_by_wl.get(wk_c)
+        if cached is not None:
+            return cached
         wm_ann = ((wl_doc.get("metadata") or {}).get("annotations")) or {}
-        if (
-            str(wm_ann.get("kueue-optimizer.gke.io/long-running-pod") or "").lower() == "true"
-            or str(wm_ann.get("kueue.x-k8s.io/pod-suspending-parent") or "").lower() == "deployment"
-        ):
-            return True, ""
+        has_serving_marker = _has_serving_marker(wm_ann)
         for ps in ((wl_doc.get("spec") or {}).get("podSets")) or []:
-            if not isinstance(ps, dict):
-                continue
-            ann = (((ps.get("template") or {}).get("metadata")) or {}).get("annotations") or {}
-            if (
-                str(ann.get("kueue-optimizer.gke.io/long-running-pod") or "").lower() == "true"
-                or str(ann.get("kueue.x-k8s.io/pod-suspending-parent") or "").lower() == "deployment"
-            ):
-                return True, ""
-        return False, ""
+            if isinstance(ps, dict):
+                ps_ann = (((ps.get("template") or {}).get("metadata")) or {}).get("annotations") or {}
+                has_serving_marker = has_serving_marker or _has_serving_marker(ps_ann)
+
+        owner_pod = _owner_pod_name(wl_doc)
+        is_known_standalone = _is_known_standalone_pod(ns_val, owner_pod)
+        result: tuple[bool, str] | None = None
+        if owner_pod_ann is not None:
+            dep_ann = str(owner_pod_ann.get("kueue-optimizer.gke.io/deployment-name") or "").strip()
+            has_serving_marker = has_serving_marker or _has_serving_marker(owner_pod_ann)
+            has_finite_pod_exec = bool(
+                str(owner_pod_ann.get("kueue-optimizer.gke.io/pod-execution-time-seconds") or "").strip()
+            )
+            if dep_ann:
+                result = (True, dep_ann)
+            elif (has_finite_pod_exec or is_known_standalone) and not has_serving_marker:
+                result = (False, "")
+        elif is_known_standalone and not has_serving_marker:
+            # Fast-exiting standalone Pod disappeared before the first Pod list: never fall back to
+            # Deployment prefix matching.
+            result = (False, "")
+        if result is None:
+            dep_n = _match_deploy_for_serving_wl(ns_val, wl_doc)
+            if dep_n:
+                result = (True, dep_n)
+            else:
+                result = (has_serving_marker, "")
+        if (owner_pod_ann is not None or is_known_standalone) and wk_c[1]:
+            serving_class_by_wl[wk_c] = result
+        return result
 
     def _non_serving_finished_keys(keys: set[tuple[str, str]]) -> set[tuple[str, str]]:
         if not known_deploy_names_by_ns and not serving_wl_keys:
@@ -1214,6 +1327,13 @@ def run_scenario_replay(
         out: set[tuple[str, str]] = set()
         for ns_k, wn_k in keys:
             if (ns_k, wn_k) in serving_wl_keys:
+                continue
+            if (ns_k, wn_k) in non_serving_wl_keys:
+                out.add((ns_k, wn_k))
+                continue
+            if _is_known_standalone_pod_wl_name(ns_k, wn_k):
+                non_serving_wl_keys.add((ns_k, wn_k))
+                out.add((ns_k, wn_k))
                 continue
             if wn_k.startswith("pod-") and any(
                 wn_k.startswith(f"pod-{d}-") for d in known_deploy_names_by_ns.get(ns_k, set())
@@ -1239,18 +1359,45 @@ def run_scenario_replay(
             if st_w != 200 or not raw_w:
                 query_all_ok = False
                 continue
-            for wl_it in json.loads(raw_w.decode("utf-8")).get("items") or []:
-                if not isinstance(wl_it, dict):
-                    continue
+            wl_items = [w for w in (json.loads(raw_w.decode("utf-8")).get("items") or []) if isinstance(w, dict)]
+
+            # List the Pods of this namespace only when a Pod-owned Workload is not classified yet.
+            def _needs_owner_pod(w_doc: dict[str, Any]) -> bool:
+                w_meta = w_doc.get("metadata") or {}
+                w_key = (str(w_meta.get("namespace") or ns_q), str(w_meta.get("name") or ""))
+                return (
+                    bool(_owner_pod_name(w_doc))
+                    and w_key not in serving_class_by_wl
+                    and w_key not in owner_pod_missing_wls
+                )
+
+            pod_ann_by_name: dict[str, dict[str, Any]] | None = None
+            if any(_needs_owner_pod(w) for w in wl_items):
+                st_p, raw_p = mgr.api_request("GET", f"/api/v1/namespaces/{ns_q}/pods")
+                if st_p == 200 and raw_p:
+                    pod_ann_by_name = {}
+                    for p_it in json.loads(raw_p.decode("utf-8")).get("items") or []:
+                        p_meta = (p_it.get("metadata") or {}) if isinstance(p_it, dict) else {}
+                        if p_meta.get("name"):
+                            pod_ann_by_name[str(p_meta["name"])] = dict(p_meta.get("annotations") or {})
+
+            for wl_it in wl_items:
                 wm = wl_it.get("metadata") or {}
                 wn = str(wm.get("name") or "")
                 actual_ns = str(wm.get("namespace") or ns_q)
                 if not wn:
                     continue
-                is_srv, dep_n = _classify_serving_workload_doc(actual_ns, wl_it)
-                if not is_srv:
-                    continue
                 wk = (actual_ns, wn)
+                owner_pod_ann: dict[str, Any] | None = None
+                if pod_ann_by_name is not None and _needs_owner_pod(wl_it):
+                    owner_pod_ann = pod_ann_by_name.get(_owner_pod_name(wl_it))
+                    if owner_pod_ann is None:
+                        # The Pod is already gone and its name is never reused: stop asking for it.
+                        owner_pod_missing_wls.add(wk)
+                is_srv, dep_n = _classify_serving_workload_doc(actual_ns, wl_it, owner_pod_ann)
+                if not is_srv:
+                    non_serving_wl_keys.add(wk)
+                    continue
                 serving_wl_keys.add(wk)
                 if wk in mgr._retired_serving_workloads:
                     continue
@@ -1374,6 +1521,7 @@ def run_scenario_replay(
             )
             dep_key = (wk[0], dep_n)
             elig_set = retire_eligible_wls.get(dep_key)
+            was_eligible = elig_set is not None and wk in elig_set
             if elig_set is not None:
                 elig_set.discard(wk)
             if was_evicted_or_preempted:
@@ -1384,7 +1532,7 @@ def run_scenario_replay(
                 mgr._retired_serving_workloads[wk] = doc_cp
             elif mark_deleted_deploy == dep_key or (
                 expected_clean_retirements.get(dep_key, 0) > 0
-                and elig_set is not None
+                and was_eligible
             ):
                 if mark_deleted_deploy != dep_key and expected_clean_retirements.get(dep_key, 0) > 0:
                     expected_clean_retirements[dep_key] -= 1
@@ -1680,10 +1828,10 @@ def run_scenario_replay(
             and w.incarnation_index == del_ev.incarnation_index
             for w in event_heap
         )
+        inc_key = (del_ev.namespace, del_ev.object_kind, del_ev.name, del_ev.incarnation_index)
+        terminated_incarnations.add(inc_key)
         if unsubmitted_match:
-            cancelled_unsubmitted_keys.add(
-                (del_ev.namespace, del_ev.object_kind, del_ev.name, del_ev.incarnation_index)
-            )
+            cancelled_unsubmitted_keys.add(inc_key)
             total_planned = max(0, total_planned - 1)
             print(
                 f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "
@@ -1758,6 +1906,8 @@ def run_scenario_replay(
 
     def _execute_workflow_update(upd: ScheduledWorkflowUpdate, wall_elapsed: float) -> None:
         nonlocal total_pods_submitted
+        if (upd.namespace, upd.object_kind, upd.name, upd.incarnation_index) in terminated_incarnations:
+            return
         _sync_serving_workloads()
         dep_key = (upd.namespace, upd.applied_name)
         known_deploy_names_by_ns.setdefault(upd.namespace, set()).add(upd.applied_name)
@@ -1810,6 +1960,55 @@ def run_scenario_replay(
             f"(types=[{types_desc}], replicas={prev_rep}->{upd.replicas}, paused={upd.paused}{tpl_desc})",
             flush=True,
         )
+
+    def _overdue_create_ts_by_key(now_el: float) -> dict[tuple[str, str, str, int], float]:
+        """Return the target time of every due create that still waits on event_heap, by incarnation key."""
+        out: dict[tuple[str, str, str, int], float] = {}
+        for w in event_heap:
+            if w.target_wall_offset_sec > now_el:
+                continue
+            w_key = (w.namespace, w.object_kind, w.name, w.incarnation_index)
+            if w_key in cancelled_unsubmitted_keys:
+                continue
+            out[w_key] = min(out.get(w_key, w.target_wall_offset_sec), w.target_wall_offset_sec)
+        return out
+
+    def _held_behind_create(
+        ev: ScheduledWorkflowUpdate | ScheduledWorkflowDeletion,
+        overdue_creates: dict[tuple[str, str, str, int], float],
+        *,
+        strictly_after_create: bool,
+    ) -> bool:
+        """Return True when the create of the same incarnation is due earlier but did not run yet.
+
+        A delete is held only when the create is strictly earlier: a delete at or before the create
+        time cancels the unsubmitted create instead.
+        """
+        if not overdue_creates or getattr(ev, "initial_workload_name", ""):
+            return False
+        create_ts = overdue_creates.get((ev.namespace, ev.object_kind, ev.name, ev.incarnation_index))
+        if create_ts is None:
+            return False
+        if strictly_after_create:
+            return create_ts < ev.target_wall_offset_sec - 1e-9
+        return create_ts <= ev.target_wall_offset_sec + 1e-9
+
+    def _first_runnable_event(
+        heap: list[Any],
+        now_el: float,
+        overdue_creates: dict[tuple[str, str, str, int], float],
+        *,
+        strictly_after_create: bool,
+    ) -> Any | None:
+        """Return the earliest due event of `heap` that is not held behind its own pending create."""
+        if not heap or heap[0].target_wall_offset_sec > now_el:
+            return None
+        if not _held_behind_create(heap[0], overdue_creates, strictly_after_create=strictly_after_create):
+            return heap[0]
+        for ev in sorted(e for e in heap if e.target_wall_offset_sec <= now_el):
+            if not _held_behind_create(ev, overdue_creates, strictly_after_create=strictly_after_create):
+                return ev
+        return None
 
     def _print_status_line(snap: ClusterStatusSnapshot, now_mono: float, note: str = "") -> None:
         wall_elapsed = now_mono - t0_mono
@@ -1915,30 +2114,78 @@ def run_scenario_replay(
                         )
                 continue
 
-            # Execute due workflow deletions BEFORE same-timestamp creations so delete-and-recreate works cleanly.
-            due_deletes: list[ScheduledWorkflowDeletion] = []
-            while delete_heap and delete_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
-                due_deletes.append(heapq.heappop(delete_heap))
+            # Drain due deletes, creates, and updates in chronological order so a stale update cannot
+            # run after a later delete (or same-timestamp delete) and re-create the object via SSA.
+            # Tie-break equal timestamps as delete -> create -> update (with terminated_incarnations
+            # skipping any same-timestamp update for an already-deleted incarnation).
+            # An update or delete whose own earlier create still waits on event_heap (behind
+            # fifo_gate_wall_sec or the batch cap) is held until that create ran, so it cannot
+            # overtake the create.
+            now_el_ev = time.monotonic() - t0_mono
+            overdue_creates = (
+                _overdue_create_ts_by_key(now_el_ev) if (update_heap or delete_heap) and event_heap else {}
+            )
+            due_del = _first_runnable_event(delete_heap, now_el_ev, overdue_creates, strictly_after_create=True)
+            due_upd = _first_runnable_event(update_heap, now_el_ev, overdue_creates, strictly_after_create=False)
+            next_del_ts = due_del.target_wall_offset_sec if due_del is not None else None
+            next_sub_ts = (
+                event_heap[0].target_wall_offset_sec
+                if (
+                    now_el_ev >= fifo_gate_wall_sec
+                    and event_heap
+                    and event_heap[0].target_wall_offset_sec <= now_el_ev
+                )
+                else None
+            )
+            next_upd_ts = due_upd.target_wall_offset_sec if due_upd is not None else None
+            due_kinds: list[tuple[float, int, str]] = []
+            if next_del_ts is not None:
+                due_kinds.append((round(next_del_ts, 6), 0, "delete"))
+            if next_sub_ts is not None:
+                due_kinds.append((round(next_sub_ts, 6), 1, "create"))
+            if next_upd_ts is not None:
+                due_kinds.append((round(next_upd_ts, 6), 2, "update"))
 
-            if due_deletes:
-                for del_ev in due_deletes:
-                    _execute_workflow_deletion(del_ev, time.monotonic() - t0_mono)
-                continue
-
-            due_batch: list[ScheduledWorkflowItem] = []
-            while (
-                (time.monotonic() - t0_mono) >= fifo_gate_wall_sec
-                and event_heap
-                and event_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono)
-            ):
-                cand_it = heapq.heappop(event_heap)
-                c_key = (cand_it.namespace, cand_it.object_kind, cand_it.name, cand_it.incarnation_index)
-                if c_key in cancelled_unsubmitted_keys:
-                    cancelled_unsubmitted_keys.discard(c_key)
+            if due_kinds:
+                due_kinds.sort()
+                win_kind = due_kinds[0][2]
+                if win_kind == "delete":
+                    delete_heap.remove(due_del)
+                    heapq.heapify(delete_heap)
+                    _execute_workflow_deletion(due_del, time.monotonic() - t0_mono)
                     continue
-                due_batch.append(cand_it)
-                if len(due_batch) >= 200:
-                    break
+                if win_kind == "update":
+                    update_heap.remove(due_upd)
+                    heapq.heapify(update_heap)
+                    _execute_workflow_update(due_upd, time.monotonic() - t0_mono)
+                    continue
+
+                # win_kind == "create": batch due creates up to any earlier due delete or update boundary.
+                batch_cutoff = now_el_ev
+                if delete_heap and delete_heap[0].target_wall_offset_sec <= batch_cutoff:
+                    batch_cutoff = min(batch_cutoff, delete_heap[0].target_wall_offset_sec - 1e-6)
+                if update_heap and update_heap[0].target_wall_offset_sec < batch_cutoff:
+                    batch_cutoff = min(batch_cutoff, update_heap[0].target_wall_offset_sec)
+                batch_cutoff = max(batch_cutoff, next_sub_ts)
+                due_batch: list[ScheduledWorkflowItem] = []
+                popped_cancelled = False
+                while (
+                    event_heap
+                    and event_heap[0].target_wall_offset_sec <= batch_cutoff + 1e-9
+                ):
+                    cand_it = heapq.heappop(event_heap)
+                    c_key = (cand_it.namespace, cand_it.object_kind, cand_it.name, cand_it.incarnation_index)
+                    if c_key in cancelled_unsubmitted_keys:
+                        cancelled_unsubmitted_keys.discard(c_key)
+                        popped_cancelled = True
+                        continue
+                    due_batch.append(cand_it)
+                    if len(due_batch) >= 200:
+                        break
+                if not due_batch and popped_cancelled:
+                    continue
+            else:
+                due_batch = []
 
             if due_batch:
                 # Preserve exact creationTime FIFO order across small batches: group by creation_epoch
@@ -2037,15 +2284,6 @@ def run_scenario_replay(
                     )
                 continue
 
-            due_updates: list[ScheduledWorkflowUpdate] = []
-            while update_heap and update_heap[0].target_wall_offset_sec <= (time.monotonic() - t0_mono):
-                due_updates.append(heapq.heappop(update_heap))
-
-            if due_updates:
-                for upd_ev in due_updates:
-                    _execute_workflow_update(upd_ev, time.monotonic() - t0_mono)
-                continue
-
             now_mono = time.monotonic()
             due_status = now_mono >= next_status_mono
             need_fast_poll = (
@@ -2130,10 +2368,18 @@ def run_scenario_replay(
                 wake_candidates.append(next_poll_mono - now_mono)
             if event_heap:
                 wake_candidates.append(max(event_heap[0].target_wall_offset_sec, fifo_gate_wall_sec) - wall_elapsed)
-            if update_heap:
-                wake_candidates.append(update_heap[0].target_wall_offset_sec - wall_elapsed)
-            if delete_heap:
-                wake_candidates.append(delete_heap[0].target_wall_offset_sec - wall_elapsed)
+            # An update or delete held behind its own pending create wakes with that create (above).
+            overdue_wake = (
+                _overdue_create_ts_by_key(wall_elapsed) if (update_heap or delete_heap) and event_heap else {}
+            )
+            for wake_heap, wake_strict in ((update_heap, False), (delete_heap, True)):
+                free_ts = [
+                    e.target_wall_offset_sec
+                    for e in wake_heap
+                    if not _held_behind_create(e, overdue_wake, strictly_after_create=wake_strict)
+                ]
+                if free_ts:
+                    wake_candidates.append(min(free_ts) - wall_elapsed)
             if infra_heap:
                 wake_candidates.append(infra_heap[0].target_wall_offset_sec - wall_elapsed)
             if max_run_seconds is not None and max_run_seconds > 0:

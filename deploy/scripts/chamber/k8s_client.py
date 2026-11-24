@@ -458,8 +458,10 @@ class ChamberK8sClientMixin:
         self,
         pod_keys: list[tuple[str, str]],
         timeout_sec: float = 90.0,
+        *,
+        require_ready: bool = False,
     ) -> None:
-        """Wait until all specified `(namespace, pod_name)` pods reach Running or Succeeded phase."""
+        """Wait until all specified `(namespace, pod_name)` pods reach Running (and Ready when requested) or Succeeded."""
         if not pod_keys:
             return
         target = set(pod_keys)
@@ -473,14 +475,22 @@ class ChamberK8sClientMixin:
                     p_key = (str(meta.get("namespace") or "default"), str(meta.get("name") or ""))
                     if p_key not in target:
                         continue
-                    phase = str((it.get("status") or {}).get("phase") or "")
-                    if phase in ("Running", "Succeeded"):
+                    pod_status = it.get("status") or {}
+                    phase = str(pod_status.get("phase") or "")
+                    if phase == "Succeeded":
                         ready_keys.add(p_key)
+                    elif phase == "Running":
+                        if not require_ready or any(
+                            isinstance(c, dict) and c.get("type") == "Ready" and c.get("status") == "True"
+                            for c in (pod_status.get("conditions") or [])
+                        ):
+                            ready_keys.add(p_key)
                 if target.issubset(ready_keys):
                     return
             time.sleep(0.25)
+        state_desc = "Running and Ready" if require_ready else "Running phase"
         raise RuntimeError(
-            f"Timed out waiting for {len(target)} initial pod(s) to reach Running phase on KWOK nodes"
+            f"Timed out waiting for {len(target)} initial pod(s) to reach {state_desc} on KWOK nodes"
         )
 
     @staticmethod

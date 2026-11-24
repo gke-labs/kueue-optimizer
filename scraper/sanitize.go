@@ -137,6 +137,7 @@ var allowedAnnotationDomains = []string{
 // cloud project/volume identifiers, or internal node IP addresses.
 var deniedAnnotationKeys = []string{
 	strings.ToLower(corev1.LastAppliedConfigAnnotation), // kubectl.kubernetes.io/last-applied-configuration
+	"deployment.kubernetes.io/revision",
 	"kubernetes.io/change-cause",
 	"kubernetes.io/description",
 	"kubernetes.io/service-account.name",

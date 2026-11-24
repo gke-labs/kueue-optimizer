@@ -67,7 +67,7 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 
 - **Controlled Variable Changed**: Replaying post-`t0` `ScaleDown` updates (`8 -> 4` at `t=+10s`, `4 -> 0` at `t=+26s` in `st83`) vs. omitting `ScaleDown` updates (`st84`) on identical `srv-pool` + `2` `4`-TPU batch `Job`s.
 - **Isolated Peer Command**: `python3 deploy/scripts/testrunner.py testscenarios/self-tests/st84-deployment-unscaled-blocks-batch-control --duration 34s --namespace kueue-optimizer-chamber-st84 --port 16484`
-- **Cross-Examination Assertion**: `st83` unblocks both `batch-0` and `batch-1` at `t=+10s` (`pods succeeded=2`, `Unadmitted=0`) and scales cleanly to `0` at `t=+26s` (`completed=10, active_at_end=0`), whereas `st84` starves both batch `Job`s (`pods succeeded=0`, `Unadmitted=2`, `active_at_end=8`).
+- **Cross-Examination Assertion**: `st83` unblocks both `batch-0` and `batch-1` at `t=+10s` (`pods succeeded=4`, `Unadmitted=0`) and scales cleanly to `0` at `t=+26s` (`completed=10, active_at_end=0`), whereas `st84` starves both batch `Job`s (`pods succeeded=0`, `Unadmitted=2`, `active_at_end=8`).
 - **Expected Target Shift**:
   - `Sec 5.1 Quota Util`: `100% (t=0..19s) -> 50% (t=19..26s) -> 0%` (`st83`) vs. `95%–100% (16/16 TPUs steady)` (`st84`)
   - `Sec 5.2 Wait Time`: `batch wait ~8s–11s (10 total admitted)` (`st83`) vs. `p-std < 2.0s (8 serving; 2 batch unadmitted)` (`st84`)

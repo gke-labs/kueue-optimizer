@@ -5336,6 +5336,1444 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
         finally:
             mgr.close()
 
+    def test_bootstrap_initial_deployments_paused_wfpr_two_phase_patch_error_and_order(self) -> None:
+        """Verify paused t0 Deployment unpause/restore, two-phase now->backdated PATCH, Ready wait, PATCH error, order, and multi-flavor node matching."""
+        from chamber.parsers import parse_rfc3339_epoch
+        from runner.loader import InitialDeploymentBootstrap, InitialPodSpec, InitialWorkloadPodGroup
+        from runner.replay import (
+            _bootstrap_initial_deployments,
+            _build_single_pod_deployment_workload_status,
+            apply_scenario_queues_and_wait,
+        )
+
+        # 1. Multi-flavor scraped_pod_set_assignments must respect node_doc flavor match.
+        cq_multi = {
+            "spec": {
+                "resourceGroups": [
+                    {
+                        "coveredResources": ["cpu", "google.com/tpu"],
+                        "flavors": [{"name": "flv-a"}, {"name": "flv-b"}],
+                    }
+                ]
+            }
+        }
+        idep_multi = InitialDeploymentBootstrap(
+            namespace="ai-lab",
+            name="web",
+            applied_name="web",
+            local_queue_name="lq-main",
+            cluster_queue_name="cq-main",
+            desired_replicas=1,
+            admitted_replicas=1,
+            paused=True,
+            original_age_sec=3600.0,
+            placements=["node-a"],
+            per_pod_requests={"cpu": "2", "google.com/tpu": "2"},
+            priority_class_name="",
+            priority=None,
+            is_tas=False,
+            manifest={
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "web", "namespace": "ai-lab"},
+                "spec": {"replicas": 1, "paused": True},
+            },
+            cq_doc=cq_multi,
+            flavors_by_name={
+                "flv-a": {"spec": {"nodeLabels": {"pool": "a"}}},
+                "flv-b": {"spec": {"nodeLabels": {"pool": "b"}}},
+            },
+            topologies_by_name={},
+            nodes_by_name={"node-a": {"metadata": {"labels": {"pool": "a"}}}},
+            scraped_pod_set_assignments=[
+                {"name": "main", "flavors": {"cpu": "flv-a", "google.com/tpu": "flv-a"}},
+                {"name": "main", "flavors": {"cpu": "flv-b", "google.com/tpu": "flv-b"}},
+            ],
+        )
+        st_multi = _build_single_pod_deployment_workload_status(
+            idep_multi,
+            {"spec": {"podSets": [{"name": "main"}]}},
+            "node-a",
+            "2026-01-01T00:00:00Z",
+        )
+        self.assertEqual(
+            st_multi["admission"]["podSetAssignments"][0]["flavors"],
+            {"cpu": "flv-a", "google.com/tpu": "flv-a"},
+        )
+
+        # 2. Unmocked _bootstrap_initial_deployments: paused t0 Deployment applied paused=False -> patched with now ->
+        #    waits for Pod Ready=True -> patched with back-dated wl_ts -> restored to paused=True.
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-test-boot", apiserver_port=16498)
+        try:
+            applied_paused_seq: list[bool] = []
+            patch_timestamps: list[str] = []
+            pod_get_calls = [0]
+
+            def fake_apply(docs, max_workers=16):
+                for d in docs:
+                    if d.get("kind") == "Deployment":
+                        applied_paused_seq.append(bool((d.get("spec") or {}).get("paused", False)))
+
+            def fake_api(method: str, path: str, body: bytes | None = None, headers: dict | None = None):
+                if method == "GET" and path.endswith("/replicasets"):
+                    # Only create ReplicaSet once Deployment has been applied unpaused!
+                    if applied_paused_seq and applied_paused_seq[-1] is False:
+                        return 200, json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "metadata": {
+                                            "name": "web-rs1",
+                                            "ownerReferences": [{"kind": "Deployment", "name": "web"}],
+                                        }
+                                    }
+                                ]
+                            }
+                        ).encode("utf-8")
+                    return 200, b'{"items": []}'
+                if method == "GET" and path.endswith("/namespaces/ai-lab/pods"):
+                    return 200, json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {
+                                        "name": "web-rs1-p0",
+                                        "namespace": "ai-lab",
+                                        "ownerReferences": [{"kind": "ReplicaSet", "name": "web-rs1"}],
+                                    }
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+                if method == "GET" and path == "/api/v1/pods":
+                    pod_get_calls[0] += 1
+                    # First poll: Running but Ready=False (must NOT return yet!); second poll: Ready=True.
+                    ready_status = "True" if pod_get_calls[0] >= 2 else "False"
+                    return 200, json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {"name": "web-rs1-p0", "namespace": "ai-lab"},
+                                    "status": {
+                                        "phase": "Running",
+                                        "conditions": [{"type": "Ready", "status": ready_status}],
+                                    },
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+                if method == "GET" and path.endswith("/workloads"):
+                    return 200, json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "metadata": {
+                                        "name": "pod-web-rs1-p0-abcde",
+                                        "namespace": "ai-lab",
+                                        "ownerReferences": [{"kind": "Pod", "name": "web-rs1-p0"}],
+                                    },
+                                    "spec": {"podSets": [{"name": "main", "count": 1}]},
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+                if method == "PATCH" and path.endswith("/status") and body:
+                    st_payload = json.loads(body.decode("utf-8"))["status"]
+                    adm_c = next(c for c in st_payload["conditions"] if c["type"] == "Admitted")
+                    patch_timestamps.append(adm_c["lastTransitionTime"])
+                    return 200, b"{}"
+                return 200, b"{}"
+
+            with (
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply),
+                mock.patch.object(mgr, "api_request", side_effect=fake_api),
+            ):
+                _bootstrap_initial_deployments(mgr, [idep_multi])
+
+            self.assertEqual(applied_paused_seq, [False, True])
+            self.assertEqual(len(patch_timestamps), 2)
+            self.assertGreaterEqual(pod_get_calls[0], 2)
+            t_first = parse_rfc3339_epoch(patch_timestamps[0])
+            t_second = parse_rfc3339_epoch(patch_timestamps[1])
+            self.assertIsNotNone(t_first)
+            self.assertIsNotNone(t_second)
+            self.assertGreater(t_first - t_second, 3500.0)
+
+            # 3. Non-2xx status PATCH fails fast instead of hanging until pod timeout.
+            def fake_api_reject(method: str, path: str, body: bytes | None = None, headers: dict | None = None):
+                if method == "PATCH" and path.endswith("/status"):
+                    return 422, b'{"message":"invalid status"}'
+                return fake_api(method, path, body, headers)
+
+            applied_paused_seq.clear()
+            with (
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply),
+                mock.patch.object(mgr, "api_request", side_effect=fake_api_reject),
+            ):
+                with self.assertRaises(RuntimeError) as ctx_err:
+                    _bootstrap_initial_deployments(mgr, [idep_multi])
+                self.assertIn("HTTP 422", str(ctx_err.exception))
+
+            # 4. apply_scenario_queues_and_wait places pinned pods BEFORE _bootstrap_initial_deployments,
+            #    and both BEFORE ClusterQueue/LocalQueue.
+            order_log: list[str] = []
+            pinned_pod = InitialPodSpec(
+                name="pinned-0",
+                namespace="infra-pods",
+                placement="node-a",
+                resource_request={"cpu": "2"},
+                remaining_duration_sec=100.0,
+                is_infinite=True,
+                manifest={"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "pinned-0", "namespace": "infra-pods"}},
+            )
+            prereqs = [
+                {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "ai-lab"}},
+                {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ResourceFlavor", "metadata": {"name": "flv-a"}},
+                {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ClusterQueue", "metadata": {"name": "cq-main"}},
+                {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "LocalQueue", "metadata": {"name": "lq-main", "namespace": "ai-lab"}},
+            ]
+
+            def record_apply(docs, max_workers=16):
+                kinds = sorted({str(d.get("kind") or "") for d in docs})
+                if kinds:
+                    order_log.append(f"apply:{','.join(kinds)}")
+
+            with (
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=record_apply),
+                mock.patch.object(mgr, "wait_for_pods_running", side_effect=lambda *_a, **_kw: order_log.append("wait_pinned")),
+                mock.patch("runner.replay._bootstrap_initial_deployments", side_effect=lambda *_a, **_kw: order_log.append("bootstrap_deps")),
+                mock.patch.object(
+                    mgr,
+                    "api_request",
+                    side_effect=lambda m, p, **kw: (
+                        200,
+                        json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "metadata": {"name": "cq-main" if "clusterqueues" in p else "lq-main", "namespace": "ai-lab"},
+                                        "status": {"conditions": [{"type": "Active", "status": "True"}]},
+                                    }
+                                ]
+                            }
+                        ).encode("utf-8"),
+                    ),
+                ),
+            ):
+                apply_scenario_queues_and_wait(
+                    mgr,
+                    prereqs,
+                    initial_deployments=[idep_multi],
+                    initial_pods=[pinned_pod],
+                )
+            self.assertLess(order_log.index("wait_pinned"), order_log.index("bootstrap_deps"))
+            self.assertLess(order_log.index("bootstrap_deps"), order_log.index("apply:ClusterQueue,LocalQueue"))
+        finally:
+            mgr.close()
+
+    def test_deployment_loader_revision_digest_recreate_orphan_updates_tpl_lq_and_zero_replicas(self) -> None:
+        """Verify revision annotation dedup, fast recreate not teleported to t0, orphan update filtering, template-only queue-name on updates, and t0 replicas=0 resources."""
+        import os
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            t0 = "2026-08-01T10:00:00Z"
+            infra_events = [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "node-0", "labels": {"kubernetes.io/hostname": "node-0"}},
+                        "status": {"allocatable": {"cpu": "16", "memory": "64Gi", "google.com/tpu": "8"}},
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ResourceFlavor",
+                        "metadata": {"name": "rf-main"},
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "cq-main"},
+                        "spec": {
+                            "resourceGroups": [
+                                {
+                                    "coveredResources": ["cpu", "memory", "google.com/tpu"],
+                                    "flavors": [{"name": "rf-main", "resources": [{"name": "cpu", "nominalQuota": "16"}, {"name": "memory", "nominalQuota": "64Gi"}, {"name": "google.com/tpu", "nominalQuota": "8"}]}],
+                                }
+                            ]
+                        },
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "LocalQueue",
+                        "metadata": {"name": "lq-main", "namespace": "ai-lab"},
+                        "spec": {"clusterQueue": "cq-main"},
+                    },
+                },
+            ]
+
+            def mk_dep_obj(name: str, replicas: int, rev: str, *, tpl_only_lq: bool = False, lq: str = "lq-main", tas: bool = False):
+                meta_lbls = {} if tpl_only_lq or not lq else {"kueue.x-k8s.io/queue-name": lq}
+                tpl_lbls = {"app": name}
+                if tpl_only_lq and lq:
+                    tpl_lbls["kueue.x-k8s.io/queue-name"] = lq
+                tpl_anns = {"kueue-optimizer.gke.io/template-hash": "th-0000000000000001"}
+                if tas:
+                    tpl_anns["kueue.x-k8s.io/podset-required-topology"] = "kubernetes.io/hostname"
+                return {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": name,
+                        "namespace": "ai-lab",
+                        "labels": meta_lbls,
+                        "annotations": {"deployment.kubernetes.io/revision": rev},
+                    },
+                    "spec": {
+                        "replicas": replicas,
+                        "selector": {"matchLabels": {"app": name}},
+                        "template": {
+                            "metadata": {"labels": tpl_lbls, "annotations": tpl_anns},
+                            "spec": {
+                                "containers": [
+                                    {
+                                        "name": "c",
+                                        "image": "pause:3.9",
+                                        "resources": {"requests": {"cpu": "4", "memory": "8Gi", "google.com/tpu": "2"}},
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                }
+
+            wf_events = [
+                # 1. t0 Deployment with template-only queue-name + revision bump (must produce 0 SpecUpdates on rev bump,
+                #    and real ScaleUp must carry queue-name in metadata.labels) + deleted at +20s and recreated at +20.1s.
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Deployment",
+                        "name": "web",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-08-01T09:59:00Z",
+                        "localQueueName": "lq-main",
+                        "replicas": 2,
+                        "readyReplicas": 2,
+                        "object": mk_dep_obj("web", 2, "1", tpl_only_lq=True),
+                    },
+                },
+                {
+                    "timestamp": "2026-08-01T10:00:05Z",
+                    "eventType": "Update",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Deployment",
+                        "name": "web",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-08-01T09:59:00Z",
+                        "localQueueName": "lq-main",
+                        "replicas": 2,
+                        "readyReplicas": 2,
+                        "object": mk_dep_obj("web", 2, "2", tpl_only_lq=True),
+                    },
+                },
+                {
+                    "timestamp": "2026-08-01T10:00:10Z",
+                    "eventType": "Update",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Deployment",
+                        "name": "web",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-08-01T09:59:00Z",
+                        "localQueueName": "lq-main",
+                        "replicas": 3,
+                        "readyReplicas": 2,
+                        "updateTypes": ["ScaleUp"],
+                        "object": mk_dep_obj("web", 3, "2", tpl_only_lq=True),
+                    },
+                },
+                {
+                    "timestamp": "2026-08-01T10:00:20Z",
+                    "eventType": "Deleted",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Deployment",
+                        "name": "web",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-08-01T09:59:00Z",
+                        "localQueueName": "lq-main",
+                        "replicas": 3,
+                        "readyReplicas": 3,
+                        "object": mk_dep_obj("web", 3, "2", tpl_only_lq=True),
+                    },
+                },
+                {
+                    "timestamp": "2026-08-01T10:00:20.100Z",
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Deployment",
+                        "name": "web",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-08-01T10:00:20.100Z",
+                        "localQueueName": "lq-main",
+                        "replicas": 2,
+                        "readyReplicas": 0,
+                        "object": mk_dep_obj("web", 2, "1", tpl_only_lq=True),
+                    },
+                },
+                # 2. Unmapped CQ Deployment with an update -> update MUST be filtered out (not orphaned).
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Deployment",
+                        "name": "unmapped-dep",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-08-01T09:59:00Z",
+                        "localQueueName": "",
+                        "replicas": 1,
+                        "readyReplicas": 1,
+                        "object": mk_dep_obj("unmapped-dep", 1, "1", lq=""),
+                    },
+                },
+                {
+                    "timestamp": "2026-08-01T10:00:08Z",
+                    "eventType": "Update",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Deployment",
+                        "name": "unmapped-dep",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-08-01T09:59:00Z",
+                        "localQueueName": "",
+                        "replicas": 4,
+                        "readyReplicas": 1,
+                        "updateTypes": ["ScaleUp"],
+                        "object": mk_dep_obj("unmapped-dep", 4, "1", lq=""),
+                    },
+                },
+                # 3. t0 Admitted Deployment with replicas=0 -> must keep real GPU/TPU requests and is_tas=True.
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "Deployment",
+                        "name": "zero-tas",
+                        "namespace": "ai-lab",
+                        "creationTime": "2026-08-01T09:59:00Z",
+                        "localQueueName": "lq-main",
+                        "replicas": 0,
+                        "readyReplicas": 0,
+                        "object": mk_dep_obj("zero-tas", 0, "1", tas=True),
+                    },
+                },
+            ]
+
+            with open(os.path.join(tmpdir, "infra.json"), "w", encoding="utf-8") as f:
+                for ev in infra_events:
+                    f.write(json.dumps(ev) + "\n")
+            with open(os.path.join(tmpdir, "workflows.json"), "w", encoding="utf-8") as f:
+                for ev in wf_events:
+                    f.write(json.dumps(ev) + "\n")
+            with open(os.path.join(tmpdir, "execution-time.json"), "w", encoding="utf-8") as f:
+                f.write("")
+
+            bundle = testrunner.load_scenario_bundle(Path(tmpdir), speedup=1.0, skip_initial_offset=False)
+
+            # F6: Only 1 ScaleUp update for web (revision-only bump ignored); N7: 0 updates for unmapped-dep.
+            self.assertEqual([(u.name, u.update_types, u.replicas) for u in bundle.scheduled_workflow_updates], [("web", ("ScaleUp",), 3)])
+            # N8: template-only queue-name injected into ScheduledWorkflowUpdate metadata.labels.
+            self.assertEqual(
+                bundle.scheduled_workflow_updates[0].manifest["metadata"]["labels"].get("kueue.x-k8s.io/queue-name"),
+                "lq-main",
+            )
+            # N2: Only 1 initial_deployments entry for web (inc 0); inc 1 at +20.1s is in scheduled_workflows!
+            web_inits = [d for d in bundle.initial_deployments if d.name == "web"]
+            self.assertEqual(len(web_inits), 1)
+            self.assertEqual(web_inits[0].incarnation_index, 0)
+            web_sched = [w for w in bundle.scheduled_workflows if w.name == "web"]
+            self.assertEqual(len(web_sched), 1)
+            self.assertEqual(web_sched[0].incarnation_index, 1)
+            # NEW-7: zero-tas keeps real per_pod_requests and is_tas=True, plus deployment-name annotation.
+            zero_dep = next(d for d in bundle.initial_deployments if d.name == "zero-tas")
+            self.assertEqual(zero_dep.per_pod_requests.get("google.com/tpu"), "2")
+            self.assertTrue(zero_dep.is_tas)
+            self.assertEqual(
+                zero_dep.manifest["spec"]["template"]["metadata"]["annotations"].get("kueue-optimizer.gke.io/deployment-name"),
+                "zero-tas",
+            )
+
+    def test_deployment_replay_chronological_update_delete_58char_name_plain_pod_and_elig_set(self) -> None:
+        """Verify chronological update/delete & cancelled-create update suppression, 58-char Deployment credit, plain-pod non-collision, and elig_set membership."""
+        from dataclasses import replace as dc_replace
+        from datetime import datetime, timezone
+        import time
+
+        from chamber.lifecycle import ClusterStatusSnapshot
+        from metrics.saturation import report_effective_uninterrupted_saturation
+        from runner.loader import (
+            ScheduledWorkflowDeletion,
+            ScheduledWorkflowItem,
+            ScheduledWorkflowUpdate,
+            load_scenario_bundle,
+        )
+        from runner.replay import run_scenario_replay
+
+        st83_dir = REPO_ROOT / "testscenarios" / "self-tests" / "st83-deployment-scale-down-unblocks-batch-and-zero"
+        base_b83 = load_scenario_bundle(st83_dir, speedup=100.0)
+
+        long_dep = "a" * 58
+        base_ep = time.time() - 10.0
+        base_iso = datetime.fromtimestamp(base_ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def mk_dep_manifest(name: str, replicas: int):
+            return {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": name, "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+                "spec": {
+                    "replicas": replicas,
+                    "paused": False,
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "kueue-optimizer.gke.io/long-running-pod": "true",
+                                "kueue-optimizer.gke.io/infinite-duration": "true",
+                                "kueue-optimizer.gke.io/deployment-name": name,
+                            }
+                        },
+                        "spec": {
+                            "containers": [
+                                {"name": "c", "image": "pause:3.9", "resources": {"requests": {"google.com/tpu": "2"}}}
+                            ]
+                        },
+                    },
+                },
+            }
+
+        bundle = dc_replace(
+            base_b83,
+            t0_epoch=base_ep,
+            t0_iso=base_iso,
+            effective_start_epoch=base_ep,
+            effective_start_iso=base_iso,
+            t_end_epoch=base_ep + 30.0,
+            t_end_iso=base_iso,
+            nodes=[],
+            initial_pods=[],
+            initial_workloads=[],
+            initial_deployments=[],
+            scheduled_infra_events=[],
+            workload_namespaces=["ai-lab"],
+            infra_pods_namespace="infra-pods",
+            scheduled_workflows=[
+                # 58-char Deployment created at t=0.0s, upgraded at 0.08s, scaled to 0 at 0.20s
+                ScheduledWorkflowItem(
+                    target_wall_offset_sec=0.0,
+                    seq=1,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name=long_dep,
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    workload_state="NotAdmitted",
+                    trigger_reason="initial_not_admitted",
+                    execution_duration_sec=10.0,
+                    compressed_duration_sec=10.0,
+                    indexed_from_execution_time=False,
+                    pod_count=1,
+                    manifest=mk_dep_manifest(long_dep, 1),
+                    creation_epoch=base_ep,
+                    incarnation_index=0,
+                ),
+                # Cancelled-before-submit Deployment: create at +0.15s, cancelled by delete at +0.05s, stale update at +0.18s
+                ScheduledWorkflowItem(
+                    target_wall_offset_sec=0.15,
+                    seq=2,
+                    raw_offset_sec=15.0,
+                    raw_offset_from_t0_sec=15.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name="ghost-srv",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    workload_state="NotAdmitted",
+                    trigger_reason="initial_not_admitted",
+                    execution_duration_sec=10.0,
+                    compressed_duration_sec=10.0,
+                    indexed_from_execution_time=False,
+                    pod_count=2,
+                    manifest=mk_dep_manifest("ghost-srv", 2),
+                    creation_epoch=base_ep + 15.0,
+                    incarnation_index=0,
+                ),
+                # Same-tick update (+0.02s) + delete (+0.03s) Deployment: update MUST run before delete, never after!
+                ScheduledWorkflowItem(
+                    target_wall_offset_sec=0.0,
+                    seq=3,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name="ephemeral",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    workload_state="NotAdmitted",
+                    trigger_reason="initial_not_admitted",
+                    execution_duration_sec=10.0,
+                    compressed_duration_sec=10.0,
+                    indexed_from_execution_time=False,
+                    pod_count=1,
+                    manifest=mk_dep_manifest("ephemeral", 1),
+                    creation_epoch=base_ep,
+                    incarnation_index=0,
+                ),
+            ],
+            scheduled_workflow_updates=[
+                ScheduledWorkflowUpdate(
+                    target_wall_offset_sec=0.02,
+                    seq=1,
+                    raw_offset_sec=2.0,
+                    raw_offset_from_t0_sec=2.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name="ephemeral",
+                    applied_name="ephemeral",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    incarnation_index=0,
+                    replicas=2,
+                    paused=False,
+                    template_hash="th-0000000000000002",
+                    update_types=("ScaleUp",),
+                    manifest=mk_dep_manifest("ephemeral", 2),
+                ),
+                ScheduledWorkflowUpdate(
+                    target_wall_offset_sec=0.08,
+                    seq=2,
+                    raw_offset_sec=8.0,
+                    raw_offset_from_t0_sec=8.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name=long_dep,
+                    applied_name=long_dep,
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    incarnation_index=0,
+                    replicas=1,
+                    paused=False,
+                    template_hash="th-0000000000000002",
+                    update_types=("Upgrade",),
+                    manifest=mk_dep_manifest(long_dep, 1),
+                ),
+                ScheduledWorkflowUpdate(
+                    target_wall_offset_sec=0.18,
+                    seq=3,
+                    raw_offset_sec=18.0,
+                    raw_offset_from_t0_sec=18.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name="ghost-srv",
+                    applied_name="ghost-srv",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    incarnation_index=0,
+                    replicas=4,
+                    paused=False,
+                    template_hash="th-0000000000000001",
+                    update_types=("ScaleUp",),
+                    manifest=mk_dep_manifest("ghost-srv", 4),
+                ),
+                ScheduledWorkflowUpdate(
+                    target_wall_offset_sec=0.22,
+                    seq=4,
+                    raw_offset_sec=22.0,
+                    raw_offset_from_t0_sec=22.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name=long_dep,
+                    applied_name=long_dep,
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    incarnation_index=0,
+                    replicas=0,
+                    paused=False,
+                    template_hash="th-0000000000000002",
+                    update_types=("ScaleDown",),
+                    manifest=mk_dep_manifest(long_dep, 0),
+                ),
+            ],
+            scheduled_workflow_deletions=[
+                ScheduledWorkflowDeletion(
+                    target_wall_offset_sec=0.03,
+                    seq=1,
+                    raw_offset_sec=3.0,
+                    raw_offset_from_t0_sec=3.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    manifest_kind="Deployment",
+                    manifest_api_version="apps/v1",
+                    name="ephemeral",
+                    applied_name="ephemeral",
+                    namespace="ai-lab",
+                    delete_reason="cancelled",
+                    incarnation_index=0,
+                ),
+                ScheduledWorkflowDeletion(
+                    target_wall_offset_sec=0.05,
+                    seq=2,
+                    raw_offset_sec=5.0,
+                    raw_offset_from_t0_sec=5.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    manifest_kind="Deployment",
+                    manifest_api_version="apps/v1",
+                    name="ghost-srv",
+                    applied_name="ghost-srv",
+                    namespace="ai-lab",
+                    delete_reason="cancelled",
+                    incarnation_index=0,
+                ),
+            ],
+        )
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-test-r2", apiserver_port=16497)
+        try:
+            actions: list[str] = []
+            live_wls: list[dict] = []
+            nodes = [{"metadata": {"name": "n0"}, "status": {"allocatable": {"google.com/tpu": "8"}}}]
+
+            def mk_long_wl(pod_name: str, suffix: str):
+                return {
+                    "metadata": {
+                        "name": f"pod-{pod_name[:50]}-{suffix}",
+                        "namespace": "ai-lab",
+                        "ownerReferences": [{"kind": "Pod", "name": pod_name}],
+                    },
+                    "spec": {
+                        "podSets": [
+                            {
+                                "name": "main",
+                                "count": 1,
+                                # Like a live Kueue Workload: the template holds Pod.spec only, no Pod annotations.
+                                "template": {
+                                    "metadata": {},
+                                    "spec": {"containers": [{"resources": {"requests": {"google.com/tpu": "2"}}}]},
+                                },
+                            }
+                        ]
+                    },
+                    "status": {
+                        "admission": {
+                            "clusterQueue": "cq-main",
+                            "podSetAssignments": [
+                                {"name": "main", "count": 1, "flavors": {"google.com/tpu": "rf"}, "resourceUsage": {"google.com/tpu": "2"}}
+                            ],
+                        },
+                        "conditions": [{"type": "Admitted", "status": "True", "lastTransitionTime": base_iso}],
+                    },
+                }
+
+            # Plain finite Pod named "<ephemeral>-smoke-test" must NOT be classified as serving.
+            plain_pod_wl = {
+                "metadata": {
+                    "name": "pod-ephemeral-smoke-test-99999",
+                    "namespace": "ai-lab",
+                    "ownerReferences": [{"kind": "Pod", "name": "ephemeral-smoke-test"}],
+                },
+                "spec": {
+                    "podSets": [
+                        {
+                            "name": "main",
+                            "count": 1,
+                            "template": {
+                                "metadata": {},
+                                "spec": {"containers": [{"resources": {"requests": {"google.com/tpu": "2"}}}]},
+                            },
+                        }
+                    ]
+                },
+                "status": {
+                    "admission": {
+                        "clusterQueue": "cq-main",
+                        "podSetAssignments": [
+                            {"name": "main", "count": 1, "flavors": {"google.com/tpu": "rf"}, "resourceUsage": {"google.com/tpu": "2"}}
+                        ],
+                    },
+                    "conditions": [{"type": "Admitted", "status": "True", "lastTransitionTime": base_iso}],
+                },
+            }
+
+            long_v1_wl = mk_long_wl(f"{long_dep}x1y2z", "11111")
+            long_v2_wl = mk_long_wl(f"{long_dep}z9y8x", "22222")
+
+            # The annotations exist only on the Pods, as in a live chamber.
+            serving_pod_ann = {
+                "kueue-optimizer.gke.io/long-running-pod": "true",
+                "kueue-optimizer.gke.io/infinite-duration": "true",
+                "kueue-optimizer.gke.io/deployment-name": long_dep,
+                "kueue.x-k8s.io/pod-suspending-parent": "deployment",
+            }
+            pod_ann_by_name = {
+                f"{long_dep}x1y2z": serving_pod_ann,
+                f"{long_dep}z9y8x": serving_pod_ann,
+                "ephemeral-smoke-test": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "10"},
+            }
+            pod_list_calls = [0]
+            upgrade_polls = [0]
+
+            def fake_apply_parallel(docs, max_workers=16):
+                for d in docs:
+                    n = (d.get("metadata") or {}).get("name")
+                    actions.append(f"CREATE:{n}")
+                    if n == long_dep:
+                        live_wls.append(long_v1_wl)
+                        live_wls.append(plain_pod_wl)
+
+            def fake_ssa(doc):
+                n = (doc.get("metadata") or {}).get("name")
+                rep = (doc.get("spec") or {}).get("replicas")
+                actions.append(f"SSA:{n}:{rep}")
+                if n == long_dep and rep == 1:
+                    # Upgrade starts: v2 pod admitted while v1 is still running!
+                    live_wls.append(long_v2_wl)
+                    upgrade_polls[0] = 1
+                elif n == long_dep and rep == 0:
+                    # ScaleDown to 0 retires v1 cleanly.
+                    live_wls[:] = [w for w in live_wls if w is not long_v1_wl]
+
+            def fake_api(method: str, path: str, body: bytes | None = None, headers: dict | None = None):
+                if method == "DELETE" and "/deployments/" in path:
+                    dep_n = path.rsplit("/", 1)[-1]
+                    actions.append(f"DELETE:{dep_n}")
+                    return 200, b"{}"
+                if method == "GET" and path.endswith("/workloads"):
+                    if upgrade_polls[0] == 1:
+                        upgrade_polls[0] = 2
+                    elif upgrade_polls[0] == 2:
+                        # Brand-new v2 pod (NOT in retire_eligible_wls!) gets preempted & GC'd between polls
+                        # while v1 is still alive and upgrade budget=1 is open -> MUST be Excluded, NOT Completed!
+                        live_wls[:] = [w for w in live_wls if w is not long_v2_wl]
+                        upgrade_polls[0] = 3
+                    return 200, json.dumps({"items": list(live_wls)}).encode("utf-8")
+                if method == "GET" and path.startswith("/api/v1/namespaces/") and path.endswith("/pods"):
+                    pod_list_calls[0] += 1
+                    live_pod_names = [w["metadata"]["ownerReferences"][0]["name"] for w in live_wls]
+                    return 200, json.dumps(
+                        {
+                            "items": [
+                                {"metadata": {"name": pn, "namespace": "ai-lab", "annotations": pod_ann_by_name[pn]}}
+                                for pn in live_pod_names
+                            ]
+                        }
+                    ).encode("utf-8")
+                if method == "GET" and path == "/api/v1/nodes":
+                    return 200, json.dumps({"items": nodes}).encode("utf-8")
+                if method == "GET" and path == "/api/v1/pods":
+                    return 200, json.dumps({"items": []}).encode("utf-8")
+                return 200, b"{}"
+
+            def fake_q_status(*_a, **_kw):
+                return ClusterStatusSnapshot(
+                    workloads_admitted=len(live_wls),
+                    workloads_pending=0,
+                    workloads_finished=0,
+                    pods_running=len(live_wls),
+                    pods_pending=0,
+                    pods_succeeded=0,
+                    pods_failed=0,
+                    jobsets_completed=0,
+                    jobsets_failed=0,
+                    cq_summary=[],
+                    finished_workload_keys=set(),
+                    present_workload_keys={("ai-lab", w["metadata"]["name"]) for w in live_wls},
+                    workloads_query_ok=True,
+                )
+
+            with (
+                mock.patch.object(mgr, "ensure_kwok_connection"),
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply_parallel),
+                mock.patch.object(mgr, "ssa_apply_doc", side_effect=fake_ssa),
+                mock.patch.object(mgr, "api_request", side_effect=fake_api),
+                mock.patch("runner.replay.query_cluster_status", side_effect=fake_q_status),
+            ):
+                _s_ep, e_ep, _sub, _ = run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle,
+                    speedup=100.0,
+                    max_run_seconds=0.4,
+                    status_interval_sec=0.03,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+                sat_snap = mgr.capture_cluster_saturation_snapshot(eval_epoch=e_ep)
+
+            # F5: ephemeral update MUST happen before ephemeral delete; ghost-srv MUST NEVER be created or updated.
+            self.assertIn("SSA:ephemeral:2", actions)
+            self.assertIn("DELETE:ephemeral", actions)
+            self.assertLess(actions.index("SSA:ephemeral:2"), actions.index("DELETE:ephemeral"))
+            self.assertFalse(any("ghost-srv" in a for a in actions), f"cancelled ghost-srv must not run: {actions}")
+
+            # R8: plain finite Pod 'ephemeral-smoke-test' was NOT captured into _retired_serving_workloads.
+            self.assertNotIn(("ai-lab", "pod-ephemeral-smoke-test-99999"), mgr._retired_serving_workloads)
+            # Both classifications come from the owning Pods: the mock Workloads carry no annotations.
+            self.assertGreaterEqual(pod_list_calls[0], 1)
+
+            # N6 + R5: long_v1 cleanly retired (Completed), long_v2 preempted during upgrade (Excluded), plain_pod active_at_end.
+            _rows, sat_subtitle = report_effective_uninterrupted_saturation(
+                sat_snap,
+                start_epoch=base_ep,
+                end_epoch=e_ep,
+            )
+            self.assertIn("completed=1 [1 pods]", sat_subtitle)
+            self.assertIn("Excluded (preempted/reclaimed/failed): 1 [1 pods]", sat_subtitle)
+        finally:
+            mgr.close()
+
+    def test_deployment_update_and_delete_wait_for_fifo_delayed_create(self) -> None:
+        """An Update or Delete must not overtake the earlier Create of the same Deployment that waits behind the FIFO gate."""
+        from dataclasses import replace as dc_replace
+        from datetime import datetime, timezone
+        import time
+
+        from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot
+        from runner.loader import (
+            ScheduledWorkflowDeletion,
+            ScheduledWorkflowItem,
+            ScheduledWorkflowUpdate,
+            load_scenario_bundle,
+        )
+        from runner.replay import run_scenario_replay
+
+        st83_dir = REPO_ROOT / "testscenarios" / "self-tests" / "st83-deployment-scale-down-unblocks-batch-and-zero"
+        base_b83 = load_scenario_bundle(st83_dir, speedup=100.0)
+        base_ep = time.time() - 30.0
+        base_iso = datetime.fromtimestamp(base_ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def mk_dep_manifest(name: str, replicas: int):
+            return {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": name, "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+                "spec": {
+                    "replicas": replicas,
+                    "paused": False,
+                    "template": {
+                        "metadata": {"annotations": {"kueue-optimizer.gke.io/deployment-name": name}},
+                        "spec": {"containers": [{"name": "c", "image": "pause:3.9"}]},
+                    },
+                },
+            }
+
+        def mk_create(seq: int, name: str, creation_offset_sec: float):
+            return ScheduledWorkflowItem(
+                target_wall_offset_sec=0.0,
+                seq=seq,
+                raw_offset_sec=0.0,
+                raw_offset_from_t0_sec=0.0,
+                event_timestamp=base_iso,
+                object_kind="Deployment",
+                name=name,
+                namespace="ai-lab",
+                local_queue_name="lq-main",
+                workload_state="NotAdmitted",
+                trigger_reason="initial_not_admitted",
+                execution_duration_sec=10.0,
+                compressed_duration_sec=10.0,
+                indexed_from_execution_time=False,
+                pod_count=1,
+                manifest=mk_dep_manifest(name, 1),
+                creation_epoch=base_ep + creation_offset_sec,
+                incarnation_index=0,
+            )
+
+        def mk_delete(seq: int, name: str, target_sec: float):
+            return ScheduledWorkflowDeletion(
+                target_wall_offset_sec=target_sec,
+                seq=seq,
+                raw_offset_sec=target_sec * 100.0,
+                raw_offset_from_t0_sec=target_sec * 100.0,
+                event_timestamp=base_iso,
+                object_kind="Deployment",
+                manifest_kind="Deployment",
+                manifest_api_version="apps/v1",
+                name=name,
+                applied_name=name,
+                namespace="ai-lab",
+                delete_reason="cancelled",
+                incarnation_index=0,
+            )
+
+        # Three Deployments are due at t=0 with three different creationTimestamps, so the replay
+        # creates one tier at a time and holds the later tiers behind the FIFO gate (up to ~1s each).
+        bundle = dc_replace(
+            base_b83,
+            t0_epoch=base_ep,
+            t0_iso=base_iso,
+            effective_start_epoch=base_ep,
+            effective_start_iso=base_iso,
+            t_end_epoch=base_ep + 30.0,
+            t_end_iso=base_iso,
+            nodes=[],
+            initial_pods=[],
+            initial_workloads=[],
+            initial_deployments=[],
+            scheduled_infra_events=[],
+            workload_namespaces=["ai-lab"],
+            infra_pods_namespace="infra-pods",
+            scheduled_workflows=[
+                mk_create(1, "first-srv", 0.0),
+                mk_create(2, "gated-srv", 5.0),
+                mk_create(3, "brief-srv", 10.0),
+            ],
+            scheduled_workflow_updates=[
+                # Due together with the gated create: it must run after that create, not before it.
+                ScheduledWorkflowUpdate(
+                    target_wall_offset_sec=0.0,
+                    seq=4,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name="gated-srv",
+                    applied_name="gated-srv",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    incarnation_index=0,
+                    replicas=3,
+                    paused=False,
+                    template_hash="th-0000000000000001",
+                    update_types=("ScaleUp",),
+                    manifest=mk_dep_manifest("gated-srv", 3),
+                ),
+            ],
+            scheduled_workflow_deletions=[
+                # Strictly after the brief-srv create time: the replay must run Create -> Delete.
+                mk_delete(5, "brief-srv", 0.01),
+                mk_delete(6, "first-srv", 0.02),
+                mk_delete(7, "gated-srv", 0.02),
+            ],
+        )
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-test-fifo", apiserver_port=16496)
+        try:
+            actions: list[str] = []
+
+            def fake_apply_parallel(docs, max_workers=16):
+                for d in docs:
+                    actions.append(f"CREATE:{(d.get('metadata') or {}).get('name')}")
+
+            def fake_ssa(doc):
+                actions.append(f"SSA:{(doc.get('metadata') or {}).get('name')}:{(doc.get('spec') or {}).get('replicas')}")
+
+            def fake_api(method: str, path: str, body: bytes | None = None, headers: dict | None = None):
+                if method == "DELETE" and "/deployments/" in path:
+                    actions.append(f"DELETE:{path.rsplit('/', 1)[-1].split('?', 1)[0]}")
+                    return 200, b"{}"
+                if method == "GET" and (path.endswith("/workloads") or path.endswith("/pods")):
+                    return 200, json.dumps({"items": []}).encode("utf-8")
+                return 200, b"{}"
+
+            def fake_q_status(*_a, **_kw):
+                return ClusterStatusSnapshot(
+                    workloads_admitted=0,
+                    workloads_pending=0,
+                    workloads_finished=0,
+                    pods_running=0,
+                    pods_pending=0,
+                    pods_succeeded=0,
+                    pods_failed=0,
+                    jobsets_completed=0,
+                    jobsets_failed=0,
+                    cq_summary=[],
+                    finished_workload_keys=set(),
+                    present_workload_keys=set(),
+                    workloads_query_ok=True,
+                )
+
+            with (
+                mock.patch.object(mgr, "ensure_kwok_connection"),
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply_parallel),
+                mock.patch.object(mgr, "ssa_apply_doc", side_effect=fake_ssa),
+                mock.patch.object(mgr, "api_request", side_effect=fake_api),
+                mock.patch("runner.replay.query_cluster_status", side_effect=fake_q_status),
+            ):
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle,
+                    speedup=100.0,
+                    max_run_seconds=8.0,
+                    status_interval_sec=0.05,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+
+            # The gated Deployment is created once with its original spec, and updated only afterwards.
+            self.assertEqual(actions.count("CREATE:gated-srv"), 1, actions)
+            self.assertIn("SSA:gated-srv:3", actions)
+            self.assertLess(actions.index("CREATE:gated-srv"), actions.index("SSA:gated-srv:3"), actions)
+            self.assertLess(actions.index("SSA:gated-srv:3"), actions.index("DELETE:gated-srv"), actions)
+            # The brief Deployment is created and then deleted, not cancelled before its create.
+            self.assertEqual(actions.count("CREATE:brief-srv"), 1, actions)
+            self.assertLess(actions.index("CREATE:brief-srv"), actions.index("DELETE:brief-srv"), actions)
+            self.assertLess(actions.index("CREATE:first-srv"), actions.index("DELETE:first-srv"), actions)
+        finally:
+            mgr.close()
+
+    def test_fast_exiting_standalone_pod_sharing_deployment_prefix_is_never_classified_as_serving(self) -> None:
+        """A standalone Pod whose name starts with '<deploy>-' must stay non-serving even if deleted before Pod list or finished before _sync_serving_workloads."""
+        from dataclasses import replace as dc_replace
+        from datetime import datetime, timezone
+        import time
+
+        from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot
+        from runner.loader import (
+            ScheduledWorkflowDeletion,
+            ScheduledWorkflowItem,
+            load_scenario_bundle,
+        )
+        from runner.replay import run_scenario_replay
+
+        st83_dir = REPO_ROOT / "testscenarios/self-tests/st83-deployment-scale-down-unblocks-batch-and-zero"
+        base_b83 = load_scenario_bundle(st83_dir, speedup=100.0)
+        base_ep = time.time() - 10.0
+        base_iso = datetime.fromtimestamp(base_ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        dep_manifest = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "ephemeral", "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+            "spec": {
+                "replicas": 1,
+                "paused": False,
+                "template": {
+                    "metadata": {"annotations": {"kueue-optimizer.gke.io/deployment-name": "ephemeral"}},
+                    "spec": {"containers": [{"name": "c", "image": "pause:3.9"}]},
+                },
+            },
+        }
+        pod_manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "ephemeral-fast-exit",
+                "namespace": "ai-lab",
+                "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                "annotations": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "1"},
+            },
+            "spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "pause:3.9"}]},
+        }
+        fast_pod_wl = {
+            "metadata": {
+                "name": "pod-ephemeral-fast-exit-abcde",
+                "namespace": "ai-lab",
+                "ownerReferences": [{"kind": "Pod", "name": "ephemeral-fast-exit"}],
+            },
+            "spec": {"podSets": [{"name": "main", "count": 1, "template": {"metadata": {}, "spec": {"containers": []}}}]},
+            "status": {
+                "admission": {"clusterQueue": "cq-main"},
+                "conditions": [
+                    {"type": "Admitted", "status": "True", "lastTransitionTime": base_iso},
+                    {"type": "Finished", "status": "True", "reason": "Succeeded", "lastTransitionTime": base_iso},
+                ],
+            },
+        }
+
+        bundle = dc_replace(
+            base_b83,
+            t0_epoch=base_ep,
+            t0_iso=base_iso,
+            effective_start_epoch=base_ep,
+            effective_start_iso=base_iso,
+            t_end_epoch=base_ep + 10.0,
+            t_end_iso=base_iso,
+            nodes=[],
+            initial_pods=[],
+            initial_workloads=[],
+            initial_deployments=[],
+            scheduled_infra_events=[],
+            workload_namespaces=["ai-lab"],
+            infra_pods_namespace="infra-pods",
+            scheduled_workflows=[
+                ScheduledWorkflowItem(
+                    target_wall_offset_sec=0.0,
+                    seq=1,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name="ephemeral",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    workload_state="NotAdmitted",
+                    trigger_reason="initial_not_admitted",
+                    execution_duration_sec=10.0,
+                    compressed_duration_sec=10.0,
+                    indexed_from_execution_time=False,
+                    pod_count=1,
+                    manifest=dep_manifest,
+                    creation_epoch=base_ep,
+                    incarnation_index=0,
+                ),
+                ScheduledWorkflowItem(
+                    target_wall_offset_sec=0.0,
+                    seq=2,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=base_iso,
+                    object_kind="Pod",
+                    name="ephemeral-fast-exit",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    workload_state="NotAdmitted",
+                    trigger_reason="initial_not_admitted",
+                    execution_duration_sec=1.0,
+                    compressed_duration_sec=0.1,
+                    indexed_from_execution_time=True,
+                    pod_count=1,
+                    manifest=pod_manifest,
+                    creation_epoch=base_ep,
+                    incarnation_index=0,
+                ),
+            ],
+            scheduled_workflow_updates=[],
+            scheduled_workflow_deletions=[
+                # Fires right after creation: _execute_workflow_deletion calls query_cluster_status ->
+                # _non_serving_finished_keys BEFORE _sync_serving_workloads has ever seen fast_pod_wl.
+                ScheduledWorkflowDeletion(
+                    target_wall_offset_sec=0.01,
+                    seq=3,
+                    raw_offset_sec=1.0,
+                    raw_offset_from_t0_sec=1.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    manifest_kind="Deployment",
+                    manifest_api_version="apps/v1",
+                    name="ephemeral",
+                    applied_name="ephemeral",
+                    namespace="ai-lab",
+                    delete_reason="cancelled",
+                    incarnation_index=0,
+                ),
+            ],
+        )
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-test-fastpod", apiserver_port=16495)
+        try:
+            def fake_api(method: str, path: str, body: bytes | None = None, headers: dict | None = None):
+                if method == "GET" and path.endswith("/workloads"):
+                    return 200, json.dumps({"items": [fast_pod_wl]}).encode("utf-8")
+                if method == "GET" and path.endswith("/pods"):
+                    # Simulate fast-exiting Pod already gone before the first Pod list!
+                    return 200, json.dumps({"items": []}).encode("utf-8")
+                return 200, b"{}"
+
+            def fake_q_status(*_a, **_kw):
+                return ClusterStatusSnapshot(
+                    workloads_admitted=0,
+                    workloads_pending=0,
+                    workloads_finished=1,
+                    pods_running=0,
+                    pods_pending=0,
+                    pods_succeeded=1,
+                    pods_failed=0,
+                    jobsets_completed=0,
+                    jobsets_failed=0,
+                    cq_summary=[],
+                    finished_workload_keys={("ai-lab", "pod-ephemeral-fast-exit-abcde")},
+                    present_workload_keys={("ai-lab", "pod-ephemeral-fast-exit-abcde")},
+                    workloads_query_ok=True,
+                )
+
+            t_start = time.monotonic()
+            with (
+                mock.patch.object(mgr, "ensure_kwok_connection"),
+                mock.patch.object(mgr, "apply_manifests_parallel"),
+                mock.patch.object(mgr, "api_request", side_effect=fake_api),
+                mock.patch("runner.replay.query_cluster_status", side_effect=fake_q_status),
+            ):
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle,
+                    speedup=100.0,
+                    max_run_seconds=3.0,
+                    status_interval_sec=0.05,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+            elapsed = time.monotonic() - t_start
+
+            # Must NOT be misclassified as a retired serving Deployment workload, and replay must exit
+            # promptly upon completion rather than stalling until max_run_seconds=3.0s.
+            self.assertNotIn(("ai-lab", "pod-ephemeral-fast-exit-abcde"), mgr._retired_serving_workloads)
+            self.assertLess(elapsed, 2.0, f"Replay stalled instead of counting standalone Pod as finished ({elapsed:.2f}s)")
+        finally:
+            mgr.close()
+
+    def test_st91_to_st95_hashing_anonymization_scenarios_load_and_validate_cleanly(self) -> None:
+        import re
+        import shutil
+
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+        h_name_re = re.compile(r"^h-[0-9a-f]{32}$")
+        th_re = re.compile(r"^th-[0-9a-f]{16}$")
+
+        # 1. st91 (anonymized) vs st92 (plaintext control) exact structural & timing parity.
+        b91 = testrunner.load_scenario_bundle(
+            suite_dir / "st91-hash-names-jobset-batch-anonymized-replay",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        b92 = testrunner.load_scenario_bundle(
+            suite_dir / "st92-hash-names-jobset-batch-plaintext-control",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b91.scheduled_workflows), 8)
+        self.assertEqual(len(b92.scheduled_workflows), 8)
+        self.assertTrue(all(h_name_re.match(w.name) for w in b91.scheduled_workflows))
+        self.assertTrue(all(w.name.startswith("batch-train-") for w in b92.scheduled_workflows))
+        self.assertEqual(
+            [
+                (w.object_kind, w.pod_count, round(w.target_wall_offset_sec, 3), round(w.execution_duration_sec, 3))
+                for w in b91.scheduled_workflows
+            ],
+            [
+                (w.object_kind, w.pod_count, round(w.target_wall_offset_sec, 3), round(w.execution_duration_sec, 3))
+                for w in b92.scheduled_workflows
+            ],
+        )
+
+        # 2. st93: hashed t0 JobSet pods separated from hashed non-Kueue infra-pods.
+        b93 = testrunner.load_scenario_bundle(
+            suite_dir / "st93-hash-names-t0-mixed-workloads-and-infra-pods",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b93.initial_workloads), 2)
+        self.assertEqual(len(b93.initial_pods), 2)
+        self.assertEqual(len(b93.scheduled_workflows), 2)
+        self.assertTrue(all(h_name_re.match(w.owner_name) for w in b93.initial_workloads))
+        self.assertTrue(all(h_name_re.match(p.name) for p in b93.initial_pods))
+        self.assertEqual([p.placement for p in b93.initial_pods], ["st-node-02", "st-node-02"])
+
+        # 3. st94: hashed Deployment salted Upgrade + ScaleDown 4 -> 2 -> 0 + hashed batch Job.
+        b94 = testrunner.load_scenario_bundle(
+            suite_dir / "st94-hash-names-deployment-salted-upgrade-and-scale",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b94.scheduled_workflows), 2)
+        self.assertEqual([w.object_kind for w in b94.scheduled_workflows], ["Deployment", "Job"])
+        self.assertTrue(all(h_name_re.match(w.name) for w in b94.scheduled_workflows))
+        dep_doc = b94.scheduled_workflows[0].manifest
+        sel_app = dep_doc["spec"]["selector"]["matchLabels"]["app"]
+        tpl_app = dep_doc["spec"]["template"]["metadata"]["labels"]["app"]
+        self.assertEqual(sel_app, tpl_app)
+        self.assertRegex(sel_app, h_name_re)
+        v1_hash = dep_doc["spec"]["template"]["metadata"]["annotations"]["kueue-optimizer.gke.io/template-hash"]
+        self.assertRegex(v1_hash, th_re)
+        self.assertEqual(len(b94.scheduled_workflow_updates), 3)
+        self.assertEqual(
+            [u.update_types for u in b94.scheduled_workflow_updates],
+            [("Upgrade",), ("ScaleDown",), ("ScaleDown",)],
+        )
+        self.assertEqual([u.replicas for u in b94.scheduled_workflow_updates], [4, 2, 0])
+        v2_hash = b94.scheduled_workflow_updates[0].template_hash
+        self.assertRegex(v2_hash, th_re)
+        self.assertNotEqual(v1_hash, v2_hash)
+
+        # 4. st95: hashed 7-level TAS + annotation-only t0 PodGroups + LowerPriority preemption.
+        b95 = testrunner.load_scenario_bundle(
+            suite_dir / "st95-hash-names-tas-podgroup-annotation-and-preemption",
+            skip_initial_offset=False,
+            missing_duration_policy="error",
+        )
+        self.assertEqual(len(b95.initial_workloads), 2)
+        self.assertEqual(len(b95.initial_pods), 0)
+        self.assertEqual(len(b95.scheduled_workflows), 3)
+        self.assertTrue(all(w.is_tas and w.owner_kind == "PodGroup" for w in b95.initial_workloads))
+        self.assertTrue(all(h_name_re.match(w.owner_name) for w in b95.initial_workloads))
+        self.assertTrue(all(h_name_re.match(w.name) for w in b95.scheduled_workflows))
+
+        # 5. execution-time.json is the only duration source: no workflow carries the replay-only
+        #    pod duration annotation, so every finite workflow must resolve through its hashed owner name.
+        for b_chk in (b91, b92, b93, b94, b95):
+            finite = [w for w in b_chk.scheduled_workflows if w.object_kind != "Deployment"]
+            self.assertTrue(finite)
+            self.assertFalse(any(w.has_explicit_pod_exec_annotation for w in finite))
+            self.assertTrue(all(w.indexed_from_execution_time for w in finite))
+
+        # A hashed owner name that execution-time.json does not contain must fail under policy "error".
+        with tempfile.TemporaryDirectory() as tmp:
+            broken_dir = Path(tmp) / "st91-broken-owner-link"
+            shutil.copytree(suite_dir / "st91-hash-names-jobset-batch-anonymized-replay", broken_dir)
+            ex_path = broken_dir / "execution-time.json"
+            broken_lines = []
+            for line in ex_path.read_text(encoding="utf-8").splitlines():
+                ev = json.loads(line)
+                ev["payload"]["ownerName"] = "h-" + "0" * 32
+                broken_lines.append(json.dumps(ev))
+            ex_path.write_text("\n".join(broken_lines) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "no recorded execution duration"):
+                testrunner.load_scenario_bundle(
+                    broken_dir,
+                    skip_initial_offset=False,
+                    missing_duration_policy="error",
+                )
+
+        # 6. Zero raw sensitive strings leaked into any JSONL trace of st91, st93, st94, st95.
+        forbidden_tokens = [
+            "alice-researcher",
+            "ml-core",
+            "secret-llm-v4",
+            "cc-999",
+            "serving-sre",
+            "llm-serving-prod",
+            "batch-train-",
+            "t0-train-",
+            "unmanaged-daemon-",
+            "infer-gateway",
+            "offline-eval-",
+            "t0-tas-pg-",
+            "tas-low-job-",
+            "tas-high-urgent-",
+            "API_KEY",
+        ]
+        for slug in (
+            "st91-hash-names-jobset-batch-anonymized-replay",
+            "st93-hash-names-t0-mixed-workloads-and-infra-pods",
+            "st94-hash-names-deployment-salted-upgrade-and-scale",
+            "st95-hash-names-tas-podgroup-annotation-and-preemption",
+        ):
+            for fname in ("infra.json", "workflows.json", "execution-time.json"):
+                raw = (suite_dir / slug / fname).read_text(encoding="utf-8")
+                for tok in forbidden_tokens:
+                    self.assertNotIn(tok, raw, f"Sensitive token {tok!r} leaked into {slug}/{fname}")
+
 
 if __name__ == "__main__":
     unittest.main()
