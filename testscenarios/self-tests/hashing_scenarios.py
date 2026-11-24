@@ -44,6 +44,24 @@ DEFAULT_FLAVOR = "st-tpu-flavor"
 DEFAULT_TOPOLOGY = "st-slice-topology"
 
 
+POD_EXEC_ANNOTATION = "kueue-optimizer.gke.io/pod-execution-time-seconds"
+
+
+def _drop_pod_exec_annotation(node: Any) -> None:
+    """Remove the replay-only pod duration annotation from every `annotations` map below `node`."""
+    if isinstance(node, dict):
+        anns = node.get("annotations")
+        if isinstance(anns, dict) and POD_EXEC_ANNOTATION in anns:
+            del anns[POD_EXEC_ANNOTATION]
+            if not anns:
+                del node["annotations"]
+        for child in node.values():
+            _drop_pod_exec_annotation(child)
+    elif isinstance(node, list):
+        for child in node:
+            _drop_pod_exec_annotation(child)
+
+
 def _hmac_name(salt: bytes, raw_val: str) -> str:
     """Match Go `hmacSensitiveDataHasher.HashName`: `'h-' + 32 lowercase hex chars`."""
     digest = hmac.new(salt, raw_val.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -304,6 +322,16 @@ def build_hashing_5_scenarios(
     scenarios: list[Any] = []
     cat = "19. Anonymization & Sensitive-Data Hashing (--hash-names)"
 
+    def _make_scraped_jobset(**kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Build a JobSet as `cluster-scraper` records it, without the replay-only duration annotation.
+
+        The duration of these workflows then comes only from `execution-time.json`, so
+        `--missing-duration-policy error` fails when the loader cannot link a hashed owner name.
+        """
+        wf_ev, ex_list = make_jobset_and_exec_events_fn(**kwargs)
+        _drop_pod_exec_annotation(wf_ev)
+        return wf_ev, ex_list
+
     # ------------------------------------------------------------------
     # st91 (Anonymized) & st92 (Plaintext Control): Batch JobSet A/B Pair
     # ------------------------------------------------------------------
@@ -346,7 +374,7 @@ def build_hashing_5_scenarios(
             raw_wl_name = f"jobset-{raw_js_name}-wl"
             js_name = _hmac_name(salt_91, raw_js_name) if is_hashed else raw_js_name
             wl_name = _hmac_name(salt_91, raw_wl_name) if is_hashed else raw_wl_name
-            wf_ev, ex_list = make_jobset_and_exec_events_fn(
+            wf_ev, ex_list = _make_scraped_jobset(
                 name=js_name,
                 arrival_sec=float(idx) * 0.1,
                 duration_sec=10.0,
@@ -457,7 +485,7 @@ def build_hashing_5_scenarios(
         h_js = _hmac_name(salt_93, f"t0-train-{i}")
         h_wl = _hmac_name(salt_93, f"jobset-t0-train-{i}-wl")
         h_pod = _hmac_name(salt_93, f"t0-train-{i}-workers-0-abcde")
-        wf_ev, ex_list = make_jobset_and_exec_events_fn(
+        wf_ev, ex_list = _make_scraped_jobset(
             name=h_js,
             arrival_sec=0.0,
             duration_sec=12.0,
@@ -506,7 +534,7 @@ def build_hashing_5_scenarios(
     for i in range(2):
         h_js = _hmac_name(salt_93, f"post-t0-train-{i}")
         h_wl = _hmac_name(salt_93, f"jobset-post-t0-train-{i}-wl")
-        wf_ev, ex_list = make_jobset_and_exec_events_fn(
+        wf_ev, ex_list = _make_scraped_jobset(
             name=h_js,
             arrival_sec=2.0 + i * 0.2,
             duration_sec=12.0,
@@ -900,7 +928,7 @@ def build_hashing_5_scenarios(
     for i in range(2):
         h_js = _hmac_name(salt_95, f"tas-low-job-{i}")
         h_wl = _hmac_name(salt_95, f"jobset-tas-low-job-{i}-wl")
-        wf_ev, ex_list = make_jobset_and_exec_events_fn(
+        wf_ev, ex_list = _make_scraped_jobset(
             name=h_js,
             arrival_sec=float(i) * 0.1,
             duration_sec=16.0,
@@ -919,7 +947,7 @@ def build_hashing_5_scenarios(
     # 1 high-priority hashed TAS JobSet at t=+4s (4 TPUs, 8s) -> preempts 1 p-low hashed workload!
     h_hi_js = _hmac_name(salt_95, "tas-high-urgent-0")
     h_hi_wl = _hmac_name(salt_95, "jobset-tas-high-urgent-0-wl")
-    wf_hi, ex_hi = make_jobset_and_exec_events_fn(
+    wf_hi, ex_hi = _make_scraped_jobset(
         name=h_hi_js,
         arrival_sec=4.0,
         duration_sec=8.0,

@@ -5994,14 +5994,9 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                             {
                                 "name": "main",
                                 "count": 1,
+                                # Like a live Kueue Workload: the template holds Pod.spec only, no Pod annotations.
                                 "template": {
-                                    "metadata": {
-                                        "annotations": {
-                                            "kueue-optimizer.gke.io/long-running-pod": "true",
-                                            "kueue-optimizer.gke.io/infinite-duration": "true",
-                                            "kueue-optimizer.gke.io/deployment-name": long_dep,
-                                        }
-                                    },
+                                    "metadata": {},
                                     "spec": {"containers": [{"resources": {"requests": {"google.com/tpu": "2"}}}]},
                                 },
                             }
@@ -6031,7 +6026,7 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                             "name": "main",
                             "count": 1,
                             "template": {
-                                "metadata": {"annotations": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "10"}},
+                                "metadata": {},
                                 "spec": {"containers": [{"resources": {"requests": {"google.com/tpu": "2"}}}]},
                             },
                         }
@@ -6050,6 +6045,20 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
 
             long_v1_wl = mk_long_wl(f"{long_dep}x1y2z", "11111")
             long_v2_wl = mk_long_wl(f"{long_dep}z9y8x", "22222")
+
+            # The annotations exist only on the Pods, as in a live chamber.
+            serving_pod_ann = {
+                "kueue-optimizer.gke.io/long-running-pod": "true",
+                "kueue-optimizer.gke.io/infinite-duration": "true",
+                "kueue-optimizer.gke.io/deployment-name": long_dep,
+                "kueue.x-k8s.io/pod-suspending-parent": "deployment",
+            }
+            pod_ann_by_name = {
+                f"{long_dep}x1y2z": serving_pod_ann,
+                f"{long_dep}z9y8x": serving_pod_ann,
+                "ephemeral-smoke-test": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "10"},
+            }
+            pod_list_calls = [0]
             upgrade_polls = [0]
 
             def fake_apply_parallel(docs, max_workers=16):
@@ -6086,6 +6095,17 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                         live_wls[:] = [w for w in live_wls if w is not long_v2_wl]
                         upgrade_polls[0] = 3
                     return 200, json.dumps({"items": list(live_wls)}).encode("utf-8")
+                if method == "GET" and path.startswith("/api/v1/namespaces/") and path.endswith("/pods"):
+                    pod_list_calls[0] += 1
+                    live_pod_names = [w["metadata"]["ownerReferences"][0]["name"] for w in live_wls]
+                    return 200, json.dumps(
+                        {
+                            "items": [
+                                {"metadata": {"name": pn, "namespace": "ai-lab", "annotations": pod_ann_by_name[pn]}}
+                                for pn in live_pod_names
+                            ]
+                        }
+                    ).encode("utf-8")
                 if method == "GET" and path == "/api/v1/nodes":
                     return 200, json.dumps({"items": nodes}).encode("utf-8")
                 if method == "GET" and path == "/api/v1/pods":
@@ -6135,6 +6155,8 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
 
             # R8: plain finite Pod 'ephemeral-smoke-test' was NOT captured into _retired_serving_workloads.
             self.assertNotIn(("ai-lab", "pod-ephemeral-smoke-test-99999"), mgr._retired_serving_workloads)
+            # Both classifications come from the owning Pods: the mock Workloads carry no annotations.
+            self.assertGreaterEqual(pod_list_calls[0], 1)
 
             # N6 + R5: long_v1 cleanly retired (Completed), long_v2 preempted during upgrade (Excluded), plain_pod active_at_end.
             _rows, sat_subtitle = report_effective_uninterrupted_saturation(
@@ -6147,8 +6169,199 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
         finally:
             mgr.close()
 
+    def test_deployment_update_and_delete_wait_for_fifo_delayed_create(self) -> None:
+        """An Update or Delete must not overtake the earlier Create of the same Deployment that waits behind the FIFO gate."""
+        from dataclasses import replace as dc_replace
+        from datetime import datetime, timezone
+        import time
+
+        from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot
+        from runner.loader import (
+            ScheduledWorkflowDeletion,
+            ScheduledWorkflowItem,
+            ScheduledWorkflowUpdate,
+            load_scenario_bundle,
+        )
+        from runner.replay import run_scenario_replay
+
+        st83_dir = REPO_ROOT / "testscenarios" / "self-tests" / "st83-deployment-scale-down-unblocks-batch-and-zero"
+        base_b83 = load_scenario_bundle(st83_dir, speedup=100.0)
+        base_ep = time.time() - 30.0
+        base_iso = datetime.fromtimestamp(base_ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def mk_dep_manifest(name: str, replicas: int):
+            return {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": name, "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/queue-name": "lq-main"}},
+                "spec": {
+                    "replicas": replicas,
+                    "paused": False,
+                    "template": {
+                        "metadata": {"annotations": {"kueue-optimizer.gke.io/deployment-name": name}},
+                        "spec": {"containers": [{"name": "c", "image": "pause:3.9"}]},
+                    },
+                },
+            }
+
+        def mk_create(seq: int, name: str, creation_offset_sec: float):
+            return ScheduledWorkflowItem(
+                target_wall_offset_sec=0.0,
+                seq=seq,
+                raw_offset_sec=0.0,
+                raw_offset_from_t0_sec=0.0,
+                event_timestamp=base_iso,
+                object_kind="Deployment",
+                name=name,
+                namespace="ai-lab",
+                local_queue_name="lq-main",
+                workload_state="NotAdmitted",
+                trigger_reason="initial_not_admitted",
+                execution_duration_sec=10.0,
+                compressed_duration_sec=10.0,
+                indexed_from_execution_time=False,
+                pod_count=1,
+                manifest=mk_dep_manifest(name, 1),
+                creation_epoch=base_ep + creation_offset_sec,
+                incarnation_index=0,
+            )
+
+        def mk_delete(seq: int, name: str, target_sec: float):
+            return ScheduledWorkflowDeletion(
+                target_wall_offset_sec=target_sec,
+                seq=seq,
+                raw_offset_sec=target_sec * 100.0,
+                raw_offset_from_t0_sec=target_sec * 100.0,
+                event_timestamp=base_iso,
+                object_kind="Deployment",
+                manifest_kind="Deployment",
+                manifest_api_version="apps/v1",
+                name=name,
+                applied_name=name,
+                namespace="ai-lab",
+                delete_reason="cancelled",
+                incarnation_index=0,
+            )
+
+        # Three Deployments are due at t=0 with three different creationTimestamps, so the replay
+        # creates one tier at a time and holds the later tiers behind the FIFO gate (up to ~1s each).
+        bundle = dc_replace(
+            base_b83,
+            t0_epoch=base_ep,
+            t0_iso=base_iso,
+            effective_start_epoch=base_ep,
+            effective_start_iso=base_iso,
+            t_end_epoch=base_ep + 30.0,
+            t_end_iso=base_iso,
+            nodes=[],
+            initial_pods=[],
+            initial_workloads=[],
+            initial_deployments=[],
+            scheduled_infra_events=[],
+            workload_namespaces=["ai-lab"],
+            infra_pods_namespace="infra-pods",
+            scheduled_workflows=[
+                mk_create(1, "first-srv", 0.0),
+                mk_create(2, "gated-srv", 5.0),
+                mk_create(3, "brief-srv", 10.0),
+            ],
+            scheduled_workflow_updates=[
+                # Due together with the gated create: it must run after that create, not before it.
+                ScheduledWorkflowUpdate(
+                    target_wall_offset_sec=0.0,
+                    seq=4,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=base_iso,
+                    object_kind="Deployment",
+                    name="gated-srv",
+                    applied_name="gated-srv",
+                    namespace="ai-lab",
+                    local_queue_name="lq-main",
+                    incarnation_index=0,
+                    replicas=3,
+                    paused=False,
+                    template_hash="th-0000000000000001",
+                    update_types=("ScaleUp",),
+                    manifest=mk_dep_manifest("gated-srv", 3),
+                ),
+            ],
+            scheduled_workflow_deletions=[
+                # Strictly after the brief-srv create time: the replay must run Create -> Delete.
+                mk_delete(5, "brief-srv", 0.01),
+                mk_delete(6, "first-srv", 0.02),
+                mk_delete(7, "gated-srv", 0.02),
+            ],
+        )
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-test-fifo", apiserver_port=16496)
+        try:
+            actions: list[str] = []
+
+            def fake_apply_parallel(docs, max_workers=16):
+                for d in docs:
+                    actions.append(f"CREATE:{(d.get('metadata') or {}).get('name')}")
+
+            def fake_ssa(doc):
+                actions.append(f"SSA:{(doc.get('metadata') or {}).get('name')}:{(doc.get('spec') or {}).get('replicas')}")
+
+            def fake_api(method: str, path: str, body: bytes | None = None, headers: dict | None = None):
+                if method == "DELETE" and "/deployments/" in path:
+                    actions.append(f"DELETE:{path.rsplit('/', 1)[-1].split('?', 1)[0]}")
+                    return 200, b"{}"
+                if method == "GET" and (path.endswith("/workloads") or path.endswith("/pods")):
+                    return 200, json.dumps({"items": []}).encode("utf-8")
+                return 200, b"{}"
+
+            def fake_q_status(*_a, **_kw):
+                return ClusterStatusSnapshot(
+                    workloads_admitted=0,
+                    workloads_pending=0,
+                    workloads_finished=0,
+                    pods_running=0,
+                    pods_pending=0,
+                    pods_succeeded=0,
+                    pods_failed=0,
+                    jobsets_completed=0,
+                    jobsets_failed=0,
+                    cq_summary=[],
+                    finished_workload_keys=set(),
+                    present_workload_keys=set(),
+                    workloads_query_ok=True,
+                )
+
+            with (
+                mock.patch.object(mgr, "ensure_kwok_connection"),
+                mock.patch.object(mgr, "apply_manifests_parallel", side_effect=fake_apply_parallel),
+                mock.patch.object(mgr, "ssa_apply_doc", side_effect=fake_ssa),
+                mock.patch.object(mgr, "api_request", side_effect=fake_api),
+                mock.patch("runner.replay.query_cluster_status", side_effect=fake_q_status),
+            ):
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle,
+                    speedup=100.0,
+                    max_run_seconds=8.0,
+                    status_interval_sec=0.05,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+
+            # The gated Deployment is created once with its original spec, and updated only afterwards.
+            self.assertEqual(actions.count("CREATE:gated-srv"), 1, actions)
+            self.assertIn("SSA:gated-srv:3", actions)
+            self.assertLess(actions.index("CREATE:gated-srv"), actions.index("SSA:gated-srv:3"), actions)
+            self.assertLess(actions.index("SSA:gated-srv:3"), actions.index("DELETE:gated-srv"), actions)
+            # The brief Deployment is created and then deleted, not cancelled before its create.
+            self.assertEqual(actions.count("CREATE:brief-srv"), 1, actions)
+            self.assertLess(actions.index("CREATE:brief-srv"), actions.index("DELETE:brief-srv"), actions)
+            self.assertLess(actions.index("CREATE:first-srv"), actions.index("DELETE:first-srv"), actions)
+        finally:
+            mgr.close()
+
     def test_st91_to_st95_hashing_anonymization_scenarios_load_and_validate_cleanly(self) -> None:
         import re
+        import shutil
 
         suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
         h_name_re = re.compile(r"^h-[0-9a-f]{32}$")
@@ -6232,7 +6445,33 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
         self.assertTrue(all(h_name_re.match(w.owner_name) for w in b95.initial_workloads))
         self.assertTrue(all(h_name_re.match(w.name) for w in b95.scheduled_workflows))
 
-        # 5. Zero raw sensitive strings leaked into any JSONL trace of st91, st93, st94, st95.
+        # 5. execution-time.json is the only duration source: no workflow carries the replay-only
+        #    pod duration annotation, so every finite workflow must resolve through its hashed owner name.
+        for b_chk in (b91, b92, b93, b94, b95):
+            finite = [w for w in b_chk.scheduled_workflows if w.object_kind != "Deployment"]
+            self.assertTrue(finite)
+            self.assertFalse(any(w.has_explicit_pod_exec_annotation for w in finite))
+            self.assertTrue(all(w.indexed_from_execution_time for w in finite))
+
+        # A hashed owner name that execution-time.json does not contain must fail under policy "error".
+        with tempfile.TemporaryDirectory() as tmp:
+            broken_dir = Path(tmp) / "st91-broken-owner-link"
+            shutil.copytree(suite_dir / "st91-hash-names-jobset-batch-anonymized-replay", broken_dir)
+            ex_path = broken_dir / "execution-time.json"
+            broken_lines = []
+            for line in ex_path.read_text(encoding="utf-8").splitlines():
+                ev = json.loads(line)
+                ev["payload"]["ownerName"] = "h-" + "0" * 32
+                broken_lines.append(json.dumps(ev))
+            ex_path.write_text("\n".join(broken_lines) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "no recorded execution duration"):
+                testrunner.load_scenario_bundle(
+                    broken_dir,
+                    skip_initial_offset=False,
+                    missing_duration_policy="error",
+                )
+
+        # 6. Zero raw sensitive strings leaked into any JSONL trace of st91, st93, st94, st95.
         forbidden_tokens = [
             "alice-researcher",
             "ml-core",

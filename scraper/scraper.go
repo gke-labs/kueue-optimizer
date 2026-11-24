@@ -165,6 +165,7 @@ type Scraper struct {
 	jobToJobSet                map[string]string                         // namespace/rawJobName -> rawJobSetName
 	rayClusterToRayJob         map[string]string                         // namespace/rawRayClusterName -> rawRayJobName
 	deploymentUIDToKey         map[string]string                         // deployment UID -> namespace/rawDeploymentName
+	deploymentDeletedAt        map[string]time.Time                      // Deployment/namespace/rawDeploymentName -> deletion time of its last incarnation
 	replicaSetToDeployment     map[string]string                         // namespace/rawReplicaSetName -> rawDeploymentName
 	podToReplicaSet            map[string]string                         // namespace/rawPodName -> rawReplicaSetName
 	podToDeployment            map[string]string                         // namespace/rawPodName -> rawDeploymentName
@@ -224,6 +225,7 @@ func NewScraper(
 		jobToJobSet:            make(map[string]string),
 		rayClusterToRayJob:     make(map[string]string),
 		deploymentUIDToKey:     make(map[string]string),
+		deploymentDeletedAt:    make(map[string]time.Time),
 		replicaSetToDeployment: make(map[string]string),
 		podToReplicaSet:        make(map[string]string),
 		podToDeployment:        make(map[string]string),
@@ -2262,7 +2264,10 @@ func (s *Scraper) handleDeploymentWatchEventAt(eventType watch.EventType, deploy
 		}
 	}
 	wlState := s.determineGroupWorkloadStateLocked("Deployment", deploy.Namespace, deploy.Name, deploy.Status.ReadyReplicas, deploy.Status.Replicas)
-	if lq != "" && wlState == WorkloadStateAdmissionInProgress && deploy.Status.ReadyReplicas == 0 {
+	// Kueue gates the pods of a queued Deployment, and of an unlabeled one when
+	// manageJobsWithoutQueueName tracks it. Without a Workload, such a Deployment is still pending.
+	queueManaged := lq != "" || (s.manageJobsWithoutQueueName && !isSystemNamespaceName(deploy.Namespace))
+	if queueManaged && wlState == WorkloadStateAdmissionInProgress && deploy.Status.ReadyReplicas == 0 {
 		if _, hasOwnerWl := s.ownerStates[oKey]; !hasOwnerWl {
 			wlState = WorkloadStateNotAdmitted
 		}
@@ -2271,6 +2276,7 @@ func (s *Scraper) handleDeploymentWatchEventAt(eventType watch.EventType, deploy
 		delete(s.deploymentWlStates, oKey)
 		delete(s.ownerStates, oKey)
 		delete(s.ownerToWorkload, oKey)
+		s.deploymentDeletedAt[oKey] = now
 	}
 	s.mu.Unlock()
 
@@ -2631,6 +2637,28 @@ func (s *Scraper) recomputeDeploymentOwnerStateLocked(ownerKey string) {
 	}
 }
 
+// isStaleDeploymentWorkloadLocked reports whether a pod Workload belongs to a deleted incarnation
+// of the Deployment at ownerKey. Kubernetes deletes a Deployment before its ReplicaSets, Pods and
+// Workloads, so events of the old Workloads still arrive after the Deployment is gone, also when a
+// Deployment with the same name already exists again. Such a Workload keeps its owner name in
+// execution-time.json, but it must not set the owner state of the Deployment.
+//
+// A Workload is older than its Deployment incarnation only when it belongs to an earlier one.
+// While no incarnation is tracked, a Workload created up to the last deletion is stale.
+func (s *Scraper) isStaleDeploymentWorkloadLocked(ownerKey string, wl *kueuev1beta2.Workload) bool {
+	if wl == nil || wl.CreationTimestamp.IsZero() {
+		return false
+	}
+	created := wl.CreationTimestamp.Time
+	if wfSt, tracked := s.workflowStates[ownerKey]; tracked {
+		return !wfSt.creationTime.IsZero() && created.Before(wfSt.creationTime.Time)
+	}
+	if deletedAt, deleted := s.deploymentDeletedAt[ownerKey]; deleted {
+		return !created.After(deletedAt)
+	}
+	return false
+}
+
 func (s *Scraper) resolveDeploymentOwnerForPodWorkload(ns, rawPodName string, wl *kueuev1beta2.Workload) string {
 	if ns == "" || rawPodName == "" {
 		return ""
@@ -2981,7 +3009,10 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	var events []ExecutionTimeEvent
 
 	s.mu.Lock()
-	s.ownerToWorkload[ownerKey] = wl.Name
+	staleDeploymentWl := rawOwnerKind == "Deployment" && s.isStaleDeploymentWorkloadLocked(ownerKey, wl)
+	if !staleDeploymentWl {
+		s.ownerToWorkload[ownerKey] = wl.Name
+	}
 	for _, ref := range wl.OwnerReferences {
 		if ref.Kind != "" && ref.Name != "" {
 			s.ownerToWorkload[ref.Kind+"/"+wl.Namespace+"/"+ref.Name] = wl.Name
@@ -3026,13 +3057,15 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 		thisWlState = WorkloadStateNotAdmitted
 	}
 	if rawOwnerKind == "Deployment" {
-		wlMap, exists := s.deploymentWlStates[ownerKey]
-		if !exists {
-			wlMap = make(map[string]WorkloadState)
-			s.deploymentWlStates[ownerKey] = wlMap
+		if !staleDeploymentWl {
+			wlMap, exists := s.deploymentWlStates[ownerKey]
+			if !exists {
+				wlMap = make(map[string]WorkloadState)
+				s.deploymentWlStates[ownerKey] = wlMap
+			}
+			wlMap[wl.Name] = thisWlState
+			s.recomputeDeploymentOwnerStateLocked(ownerKey)
 		}
-		wlMap[wl.Name] = thisWlState
-		s.recomputeDeploymentOwnerStateLocked(ownerKey)
 	} else {
 		s.ownerStates[ownerKey] = thisWlState
 	}
@@ -3770,6 +3803,7 @@ func (s *Scraper) reconcileWorkflowDeletionsOnRelist(kind string, presentRawKeys
 			delete(s.deploymentWlStates, k)
 			delete(s.ownerStates, k)
 			delete(s.ownerToWorkload, k)
+			s.deploymentDeletedAt[k] = now
 			depNSName := st.namespace + "/" + st.name
 			for uid, v := range s.deploymentUIDToKey {
 				if v == depNSName {

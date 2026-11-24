@@ -1184,6 +1184,10 @@ def run_scenario_replay(
     live_serving_wls: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
     serving_wl_keys: set[tuple[str, str]] = set()
     non_serving_wl_keys: set[tuple[str, str]] = set()
+    # (namespace, workload) -> (is_serving, deployment_name), confirmed from the owning Pod's annotations.
+    serving_class_by_wl: dict[tuple[str, str], tuple[bool, str]] = {}
+    # Pod-owned Workloads whose owning Pod was already gone when first looked up.
+    owner_pod_missing_wls: set[tuple[str, str]] = set()
     terminated_incarnations: set[tuple[str, str, str, int]] = set()
     scale_zero_drain_deadline: float | None = None
 
@@ -1216,13 +1220,14 @@ def run_scenario_replay(
             for c in conds
         )
 
-    def _match_deploy_for_serving_wl(ns_val: str, wl_doc: dict[str, Any]) -> str:
-        owners = (wl_doc.get("metadata") or {}).get("ownerReferences") or []
-        pod_ref = ""
-        for o in owners:
+    def _owner_pod_name(wl_doc: dict[str, Any]) -> str:
+        for o in (wl_doc.get("metadata") or {}).get("ownerReferences") or []:
             if isinstance(o, dict) and o.get("kind") == "Pod" and o.get("name"):
-                pod_ref = str(o["name"])
-                break
+                return str(o["name"])
+        return ""
+
+    def _match_deploy_for_serving_wl(ns_val: str, wl_doc: dict[str, Any]) -> str:
+        pod_ref = _owner_pod_name(wl_doc)
         if not pod_ref:
             return ""
         best = ""
@@ -1231,38 +1236,56 @@ def run_scenario_replay(
                 best = cand_dep
         return best
 
-    def _classify_serving_workload_doc(ns_val: str, wl_doc: dict[str, Any]) -> tuple[bool, str]:
-        wm_ann = ((wl_doc.get("metadata") or {}).get("annotations")) or {}
-        dep_ann = str(wm_ann.get("kueue-optimizer.gke.io/deployment-name") or "").strip()
-        if dep_ann:
-            return True, dep_ann
-        has_serving_marker = (
-            str(wm_ann.get("kueue-optimizer.gke.io/long-running-pod") or "").lower() == "true"
-            or str(wm_ann.get("kueue.x-k8s.io/pod-suspending-parent") or "").lower() == "deployment"
+    def _has_serving_marker(ann: dict[str, Any]) -> bool:
+        return (
+            str(ann.get("kueue-optimizer.gke.io/long-running-pod") or "").lower() == "true"
+            or str(ann.get("kueue.x-k8s.io/pod-suspending-parent") or "").lower() == "deployment"
         )
-        has_finite_pod_exec = bool(str(wm_ann.get("kueue-optimizer.gke.io/pod-execution-time-seconds") or "").strip())
+
+    def _classify_serving_workload_doc(
+        ns_val: str,
+        wl_doc: dict[str, Any],
+        owner_pod_ann: dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        """Return `(is_serving, deployment_name)` for a Workload.
+
+        Kueue's pod integration builds `spec.podSets[].template` from `Pod.spec` only and copies no
+        `kueue-optimizer.gke.io/*` annotation onto the Workload. So the Deployment name and the finite
+        pod marker come from the annotations of the owning Pod (`owner_pod_ann`, `None` when the Pod is
+        unknown). A result that the owning Pod confirmed is cached, because the Pod can be gone on a
+        later poll while its Workload is still listed.
+        """
+        wk_c = (ns_val, str((wl_doc.get("metadata") or {}).get("name") or ""))
+        cached = serving_class_by_wl.get(wk_c)
+        if cached is not None:
+            return cached
+        wm_ann = ((wl_doc.get("metadata") or {}).get("annotations")) or {}
+        has_serving_marker = _has_serving_marker(wm_ann)
         for ps in ((wl_doc.get("spec") or {}).get("podSets")) or []:
-            if not isinstance(ps, dict):
-                continue
-            ann = (((ps.get("template") or {}).get("metadata")) or {}).get("annotations") or {}
-            ps_dep_ann = str(ann.get("kueue-optimizer.gke.io/deployment-name") or "").strip()
-            if ps_dep_ann:
-                return True, ps_dep_ann
-            if (
-                str(ann.get("kueue-optimizer.gke.io/long-running-pod") or "").lower() == "true"
-                or str(ann.get("kueue.x-k8s.io/pod-suspending-parent") or "").lower() == "deployment"
-            ):
-                has_serving_marker = True
-            if str(ann.get("kueue-optimizer.gke.io/pod-execution-time-seconds") or "").strip():
-                has_finite_pod_exec = True
-        if has_finite_pod_exec and not has_serving_marker:
-            return False, ""
-        dep_n = _match_deploy_for_serving_wl(ns_val, wl_doc)
-        if dep_n:
-            return True, dep_n
-        if has_serving_marker:
-            return True, ""
-        return False, ""
+            if isinstance(ps, dict):
+                ps_ann = (((ps.get("template") or {}).get("metadata")) or {}).get("annotations") or {}
+                has_serving_marker = has_serving_marker or _has_serving_marker(ps_ann)
+
+        result: tuple[bool, str] | None = None
+        if owner_pod_ann is not None:
+            dep_ann = str(owner_pod_ann.get("kueue-optimizer.gke.io/deployment-name") or "").strip()
+            has_serving_marker = has_serving_marker or _has_serving_marker(owner_pod_ann)
+            has_finite_pod_exec = bool(
+                str(owner_pod_ann.get("kueue-optimizer.gke.io/pod-execution-time-seconds") or "").strip()
+            )
+            if dep_ann:
+                result = (True, dep_ann)
+            elif has_finite_pod_exec and not has_serving_marker:
+                result = (False, "")
+        if result is None:
+            dep_n = _match_deploy_for_serving_wl(ns_val, wl_doc)
+            if dep_n:
+                result = (True, dep_n)
+            else:
+                result = (has_serving_marker, "")
+        if owner_pod_ann is not None and wk_c[1]:
+            serving_class_by_wl[wk_c] = result
+        return result
 
     def _non_serving_finished_keys(keys: set[tuple[str, str]]) -> set[tuple[str, str]]:
         if not known_deploy_names_by_ns and not serving_wl_keys:
@@ -1298,16 +1321,42 @@ def run_scenario_replay(
             if st_w != 200 or not raw_w:
                 query_all_ok = False
                 continue
-            for wl_it in json.loads(raw_w.decode("utf-8")).get("items") or []:
-                if not isinstance(wl_it, dict):
-                    continue
+            wl_items = [w for w in (json.loads(raw_w.decode("utf-8")).get("items") or []) if isinstance(w, dict)]
+
+            # List the Pods of this namespace only when a Pod-owned Workload is not classified yet.
+            def _needs_owner_pod(w_doc: dict[str, Any]) -> bool:
+                w_meta = w_doc.get("metadata") or {}
+                w_key = (str(w_meta.get("namespace") or ns_q), str(w_meta.get("name") or ""))
+                return (
+                    bool(_owner_pod_name(w_doc))
+                    and w_key not in serving_class_by_wl
+                    and w_key not in owner_pod_missing_wls
+                )
+
+            pod_ann_by_name: dict[str, dict[str, Any]] | None = None
+            if any(_needs_owner_pod(w) for w in wl_items):
+                st_p, raw_p = mgr.api_request("GET", f"/api/v1/namespaces/{ns_q}/pods")
+                if st_p == 200 and raw_p:
+                    pod_ann_by_name = {}
+                    for p_it in json.loads(raw_p.decode("utf-8")).get("items") or []:
+                        p_meta = (p_it.get("metadata") or {}) if isinstance(p_it, dict) else {}
+                        if p_meta.get("name"):
+                            pod_ann_by_name[str(p_meta["name"])] = dict(p_meta.get("annotations") or {})
+
+            for wl_it in wl_items:
                 wm = wl_it.get("metadata") or {}
                 wn = str(wm.get("name") or "")
                 actual_ns = str(wm.get("namespace") or ns_q)
                 if not wn:
                     continue
-                is_srv, dep_n = _classify_serving_workload_doc(actual_ns, wl_it)
                 wk = (actual_ns, wn)
+                owner_pod_ann: dict[str, Any] | None = None
+                if pod_ann_by_name is not None and _needs_owner_pod(wl_it):
+                    owner_pod_ann = pod_ann_by_name.get(_owner_pod_name(wl_it))
+                    if owner_pod_ann is None:
+                        # The Pod is already gone and its name is never reused: stop asking for it.
+                        owner_pod_missing_wls.add(wk)
+                is_srv, dep_n = _classify_serving_workload_doc(actual_ns, wl_it, owner_pod_ann)
                 if not is_srv:
                     non_serving_wl_keys.add(wk)
                     continue
@@ -1874,6 +1923,55 @@ def run_scenario_replay(
             flush=True,
         )
 
+    def _overdue_create_ts_by_key(now_el: float) -> dict[tuple[str, str, str, int], float]:
+        """Return the target time of every due create that still waits on event_heap, by incarnation key."""
+        out: dict[tuple[str, str, str, int], float] = {}
+        for w in event_heap:
+            if w.target_wall_offset_sec > now_el:
+                continue
+            w_key = (w.namespace, w.object_kind, w.name, w.incarnation_index)
+            if w_key in cancelled_unsubmitted_keys:
+                continue
+            out[w_key] = min(out.get(w_key, w.target_wall_offset_sec), w.target_wall_offset_sec)
+        return out
+
+    def _held_behind_create(
+        ev: ScheduledWorkflowUpdate | ScheduledWorkflowDeletion,
+        overdue_creates: dict[tuple[str, str, str, int], float],
+        *,
+        strictly_after_create: bool,
+    ) -> bool:
+        """Return True when the create of the same incarnation is due earlier but did not run yet.
+
+        A delete is held only when the create is strictly earlier: a delete at or before the create
+        time cancels the unsubmitted create instead.
+        """
+        if not overdue_creates or getattr(ev, "initial_workload_name", ""):
+            return False
+        create_ts = overdue_creates.get((ev.namespace, ev.object_kind, ev.name, ev.incarnation_index))
+        if create_ts is None:
+            return False
+        if strictly_after_create:
+            return create_ts < ev.target_wall_offset_sec - 1e-9
+        return create_ts <= ev.target_wall_offset_sec + 1e-9
+
+    def _first_runnable_event(
+        heap: list[Any],
+        now_el: float,
+        overdue_creates: dict[tuple[str, str, str, int], float],
+        *,
+        strictly_after_create: bool,
+    ) -> Any | None:
+        """Return the earliest due event of `heap` that is not held behind its own pending create."""
+        if not heap or heap[0].target_wall_offset_sec > now_el:
+            return None
+        if not _held_behind_create(heap[0], overdue_creates, strictly_after_create=strictly_after_create):
+            return heap[0]
+        for ev in sorted(e for e in heap if e.target_wall_offset_sec <= now_el):
+            if not _held_behind_create(ev, overdue_creates, strictly_after_create=strictly_after_create):
+                return ev
+        return None
+
     def _print_status_line(snap: ClusterStatusSnapshot, now_mono: float, note: str = "") -> None:
         wall_elapsed = now_mono - t0_mono
         sim_elapsed = wall_elapsed * speedup
@@ -1982,12 +2080,16 @@ def run_scenario_replay(
             # run after a later delete (or same-timestamp delete) and re-create the object via SSA.
             # Tie-break equal timestamps as delete -> create -> update (with terminated_incarnations
             # skipping any same-timestamp update for an already-deleted incarnation).
+            # An update or delete whose own earlier create still waits on event_heap (behind
+            # fifo_gate_wall_sec or the batch cap) is held until that create ran, so it cannot
+            # overtake the create.
             now_el_ev = time.monotonic() - t0_mono
-            next_del_ts = (
-                delete_heap[0].target_wall_offset_sec
-                if delete_heap and delete_heap[0].target_wall_offset_sec <= now_el_ev
-                else None
+            overdue_creates = (
+                _overdue_create_ts_by_key(now_el_ev) if (update_heap or delete_heap) and event_heap else {}
             )
+            due_del = _first_runnable_event(delete_heap, now_el_ev, overdue_creates, strictly_after_create=True)
+            due_upd = _first_runnable_event(update_heap, now_el_ev, overdue_creates, strictly_after_create=False)
+            next_del_ts = due_del.target_wall_offset_sec if due_del is not None else None
             next_sub_ts = (
                 event_heap[0].target_wall_offset_sec
                 if (
@@ -1997,11 +2099,7 @@ def run_scenario_replay(
                 )
                 else None
             )
-            next_upd_ts = (
-                update_heap[0].target_wall_offset_sec
-                if update_heap and update_heap[0].target_wall_offset_sec <= now_el_ev
-                else None
-            )
+            next_upd_ts = due_upd.target_wall_offset_sec if due_upd is not None else None
             due_kinds: list[tuple[float, int, str]] = []
             if next_del_ts is not None:
                 due_kinds.append((round(next_del_ts, 6), 0, "delete"))
@@ -2014,12 +2112,14 @@ def run_scenario_replay(
                 due_kinds.sort()
                 win_kind = due_kinds[0][2]
                 if win_kind == "delete":
-                    del_ev = heapq.heappop(delete_heap)
-                    _execute_workflow_deletion(del_ev, time.monotonic() - t0_mono)
+                    delete_heap.remove(due_del)
+                    heapq.heapify(delete_heap)
+                    _execute_workflow_deletion(due_del, time.monotonic() - t0_mono)
                     continue
                 if win_kind == "update":
-                    upd_ev = heapq.heappop(update_heap)
-                    _execute_workflow_update(upd_ev, time.monotonic() - t0_mono)
+                    update_heap.remove(due_upd)
+                    heapq.heapify(update_heap)
+                    _execute_workflow_update(due_upd, time.monotonic() - t0_mono)
                     continue
 
                 # win_kind == "create": batch due creates up to any earlier due delete or update boundary.
@@ -2230,10 +2330,18 @@ def run_scenario_replay(
                 wake_candidates.append(next_poll_mono - now_mono)
             if event_heap:
                 wake_candidates.append(max(event_heap[0].target_wall_offset_sec, fifo_gate_wall_sec) - wall_elapsed)
-            if update_heap:
-                wake_candidates.append(update_heap[0].target_wall_offset_sec - wall_elapsed)
-            if delete_heap:
-                wake_candidates.append(delete_heap[0].target_wall_offset_sec - wall_elapsed)
+            # An update or delete held behind its own pending create wakes with that create (above).
+            overdue_wake = (
+                _overdue_create_ts_by_key(wall_elapsed) if (update_heap or delete_heap) and event_heap else {}
+            )
+            for wake_heap, wake_strict in ((update_heap, False), (delete_heap, True)):
+                free_ts = [
+                    e.target_wall_offset_sec
+                    for e in wake_heap
+                    if not _held_behind_create(e, overdue_wake, strictly_after_create=wake_strict)
+                ]
+                if free_ts:
+                    wake_candidates.append(min(free_ts) - wall_elapsed)
             if infra_heap:
                 wake_candidates.append(infra_heap[0].target_wall_offset_sec - wall_elapsed)
             if max_run_seconds is not None and max_run_seconds > 0:
