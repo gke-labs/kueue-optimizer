@@ -3174,7 +3174,8 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	}
 	var podSetAssignments []kueuev1beta2.PodSetAssignment
 	if wl.Status.Admission != nil && len(wl.Status.Admission.PodSetAssignments) > 0 {
-		podSetAssignments = SanitizePodSetAssignments(wl.Status.Admission.PodSetAssignments, s.hasher)
+		isPodGroup := rawOwnerKind == "PodGroup" || (wl.Annotations != nil && wl.Annotations[KueueIsGroupWorkloadAnnotation] == "true")
+		podSetAssignments = SanitizePodSetAssignmentsForPodGroup(wl.Status.Admission.PodSetAssignments, isPodGroup, s.hasher)
 	}
 	var unhealthyNodes []string
 	if len(wl.Status.UnhealthyNodes) > 0 {

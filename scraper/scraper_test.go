@@ -227,6 +227,8 @@ func TestShouldKeepAnnotation(t *testing.T) {
 		// Explicitly denied sensitive Kubernetes annotations.
 		{key: corev1.LastAppliedConfigAnnotation, want: false},
 		{key: "Kubectl.Kubernetes.io/Last-Applied-Configuration", want: false},
+		{key: "kubectl.kubernetes.io/default-container", want: false},
+		{key: "kubectl.kubernetes.io/default-logs-container", want: false},
 		{key: "kubernetes.io/change-cause", want: false},
 		{key: "kubernetes.io/created-by", want: false},
 		{key: "kubernetes.io/description", want: false},
@@ -242,6 +244,10 @@ func TestShouldKeepAnnotation(t *testing.T) {
 		{key: "container.seccomp.security.alpha.kubernetes.io/secret-ctr", want: false},
 		{key: "apparmor.security.beta.kubernetes.io/pod", want: false},
 		{key: "container.apparmor.security.beta.kubernetes.io/secret-ctr", want: false},
+		{key: "kueue.x-k8s.io/multikueue-origin-uid", want: false},
+		{key: "scheduler.alpha.kubernetes.io/node-selector", want: false},
+		{key: "provreq.kueue.x-k8s.io/ValidUntilSeconds", want: false},
+		{key: "provreq.kueue.x-k8s.io/reservation-name", want: false},
 
 		// Custom/third-party domains that contain "k8s", "kubernetes", "x-k8s", or "kueue-optimizer" as substrings.
 		{key: "k8s.client-domain.com/owner", want: false},
@@ -398,6 +404,7 @@ func TestSanitizationListsAreLowercase(t *testing.T) {
 		keys map[string]bool
 	}{
 		{"protectedLabelKeys", protectedLabelKeys},
+		{"workflowHashedLabelKeys", workflowHashedLabelKeys},
 		{"labelKeysHoldingWorkloadNames", labelKeysHoldingWorkloadNames},
 		{"labelKeysHoldingPodSetNames", labelKeysHoldingPodSetNames},
 		{"annotationKeysHoldingWorkloadNames", annotationKeysHoldingWorkloadNames},
@@ -5956,10 +5963,32 @@ func TestSensitiveDataHardeningL1ToL8(t *testing.T) {
 	if len(wantTrainerPS) != 10 || !strings.HasPrefix(wantTrainerPS, "r-") {
 		t.Fatalf("expected 10-char r-<8hex> PodSet hash, got %q", wantTrainerPS)
 	}
-	for _, fixed := range []string{"main", "head", "leader", "worker", "submitter", "default", "a1b2c3d4"} {
+	for _, fixed := range []string{"main", "head", "leader", "worker", "submitter", "default"} {
 		if got := hasher.HashPodSetName(fixed); got != fixed {
-			t.Errorf("expected fixed/role-hash PodSet %q to remain plain, got %q", fixed, got)
+			t.Errorf("expected fixed PodSet %q to remain plain, got %q", fixed, got)
 		}
+	}
+	// User-chosen 8-char hex JobSet/Ray PodSet names must NOT bypass HashPodSetName;
+	// 8-char hex exemption applies strictly to PodGroup role-hashes.
+	if got := hasher.HashPodSetName("deadbeef"); got == "deadbeef" || !strings.HasPrefix(got, "r-") {
+		t.Errorf("expected 8-char hex user PodSet name 'deadbeef' to be hashed, got %q", got)
+	}
+	pgPSAs := SanitizePodSetAssignmentsForPodGroup([]kueuev1beta2.PodSetAssignment{{Name: "a1b2c3d4"}}, true, hasher)
+	if string(pgPSAs[0].Name) != "a1b2c3d4" {
+		t.Errorf("expected PodGroup 8-char hex role-hash to stay plain, got %q", pgPSAs[0].Name)
+	}
+	nonPGPSAs := SanitizePodSetAssignmentsForPodGroup([]kueuev1beta2.PodSetAssignment{{Name: "deadbeef"}}, false, hasher)
+	if string(nonPGPSAs[0].Name) != hasher.HashPodSetName("deadbeef") {
+		t.Errorf("expected non-PodGroup 8-char hex PodSet name to be hashed, got %q", nonPGPSAs[0].Name)
+	}
+	pgPodPayload := BuildScrapedPodPayloadWithLinkage(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pg-p0", Namespace: "ai-lab"}},
+		time.Now(), nil,
+		PodWorkloadLinkage{RawWorkloadName: "wl-pg", OwnerKind: "PodGroup", RawOwnerName: "pg-0", PodSetName: "a1b2c3d4"},
+		hasher,
+	)
+	if pgPodPayload.PodSetName != "a1b2c3d4" {
+		t.Errorf("expected PodGroup ScrapedPodPayload role-hash to stay plain, got %q", pgPodPayload.PodSetName)
 	}
 
 	js := &jobsetv1alpha2.JobSet{
@@ -6155,5 +6184,284 @@ func TestSensitiveDataHardeningL1ToL8(t *testing.T) {
 	plainEvs := runWL(false)
 	if len(plainEvs) != 2 || plainEvs[1].Payload.Message == "" {
 		t.Errorf("expected plain events to preserve Message, got %+v", plainEvs)
+	}
+}
+
+func TestPR19ReviewCompletenessGaps(t *testing.T) {
+	hasher := NewSensitiveDataHasher([]string{"corp.example.com/pool"}, nil)
+	noop := NewNoopHasher()
+
+	// 1. Job & JobSet PodFailurePolicy.OnExitCodes.ContainerName + JobTemplate ObjectMeta + unconditional OnJobFailureMessagePatterns.
+	ctrName := "canary-trainer-ctr"
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "canary-job",
+			Namespace:  "ai-lab",
+			Finalizers: []string{"corp.example.com/secret-cleanup"},
+		},
+		Spec: batchv1.JobSpec{
+			PodFailurePolicy: &batchv1.PodFailurePolicy{
+				Rules: []batchv1.PodFailurePolicyRule{
+					{
+						Action: batchv1.PodFailurePolicyActionFailJob,
+						OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
+							ContainerName: ptr.To(ctrName),
+							Operator:      batchv1.PodFailurePolicyOnExitCodesOpIn,
+							Values:        []int32{42},
+						},
+					},
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"kubectl.kubernetes.io/default-container":      ctrName,
+						"kubectl.kubernetes.io/default-logs-container": ctrName,
+						"kueue.x-k8s.io/multikueue-origin-uid":         "deadbeef-1111-2222-3333-444444444444",
+						"scheduler.alpha.kubernetes.io/node-selector":  `{"owner":"canary-raw-ns"}`,
+						"provreq.kueue.x-k8s.io/reservation-name":      "canary-reservation",
+					},
+				},
+				Spec: corev1.PodSpec{
+					ResourceClaims: []corev1.PodResourceClaim{
+						{Name: "canary-claim", ResourceClaimTemplateName: ptr.To("canary-claim-tpl")},
+					},
+					Resources: &corev1.ResourceRequirements{
+						Claims: []corev1.ResourceClaim{{Name: "canary-claim", Request: "canary-req"}},
+					},
+					SchedulingGroup: &corev1.PodSchedulingGroup{PodGroupName: ptr.To("canary-sched-group")},
+					SchedulingGates: []corev1.PodSchedulingGate{
+						{Name: KueueAdmissionGateName},
+						{Name: "corp.example.com/secret-gate"},
+					},
+					ReadinessGates: []corev1.PodReadinessGate{{ConditionType: "corp.example.com/secret-ready"}},
+					SecurityContext: &corev1.PodSecurityContext{
+						SELinuxOptions: &corev1.SELinuxOptions{User: "canary-selinux-user"},
+						Sysctls:        []corev1.Sysctl{{Name: "net.core.canary", Value: "1"}},
+					},
+					Tolerations: []corev1.Toleration{
+						{Key: "tenant", Operator: corev1.TolerationOpEqual, Value: "acme-secret", Effect: corev1.TaintEffectNoSchedule},
+						{Key: "corp.example.com/pool", Operator: corev1.TolerationOpEqual, Value: "pool-secret", Effect: corev1.TaintEffectNoSchedule},
+						{Key: "kwok.x-k8s.io/node", Operator: corev1.TolerationOpEqual, Value: "fake", Effect: corev1.TaintEffectNoSchedule},
+					},
+					Containers: []corev1.Container{
+						{
+							Name:                   ctrName,
+							Image:                  testSecretImage,
+							TerminationMessagePath: "/var/log/canary-term.log",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+								Claims:   []corev1.ResourceClaim{{Name: "canary-claim", Request: "canary-req"}},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								SELinuxOptions: &corev1.SELinuxOptions{Role: "canary-selinux-role"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	jobBytes, _ := json.Marshal(SanitizeJob(job, DefaultPauseImage, hasher))
+	jobJSON := string(jobBytes)
+	for _, leak := range []string{
+		ctrName, "secret-cleanup", "deadbeef-1111", "canary-raw-ns", "canary-reservation",
+		"canary-claim", "canary-req", "canary-sched-group", "secret-gate", "secret-ready",
+		"canary-selinux-user", "canary-selinux-role", "net.core.canary", "canary-term.log",
+		"acme-secret", "pool-secret",
+	} {
+		if strings.Contains(jobJSON, leak) {
+			t.Errorf("SanitizeJob leaked %q in %s", leak, jobJSON)
+		}
+	}
+	wantCtrHash := hasher.HashName(ctrName)
+	if !strings.Contains(jobJSON, `"containerName":"`+wantCtrHash+`"`) {
+		t.Errorf("expected PodFailurePolicy onExitCodes.containerName to match hashed container name %q in %s", wantCtrHash, jobJSON)
+	}
+	if !strings.Contains(jobJSON, KueueAdmissionGateName) {
+		t.Errorf("expected Kueue scheduling gate to be preserved in %s", jobJSON)
+	}
+	if !strings.Contains(jobJSON, `"podGroupName":"`+hasher.HashName("canary-sched-group")+`"`) {
+		t.Errorf("expected SchedulingGroup.PodGroupName to be hashed in %s", jobJSON)
+	}
+
+	// JobSet: unconditional OnJobFailureMessagePatterns stripping (even under NoopHasher),
+	// rj.Template.ObjectMeta sanitization, and rj.Template.Spec.PodFailurePolicy containerName hashing.
+	js := &jobsetv1alpha2.JobSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "canary-js", Namespace: "ai-lab"},
+		Spec: jobsetv1alpha2.JobSetSpec{
+			FailurePolicy: &jobsetv1alpha2.FailurePolicy{
+				Rules: []jobsetv1alpha2.FailurePolicyRule{
+					{
+						Name:                        "RuleA",
+						Action:                      jobsetv1alpha2.RestartJobSet,
+						OnJobFailureMessagePatterns: []string{".*canary-app-err.*"},
+					},
+				},
+			},
+			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
+				{
+					Name: "deadbeef",
+					Template: batchv1.JobTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:         "canary-tpl-name",
+							GenerateName: "canary-tpl-gen-",
+							Finalizers:   []string{"corp.example.com/tpl-fin"},
+							OwnerReferences: []metav1.OwnerReference{
+								{APIVersion: "v1", Kind: "Job", Name: "canary-tpl-owner", UID: "12345678-1234-1234-1234-123456789012"},
+							},
+						},
+						Spec: batchv1.JobSpec{
+							PodFailurePolicy: job.Spec.PodFailurePolicy.DeepCopy(),
+							Template:         corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: ctrName, Image: "img:1"}}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	jsNoopBytes, _ := json.Marshal(SanitizeJobSet(js, DefaultPauseImage, noop))
+	if strings.Contains(string(jsNoopBytes), "canary-app-err") {
+		t.Errorf("expected OnJobFailureMessagePatterns to be stripped even under NoopHasher, got %s", string(jsNoopBytes))
+	}
+	jsHashBytes, _ := json.Marshal(SanitizeJobSet(js, DefaultPauseImage, hasher))
+	jsHashJSON := string(jsHashBytes)
+	for _, leak := range []string{ctrName, "deadbeef", "canary-tpl-name", "canary-tpl-gen-", "tpl-fin", "canary-tpl-owner", "12345678-1234"} {
+		if strings.Contains(jsHashJSON, leak) {
+			t.Errorf("SanitizeJobSet leaked %q in %s", leak, jsHashJSON)
+		}
+	}
+	if !strings.Contains(jsHashJSON, `"containerName":"`+wantCtrHash+`"`) {
+		t.Errorf("expected JobSet PodFailurePolicy onExitCodes.containerName to match %q in %s", wantCtrHash, jsHashJSON)
+	}
+
+	// 2. Ray sanitization: AutoscalerOptions.SecurityContext, HeadService.Spec.Ports, EntrypointResources, logical Resources.
+	secretProfile := "profiles/canary-ray-seccomp.json"
+	rayJob := &rayv1.RayJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "canary-rayjob", Namespace: "ai-lab"},
+		Spec: rayv1.RayJobSpec{
+			EntrypointResources: `{"canary_custom_gpu": 2}`,
+			RayClusterSpec: &rayv1.RayClusterSpec{
+				AutoscalerOptions: &rayv1.AutoscalerOptions{
+					SecurityContext: &corev1.SecurityContext{
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: &secretProfile},
+						SELinuxOptions: &corev1.SELinuxOptions{User: "canary-ray-selinux"},
+					},
+					Resources: &corev1.ResourceRequirements{
+						Claims: []corev1.ResourceClaim{{Name: "canary-ray-claim"}},
+					},
+				},
+				HeadGroupSpec: rayv1.HeadGroupSpec{
+					Resources: map[string]string{"canary_head_res": "1"},
+					HeadService: &corev1.Service{
+						ObjectMeta: metav1.ObjectMeta{Name: "canary-head-svc"},
+						Spec: corev1.ServiceSpec{
+							Ports: []corev1.ServicePort{{Name: "canary-dashboard-port", Port: 8265}},
+						},
+					},
+					Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "ray-head", Image: "img:1"}}}},
+				},
+				WorkerGroupSpecs: []rayv1.WorkerGroupSpec{
+					{
+						GroupName: "abc12345",
+						Resources: map[string]string{"canary_worker_res": "4"},
+						Template:  corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "ray-worker", Image: "img:1"}}}},
+					},
+				},
+			},
+		},
+	}
+	rjBytes, _ := json.Marshal(SanitizeRayJob(rayJob, DefaultPauseImage, hasher))
+	rjJSON := string(rjBytes)
+	for _, leak := range []string{
+		"canary_custom_gpu", "canary-ray-seccomp", "canary-ray-selinux", "canary-ray-claim",
+		"canary_head_res", "canary_worker_res", "canary-dashboard-port", "abc12345",
+	} {
+		if strings.Contains(rjJSON, leak) {
+			t.Errorf("SanitizeRayJob leaked %q in %s", leak, rjJSON)
+		}
+	}
+
+	// 3. Taints & Tolerations consistency across Node, ResourceFlavor, RuntimeClass, and Pod + Infra OwnerReferences/Finalizers + hardware label preservation.
+	wantTenantHash := hasher.HashName("acme-secret")
+	wantPoolHash := hasher.HashName("pool-secret")
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "node-0",
+			Finalizers: []string{"corp.example.com/node-fin"},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "v1", Kind: "Machine", Name: "canary-machine-0", UID: "eeeeeeee-ffff-0000-1111-222222222222"},
+			},
+			Labels: map[string]string{
+				"tenant":                   "acme-secret",
+				"corp.example.com/pool":    "pool-secret",
+				"gpu.nvidia.com/model":     "h100-80gb",
+				"accelerator.k8s.io/model": "v6e",
+				"kubernetes.io/component":  "kubelet",
+			},
+		},
+		Spec: corev1.NodeSpec{
+			Taints: []corev1.Taint{
+				{Key: "tenant", Value: "acme-secret", Effect: corev1.TaintEffectNoSchedule},
+				{Key: "corp.example.com/pool", Value: "pool-secret", Effect: corev1.TaintEffectNoSchedule},
+				{Key: "kwok.x-k8s.io/node", Value: "fake", Effect: corev1.TaintEffectNoSchedule},
+			},
+		},
+	}
+	nodeBytes, _ := json.Marshal(SanitizeNode(node, hasher))
+	nodeJSON := string(nodeBytes)
+	for _, leak := range []string{"acme-secret", "pool-secret", "node-fin", "canary-machine-0", "eeeeeeee-ffff"} {
+		if strings.Contains(nodeJSON, leak) {
+			t.Errorf("SanitizeNode leaked %q in %s", leak, nodeJSON)
+		}
+	}
+	for _, preserved := range []string{"h100-80gb", "v6e", "kubelet", wantTenantHash, wantPoolHash, `"value":"fake"`} {
+		if !strings.Contains(nodeJSON, preserved) {
+			t.Errorf("SanitizeNode expected %q to be present in %s", preserved, nodeJSON)
+		}
+	}
+
+	rf := &kueuev1beta2.ResourceFlavor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "rf-tenant",
+			Finalizers: []string{"kueue.x-k8s.io/resource-in-use"},
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "v1", Kind: "HelmRelease", Name: "canary-helm-rel", UID: "99999999-0000-1111-2222-333333333333"},
+			},
+		},
+		Spec: kueuev1beta2.ResourceFlavorSpec{
+			NodeLabels: map[string]string{"tenant": "acme-secret", "gpu.nvidia.com/model": "h100-80gb"},
+			NodeTaints: []corev1.Taint{{Key: "tenant", Value: "acme-secret", Effect: corev1.TaintEffectNoSchedule}},
+			Tolerations: []corev1.Toleration{
+				{Key: "corp.example.com/pool", Operator: corev1.TolerationOpEqual, Value: "pool-secret", Effect: corev1.TaintEffectNoSchedule},
+			},
+		},
+	}
+	rfBytes, _ := json.Marshal(SanitizeResourceFlavor(rf, hasher))
+	rfJSON := string(rfBytes)
+	for _, leak := range []string{"acme-secret", "pool-secret", "canary-helm-rel", "99999999-0000", "finalizers"} {
+		if strings.Contains(rfJSON, leak) {
+			t.Errorf("SanitizeResourceFlavor leaked %q in %s", leak, rfJSON)
+		}
+	}
+	for _, preserved := range []string{"h100-80gb", wantTenantHash, wantPoolHash} {
+		if !strings.Contains(rfJSON, preserved) {
+			t.Errorf("SanitizeResourceFlavor expected %q in %s", preserved, rfJSON)
+		}
+	}
+
+	rc := &nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "rc-tenant"},
+		Scheduling: &nodev1.Scheduling{
+			NodeSelector: map[string]string{"tenant": "acme-secret", "gpu.nvidia.com/model": "h100-80gb"},
+			Tolerations: []corev1.Toleration{
+				{Key: "tenant", Operator: corev1.TolerationOpEqual, Value: "acme-secret", Effect: corev1.TaintEffectNoSchedule},
+			},
+		},
+	}
+	rcBytes, _ := json.Marshal(SanitizeRuntimeClass(rc, hasher))
+	rcJSON := string(rcBytes)
+	if strings.Contains(rcJSON, "acme-secret") || !strings.Contains(rcJSON, wantTenantHash) || !strings.Contains(rcJSON, "h100-80gb") {
+		t.Errorf("SanitizeRuntimeClass taint/label hashing mismatch: %s", rcJSON)
 	}
 }
