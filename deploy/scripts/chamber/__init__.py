@@ -39,6 +39,7 @@ from chamber.constants import (
     DEFAULT_TOPOLOGY_NAME,
     DEPLOY_DIR,
     DNS_LABEL_RE,
+    DNS_SUBDOMAIN_RE,
     METRICS_TOKEN_CSV,
     NODEPORT_MAX,
     NODEPORT_MIN,
@@ -50,6 +51,7 @@ from chamber.constants import (
     SCRIPT_DIR,
     SCRIPT_PATH,
     validate_dns_label,
+    validate_dns_subdomain,
 )
 from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot, query_cluster_status
 from chamber.manifests import (
@@ -193,6 +195,7 @@ __all__ = [
     "DEPRECATED_KUEUE_FEATURE_GATES",
     "DEPLOY_DIR",
     "DNS_LABEL_RE",
+    "DNS_SUBDOMAIN_RE",
     "ExecutionTimeIndex",
     "InterruptedDurationOverride",
     "K8S_META_KEY_ORDER",
@@ -294,4 +297,5 @@ __all__ = [
     "summarize_samples",
     "to_clean_yaml",
     "validate_dns_label",
+    "validate_dns_subdomain",
 ]

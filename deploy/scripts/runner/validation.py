@@ -21,7 +21,12 @@ import math
 from pathlib import Path
 from typing import Any
 
-from chamber.constants import DEFAULT_PAUSE_IMAGE, RESERVED_POD_LABELS, validate_dns_label
+from chamber.constants import (
+    DEFAULT_PAUSE_IMAGE,
+    RESERVED_POD_LABELS,
+    validate_dns_label,
+    validate_dns_subdomain,
+)
 from chamber.parsers import (
     format_pod_execution_seconds,
     parse_k8s_quantity,
@@ -135,13 +140,13 @@ def validate_workflow_events(workflow_events: list[dict[str, Any]], wf_file: Pat
                 f"{wf_file} event #{idx_wf}: disallowed workflow objectKind {kind!r}; "
                 f"allowed kinds: {sorted(ALLOWED_WORKFLOW_KINDS)}."
             )
-        wf_name = validate_dns_label(pl.get("name"), f"{wf_file} event #{idx_wf} payload.name")
+        wf_name = validate_dns_subdomain(pl.get("name"), f"{wf_file} event #{idx_wf} payload.name")
         wf_orig_ns = validate_dns_label(
             pl.get("namespace") or "default", f"{wf_file} event #{idx_wf} payload.namespace"
         )
         wf_lq = str(pl.get("localQueueName") or "")
         if wf_lq:
-            validate_dns_label(wf_lq, f"{wf_file} event #{idx_wf} payload.localQueueName")
+            validate_dns_subdomain(wf_lq, f"{wf_file} event #{idx_wf} payload.localQueueName")
         _parse_optional_event_epoch(pl.get("creationTime"), wf_file, idx_wf, "payload.creationTime")
 
         raw_obj = pl.get("object")
@@ -165,7 +170,7 @@ def validate_workflow_events(workflow_events: list[dict[str, Any]], wf_file: Pat
                 raise ValueError(f"{wf_file} event #{idx_wf}: 'payload.object.metadata' must be a JSON object.")
             meta_dict = meta or {}
             if meta_dict.get("name"):
-                meta_name = validate_dns_label(
+                meta_name = validate_dns_subdomain(
                     meta_dict.get("name"), f"{wf_file} event #{idx_wf} payload.object.metadata.name"
                 )
                 if meta_name != wf_name:
@@ -225,7 +230,8 @@ def _prepare_node_manifest(node_obj: dict[str, Any], node_idx: int) -> dict[str,
 
     labels = dict(meta.get("labels") or {})
     labels["type"] = "kwok"
-    labels.setdefault("kubernetes.io/hostname", name)
+    hostname_label = name if len(name) <= 63 else sanitize_k8s_name(name, max_len=63)
+    labels.setdefault("kubernetes.io/hostname", hostname_label)
     labels.setdefault("kubernetes.io/os", "linux")
     labels.setdefault("kubernetes.io/arch", "amd64")
     labels.setdefault("kubernetes.io/role", "agent")

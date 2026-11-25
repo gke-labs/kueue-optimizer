@@ -148,10 +148,12 @@ class WorkloadExecutionInfo:
     creation_epoch: float | None = None
     full_duration_sec: float | None = None
     full_end_epoch: float | None = None
+    terminal_end_epoch: float | None = None
     partial_durations_sec: list[float] = field(default_factory=list)
     admitted_epochs: list[float] = field(default_factory=list)
     preempted_epochs: list[float] = field(default_factory=list)
     interrupted_epochs: list[float] = field(default_factory=list)
+    requeueable_interrupted_epochs: list[float] = field(default_factory=list)
     interruption_reasons: list[str] = field(default_factory=list)
     true_duration_sec: float | None = None
     missing_duration_multiplier: float | None = None
@@ -493,6 +495,11 @@ def index_execution_times(
             if end_ts is not None:
                 if int_reason != "ScrapeEnded":
                     info.interrupted_epochs.append(end_ts)
+                if int_reason not in ("ScrapeEnded", "Failed", "Deleted"):
+                    info.requeueable_interrupted_epochs.append(end_ts)
+                elif int_reason in ("Failed", "Deleted"):
+                    if info.terminal_end_epoch is None or end_ts > info.terminal_end_epoch:
+                        info.terminal_end_epoch = end_ts
                 if bool(preempted_flag) or int_reason == "Preempted":
                     info.preempted_epochs.append(end_ts)
         elif ev_type == "FullExecution":
@@ -838,15 +845,29 @@ def filter_initial_running_pods(
             for (p_ns, p_name), (ev_epoch, pl) in sorted(pod_new_events.items())
         ]
 
+    has_enriched_linkage = any(
+        bool(entry[3].get("workloadName") or entry[3].get("ownerName"))
+        for entry in pod_entries
+    )
+
     qualifying: list[tuple[str, str, float, dict[str, Any], float | None]] = []
     expired_count = 0
 
     for p_ns, p_name, ev_epoch, pl, del_ep in pod_entries:
         if (p_ns, p_name) in not_admitted_exact:
             continue
-        ns_prefixes = ns_prefix_tuples.get(p_ns)
-        if ns_prefixes and p_name.startswith(ns_prefixes):
-            continue
+        p_owner = str(pl.get("ownerName") or "")
+        p_wl = str(pl.get("workloadName") or "")
+        if p_owner:
+            if (p_ns, p_owner) in not_admitted_exact:
+                continue
+        elif p_wl:
+            if (p_ns, p_wl) in not_admitted_exact:
+                continue
+        elif not has_enriched_linkage:
+            ns_prefixes = ns_prefix_tuples.get(p_ns)
+            if ns_prefixes and p_name.startswith(ns_prefixes):
+                continue
 
         sched_ep = parse_rfc3339_epoch(pl.get("schedulingTime"), strict=strict_timestamps)
         first_notice_ep = parse_rfc3339_epoch(pl.get("firstNoticeTime"), strict=strict_timestamps)

@@ -694,5 +694,284 @@ class LoaderCoreBugTests(unittest.TestCase):
         )
 
 
+class LoaderEdgeCaseBugTests(unittest.TestCase):
+    """Regression tests for scenario loader edge-case bugs (L7-L12)."""
+
+    def test_l7_explicit_linkage_beats_name_prefix_heuristic(self) -> None:
+        """L7: Queued Job 'train' must not drop unrelated 'train-*' infra pods or linked 'train-2' pods."""
+        infra = _base_infra() + [
+            _infra_pod(
+                "train-dashboard-7c9f-abcde",
+                ns="team",
+                node_name="n1",
+                offset=0.0,
+                sched_off=-500,
+                reqs={"cpu": "4", "memory": "8Gi"},
+            ),
+            _infra_pod("other-svc-1", ns="team", node_name="n1", offset=0.0, sched_off=-500),
+            _infra_pod(
+                "train-2-xk2lp",
+                ns="team",
+                node_name="n2",
+                offset=0.0,
+                sched_off=-300,
+                reqs={"cpu": "3", "memory": "1Gi"},
+                workload_name="job-train-2-aaaaa",
+                owner_kind="Job",
+                owner_name="train-2",
+            ),
+            _infra_pod(
+                "train-metrics-exporter-0",
+                ns="team",
+                node_name="n1",
+                offset=40.0,
+                reqs={"cpu": "2", "memory": "2Gi"},
+            ),
+            _infra_pod("other-svc-2", ns="team", node_name="n1", offset=41.0),
+        ]
+        wfs = [
+            _wf_ev(_job_obj("train-2", suspend=False, cpu="3", creation_off=-300), 0.0, state="Admitted", creation_off=-300),
+            _wf_ev(_job_obj("train", creation_off=-10), 0.0, state="NotAdmitted", creation_off=-10),
+        ]
+        execs = [_exec_ev("Admitted", "job-train-2-aaaaa", "Job", "train-2", 0.0, -300)]
+
+        bundle = _load_bundle(infra, wfs, execs)
+
+        # Running Job 'train-2' must keep its real bound pod on n2 (not synthesize a fake pod on n1).
+        self.assertEqual(len(bundle.initial_workloads), 1)
+        iwl = bundle.initial_workloads[0]
+        self.assertEqual([(p.name, p.placement) for p in iwl.pods], [("train-2-xk2lp", "n2")])
+
+        # Unrelated t0 and post-t0 pods sharing the 'train-' prefix must be preserved as infra pods.
+        self.assertEqual(
+            sorted(p.name for p in bundle.initial_pods),
+            ["other-svc-1", "train-dashboard-7c9f-abcde"],
+        )
+        post_pod_names = sorted(
+            ie.manifest["metadata"]["annotations"]["kueue-optimizer.gke.io/original-name"]
+            for ie in bundle.scheduled_infra_events
+            if ie.object_kind == "Pod"
+        )
+        self.assertEqual(post_pod_names, ["other-svc-2", "train-metrics-exporter-0"])
+
+    def test_l8_tier4_partial_t0_binding_does_not_double_count_on_request_mismatch(self) -> None:
+        """L8: Tier-4 synthesis counts unmatched linked pods when template requests differ from scraped LimitRange requests."""
+        job_no_reqs = _job_obj("big", parallelism=4, suspend=False, creation_off=-200)
+        job_no_reqs["spec"]["template"]["spec"]["containers"][0].pop("resources", None)
+        infra = _base_infra() + [
+            _infra_pod(
+                f"big-{i}",
+                ns="team",
+                node_name="n2",
+                sched_off=-200,
+                reqs={"cpu": "100m", "memory": "128Mi"},
+                workload_name="job-big-aaaaa",
+                owner_kind="Job",
+                owner_name="big",
+            )
+            for i in range(3)
+        ]
+        wfs = [
+            _wf_ev(job_no_reqs, 0.0, state="Admitted", creation_off=-200),
+            _wf_ev(_job_obj("q"), 12.5),
+        ]
+        execs = [_exec_ev("Admitted", "job-big-aaaaa", "Job", "big", 0.0, -200)]
+
+        bundle = _load_bundle(infra, wfs, execs)
+        self.assertEqual(len(bundle.initial_workloads), 1)
+        iwl = bundle.initial_workloads[0]
+        self.assertEqual(len(iwl.pods), 4)
+        self.assertEqual(sum(ps["count"] for ps in iwl.workload_manifest["spec"]["podSets"]), 4)
+        for p in iwl.pods:
+            self.assertEqual(p.resource_request, {"cpu": "100m", "memory": "128Mi"})
+
+    def test_l9_failed_t0_job_is_not_resubmitted_after_initial_jump(self) -> None:
+        """L9: A t0-running Job that ended with PartialExecution reason=Failed is not resubmitted as preempted."""
+        infra = _base_infra() + [
+            _infra_pod(
+                "flaky-abc",
+                ns="team",
+                node_name="n1",
+                sched_off=-100,
+                workload_name="job-flaky-x",
+                owner_kind="Job",
+                owner_name="flaky",
+            ),
+            _infra_pod(
+                "flaky-abc",
+                ns="team",
+                node_name="n1",
+                offset=20.2,
+                ev_type="Deleted",
+                sched_off=-100,
+                del_off=20.0,
+                workload_name="job-flaky-x",
+                owner_kind="Job",
+                owner_name="flaky",
+            ),
+        ]
+        wfs = [
+            _wf_ev(_job_obj("flaky", suspend=False, creation_off=-100), 0.0, state="Admitted", creation_off=-100),
+            _wf_ev(_job_obj("queued"), 100.3),
+        ]
+        execs = [
+            _exec_ev("Admitted", "job-flaky-x", "Job", "flaky", 0.0, -100),
+            _exec_ev(
+                "PartialExecution",
+                "job-flaky-x",
+                "Job",
+                "flaky",
+                20.2,
+                -100,
+                end_off=20.0,
+                preempted=False,
+                interruption_reason="Failed",
+            ),
+        ]
+
+        bundle = _load_bundle(infra, wfs, execs)
+        self.assertEqual([w.name for w in bundle.scheduled_workflows], ["queued"])
+        self.assertAlmostEqual(bundle.initial_jump_raw_sec, 100.3, places=3)
+        self.assertEqual(len(bundle.initial_workloads), 0)
+
+    def test_l10_accepts_dns_subdomain_node_and_long_pod_names(self) -> None:
+        """L10: Dotted FQDN Node/Pod/Queue names and >63-char RFC 1123 subdomain names load cleanly; hostname label stays <=63."""
+        long_pod = "kube-proxy-gke-kueue-optimizer-prod-tpu-v6e-pool-1a2b3c4d-x9zq-extra"
+        fqdn_node = "ip-10-0-1-23.us-west-2.compute.internal"
+        long_node = "gke-prod-tpu-cluster-pool-very-long-node-name-0123456789abcdef-extra"
+        dotted_pod = "etcd-ip-10-0-1-23.ec2.internal"
+
+        long_node_ev = _node(long_node)
+        long_node_ev["payload"]["metadata"]["labels"] = {}
+        infra = (
+            [_node(fqdn_node), long_node_ev]
+            + _base_infra(nodes=())
+            + [
+                {
+                    "timestamp": _ts(0),
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "LocalQueue",
+                        "metadata": {"name": "team.lq", "namespace": "team"},
+                        "spec": {"clusterQueue": "cq"},
+                    },
+                },
+                _infra_pod(long_pod, ns="kube-system", node_name=fqdn_node, sched_off=-100),
+                _infra_pod(dotted_pod, ns="kube-system", node_name=fqdn_node, sched_off=-100),
+            ]
+        )
+        bundle = _load_bundle(infra, [_wf_ev(_job_obj("j1", lq="team.lq"), 5.0, lq="team.lq")], [])
+
+        self.assertEqual([n["metadata"]["name"] for n in bundle.nodes], [fqdn_node, long_node])
+        long_node_doc = next(n for n in bundle.nodes if n["metadata"]["name"] == long_node)
+        self.assertLessEqual(len(long_node_doc["metadata"]["labels"]["kubernetes.io/hostname"]), 63)
+        orig_names = sorted(p.name for p in bundle.initial_pods)
+        self.assertEqual(orig_names, sorted([long_pod, dotted_pod]))
+        for p in bundle.initial_pods:
+            self.assertEqual(p.placement, fqdn_node)
+            self.assertLessEqual(len(p.manifest["metadata"]["name"]), 63)
+
+        # Trailing hyphen remains invalid.
+        bad_infra = _base_infra() + [_infra_pod(long_pod[:63], ns="kube-system", node_name="n1", sched_off=-10)]
+        with self.assertRaisesRegex(ValueError, "RFC 1123 DNS subdomain"):
+            _load_bundle(bad_infra, [_wf_ev(_job_obj("j1"), 5.0)], [])
+
+    def test_l11_imputation_stamps_standalone_pods_and_uses_full_queue_median(self) -> None:
+        """L11: Imputed duration is stamped onto standalone Pods and queue fallback computes median across all queue samples."""
+        solo_pod = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "solo",
+                "namespace": "team",
+                "labels": {"kueue.x-k8s.io/queue-name": "lq"},
+            },
+            "spec": {
+                "containers": [{"name": "c", "resources": {"requests": {"cpu": "1", "memory": "1Gi"}}}],
+                "schedulingGates": [{"name": "kueue.x-k8s.io/admission"}],
+            },
+        }
+        wfs = [_wf_ev(_job_obj("peer"), 5.0), _wf_ev(solo_pod, 9.0), _wf_ev(_job_obj("never"), 9.5)]
+        execs = [
+            _exec_ev("Admitted", "job-peer-x", "Job", "peer", 5.5, 5.5),
+            _exec_ev("FullExecution", "job-peer-x", "Job", "peer", 3605.5, 5.5, end_off=3605.5),
+        ]
+        bundle = _load_bundle(_base_infra(), wfs, execs)
+        solo = next(w for w in bundle.scheduled_workflows if w.name == "solo")
+        self.assertAlmostEqual(solo.execution_duration_sec, 3600.0, places=3)
+        self.assertEqual(
+            solo.manifest["metadata"]["annotations"]["kueue-optimizer.gke.io/pod-execution-time-seconds"],
+            "3600",
+        )
+
+        # Queue fallback with 3 unscheduled workloads [100, 1000, 5000] must impute median 1000 (not first sample 100).
+        execs_q: list[dict[str, Any]] = []
+        for idx, dur in enumerate((100, 1000, 5000)):
+            execs_q.append(_exec_ev("Admitted", f"wl-{idx}", "Job", f"old-{idx}", 1.0 + idx, 1.0 + idx))
+            execs_q.append(
+                _exec_ev("FullExecution", f"wl-{idx}", "Job", f"old-{idx}", 1.0 + idx + dur, 1.0 + idx, end_off=1.0 + idx + dur)
+            )
+        bundle_q = _load_bundle(_base_infra(), [_wf_ev(_job_obj("never", parallelism=3), 9.5)], execs_q)
+        self.assertAlmostEqual(bundle_q.scheduled_workflows[0].execution_duration_sec, 1000.0, places=3)
+
+    def test_l12_all_fast_admitted_trace_settles_initial_jump(self) -> None:
+        """L12: A trace where every workflow is first seen Admitted settles cleanly with skip_initial_offset=True."""
+        wfs: list[dict[str, Any]] = []
+        execs: list[dict[str, Any]] = []
+        for i in range(5):
+            off = 5.0 + 20.0 * i
+            wfs.append(
+                _wf_ev(
+                    _job_obj(f"fast-{i}", suspend=False, creation_off=off),
+                    off + 0.3,
+                    state="Admitted",
+                    creation_off=off,
+                )
+            )
+            execs.append(_exec_ev("Admitted", f"job-fast-{i}-abcde", "Job", f"fast-{i}", off + 0.3, off))
+            execs.append(
+                _exec_ev(
+                    "FullExecution",
+                    f"job-fast-{i}-abcde",
+                    "Job",
+                    f"fast-{i}",
+                    off + 10.3,
+                    off,
+                    end_off=off + 10.0,
+                )
+            )
+
+        bundle = _load_bundle(_base_infra(), wfs, execs, skip_initial_offset=True)
+        self.assertAlmostEqual(bundle.initial_jump_raw_sec, 5.0, places=3)
+        self.assertEqual(len(bundle.initial_workloads), 0)
+        self.assertEqual(bundle.skipped_already_admitted_workflows, [])
+        self.assertEqual([w.name for w in bundle.scheduled_workflows], [f"fast-{i}" for i in range(5)])
+        self.assertEqual([round(w.raw_offset_sec, 1) for w in bundle.scheduled_workflows], [0.0, 20.0, 40.0, 60.0, 80.0])
+
+        # Combined L5+L12: earliest workflow is fast-admitted at +30s and preempted at +50s (no earlier NotAdmitted arrival).
+        wfs_combo = [
+            _wf_ev(_job_obj("solo-victim", suspend=False, creation_off=30.0), 30.3, state="Admitted", creation_off=30.0),
+            _wf_ev(
+                _job_obj("solo-victim", suspend=True, creation_off=30.0),
+                50.4,
+                ev_type="Update",
+                state="NotAdmitted",
+                creation_off=30.0,
+            ),
+        ]
+        execs_combo = [
+            _exec_ev("Admitted", "job-solo-victim-x", "Job", "solo-victim", 30.3, 30.0),
+            _exec_ev("PartialExecution", "job-solo-victim-x", "Job", "solo-victim", 50.4, 30.0, end_off=50.0, preempted=True),
+            _exec_ev("Admitted", "job-solo-victim-x", "Job", "solo-victim", 70.0, 70.0),
+            _exec_ev("FullExecution", "job-solo-victim-x", "Job", "solo-victim", 100.0, 70.0, end_off=100.0),
+        ]
+        bundle_combo = _load_bundle(_base_infra(), wfs_combo, execs_combo, skip_initial_offset=True)
+        self.assertAlmostEqual(bundle_combo.initial_jump_raw_sec, 30.0, places=3)
+        self.assertEqual(len(bundle_combo.scheduled_workflows), 1)
+        self.assertEqual(bundle_combo.scheduled_workflows[0].trigger_reason, "post_t0_fast_admitted")
+        self.assertAlmostEqual(bundle_combo.scheduled_workflows[0].raw_offset_from_t0_sec, 30.0, places=3)
+
+
 if __name__ == "__main__":
     unittest.main()
