@@ -94,6 +94,7 @@ from runner.loader import (
 )
 from runner.outline import print_scenario_outline
 from runner.replay import (
+    ReplayResult,
     apply_scenario_queues_and_wait,
     cleanup_scenario_workloads,
     run_scenario_replay,
@@ -120,6 +121,7 @@ __all__ = [
     "InterruptedDurationOverride",
     "KueueScenarioConfiguration",
     "MAX_K8S_NAME_LEN",
+    "ReplayResult",
     "SERVER_METADATA_FIELDS",
     "SYSTEM_NAMESPACES",
     "ScenarioBundle",
@@ -488,12 +490,15 @@ def main(argv: list[str] | None = None) -> int:
     override_q_strategy = normalize_queueing_strategy(args.queueing_mode) if args.queueing_mode else None
     override_wl_ns = args.workload_namespace.strip() if args.workload_namespace else None
 
-    status_interval_sec = parse_duration_seconds(args.status_interval) or 3.0
-    min_pod_duration_sec = parse_duration_seconds(args.min_pod_duration) or 0.1
-    default_exec_sec = parse_duration_seconds(args.default_exec_seconds) or DEFAULT_FALLBACK_EXEC_SEC
-    infinite_pod_sec = parse_duration_seconds(args.infinite_pod_duration) or DEFAULT_INFINITE_POD_DURATION_SEC
-    initial_window_sec = parse_duration_seconds(args.initial_window) or 1.0
-    max_run_seconds = parse_duration_seconds(args.duration)
+    try:
+        status_interval_sec = parse_duration_seconds(args.status_interval) or 3.0
+        min_pod_duration_sec = parse_duration_seconds(args.min_pod_duration) or 0.1
+        default_exec_sec = parse_duration_seconds(args.default_exec_seconds) or DEFAULT_FALLBACK_EXEC_SEC
+        infinite_pod_sec = parse_duration_seconds(args.infinite_pod_duration) or DEFAULT_INFINITE_POD_DURATION_SEC
+        initial_window_sec = parse_duration_seconds(args.initial_window) or 1.0
+        max_run_seconds = parse_duration_seconds(args.duration)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.cleanup:
         if args.dry_run:
@@ -866,15 +871,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             replay_started = True
-            start_epoch, end_epoch, submitted_count, total_pods = run_scenario_replay(
+            replay_result = run_scenario_replay(
                 mgr=mgr,
                 bundle=bundle,
                 speedup=args.speedup,
                 max_run_seconds=max_run_seconds,
                 status_interval_sec=status_interval_sec,
                 wait_for_completion=args.wait_for_completion,
-                initial_state_already_bootstrapped=True,
             )
+            start_epoch, end_epoch, submitted_count, total_pods = replay_result
         finally:
             if scraper_proc is not None:
                 if replay_started:
@@ -947,9 +952,12 @@ def main(argv: list[str] | None = None) -> int:
             f"failed={final_snap.pods_failed}"
         )
         print(f"  ClusterQueues Status    : {' '.join(final_snap.cq_summary)}")
+        if replay_result.stop_reason != "completed":
+            sig_note = f" (signal {replay_result.signal_num})" if replay_result.signal_num is not None else ""
+            print(f"  Stop Reason             : {replay_result.stop_reason}{sig_note}")
         print("================================================================================", flush=True)
 
-        if args.metrics_report:
+        if args.metrics_report and not replay_result.interrupted:
             mgr.run_kueue_metrics_report(
                 queueing_strategy=bundle.queueing_strategy,
                 start_epoch=start_epoch,
@@ -959,8 +967,9 @@ def main(argv: list[str] | None = None) -> int:
                 wait_for_scrape=True,
             )
 
+    exit_code = replay_result.exit_code
     if should_cleanup_chamber:
-        return 0
+        return exit_code
 
     print(f"\nChamber '{args.namespace}' left running (--no-cleanup).")
     print(f"  export KUBECONFIG={mgr.kubeconfig_path}")
@@ -969,7 +978,7 @@ def main(argv: list[str] | None = None) -> int:
         f"To clean up workloads only: python3 deploy/scripts/testrunner.py --cleanup-workloads --namespace {args.namespace}"
     )
     print(f"To tear down the chamber  : python3 deploy/scripts/testrunner.py --cleanup --namespace {args.namespace}")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -56,33 +56,63 @@ def env_bool(name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+_DURATION_UNIT_SECONDS: dict[str, float] = {
+    "ns": 1e-9,
+    "us": 1e-6,
+    "µs": 1e-6,
+    "μs": 1e-6,
+    "ms": 1e-3,
+    "s": 1.0,
+    "sec": 1.0,
+    "secs": 1.0,
+    "m": 60.0,
+    "min": 60.0,
+    "mins": 60.0,
+    "h": 3600.0,
+    "hr": 3600.0,
+    "hrs": 3600.0,
+    "d": 86400.0,
+    "day": 86400.0,
+    "days": 86400.0,
+}
+
+_DURATION_BARE_RE = re.compile(r"^(?:\d+(?:\.\d*)?|\.\d+)$")
+_DURATION_TOKEN_RE = re.compile(
+    r"(\d+(?:\.\d*)?|\.\d+)\s*(secs|sec|mins|min|hrs|hr|days|day|ms|ns|us|µs|μs|s|m|h|d)"
+)
+_DURATION_COMPOUND_RE = re.compile(
+    r"^(?:(?:\d+(?:\.\d*)?|\.\d+)\s*(?:secs|sec|mins|min|hrs|hr|days|day|ms|ns|us|µs|μs|s|m|h|d)\s*)+$"
+)
+
+
 def parse_duration_seconds(raw: str | float | int | None) -> float | None:
-    """Parse a duration string (e.g. '300', '45s', '10m', '1.5h') into seconds."""
+    """Parse a duration string (e.g. '300', '45s', '1m30s', '1h2m3.5s', '500ms', '2d12h') into seconds."""
     if raw is None:
         return None
+    if isinstance(raw, bool):
+        raise ValueError(
+            f"Invalid duration '{raw}'. Expected non-negative seconds or duration string (e.g. 30s, 1m30s, 1h)."
+        )
     if isinstance(raw, (int, float)):
-        return float(raw)
+        val = float(raw)
+        if math.isnan(val) or math.isinf(val) or val < 0.0:
+            raise ValueError(
+                f"Invalid duration '{raw}'. Expected finite non-negative seconds (e.g. 120) or duration string."
+            )
+        return val
     s = str(raw).strip().lower()
     if not s:
         return None
-    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(ms|s|sec|secs|m|min|mins|h|hr|hrs|d)?", s)
-    if not m:
+    if _DURATION_BARE_RE.fullmatch(s):
+        return float(s)
+    if not _DURATION_COMPOUND_RE.fullmatch(s):
         raise ValueError(
-            f"Invalid duration '{raw}'. Expected seconds (e.g. 120) or unit suffix (e.g. 30s, 5m, 1h)."
+            f"Invalid duration '{raw}'. Expected seconds (e.g. 120) or unit-suffixed duration (e.g. 30s, 1m30s, 1h)."
         )
-    val = float(m.group(1))
-    unit = m.group(2) or "s"
-    if unit == "ms":
-        return val / 1000.0
-    if unit in ("s", "sec", "secs"):
-        return val
-    if unit in ("m", "min", "mins"):
-        return val * 60.0
-    if unit in ("h", "hr", "hrs"):
-        return val * 3600.0
-    if unit == "d":
-        return val * 86400.0
-    return val
+    total = 0.0
+    for num_str, unit in _DURATION_TOKEN_RE.findall(s):
+        total += float(num_str) * _DURATION_UNIT_SECONDS[unit]
+    return total
 
 
 def normalize_scrape_interval(raw: str) -> str:

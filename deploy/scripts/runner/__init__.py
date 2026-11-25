@@ -29,6 +29,7 @@ from runner.loader import (
 )
 from runner.outline import print_scenario_outline
 from runner.replay import (
+    ReplayResult,
     apply_scenario_queues_and_wait,
     cleanup_scenario_workloads,
     run_scenario_replay,
@@ -52,6 +53,7 @@ __all__ = [
     "InitialPodSpec",
     "InitialWorkloadPodGroup",
     "MAX_K8S_NAME_LEN",
+    "ReplayResult",
     "SERVER_METADATA_FIELDS",
     "SYSTEM_NAMESPACES",
     "ScenarioBundle",

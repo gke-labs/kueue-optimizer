@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace as dc_replace
+from collections.abc import Iterator
+from dataclasses import dataclass, replace as dc_replace
 from datetime import datetime, timezone
 import heapq
 import json
@@ -45,6 +46,92 @@ from runner.loader import (
     ScheduledWorkflowUpdate,
 )
 from runner.validation import SYSTEM_NAMESPACES
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """Structured outcome of `run_scenario_replay`, unpackable as `(start_epoch, end_epoch, submitted_count, total_pods)`."""
+
+    start_epoch: float
+    end_epoch: float
+    submitted_count: int
+    total_pods: int
+    stop_reason: str = "completed"
+    signal_num: int | None = None
+
+    @property
+    def interrupted(self) -> bool:
+        return self.stop_reason == "interrupted"
+
+    @property
+    def exit_code(self) -> int:
+        if not self.interrupted:
+            return 0
+        if self.signal_num is not None and self.signal_num > 0:
+            return 128 + self.signal_num
+        return 130
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.start_epoch
+        yield self.end_epoch
+        yield self.submitted_count
+        yield self.total_pods
+
+    def __len__(self) -> int:
+        return 4
+
+    def __getitem__(self, idx: int | slice) -> Any:
+        return (self.start_epoch, self.end_epoch, self.submitted_count, self.total_pods)[idx]
+
+
+def _checked_api_request(
+    mgr: ChamberManager,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    content_type: str | None = None,
+    ignore_not_found: bool = False,
+    context: str = "",
+) -> tuple[int, bytes]:
+    """Execute an API request and raise RuntimeError on unexpected non-2xx responses."""
+    kwargs: dict[str, Any] = {}
+    if body is not None:
+        kwargs["body"] = body
+    if headers is not None:
+        kwargs["headers"] = headers
+    if content_type is not None:
+        kwargs["content_type"] = content_type
+    st_code, raw_resp = mgr.api_request(method, path, **kwargs)
+    if 200 <= st_code < 300 or (ignore_not_found and st_code == 404):
+        return st_code, raw_resp
+    resp_txt = raw_resp.decode("utf-8", errors="replace").strip()[:500] if raw_resp else ""
+    ctx_prefix = f"{context}: " if context else ""
+    raise RuntimeError(f"{ctx_prefix}{method} {path} failed with HTTP {st_code}: {resp_txt}")
+
+
+def _workload_name_matches_owner(wl_name: str, kind: str, owner_name: str) -> bool:
+    """Return True if Kueue Workload name `wl_name` matches owner `(kind, owner_name)`."""
+    if not wl_name or not owner_name:
+        return False
+    if wl_name == owner_name:
+        return True
+    kind_prefixes = {
+        "JobSet": ("jobset",),
+        "Job": ("job",),
+        "Pod": ("pod",),
+        "PodGroup": ("pod",),
+        "LeaderWorkerSet": ("leaderworkerset", "lws"),
+        "RayJob": ("rayjob",),
+        "RayCluster": ("raycluster",),
+    }.get(kind, (kind.lower(),) if kind else ())
+    for pref in kind_prefixes:
+        if wl_name == f"{pref}-{owner_name}" or wl_name.startswith(f"{pref}-{owner_name}-"):
+            return True
+        if len(owner_name) > 53 and wl_name.startswith(f"{pref}-{owner_name[:53]}-"):
+            return True
+    return False
 
 
 def _pod_tolerates_taint(pod_spec: dict[str, Any] | None, taint: dict[str, Any]) -> bool:
@@ -220,11 +307,38 @@ def _patch_node_ready_condition(
         for k in ("allocatable", "capacity", "nodeInfo"):
             if extra_status.get(k):
                 status_body[k] = extra_status[k]
-    mgr.api_request(
+    _checked_api_request(
+        mgr,
         "PATCH",
         f"/api/v1/nodes/{node_name}/status",
         body=json.dumps({"status": status_body}).encode("utf-8"),
         headers={"Content-Type": "application/merge-patch+json"},
+        context=f"Patch Node '{node_name}' status",
+    )
+
+
+def _patch_node_status_resources(
+    mgr: ChamberManager,
+    node_name: str,
+    extra_status: dict[str, Any] | None,
+) -> None:
+    """Patch Node /status allocatable/capacity/nodeInfo fields without modifying Ready conditions."""
+    if not extra_status:
+        return
+    status_body = {
+        k: extra_status[k]
+        for k in ("allocatable", "capacity", "nodeInfo")
+        if extra_status.get(k)
+    }
+    if not status_body:
+        return
+    _checked_api_request(
+        mgr,
+        "PATCH",
+        f"/api/v1/nodes/{node_name}/status",
+        body=json.dumps({"status": status_body}).encode("utf-8"),
+        headers={"Content-Type": "application/merge-patch+json"},
+        context=f"Patch Node '{node_name}' status resources",
     )
 
 
@@ -441,7 +555,13 @@ def _execute_scheduled_infra_event(
             reason="NodeDeleted",
             message=f"Simulated Node '{ie.name}' deleted during scenario replay",
         )
-        mgr.api_request("DELETE", f"/api/v1/nodes/{ie.name}")
+        _checked_api_request(
+            mgr,
+            "DELETE",
+            f"/api/v1/nodes/{ie.name}",
+            ignore_not_found=True,
+            context=f"Delete Node '{ie.name}'",
+        )
         print(
             f"  ! [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
             f"Deleted Node '{ie.name}' (failed {failed_pods} bound pod(s))",
@@ -478,25 +598,42 @@ def _execute_scheduled_infra_event(
         return False, ""
 
     # ie.event_type == "Update"
+    meta_in = (ie.manifest.get("metadata") or {}) if isinstance(ie.manifest, dict) else {}
+    labels_in = meta_in.get("labels") if isinstance(meta_in.get("labels"), dict) else None
+    anns_in = meta_in.get("annotations") if isinstance(meta_in.get("annotations"), dict) else None
     spec_in = dict((ie.manifest.get("spec") or {}) if isinstance(ie.manifest, dict) else {})
+    st_in = (ie.manifest.get("status") or {}) if isinstance(ie.manifest, dict) else {}
+    extra_status = (
+        st_in
+        if isinstance(st_in, dict) and any(st_in.get(k) for k in ("allocatable", "capacity", "nodeInfo"))
+        else None
+    )
     taints_list = [dict(t) for t in (spec_in.get("taints") or []) if isinstance(t, dict)]
+    patch_meta: dict[str, Any] = {}
+    if labels_in:
+        patch_meta["labels"] = dict(labels_in)
+    patch_anns: dict[str, Any] = dict(anns_in) if anns_in else {}
     if ie.is_not_ready or ie.has_no_execute_taint:
         if ie.is_not_ready and not any(
             t.get("key") == "node.kubernetes.io/not-ready" for t in taints_list
         ):
             taints_list.append({"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"})
+        patch_anns["kueue-optimizer.gke.io/node-failed"] = "true"
+        patch_meta["annotations"] = patch_anns
         patch_doc = {
-            "metadata": {"annotations": {"kueue-optimizer.gke.io/node-failed": "true"}},
+            "metadata": patch_meta,
             "spec": {
                 "unschedulable": bool(spec_in.get("unschedulable", ie.is_not_ready)),
                 "taints": taints_list,
             },
         }
-        mgr.api_request(
+        _checked_api_request(
+            mgr,
             "PATCH",
             f"/api/v1/nodes/{ie.name}",
             body=json.dumps(patch_doc).encode("utf-8"),
             headers={"Content-Type": "application/merge-patch+json"},
+            context=f"Patch Node '{ie.name}'",
         )
         if ie.is_not_ready:
             _patch_node_ready_condition(
@@ -505,7 +642,10 @@ def _execute_scheduled_infra_event(
                 ready_status=ie.ready_status or "False",
                 reason="KubeletNotReady",
                 message="Simulated node failure during scenario replay",
+                extra_status=extra_status,
             )
+        elif extra_status:
+            _patch_node_status_resources(mgr, ie.name, extra_status)
         no_exec_filter = (
             [t for t in taints_list if str(t.get("effect") or "") == "NoExecute"]
             if (not ie.is_not_ready and ie.has_no_execute_taint)
@@ -526,18 +666,22 @@ def _execute_scheduled_infra_event(
             flush=True,
         )
     else:
+        patch_anns["kueue-optimizer.gke.io/node-failed"] = None
+        patch_meta["annotations"] = patch_anns
         patch_doc = {
-            "metadata": {"annotations": {"kueue-optimizer.gke.io/node-failed": None}},
+            "metadata": patch_meta,
             "spec": {
                 "unschedulable": bool(spec_in.get("unschedulable", False)),
                 "taints": taints_list,
             },
         }
-        mgr.api_request(
+        _checked_api_request(
+            mgr,
             "PATCH",
             f"/api/v1/nodes/{ie.name}",
             body=json.dumps(patch_doc).encode("utf-8"),
             headers={"Content-Type": "application/merge-patch+json"},
+            context=f"Patch Node '{ie.name}'",
         )
         _patch_node_ready_condition(
             mgr,
@@ -545,6 +689,7 @@ def _execute_scheduled_infra_event(
             ready_status="True",
             reason="KubeletReady",
             message="kubelet is posting ready status",
+            extra_status=extra_status,
         )
         print(
             f"  * [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
@@ -1087,9 +1232,7 @@ def run_scenario_replay(
     max_run_seconds: float | None,
     status_interval_sec: float,
     wait_for_completion: bool,
-    *,
-    initial_state_already_bootstrapped: bool = False,
-) -> tuple[float, float, int, int]:
+) -> ReplayResult:
     """Run timed workflow arrivals and watch workloads until completion."""
     if bundle.initial_jump_raw_sec > 0:
         expired_msg = (
@@ -1102,29 +1245,6 @@ def run_scenario_replay(
             f"(+{bundle.initial_jump_raw_sec:.2f}s raw / +{bundle.initial_jump_wall_sec:.2f}s wall from t0{expired_msg})...",
             flush=True,
         )
-
-    if not initial_state_already_bootstrapped:
-        if bundle.initial_workloads:
-            mgr.apply_pre_admitted_workloads_parallel(
-                _stamp_initial_workloads_for_bootstrap(bundle.initial_workloads)
-            )
-            init_wl_pods = [p for w in bundle.initial_workloads for p in w.pods]
-            mgr.apply_manifests_parallel([p.manifest for p in init_wl_pods], max_workers=16)
-            mgr.wait_for_pods_running(
-                [(p.namespace, str((p.manifest.get("metadata") or {}).get("name") or p.name)) for p in init_wl_pods]
-            )
-        if bundle.initial_pods:
-            print(
-                f"==> Placing {len(bundle.initial_pods)} initial running Pod(s) into Kueue-excluded "
-                f"namespace '{bundle.infra_pods_namespace}' onto their nodes...",
-                flush=True,
-            )
-            mgr.apply_manifests_parallel([p.manifest for p in bundle.initial_pods], max_workers=16)
-            mgr.wait_for_pods_running(
-                [(p.namespace, str((p.manifest.get("metadata") or {}).get("name") or p.name)) for p in bundle.initial_pods]
-            )
-        if bundle.initial_deployments:
-            _bootstrap_initial_deployments(mgr, bundle.initial_deployments)
 
     mgr._retired_serving_workloads = {}
     mgr._node_capacity_timeline = []
@@ -1179,8 +1299,11 @@ def run_scenario_replay(
         if not all(p.is_infinite for p in w.pods)
     }
     resubmitted_initial_wls: set[tuple[str, str]] = set()
+    ever_seen_sched_wl_keys: set[tuple[str, str]] = set()
     ever_finished_sched_wl_keys: set[tuple[str, str]] = set()
     ever_finished_init_wl_keys: set[tuple[str, str]] = set()
+    cancelled_sched_wl_keys: set[tuple[str, str]] = set()
+    submitted_batch_records: dict[tuple[str, str, str, int], tuple[str, str, str, str, float]] = {}
     cancelled_workflow_count = 0
     cancelled_unsubmitted_keys: set[tuple[str, str, str, int]] = set()
     recreated_names: set[tuple[str, str]] = {
@@ -1654,11 +1777,15 @@ def run_scenario_replay(
     )
 
     stop_requested = False
+    received_signal: int | None = None
+    stop_reason = "completed"
 
     def _sig_handler(signum: int, _frame: Any) -> None:
-        nonlocal stop_requested
+        nonlocal stop_requested, received_signal, stop_reason
         print(f"\n==> Received signal {signum}; stopping testrunner gracefully...", flush=True)
         stop_requested = True
+        received_signal = signum
+        stop_reason = "interrupted"
 
     old_sigint = signal.signal(signal.SIGINT, _sig_handler)
     old_sigterm = signal.signal(signal.SIGTERM, _sig_handler)
@@ -1671,6 +1798,48 @@ def run_scenario_replay(
     next_status_mono = t0_mono
     next_poll_mono = t0_mono
 
+    def _record_sched_wl_progress(snap: ClusterStatusSnapshot) -> None:
+        present_sched = _non_serving_finished_keys(snap.present_workload_keys - initial_wl_keys)
+        finished_sched = _non_serving_finished_keys(snap.finished_workload_keys - initial_wl_keys)
+        ever_seen_sched_wl_keys.update(present_sched)
+        ever_finished_sched_wl_keys.update(finished_sched)
+        if snap.workloads_query_ok:
+            # If a previously observed scheduled Workload disappears before any poll catches
+            # Finished=True (for example due to ttlSecondsAfterFinished or external deletion),
+            # treat it as terminal unless it was explicitly cancelled by replay.
+            vanished_seen = (
+                ever_seen_sched_wl_keys
+                - snap.present_workload_keys
+                - ever_finished_sched_wl_keys
+                - cancelled_sched_wl_keys
+            )
+            if vanished_seen:
+                ever_finished_sched_wl_keys.update(vanished_seen)
+
+    def _reconcile_vanished_unseen_workflows(snap: ClusterStatusSnapshot, now_mono: float) -> None:
+        """Detect submitted batch workflows whose parent and Workload both vanished before first poll."""
+        if not snap.workloads_query_ok or not submitted_batch_records:
+            return
+        if len(ever_seen_sched_wl_keys | ever_finished_sched_wl_keys) + finite_batch_cancelled >= finite_batch_submitted:
+            return
+        grace_sec = max(2.0, poll_interval_sec * 2.0)
+        known_wls = ever_seen_sched_wl_keys | ever_finished_sched_wl_keys | cancelled_sched_wl_keys
+        for rec_key, (api_ver, m_kind, r_ns, r_name, sub_mono) in list(submitted_batch_records.items()):
+            if any(
+                w_ns == r_ns and _workload_name_matches_owner(w_n, m_kind, r_name)
+                for (w_ns, w_n) in known_wls
+            ):
+                submitted_batch_records.pop(rec_key, None)
+                continue
+            if now_mono - sub_mono < grace_sec:
+                continue
+            parent_path = _delete_rest_path(api_ver, m_kind, r_ns, r_name)
+            st_parent, _ = mgr.api_request("GET", parent_path)
+            if st_parent == 404:
+                vanished_key = (r_ns, f"__vanished__/{m_kind}/{r_name}#{rec_key[3]}")
+                ever_finished_sched_wl_keys.add(vanished_key)
+                submitted_batch_records.pop(rec_key, None)
+
     def _check_and_resubmit_evicted_initial_workloads(
         snap: ClusterStatusSnapshot,
         wall_elapsed: float,
@@ -1678,16 +1847,21 @@ def run_scenario_replay(
         nonlocal total_planned, submitted_count, finite_batch_submitted, total_pods_submitted
         if not initial_wl_keys:
             return
-        detected_evicted = set(snap.evicted_workload_keys & initial_wl_keys)
+        ever_finished_init_wl_keys.update(snap.finished_workload_keys & initial_wl_keys)
+        detected_evicted = set(snap.evicted_workload_keys & initial_wl_keys) - ever_finished_init_wl_keys
         if snap.workloads_query_ok:
             # When Kueue preempts a PodGroup (`retriable-in-group: "false"`), its member Pods are deleted
             # and Kubernetes GC may garbage-collect the PodGroup Workload within milliseconds before the next
-            # poll; normal completion leaves Succeeded Pods and the Finished Workload intact.
+            # poll; normal completion leaves Succeeded Pods and the Finished Workload intact until GC.
+            # Never re-submit an initial Workload that was already observed Finished before disappearing.
             gc_after_preempt = (
-                initial_wl_keys - snap.present_workload_keys - snap.finished_workload_keys
+                initial_wl_keys
+                - snap.present_workload_keys
+                - snap.finished_workload_keys
+                - ever_finished_init_wl_keys
             )
             detected_evicted |= gc_after_preempt
-        newly_evicted = sorted(detected_evicted - resubmitted_initial_wls)
+        newly_evicted = sorted(detected_evicted - resubmitted_initial_wls - ever_finished_init_wl_keys)
         for wl_key in newly_evicted:
             resubmitted_initial_wls.add(wl_key)
             iwl = initial_wl_by_key[wl_key]
@@ -1705,6 +1879,15 @@ def run_scenario_replay(
             submitted_count += 1
             if it.object_kind != "Deployment":
                 finite_batch_submitted += 1
+                resub_api = str(it.manifest.get("apiVersion") or "")
+                resub_kind = str(it.manifest.get("kind") or it.object_kind)
+                submitted_batch_records[(it.namespace, it.object_kind, it.name, it.incarnation_index)] = (
+                    resub_api,
+                    resub_kind,
+                    it.namespace,
+                    resub_applied,
+                    time.monotonic(),
+                )
             total_pods_submitted += it.pod_count
             print(
                 f"  ~ [t={wall_elapsed:.2f}s wall] Initial t0 PodGroup Workload '{iwl.namespace}/{iwl.workload_name}' "
@@ -1714,7 +1897,7 @@ def run_scenario_replay(
             )
 
     def _scheduled_done_count(snap: ClusterStatusSnapshot) -> int:
-        ever_finished_sched_wl_keys.update(_non_serving_finished_keys(snap.finished_workload_keys - initial_wl_keys))
+        _record_sched_wl_progress(snap)
         wl_done = len(ever_finished_sched_wl_keys) + cancelled_workflow_count
         if recreated_names or known_deploy_names_by_ns:
             return wl_done
@@ -1726,6 +1909,7 @@ def run_scenario_replay(
         for wl_key in finite_initial_wl_keys:
             if (
                 wl_key in snap.finished_workload_keys
+                or wl_key in ever_finished_init_wl_keys
                 or wl_key in resubmitted_initial_wls
                 or wl_key in snap.evicted_workload_keys
                 or (snap.workloads_query_ok and wl_key not in snap.present_workload_keys)
@@ -1784,25 +1968,34 @@ def run_scenario_replay(
                 except Exception:
                     pass
 
-        mgr.api_request(
+        _checked_api_request(
+            mgr,
             "DELETE",
             del_path,
             body=del_opts,
             headers={"Content-Type": "application/json"},
+            ignore_not_found=True,
+            context=f"Delete {del_ev.manifest_kind} '{del_ev.namespace}/{del_ev.applied_name}'",
         )
         for jn in sorted(owned_job_names):
-            mgr.api_request(
+            _checked_api_request(
+                mgr,
                 "DELETE",
                 f"/apis/batch/v1/namespaces/{del_ev.namespace}/jobs/{jn}",
                 body=del_opts,
                 headers={"Content-Type": "application/json"},
+                ignore_not_found=True,
+                context=f"Delete owned Job '{del_ev.namespace}/{jn}'",
             )
         for rsn in sorted(owned_rs_names):
-            mgr.api_request(
+            _checked_api_request(
+                mgr,
                 "DELETE",
                 f"/apis/apps/v1/namespaces/{del_ev.namespace}/replicasets/{rsn}",
                 body=del_opts,
                 headers={"Content-Type": "application/json"},
+                ignore_not_found=True,
+                context=f"Delete owned ReplicaSet '{del_ev.namespace}/{rsn}'",
             )
 
         # Remove pods strictly owned by this workflow so KWOK pods release nodes immediately without touching sibling jobs.
@@ -1817,9 +2010,12 @@ def run_scenario_replay(
                     owned_job_names=owned_job_names,
                     owned_rs_names=owned_rs_names,
                 ):
-                    mgr.api_request(
+                    _checked_api_request(
+                        mgr,
                         "DELETE",
                         f"/api/v1/namespaces/{del_ev.namespace}/pods/{pn}?gracePeriodSeconds=0",
+                        ignore_not_found=True,
+                        context=f"Delete owned Pod '{del_ev.namespace}/{pn}'",
                     )
         if wait_gone:
             wait_deadline = time.monotonic() + 5.0
@@ -1838,9 +2034,12 @@ def run_scenario_replay(
             if iwl is not None:
                 for p_spec in iwl.pods:
                     pm_name = str((p_spec.manifest.get("metadata") or {}).get("name") or p_spec.name)
-                    mgr.api_request(
+                    _checked_api_request(
+                        mgr,
                         "DELETE",
                         f"/api/v1/namespaces/{del_ev.namespace}/pods/{pm_name}?gracePeriodSeconds=0",
+                        ignore_not_found=True,
+                        context=f"Delete t0 Pod '{del_ev.namespace}/{pm_name}'",
                     )
             mgr.api_delete(
                 f"/apis/kueue.x-k8s.io/v1beta2/namespaces/{del_ev.namespace}/workloads/{del_ev.initial_workload_name}",
@@ -1859,7 +2058,7 @@ def run_scenario_replay(
             workload_namespaces=bundle.workload_namespaces,
             include_kueue_workloads=True,
         )
-        ever_finished_sched_wl_keys.update(_non_serving_finished_keys(pre_snap.finished_workload_keys - initial_wl_keys))
+        _record_sched_wl_progress(pre_snap)
         ever_finished_init_wl_keys.update(pre_snap.finished_workload_keys & initial_wl_keys)
 
         unsubmitted_match = any(
@@ -1888,6 +2087,7 @@ def run_scenario_replay(
         # - If NOT Finished=True (for BOTH `cancelled` and `before_recreate` deletions that cut short a still-running
         #   or still-pending incarnation), increment cancelled_workflow_count so `done` never stalls below total_planned.
         already_finished_in_chamber = False
+        matched_wl_keys: set[tuple[str, str]] = set()
         st_wls, raw_wls = mgr.api_request(
             "GET",
             f"/apis/kueue.x-k8s.io/v1beta2/namespaces/{del_ev.namespace}/workloads",
@@ -1903,6 +2103,8 @@ def run_scenario_replay(
                         if isinstance(o, dict)
                     ]
                     if del_ev.applied_name in owners or wl_n == del_ev.applied_name:
+                        if wl_n and (del_ev.namespace, wl_n) not in initial_wl_keys:
+                            matched_wl_keys.add((del_ev.namespace, wl_n))
                         conds = ((wl_it.get("status") or {}).get("conditions")) or []
                         if any(
                             isinstance(c, dict)
@@ -1927,17 +2129,25 @@ def run_scenario_replay(
             retire_eligible_wls.pop(dep_del_key, None)
             upgrade_active_deps.discard(dep_del_key)
 
-        submitted_non_cancelled.pop((del_ev.namespace, del_ev.applied_name), None)
         has_future_same_name = any(
             w.namespace == del_ev.namespace
             and str((w.manifest.get("metadata") or {}).get("name") or w.name) == del_ev.applied_name
             for w in event_heap
         )
         _delete_workflow_and_children(del_ev, wait_gone=(del_ev.delete_reason == "before_recreate" or has_future_same_name))
+        submitted_non_cancelled.pop((del_ev.namespace, del_ev.applied_name), None)
+        submitted_batch_records.pop(inc_key, None)
         if not already_finished_in_chamber:
             cancelled_workflow_count += 1
             if del_ev.object_kind != "Deployment" and del_ev.manifest_kind != "Deployment":
                 finite_batch_cancelled += 1
+            cancelled_sched_wl_keys.update(matched_wl_keys)
+            del_kind = del_ev.manifest_kind or del_ev.object_kind
+            for wk_seen in list(ever_seen_sched_wl_keys - ever_finished_sched_wl_keys):
+                if wk_seen[0] == del_ev.namespace and _workload_name_matches_owner(
+                    wk_seen[1], del_kind, del_ev.applied_name
+                ):
+                    cancelled_sched_wl_keys.add(wk_seen)
         print(
             f"  - [t={wall_elapsed:.2f}s wall / +{del_ev.raw_offset_sec:.2f}s] "
             f"Deleted {del_ev.object_kind} '{del_ev.namespace}/{del_ev.name}' "
@@ -2091,7 +2301,7 @@ def run_scenario_replay(
             workload_namespaces=bundle.workload_namespaces,
             include_kueue_workloads=True,
         )
-        ever_finished_sched_wl_keys.update(_non_serving_finished_keys(snap.finished_workload_keys - initial_wl_keys))
+        _record_sched_wl_progress(snap)
         ever_finished_init_wl_keys.update(snap.finished_workload_keys & initial_wl_keys)
         _check_and_resubmit_evicted_initial_workloads(snap, wall_elapsed)
         return snap
@@ -2113,6 +2323,8 @@ def run_scenario_replay(
                     f"{submitted_count}/{total_planned} workflows.",
                     flush=True,
                 )
+                if not stop_requested:
+                    stop_reason = "duration_reached"
                 break
 
             due_infra: list[ScheduledInfraEvent] = []
@@ -2307,6 +2519,15 @@ def run_scenario_replay(
                             item.local_queue_name,
                             it_applied,
                         )
+                        submitted_batch_records[
+                            (item.namespace, item.object_kind, item.name, item.incarnation_index)
+                        ] = (
+                            str(item.manifest.get("apiVersion") or ""),
+                            str(item.manifest.get("kind") or item.object_kind),
+                            item.namespace,
+                            it_applied,
+                            t0_mono + now_off,
+                        )
                     submitted_count += 1
                     total_pods_submitted += item.pod_count
 
@@ -2358,7 +2579,10 @@ def run_scenario_replay(
                         if not status_printed:
                             _print_status_line(snap, now_mono)
                         print("==> All scenario workflows submitted (--no-wait-for-completion).", flush=True)
+                        if not stop_requested:
+                            stop_reason = "completed"
                         break
+                    _reconcile_vanished_unseen_workflows(snap, now_mono)
                     done_count = _scheduled_done_count(snap)
                     finite_batch_done = len(ever_finished_sched_wl_keys) + finite_batch_cancelled
                     init_done = _finite_initial_wls_done(snap)
@@ -2382,6 +2606,8 @@ def run_scenario_replay(
                             if not status_printed:
                                 _print_status_line(snap, now_mono)
                             print(f"==> All {submitted_count} submitted scenario workflows completed!", flush=True)
+                            if not stop_requested:
+                                stop_reason = "completed"
                             break
                         if (
                             submitted_count == 0
@@ -2394,6 +2620,8 @@ def run_scenario_replay(
                             if not status_printed:
                                 _print_status_line(snap, now_mono)
                             print("==> No pending workflows or running finite initial workloads remaining.", flush=True)
+                            if not stop_requested:
+                                stop_reason = "completed"
                             break
                     elif (
                         max_run_seconds is None
@@ -2409,6 +2637,8 @@ def run_scenario_replay(
                             f"({default_serving_settle_wall_sec:.1f}s window reached).",
                             flush=True,
                         )
+                        if not stop_requested:
+                            stop_reason = "completed"
                         break
 
             now_mono = time.monotonic()
@@ -2446,4 +2676,11 @@ def run_scenario_replay(
         signal.signal(signal.SIGTERM, old_sigterm)
 
     end_epoch = time.time()
-    return start_epoch, end_epoch, submitted_count, total_pods_submitted
+    return ReplayResult(
+        start_epoch=start_epoch,
+        end_epoch=end_epoch,
+        submitted_count=submitted_count,
+        total_pods=total_pods_submitted,
+        stop_reason="interrupted" if stop_requested else stop_reason,
+        signal_num=received_signal if stop_requested else None,
+    )
