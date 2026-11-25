@@ -159,7 +159,7 @@ class WorkloadExecutionInfo:
     @property
     def is_interrupted_only(self) -> bool:
         """True when the workload recorded PartialExecution(s) without completing FullExecution."""
-        return (self.full_duration_sec is None or self.full_duration_sec <= 0) and bool(self.partial_durations_sec)
+        return (self.full_duration_sec is None or self.full_duration_sec < 0) and bool(self.partial_durations_sec)
 
     @property
     def has_external_interruption(self) -> bool:
@@ -189,7 +189,7 @@ class WorkloadExecutionInfo:
              (Preempted, NodeFailure, PodsReadyTimeout, Evicted, ScrapeEnded), or 1.0x for
              self-terminal Failed / user-Deleted exits unless explicitly overridden.
         """
-        if self.full_duration_sec is not None and self.full_duration_sec > 0:
+        if self.full_duration_sec is not None and self.full_duration_sec >= 0:
             return self.full_duration_sec
         if self.partial_durations_sec:
             observed_partial = max(self.partial_durations_sec)
@@ -356,7 +356,7 @@ class ExecutionTimeIndex:
             incarnation_index=incarnation_index,
         )
         if info is not None:
-            if (info.full_duration_sec is not None and info.full_duration_sec > 0) or info.partial_durations_sec:
+            if (info.full_duration_sec is not None and info.full_duration_sec >= 0) or info.partial_durations_sec:
                 return (
                     info.resolved_duration_sec(
                         default_sec=fallback_sec,
@@ -497,7 +497,7 @@ def index_execution_times(
                     info.preempted_epochs.append(end_ts)
         elif ev_type == "FullExecution":
             idx.full_events += 1
-            if dur_val is not None and dur_val > 0:
+            if dur_val is not None and dur_val >= 0:
                 info.full_duration_sec = dur_val
             end_ts = parse_rfc3339_epoch(pl.get("endTime"), strict=strict_timestamps) or ev_ts
             if end_ts is not None:
@@ -807,6 +807,7 @@ def filter_initial_running_pods(
     not_admitted_workflow_names: list[tuple[str, str]] | set[tuple[str, str]] = (),
     earliest_admit_by_ns: dict[str, float] | None = None,
     strict_timestamps: bool = False,
+    pod_incarnations: list[tuple[str, str, float, dict[str, Any], float | None]] | None = None,
 ) -> tuple[list[tuple[str, str, float, dict[str, Any], float | None]], int]:
     """Select pods from infra.json that were genuinely running at the start of the test.
 
@@ -829,10 +830,18 @@ def filter_initial_running_pods(
     ns_prefix_tuples = {ns: tuple(p_list) for ns, p_list in prefixes_by_ns.items()}
     admit_map = earliest_admit_by_ns or {}
 
+    if pod_incarnations is not None:
+        pod_entries = sorted(pod_incarnations, key=lambda x: (x[0], x[1], x[2]))
+    else:
+        pod_entries = [
+            (p_ns, p_name, ev_epoch, pl, pod_delete_epochs.get((p_ns, p_name)))
+            for (p_ns, p_name), (ev_epoch, pl) in sorted(pod_new_events.items())
+        ]
+
     qualifying: list[tuple[str, str, float, dict[str, Any], float | None]] = []
     expired_count = 0
 
-    for (p_ns, p_name), (ev_epoch, pl) in sorted(pod_new_events.items()):
+    for p_ns, p_name, ev_epoch, pl, del_ep in pod_entries:
         if (p_ns, p_name) in not_admitted_exact:
             continue
         ns_prefixes = ns_prefix_tuples.get(p_ns)
@@ -870,7 +879,6 @@ def filter_initial_running_pods(
         if not is_initial:
             continue
 
-        del_ep = pod_delete_epochs.get((p_ns, p_name))
         if del_ep is not None and del_ep <= effective_start_epoch:
             expired_count += 1
             continue

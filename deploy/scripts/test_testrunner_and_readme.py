@@ -2354,7 +2354,7 @@ class FidelityReviewRegressionTests(unittest.TestCase):
                     "metadata": {"name": "cq-main"},
                     "spec": {
                         "admissionChecks": ["prov-check-1"],
-                        "admissionCheckStrategy": {"admissionChecks": [{"name": "prov-check-2"}]},
+                        "admissionChecksStrategy": {"admissionChecks": [{"name": "prov-check-2"}]},
                         "resourceGroups": [
                             {
                                 "coveredResources": ["cpu", "memory", "google.com/tpu", "nvidia.com/gpu"],
@@ -2973,7 +2973,7 @@ class FidelityReviewRegressionTests(unittest.TestCase):
             # ClusterQueue admissionChecks stripped & recorded in annotation
             cq_doc = next(d for d in bundle.prereq_and_queue_docs if d.get("kind") == "ClusterQueue")
             self.assertNotIn("admissionChecks", cq_doc["spec"])
-            self.assertNotIn("admissionCheckStrategy", cq_doc["spec"])
+            self.assertNotIn("admissionChecksStrategy", cq_doc["spec"])
             self.assertEqual(
                 cq_doc["metadata"]["annotations"]["kueue-optimizer.gke.io/stripped-admission-checks"],
                 "prov-check-1,prov-check-2",
