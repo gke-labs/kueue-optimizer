@@ -15,7 +15,7 @@
 - **Title**: Non-TAS `NoExecute` Node Failure Pod Rescheduling + `LowerPriority` Preemption + Node Recovery
 - **Primary Verification Target**: Quota-only (non-TAS) `NoExecute` node failure reschedules replacement pod onto spare node (`0` node-failure evictions), followed by `p-high` arrival preempting `2` `p-low` jobs (`40 > 32` TPUs) and `st-node-00` recovery
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st65` (`--namespace kueue-optimizer-chamber-st65`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16465` | Prometheus `19112` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16465` | Prometheus `19112` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st61-tas-single-node-failure-hotswap-same-rack`](../st61-tas-single-node-failure-hotswap-same-rack/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST65 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st65' (API port 16465, Prom port 19112):

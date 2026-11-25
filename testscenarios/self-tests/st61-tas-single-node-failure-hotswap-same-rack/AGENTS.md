@@ -15,7 +15,7 @@
 - **Title**: TAS Single-Node Failure In-Place Placement Hot-Swap (`0` Workload Evictions)
 - **Primary Verification Target**: Kueue `TASFailedNodeReplacement` + `TASReplaceNodeOnPodTermination` hot-swaps a failed rack node (`st-node-00`) to a healthy spare node (`st-node-03`) in the same `2x2x4-id` rack without evicting the Workload
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st61` (`--namespace kueue-optimizer-chamber-st61`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16461` | Prometheus `19108` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16461` | Prometheus `19108` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st63-tas-node-failure-no-spare-failfast-evict`](../st63-tas-node-failure-no-spare-failfast-evict/AGENTS.md), [`st62-tas-node-deleted-hotswap-and-scaleup`](../st62-tas-node-deleted-hotswap-and-scaleup/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST61 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st61' (API port 16461, Prom port 19108):

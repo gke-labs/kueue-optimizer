@@ -15,7 +15,7 @@
 - **Title**: 144-Node, 1,116-Workload Quota-Only Cohort Borrowing (`200%`) & Instant Reclamation
 - **Primary Verification Target**: Verifies Cohort borrowing (`1,152/576 = 200%`) at `t0` across `144` nodes and exact `72`-workload (`576`-TPU) reclamation when `cq-scale-lender` arrives at `t=3s`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st48` (`--namespace kueue-optimizer-chamber-st48`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16448` | Prometheus `19095` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16448` | Prometheus `19095` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st57-scale-tas-cohort-borrow-reclaim-128n-1088w`](../st57-scale-tas-cohort-borrow-reclaim-128n-1088w/AGENTS.md), [`st49-scale-quota-fair-sharing-160n-1160w`](../st49-scale-quota-fair-sharing-160n-1160w/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST48 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st48' (API port 16448, Prom port 19095):

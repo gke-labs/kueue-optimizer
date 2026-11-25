@@ -15,7 +15,7 @@
 - **Title**: 144-Node, 1,080-Workload Hybrid Multi-API TAS + `infra-pods` + Infinite `Deployment` Scraper Stress
 - **Primary Verification Target**: End-to-end TAS + `cluster-scraper` (`--hash-names` & plain) capstone combining `144` TAS nodes, `16` `infra-pods`, `64` multi-API `t0` TAS workloads (`JobSet`, `Job`, `PodGroup`, infinite `Deployment`), and `1,016` multi-API TAS arrivals
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st60` (`--namespace kueue-optimizer-chamber-st60`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16460` | Prometheus `19107` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16460` | Prometheus `19107` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st50-scale-quota-mixed-apis-infra-128n-1064w`](../st50-scale-quota-mixed-apis-infra-128n-1064w/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST60 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st60' (API port 16460, Prom port 19107):

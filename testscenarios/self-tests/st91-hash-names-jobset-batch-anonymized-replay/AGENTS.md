@@ -15,7 +15,7 @@
 - **Title**: `--hash-names` Anonymized Batch `JobSet` Replay (Independent Hashed Names & Labels)
 - **Primary Verification Target**: Verifies `testrunner.py` replays a `--hash-names` trace (`h-<32hex>` `JobSet` names, independent hashed `workloadName`s, hashed sensitive label values, plaintext queues/nodes) with identical metrics to its plaintext twin `st92`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st91` (`--namespace kueue-optimizer-chamber-st91`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16491` | Prometheus `19138` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16491` | Prometheus `19138` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st92-hash-names-jobset-batch-plaintext-control`](../st92-hash-names-jobset-batch-plaintext-control/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST91 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st91' (API port 16491, Prom port 19138):

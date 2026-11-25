@@ -15,7 +15,7 @@
 - **Title**: 160-Node, 1,160-Workload 4-CQ Preemption-Based Fair Sharing Against `t0` Monopolizer
 - **Primary Verification Target**: Verifies `InCohortFairSharing` across `160` nodes (`1,280` TPUs) when `cq-fs-q1` holds `100%` of the cohort at `t0` (`160` jobs) and 3 equal-weight peer CQs arrive at `t=3s`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st49` (`--namespace kueue-optimizer-chamber-st49`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16449` | Prometheus `19096` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16449` | Prometheus `19096` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st58-scale-tas-fair-sharing-160n-1140w`](../st58-scale-tas-fair-sharing-160n-1140w/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST49 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st49' (API port 16449, Prom port 19096):

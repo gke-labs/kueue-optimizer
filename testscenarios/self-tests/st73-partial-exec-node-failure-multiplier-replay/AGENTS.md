@@ -15,7 +15,7 @@
 - **Title**: Node-Failure Interrupted TAS Workloads (`PartialExecution = 7s`, `missingDurationMultiplier = 2.5`) Replayed Alongside `FullExecution` Peers
 - **Primary Verification Target**: Schema `interruptionReason: 'NodeFailure'` + `missingDurationMultiplier: 2.5` scaling interrupted TAS `JobSet`s from `7.0s -> 17.5s` while leaving `FullExecution = 14.0s` peer `JobSet`s untouched
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st73` (`--namespace kueue-optimizer-chamber-st73`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16473` | Prometheus `19120` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16473` | Prometheus `19120` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st71-partial-exec-preempted-multiplier-replay`](../st71-partial-exec-preempted-multiplier-replay/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST73 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st73' (API port 16473, Prom port 19120):

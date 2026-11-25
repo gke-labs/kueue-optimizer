@@ -15,7 +15,7 @@
 - **Title**: `Deployment` Rolling Upgrade Surge Quota Deadlock (`maxUnavailable: 0, maxSurge: 2` — Twin of st85)
 - **Primary Verification Target**: Direct A/B twin of `st85` changing ONLY `rollingUpdate` to `{maxUnavailable: 0, maxSurge: 2}` in the same `8`-TPU `ClusterQueue`: `2` surge `v2` pods block on Kueue admission gate while `4` `v1` pods hold `8/8` TPUs, reproducing the classic Kueue surge rollout deadlock
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st86` (`--namespace kueue-optimizer-chamber-st86`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16486` | Prometheus `19133` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16486` | Prometheus `19133` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st85-deployment-rolling-upgrade-max-unavailable`](../st85-deployment-rolling-upgrade-max-unavailable/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST86 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st86' (API port 16486, Prom port 19133):

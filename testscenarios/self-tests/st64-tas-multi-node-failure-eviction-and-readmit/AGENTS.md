@@ -15,7 +15,7 @@
 - **Title**: TAS Sequential Dual-Node Failure — 1st Node Hot-Swaps, 2nd Node Evicts & Re-Admits on Healthy Spares
 - **Primary Verification Target**: Sequential two-node failure (`st-node-00` at `t=4s`, `st-node-01` at `t=8s`) on a `4`-pod block-level TAS `Job` with `8` block nodes (`6` remain healthy): verifies multi-node `NodeFailures` eviction and immediate re-admission onto the `6` remaining healthy nodes
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st64` (`--namespace kueue-optimizer-chamber-st64`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16464` | Prometheus `19111` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16464` | Prometheus `19111` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st61-tas-single-node-failure-hotswap-same-rack`](../st61-tas-single-node-failure-hotswap-same-rack/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST64 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st64' (API port 16464, Prom port 19111):

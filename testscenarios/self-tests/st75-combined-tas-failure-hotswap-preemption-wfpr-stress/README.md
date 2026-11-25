@@ -8,7 +8,7 @@
 | :--- | :--- |
 | **Scenario Directory** | `testscenarios/self-tests/st75-combined-tas-failure-hotswap-preemption-wfpr-stress` |
 | **Raw Event Counts** | `infra.json`: **41** events · `workflows.json`: **7** events · `execution-time.json`: **14** events |
-| **Cluster Capacity** | **16 nodes** · `256 cores` · `1,024 GiB` · `64` `google.com/tpu` (1 distinct node group) |
+| **Cluster Capacity** | **16 nodes** · `256 cores` · `1,024 GiB` · `64` `google.com/tpu` (1 distinct node group; +1 post-$t_0$ `Node` event(s): 1 `Update`) |
 | **Topology Configuration** | **1** `Topology` CRD(s) (`st-slice-topology`) |
 | **Initial In-Flight Pods at $t_0$** | **8** pods across **8** / 16 nodes (initial `google.com/tpu` utilization: **50.00%**) |
 | **Kueue Objects** | **1** `ResourceFlavor`(s) · **0** `Cohort`(s) · **1** `ClusterQueue`(s) · **1** `LocalQueue`(s) · **3** `WorkloadPriorityClass`(es) |

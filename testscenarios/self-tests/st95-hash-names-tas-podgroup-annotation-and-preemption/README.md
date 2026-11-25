@@ -148,7 +148,7 @@ Cluster Total: 4 nodes
 ## 4. Initial Running Pods & Initial Cluster Utilization at $t_0$
 
 At scenario start ($t_0 = 2026-06-01T00:00:00Z$), **`2`** running `Pod` objects are pre-placed across **`2`** of the **`4`** cluster nodes (`50.0%` of nodes occupied; `2` nodes completely free).
-Additionally, `workflows.json` records **`2`** pre-existing `Admitted` `JobSet` warmup workflow object(s) at $t_0$.
+Additionally, `workflows.json` records **`2`** pre-existing `Admitted` `PodGroup` warmup workflow object(s) at $t_0$.
 
 ### 4.1 Initial Cluster Utilization Breakdown
 

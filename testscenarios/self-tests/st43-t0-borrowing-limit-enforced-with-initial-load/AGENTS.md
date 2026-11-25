@@ -12,10 +12,10 @@
 
 - **Scenario ID / Directory**: `st43-t0-borrowing-limit-enforced-with-initial-load`
 - **Category**: 9. Initial t0 Workloads — Reclaims, Limits & Fair Sharing
-- **Title**: `borrowingLimit: 8` & `lendingLimit: 8` Enforced on Top of `t0` Nominal Quota Load (`150%` Ceiling)
-- **Primary Verification Target**: Verifies `16` TPUs of `t0` nominal usage + `8` TPUs of `t=0s` arrivals hit the exact `24`-TPU (`150.0%`) borrowing ceiling while keeping 2 nodes idle and 2 arrivals queued
+- **Title**: Asymmetric `borrowingLimit: 12` vs. `lendingLimit: 8` Enforced on Top of `t0` Nominal Quota Load (`150%` Ceiling)
+- **Primary Verification Target**: Verifies `16` TPUs of `t0` nominal usage + `8` TPUs capped strictly by donor `lendingLimit: 8` (below `borrowingLimit: 12`) hit the exact `24`-TPU (`150.0%`) ceiling while keeping 2 nodes idle and 2 arrivals queued
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st43` (`--namespace kueue-optimizer-chamber-st43`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16443` | Prometheus `19090` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16443` | Prometheus `19090` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st20-borrowing-and-lending-limits-enforced`](../st20-borrowing-and-lending-limits-enforced/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST43 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st43' (API port 16443, Prom port 19090):
@@ -63,11 +63,11 @@ python3 deploy/scripts/testrunner.py testscenarios/self-tests/st43-t0-borrowing-
 
 Never evaluate this scenario in isolation when validating scheduler behavior or `kueue_metrics_report.py` changes. Always execute it in its dedicated `kueue-optimizer` chamber (`kueue-optimizer-chamber-st43`) alongside its paired counterpart(s) in their dedicated chamber(s) below and verify every cross-scenario delta:
 
-### Pair: `st43-t0-borrowing-limit-enforced-with-initial-load` (`kueue-optimizer-chamber-st43`) ↔ [`st20-borrowing-and-lending-limits-enforced`](../st20-borrowing-and-lending-limits-enforced/AGENTS.md) (`kueue-optimizer-chamber-st20`) — `t0`-Loaded `borrowingLimit: 8` (`st43`) vs. Fresh `borrowingLimit: 8` (`st20`) Pair
+### Pair: `st43-t0-borrowing-limit-enforced-with-initial-load` (`kueue-optimizer-chamber-st43`) ↔ [`st20-borrowing-and-lending-limits-enforced`](../st20-borrowing-and-lending-limits-enforced/AGENTS.md) (`kueue-optimizer-chamber-st20`) — `t0`-Loaded `lendingLimit: 8` (`st43`, `borrowingLimit: 12`) vs. Fresh `borrowingLimit: 8` (`st20`, `lendingLimit: 12`) Pair
 
-- **Controlled Variable Changed**: `st43` pre-fills `cq-capped`'s `16` nominal TPUs with 4 `t0` `PodGroup`s before 4 arrivals submit at `t=0s`, whereas `st20` submits all 8 as `NotAdmitted` at `t=0s`.
+- **Controlled Variable Changed**: `st43` binds on `lendingLimit: 8` (`< borrowingLimit: 12`) with 4 `t0` `PodGroup`s pre-filling `cq-capped`'s `16` nominal TPUs before 4 arrivals submit at `t=0s`, whereas `st20` binds on `borrowingLimit: 8` (`< lendingLimit: 12`) with all 8 jobs submitted as `NotAdmitted` at `t=0s`.
 - **Isolated Peer Command**: `python3 deploy/scripts/testrunner.py testscenarios/self-tests/st20-borrowing-and-lending-limits-enforced --namespace kueue-optimizer-chamber-st20 --port 16420`
-- **Cross-Examination Assertion**: Both enforce the exact `24`-TPU (`150.0%`) ceiling in `Sec 5.1` and yield `Sec 5.4 EFFECTIVE SAT ≈ 50.0%` (`2` arrivals admitted immediately + `2` queued `~22s` in `st43`).
+- **Cross-Examination Assertion**: Both enforce the exact `24`-TPU (`150.0%`) ceiling in `Sec 5.1` and yield `Sec 5.4 EFFECTIVE SAT ≈ 50.0%` (`2` arrivals admitted immediately + `2` queued `~22s` in `st43`), verifying independent enforcement of both `lendingLimit` and `borrowingLimit`.
 - **Expected Target Shift**:
   - `Sec 5.1 Quota Util`: `cq-capped P90/P99 = 150.0% (24/16 TPUs)` (`st43`) vs. `cq-capped P90/P99 = 150.0% (24/16 TPUs)` (`st20`)
   - `Sec 5.2 Wait Time`: `2 jobs ~0s, 2 jobs ~22s (AVG ~11s)` (`st43`) vs. `6 jobs ~0s, 2 jobs ~22s` (`st20`)
@@ -78,8 +78,8 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 
 ## 4. Scenario Mechanics & Expected Live Metrics
 
-- **Setup**: 8-node (`32`-TPU) cluster, `cohort-t0-lim`. `cq-capped` (`nominalQuota=16, borrowingLimit=8`); `cq-donor` (`nominalQuota=16, lendingLimit=8`). At `t0`, 4 `Admitted` `init-cap-*` jobs (`16` TPUs, `22s`) already fill `cq-capped`'s nominal quota. At `t=0s`, 4 `NotAdmitted` `arr-cap-*` jobs (`16` TPUs, `22s`) arrive.
-- **Expected Runtime Behavior**: Kueue accounts for `init-cap-0..3`'s `16` TPUs, admits **only 2** of the 4 `arr-cap-*` arrivals at `t=0s` (`16 + 8 = 24` TPUs = `150.0%` of nominal, leaving 2 nodes idle), queues the other 2 `arr-cap-*` jobs for `~22s`, and drains them in `22s–44s`.
+- **Setup**: 8-node (`32`-TPU) cluster, `cohort-t0-lim`. `cq-capped` (`nominalQuota=16, borrowingLimit=12`); `cq-donor` (`nominalQuota=16, lendingLimit=8`, asymmetric so `lendingLimit=8` is strictly the binding cap). At `t0`, 4 `Admitted` `init-cap-*` jobs (`16` TPUs, `22s`) already fill `cq-capped`'s nominal quota. At `t=0s`, 4 `NotAdmitted` `arr-cap-*` jobs (`16` TPUs, `22s`) arrive.
+- **Expected Runtime Behavior**: Kueue accounts for `init-cap-0..3`'s `16` TPUs, admits **only 2** of the 4 `arr-cap-*` arrivals at `t=0s` (`16 + 8 = 24` TPUs = `150.0%` of nominal, capped strictly by `cq-donor`'s `lendingLimit: 8` below `cq-capped`'s `borrowingLimit: 12`, leaving 2 nodes idle), queues the other 2 `arr-cap-*` jobs for `~22s`, and drains them in `22s–44s`.
 
 ### Target Metric Scorecard
 
@@ -92,13 +92,13 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 
 ### Detailed Metric Checkpoints
 
-- `Section 5.1 (cq-capped)`: Peak utilization hits **exact `150.0%`** (`24 / 16` TPUs) and NEVER reaches `200%` (`32 / 16`).
+- `Section 5.1 (cq-capped)`: Peak utilization hits **exact `150.0%`** (`24 / 16` TPUs) and NEVER reaches `175%` (`28 / 16`) or `200%` (`32 / 16`).
 - `Section 5.2`: 2 immediate arrivals (`<= 1.0s`) + 2 queued arrivals (`~22s`), `AVG ≈ 10s–12s`.
 - `Section 5.4`: `Qualifying Workloads: 8 (completed=8 [8 pods])`, **`EFFECTIVE SAT ≈ 46%–52%`** (`704 / 1,408 TPU-s = 50.0%`).
 
 ### Hard Failure Invariants (What Definitely MUST NOT Happen)
 
-- ❌ `cq-capped` admitting all 4 `arr-cap-*` jobs at `t=0s` (`32` TPUs = `200%`, which would happen if `init-cap-*`'s `16` TPUs were missing from `cq-capped` quota accounting).
+- ❌ `cq-capped` admitting 3 or 4 `arr-cap-*` jobs at `t=0s` (`28` or `32` TPUs = `175%`–`200%`, which would happen if `lendingLimit: 8` were ignored in favor of `borrowingLimit: 12` or `init-cap-*`'s `16` TPUs were missing from `cq-capped` quota accounting).
 
 ---
 

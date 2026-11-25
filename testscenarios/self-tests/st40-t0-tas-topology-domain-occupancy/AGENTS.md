@@ -15,7 +15,7 @@
 - **Title**: 7-Level TAS `t0` Domain Occupancy (`p244-0` + `p224-2` Occupied at `t0`, Disjoint `p224-3` Fit + `p244` Queueing)
 - **Primary Verification Target**: Verifies `build_topology_assignment` populates Kueue's TAS cache at `t0` so `arr-tas-4n-fit` lands on disjoint `st-node-12..15` (`<2s`) while `arr-tas-8n-wait` waits `~26s`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st40` (`--namespace kueue-optimizer-chamber-st40`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16440` | Prometheus `19087` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16440` | Prometheus `19087` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st10-tas-subslice-and-cube-packing`](../st10-tas-subslice-and-cube-packing/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST40 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st40' (API port 16440, Prom port 19087):

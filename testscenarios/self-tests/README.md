@@ -23,11 +23,11 @@ Every scenario in `testscenarios/self-tests/` uses power-of-two/multiple-of-16 i
 - **Category 2 (`st06`–`st10`)**: Queueing discipline (`StrictFIFO` HoL blocking vs. `BestEffortFIFO` backfill), 4-wave backlog wait-time staircase, non-preemptive priority ordering, and 7-level TAS binary-tree cube packing.
 - **Category 3 (`st11`–`st15`)**: Intra-ClusterQueue preemption policies (`Never`, `LowerPriority`, `LowerOrNewerEqualPriority`), 4-tier cascading preemptions, and adversarial late-preemption badput collapse.
 - **Category 4 (`st16`–`st20`)**: Multi-CQ quota isolation vs. Cohort borrowing (`200%` of nominal quota), instant Cohort reclaim (`reclaimWithinCohort: Any` vs. `Never`), and explicit `borrowingLimit` / `lendingLimit` ceilings (`150%`).
-- **Category 5 (`st21`–`st25`)**: Fair-sharing spectrum from unweighted monopolization (`st21`) to symmetric `1:1` DRF (`st22`), asymmetric `7:1` DRF (`st23`), 6-CQ geometric hierarchy `1..32` (`st24`), and Classical `borrowWithinCohort.maxPriorityThreshold` gating (`st25`).
+- **Category 5 (`st21`–`st25`)**: Fair-sharing spectrum from Fair-Sharing-disabled monopolization (`st21`, `--no-fair-sharing`) to symmetric `1:1` DRF (`st22`), asymmetric `7:1` DRF (`st23`), 6-CQ geometric hierarchy `1..32` (`st24`), and Classical `borrowWithinCohort.maxPriorityThreshold` gating (`st25`).
 - **Category 6 (`st26`–`st30`)**: Real-world Kubernetes/Kueue accounting edge cases — pre-existing `t0` unmanaged pods in `infra-pods` (`st26`), host CPU/RAM bottleneck inversion (`st27`), `initContainers` high-water mark + `spec.overhead` (`st28`), multi-role heterogeneous `JobSet` PodSets (`st29`), and permanently `inadmissible` oversized jobs (`st30`).
 - **Category 7 (`st31`–`st35`) — Initial `t0` Workloads: Handling & Accounting**: Pre-admitted `t0` Kueue `PodGroup` quota occupancy & offset-jump remaining duration (`st31`), hybrid `t0` Kueue `PodGroup`s + non-Kueue `infra-pods` separation (`st32`), legacy `--hash-names` Tier-3 matching + Tier-4 missing-pod synthesis (`st33`), multi-role heterogeneous `t0` `PodGroup` divisibility (`st34`), and infinite-duration `t0` `PodGroup` `ACTIVE AT END` / `FULL-DUR SAT` non-inflation (`st35`).
 - **Category 8 (`st36`–`st40`) — Initial `t0` Workloads: Preemption & TAS**: Non-preemptive `t0` protection (`st36`) vs. active `LowerPriority` preemption + dynamic parent `JobSet` resubmission without `Workload` name collisions (`st37`), `LowerOrNewerEqualPriority` `t0` seniority protection (`st38`), adversarial `t0` late-preemption badput exclusion (`st39`), and `t0` 7-level TAS topology domain occupancy (`st40`).
-- **Category 9 (`st41`–`st45`) — Initial `t0` Workloads: Reclaims, Limits & Fair Sharing**: Cohort reclamation against `200%` `t0` borrowers (`st41` `Any` vs. `st42` `Never`), `borrowingLimit: 8` / `lendingLimit: 8` enforced on top of `t0` nominal load (`st43`), and `1:1` Cohort Fair-Sharing preemption evicting exact `4` of `8` `t0` monopolizer `PodGroup`s (`st44`) vs. `reclaimWithinCohort: Never` control (`st45`).
+- **Category 9 (`st41`–`st45`) — Initial `t0` Workloads: Reclaims, Limits & Fair Sharing**: Cohort reclamation against `200%` `t0` borrowers (`st41` `Any` vs. `st42` `Never`), asymmetric `borrowingLimit: 12` / `lendingLimit: 8` enforced on top of `t0` nominal load (`st43`), and `1:1` Cohort Fair-Sharing preemption evicting exact `4` of `8` `t0` monopolizer `PodGroup`s (`st44`) vs. `reclaimWithinCohort: Never` control (`st45`).
 - **Category 10 (`st46`–`st50`) — Large-Scale Quota-Only Admission (`>100` Nodes, `>1,000` Workloads, No TAS)**: `128`-node `1,056`-workload full saturation (`st46`), `128`-node `1,080`-workload intra-CQ preemption & `64`-job `t0` resubmit (`st47`), `144`-node `1,116`-workload Cohort `200%` borrowing & `72`-job reclaim (`st48`), `160`-node `1,160`-workload 4-CQ Fair Sharing (`st49`), and `128`-node `1,064`-workload multi-API (`JobSet`, `Job`, `PodGroup`, infinite `Deployment`) + `16` `infra-pods` parity (`st50`).
 - **Category 11 (`st51`–`st55`) — Large-Scale TAS Packing, Slices & Multi-Pool (`>100` Nodes, `>1,000` Workloads)**: `128`-node `1,088`-workload 7-level TAS packing (`st51`), `160`-node `1,120`-workload `4`/`2`/`1`-node mixed TAS slices (`st52`), `128`-node `1,056`-workload rack-fragmentation blocking & `BestEffortFIFO` backfill (`st53`), `144`-node `1,104`-workload partial vanilla-K8s `t0` TAS binding + `required`/`preferred`/`unconstrained` modes (`st54`), and `256`-node (`2,048`-TPU) `1,200`-workload dual-`ResourceFlavor` TAS stress (`st55`).
 - **Category 12 (`st56`–`st60`) — Large-Scale TAS Preemption, Reclaim, Fair Sharing & Hybrid (`>100` Nodes, `>1,000` Workloads)**: `128`-node `1,060`-workload `2x2x2-id` TAS preemption (`st56`), `128`-node `1,088`-workload TAS Cohort `200%` borrowing & `64`-job reclaim (`st57`), `160`-node `1,140`-workload 4-CQ TAS Fair Sharing (`st58`), `128`-node `1,048`-workload TAS `borrowingLimit: 256` (`150%`) cap (`st59`), and `144`-node `1,080`-workload hybrid multi-API TAS + `16` `infra-pods` + `16` infinite `Deployment`s scraper stress (`st60`).
@@ -437,34 +437,34 @@ Every scenario in `testscenarios/self-tests/` uses power-of-two/multiple-of-16 i
 - **What Definitely MUST NOT Happen (Red Flags / Regression Bugs)**:
   - ❌ Any reclaim eviction (`Section 5.3 > 0`) when `reclaimWithinCohort: Never`.
 
-#### `st20-borrowing-and-lending-limits-enforced` — Explicit `borrowingLimit` (`+8` TPUs) & `lendingLimit` (`8` TPUs) Cap Verification
+#### `st20-borrowing-and-lending-limits-enforced` — Explicit Asymmetric `borrowingLimit: 8` vs. `lendingLimit: 12` Cap Verification
 
-- **Feature Focus**: Verifies `cq-capped` stops at exactly `16 + 8 = 24` TPUs (`150%` of nominal, `75%` of cluster) even when `8` TPUs sit free
+- **Feature Focus**: Verifies `cq-capped` stops at exact `borrowingLimit: 8` (`16 + 8 = 24` TPUs = `150%` of nominal) even though `cq-donor` permits `lendingLimit: 12`
 - **Isolated Run Command**: `python3 deploy/scripts/testrunner.py testscenarios/self-tests/st20-borrowing-and-lending-limits-enforced --namespace kueue-optimizer-chamber-st20 --port 16420` (Guides: [`st20-borrowing-and-lending-limits-enforced/AGENTS.md`](st20-borrowing-and-lending-limits-enforced/AGENTS.md) | [`st20-borrowing-and-lending-limits-enforced/README.md`](st20-borrowing-and-lending-limits-enforced/README.md))
 - **Side-by-Side Pair(s)**: [`st43-t0-borrowing-limit-enforced-with-initial-load`](st43-t0-borrowing-limit-enforced-with-initial-load/AGENTS.md)
-- **Scenario Setup**: 8-node (`32`-TPU) cluster, `cohort-limits`. `cq-capped` has `nominalQuota=16, borrowingLimit=8`; `cq-donor` has `nominalQuota=16, lendingLimit=8`. 8 single-node (`4`-TPU, `22s`) jobs submitted to `cq-capped` at `t=0s`; `0` jobs in `cq-donor`.
-- **Expected Live Behavior**: Wave 1 admits **6 jobs** (`24` TPUs = `16` nominal + `8` borrowed = `150%` of nominal quota), leaving 2 physical nodes (`8` TPUs) reserved/unborrowable and keeping 2 jobs queued for `22s`. Wave 2 runs those last 2 jobs (`8` TPUs) from `22s` to `44s`.
+- **Scenario Setup**: 8-node (`32`-TPU) cluster, `cohort-limits`. `cq-capped` has `nominalQuota=16, borrowingLimit=8`; `cq-donor` has `nominalQuota=16, lendingLimit=12` (asymmetric so `borrowingLimit=8` is strictly the binding cap). 8 single-node (`4`-TPU, `22s`) jobs submitted to `cq-capped` at `t=0s`; `0` jobs in `cq-donor`.
+- **Expected Live Behavior**: Wave 1 admits **6 jobs** (`24` TPUs = `16` nominal + `8` borrowed = `150%` of nominal quota) because `cq-capped`'s `borrowingLimit: 8` binds strictly below `cq-donor`'s `lendingLimit: 12`, leaving 2 physical nodes (`8` TPUs) idle and keeping 2 jobs queued for `22s`. Wave 2 runs those last 2 jobs (`8` TPUs) from `22s` to `44s`.
 - **What MUST Be Visible in the Metrics**:
   - `Section 5.1 (cq-capped)`: Peak utilization hits **exact `150.0%`** (`24 / 16` TPUs) during Wave 1 and never exceeds `150%`.
   - `Section 5.4 (Effective Saturation)`: `8 × 4 × 22 = 704 TPU-s` over `44s × 32 = 1,408 TPU-s` → **`EFFECTIVE SAT ≈ 47%–52%`** (Wave 1 = `75%`, Wave 2 = `25%`, average = `50%`).
 - **What Definitely MUST NOT Happen (Red Flags / Regression Bugs)**:
-  - ❌ `cq-capped` utilization exceeding `150%` (`> 24` TPUs) in `Section 5.1` (would mean `borrowingLimit` / `lendingLimit` was violated).
+  - ❌ `cq-capped` utilization exceeding `150%` (`> 24` TPUs) in `Section 5.1` (would mean `borrowingLimit: 8` was ignored in favor of `lendingLimit: 12`).
 
 ### Category 5. Fair Sharing & Priority Thresholds
 
-#### `st21-no-fair-sharing-fcfs-hogging` — Zero-Nominal Shared Pool Without Fair Sharing (First-Mover Monopolization)
+#### `st21-no-fair-sharing-fcfs-hogging` — Zero-Nominal Shared Pool Without Fair Sharing (First-Mover Monopolization, `--no-fair-sharing`)
 
-- **Feature Focus**: Baseline control for `st22`: shared `32`-TPU Cohort pool (`0` CQ nominal quotas, `reclaimWithinCohort: Never`)
-- **Isolated Run Command**: `python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging --namespace kueue-optimizer-chamber-st21 --port 16421` (Guides: [`st21-no-fair-sharing-fcfs-hogging/AGENTS.md`](st21-no-fair-sharing-fcfs-hogging/AGENTS.md) | [`st21-no-fair-sharing-fcfs-hogging/README.md`](st21-no-fair-sharing-fcfs-hogging/README.md))
+- **Feature Focus**: Baseline control for `st22`: global Fair Sharing disabled (`Configuration` omitting `fairSharing` + `--no-fair-sharing`) on a shared `32`-TPU Cohort pool (`0` CQ nominal quotas, `reclaimWithinCohort: Never`)
+- **Isolated Run Command**: `python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging --no-fair-sharing --namespace kueue-optimizer-chamber-st21 --port 16421` (Guides: [`st21-no-fair-sharing-fcfs-hogging/AGENTS.md`](st21-no-fair-sharing-fcfs-hogging/AGENTS.md) | [`st21-no-fair-sharing-fcfs-hogging/README.md`](st21-no-fair-sharing-fcfs-hogging/README.md))
 - **Side-by-Side Pair(s)**: [`st22-equal-fair-sharing-50-50-split`](st22-equal-fair-sharing-50-50-split/AGENTS.md)
-- **Scenario Setup**: 8-node (`32`-TPU) cluster. All `32` TPUs live on `Cohort: cohort-nofs`; both `cq-hog` and `cq-victim` have `nominalQuota: 0` and `reclaimWithinCohort: Never`. `cq-hog` submits 8 jobs (`32` TPUs, `28s`) at `t=0s`; `cq-victim` submits 4 jobs (`16` TPUs, `18s`) at `t=4s`.
-- **Expected Live Behavior**: `cq-hog` grabs 100% of the shared `32`-TPU cohort pool at `t=0s`. When `cq-victim` arrives at `t=4s`, `reclaimWithinCohort: Never` prevents cohort preemption, so `cq-victim` waits (`0` TPUs) for `24s` until `cq-hog` finishes at `t=28s`.
+- **Scenario Setup**: 8-node (`32`-TPU) cluster with global Fair Sharing disabled (`kind: Configuration` omitting `fairSharing` + `--no-fair-sharing`). All `32` TPUs live on `Cohort: cohort-nofs`; both `cq-hog` and `cq-victim` have `nominalQuota: 0` and `reclaimWithinCohort: Never`. `cq-hog` submits 8 jobs (`32` TPUs, `28s`) at `t=0s`; `cq-victim` submits 4 jobs (`16` TPUs, `18s`) at `t=4s`.
+- **Expected Live Behavior**: `testrunner.py` deploys `kueue-controller-manager` with Fair Sharing disabled. `cq-hog` grabs 100% of the shared `32`-TPU cohort pool at `t=0s`. When `cq-victim` arrives at `t=4s`, both disabled Fair Sharing and `reclaimWithinCohort: Never` prevent cohort preemption, so `cq-victim` waits (`0` TPUs) for `24s` until `cq-hog` finishes at `t=28s`.
 - **What MUST Be Visible in the Metrics**:
   - `Section 5.1 (Cohort: cohort-nofs)`: `AVG ≈ 80%–95%` (`32/32` from `0s–28s`, `16/32` from `28s–46s`).
   - `Section 5.2`: `cq-victim` jobs wait **`~24s`** while `cq-hog` jobs wait `~0s`.
   - `Section 5.3`: **`0`** evictions.
 - **What Definitely MUST NOT Happen (Red Flags / Regression Bugs)**:
-  - ❌ `cq-victim` preempting `cq-hog` when both have `0` nominal quota and `reclaimWithinCohort: Never`.
+  - ❌ `cq-victim` preempting `cq-hog` when global Fair Sharing is disabled and both CQs have `0` nominal quota and `reclaimWithinCohort: Never`.
 
 #### `st22-equal-fair-sharing-50-50-split` — Equal-Weight (`1 : 1`) Cohort Fair Sharing Convergence Under Heavy Dual Backlog
 
@@ -782,19 +782,19 @@ Every scenario in `testscenarios/self-tests/` uses power-of-two/multiple-of-16 i
   - ❌ Any eviction (`Section 5.3 > 0`) when `reclaimWithinCohort: Never`.
   - ❌ `arr-lend-*` admitting at `t=11s` (which would mean `cq-borrower`'s `t0` borrowed quota was not tracked in the Cohort).
 
-#### `st43-t0-borrowing-limit-enforced-with-initial-load` — `borrowingLimit: 8` & `lendingLimit: 8` Enforced on Top of `t0` Nominal Quota Load (`150%` Ceiling)
+#### `st43-t0-borrowing-limit-enforced-with-initial-load` — Asymmetric `borrowingLimit: 12` vs. `lendingLimit: 8` Enforced on Top of `t0` Nominal Quota Load (`150%` Ceiling)
 
-- **Feature Focus**: Verifies `16` TPUs of `t0` nominal usage + `8` TPUs of `t=0s` arrivals hit the exact `24`-TPU (`150.0%`) borrowing ceiling while keeping 2 nodes idle and 2 arrivals queued
+- **Feature Focus**: Verifies `16` TPUs of `t0` nominal usage + `8` TPUs capped strictly by donor `lendingLimit: 8` (below `borrowingLimit: 12`) hit the exact `24`-TPU (`150.0%`) ceiling while keeping 2 nodes idle and 2 arrivals queued
 - **Isolated Run Command**: `python3 deploy/scripts/testrunner.py testscenarios/self-tests/st43-t0-borrowing-limit-enforced-with-initial-load --namespace kueue-optimizer-chamber-st43 --port 16443` (Guides: [`st43-t0-borrowing-limit-enforced-with-initial-load/AGENTS.md`](st43-t0-borrowing-limit-enforced-with-initial-load/AGENTS.md) | [`st43-t0-borrowing-limit-enforced-with-initial-load/README.md`](st43-t0-borrowing-limit-enforced-with-initial-load/README.md))
 - **Side-by-Side Pair(s)**: [`st20-borrowing-and-lending-limits-enforced`](st20-borrowing-and-lending-limits-enforced/AGENTS.md)
-- **Scenario Setup**: 8-node (`32`-TPU) cluster, `cohort-t0-lim`. `cq-capped` (`nominalQuota=16, borrowingLimit=8`); `cq-donor` (`nominalQuota=16, lendingLimit=8`). At `t0`, 4 `Admitted` `init-cap-*` jobs (`16` TPUs, `22s`) already fill `cq-capped`'s nominal quota. At `t=0s`, 4 `NotAdmitted` `arr-cap-*` jobs (`16` TPUs, `22s`) arrive.
-- **Expected Live Behavior**: Kueue accounts for `init-cap-0..3`'s `16` TPUs, admits **only 2** of the 4 `arr-cap-*` arrivals at `t=0s` (`16 + 8 = 24` TPUs = `150.0%` of nominal, leaving 2 nodes idle), queues the other 2 `arr-cap-*` jobs for `~22s`, and drains them in `22s–44s`.
+- **Scenario Setup**: 8-node (`32`-TPU) cluster, `cohort-t0-lim`. `cq-capped` (`nominalQuota=16, borrowingLimit=12`); `cq-donor` (`nominalQuota=16, lendingLimit=8`, asymmetric so `lendingLimit=8` is strictly the binding cap). At `t0`, 4 `Admitted` `init-cap-*` jobs (`16` TPUs, `22s`) already fill `cq-capped`'s nominal quota. At `t=0s`, 4 `NotAdmitted` `arr-cap-*` jobs (`16` TPUs, `22s`) arrive.
+- **Expected Live Behavior**: Kueue accounts for `init-cap-0..3`'s `16` TPUs, admits **only 2** of the 4 `arr-cap-*` arrivals at `t=0s` (`16 + 8 = 24` TPUs = `150.0%` of nominal, capped strictly by `cq-donor`'s `lendingLimit: 8` below `cq-capped`'s `borrowingLimit: 12`, leaving 2 nodes idle), queues the other 2 `arr-cap-*` jobs for `~22s`, and drains them in `22s–44s`.
 - **What MUST Be Visible in the Metrics**:
-  - `Section 5.1 (cq-capped)`: Peak utilization hits **exact `150.0%`** (`24 / 16` TPUs) and NEVER reaches `200%` (`32 / 16`).
+  - `Section 5.1 (cq-capped)`: Peak utilization hits **exact `150.0%`** (`24 / 16` TPUs) and NEVER reaches `175%` (`28 / 16`) or `200%` (`32 / 16`).
   - `Section 5.2`: 2 immediate arrivals (`<= 1.0s`) + 2 queued arrivals (`~22s`), `AVG ≈ 10s–12s`.
   - `Section 5.4`: `Qualifying Workloads: 8 (completed=8 [8 pods])`, **`EFFECTIVE SAT ≈ 46%–52%`** (`704 / 1,408 TPU-s = 50.0%`).
 - **What Definitely MUST NOT Happen (Red Flags / Regression Bugs)**:
-  - ❌ `cq-capped` admitting all 4 `arr-cap-*` jobs at `t=0s` (`32` TPUs = `200%`, which would happen if `init-cap-*`'s `16` TPUs were missing from `cq-capped` quota accounting).
+  - ❌ `cq-capped` admitting 3 or 4 `arr-cap-*` jobs at `t=0s` (`28` or `32` TPUs = `175%`–`200%`, which would happen if `lendingLimit: 8` were ignored in favor of `borrowingLimit: 12` or `init-cap-*`'s `16` TPUs were missing from `cq-capped` quota accounting).
 
 #### `st44-t0-fair-sharing-preemption-over-monopolizer` — Cohort Fair-Sharing Preemption (`1 : 1` Weights) Evicting **Exact 4** of 8 `t0` Monopolizer `PodGroup`s
 

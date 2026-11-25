@@ -127,7 +127,7 @@ No `kueue.x-k8s.io/Topology` CRD is defined in `infra.json` (Topology-Aware Sche
 | ClusterQueue | Cohort | Queueing Strategy | FS Weight | Flavors | Nominal `cpu` | Nominal `memory` | Nominal `google.com/tpu` | Borrowing / Lending Limits | Preemption Policy (`withinCQ` / `reclaim` / `borrow`) |
 | :--- | :--- | :--- | :---: | :--- | ---: | ---: | ---: | :--- | :--- |
 | `cq-capped` | `cohort-limits` | `BestEffortFIFO` | `1` | `st-tpu-flavor` | **96 cores** | **384 GiB** | **16** | borrow: `google.com/tpu=8` | `Never` / `Never` / `Never` |
-| `cq-donor` | `cohort-limits` | `BestEffortFIFO` | `1` | `st-tpu-flavor` | **64 cores** | **256 GiB** | **16** | lend: `google.com/tpu=8` | `Never` / `Never` / `Never` |
+| `cq-donor` | `cohort-limits` | `BestEffortFIFO` | `1` | `st-tpu-flavor` | **64 cores** | **256 GiB** | **16** | lend: `google.com/tpu=12` | `Never` / `Never` / `Never` |
 | **Total Nominal Quota (CQs + Cohort)** | — | — | — | — | **160 cores** (125.0% of cluster) | **640 GiB** (125.0% of cluster) | **32** (100.0% of cluster) | — | — |
 
 ### 5.4 Namespaces & LocalQueues (`Namespace` & `LocalQueue`)

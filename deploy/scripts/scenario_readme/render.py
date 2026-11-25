@@ -76,9 +76,14 @@ def _render_overview_section(
         f"`workflows.json`: **{a.workflow_events_count:,}** events · "
         f"`execution-time.json`: **{a.exec_index.total_events:,}** events |"
     )
+    post_t0_node_note = ""
+    if a.post_t0_node_events:
+        ev_counts = Counter(ev_t for ev_t, _, _ in a.post_t0_node_events)
+        ev_desc = ", ".join(f"{cnt} `{ev_t}`" for ev_t, cnt in sorted(ev_counts.items()))
+        post_t0_node_note = f"; +{len(a.post_t0_node_events)} post-$t_0$ `Node` event(s): {ev_desc}"
     md.append(
         f"| **Cluster Capacity** | {' · '.join(cap_summary_parts)} "
-        f"({len(a.node_groups)} distinct node group{'s' if len(a.node_groups) != 1 else ''}) |"
+        f"({len(a.node_groups)} distinct node group{'s' if len(a.node_groups) != 1 else ''}{post_t0_node_note}) |"
     )
     md.append(
         f"| **Topology Configuration** | **{len(a.topologies_by_name)}** `Topology` CRD(s) "
@@ -89,10 +94,15 @@ def _render_overview_section(
         if a.cluster_alloc.get(a.primary_sat_resource, 0.0) > 0
         else 0.0
     )
+    synth_init_note = (
+        f"; includes {a.synthesized_initial_pods:,} synthesized from pre-admitted $t_0$ workloads"
+        if a.synthesized_initial_pods > 0
+        else ""
+    )
     md.append(
         f"| **Initial In-Flight Pods at $t_0$** | **{a.total_initial_pods:,}** pods across "
         f"**{len(a.init_nodes_used):,}** / {a.total_node_count:,} nodes "
-        f"(initial `{a.primary_sat_resource}` utilization: **{init_prim_pct:.2f}%**) |"
+        f"(initial `{a.primary_sat_resource}` utilization: **{init_prim_pct:.2f}%**{synth_init_note}) |"
     )
     md.append(
         f"| **Kueue Objects** | **{len(a.flavors_by_name)}** `ResourceFlavor`(s) · "
@@ -148,8 +158,16 @@ def _render_overview_section(
         sat_parts.append(f"{a.primary_sat_label}: **{headline_sat:.2f}%**")
     if a.primary_sat_resource != "cpu" and cpu_sat_all is not None:
         sat_parts.append(f"`cpu`: **{cpu_sat_all:.2f}%**")
-    if mem_sat_all is not None:
+    if a.primary_sat_resource != "memory" and mem_sat_all is not None:
         sat_parts.append(f"`memory`: **{mem_sat_all:.2f}%**")
+    if (
+        a.primary_accel_resource
+        and a.primary_accel_resource != a.primary_sat_resource
+        and a.total_wf_accel > 0
+    ):
+        acc_sat_all = a.saturation_pct(a.unadmitted_wfs, a.primary_accel_resource)
+        if acc_sat_all is not None:
+            sat_parts.append(f"`{a.primary_accel_resource}`: **{acc_sat_all:.2f}%**")
 
     headline_sat_6h = a.saturation_over_window_pct(a.unadmitted_wfs, a.primary_sat_resource, DEFAULT_SIX_HOUR_SEC)
     cpu_sat_6h = a.saturation_over_window_pct(a.unadmitted_wfs, "cpu", DEFAULT_SIX_HOUR_SEC)
@@ -159,8 +177,18 @@ def _render_overview_section(
         sat_6h_parts.append(f"{a.primary_sat_label}: **{headline_sat_6h:.2f}%**")
     if a.primary_sat_resource != "cpu" and cpu_sat_6h is not None:
         sat_6h_parts.append(f"`cpu`: **{cpu_sat_6h:.2f}%**")
-    if mem_sat_6h is not None:
+    if a.primary_sat_resource != "memory" and mem_sat_6h is not None:
         sat_6h_parts.append(f"`memory`: **{mem_sat_6h:.2f}%**")
+    if (
+        a.primary_accel_resource
+        and a.primary_accel_resource != a.primary_sat_resource
+        and a.total_wf_accel > 0
+    ):
+        acc_sat_6h = a.saturation_over_window_pct(
+            a.unadmitted_wfs, a.primary_accel_resource, DEFAULT_SIX_HOUR_SEC
+        )
+        if acc_sat_6h is not None:
+            sat_6h_parts.append(f"`{a.primary_accel_resource}`: **{acc_sat_6h:.2f}%**")
 
     empty_sat_note = "n/a (instantaneous $t=0$ burst: $T_{\\text{test}} = 0$)"
     sat_window_summary = " · ".join(sat_parts) if sat_parts else empty_sat_note
@@ -431,10 +459,22 @@ def _render_initial_pods_section(a: ScenarioAnalysis) -> list[str]:
         f"`{a.total_node_count - len(a.init_nodes_used):,}` nodes completely free)."
     )
     if a.admitted_at_start_wfs:
-        md.append(
-            f"Additionally, `workflows.json` records **`{len(a.admitted_at_start_wfs):,}`** pre-existing `Admitted` "
-            f"`JobSet` warmup workflow object(s) at $t_0$."
-        )
+        kind_counts = Counter(w.kind for w in a.admitted_at_start_wfs)
+        if len(kind_counts) == 1:
+            only_kind = next(iter(kind_counts))
+            md.append(
+                f"Additionally, `workflows.json` records **`{len(a.admitted_at_start_wfs):,}`** pre-existing `Admitted` "
+                f"`{only_kind}` warmup workflow object(s) at $t_0$."
+            )
+        else:
+            kind_parts = ", ".join(
+                f"{cnt:,} `{k}`"
+                for k, cnt in sorted(kind_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+            md.append(
+                f"Additionally, `workflows.json` records **`{len(a.admitted_at_start_wfs):,}`** pre-existing `Admitted` "
+                f"warmup workflow object(s) at $t_0$ ({kind_parts})."
+            )
     md.append("")
 
     md.append("### 4.1 Initial Cluster Utilization Breakdown")
@@ -826,6 +866,9 @@ def _render_workload_analysis_section(
     sat_summary_res_keys: list[str] = []
     if a.primary_accel_resource and a.primary_accel_resource in a.cluster_cap:
         sat_summary_res_keys.append(a.primary_accel_resource)
+    for extra_ar in a.accel_resources:
+        if extra_ar in a.cluster_cap and extra_ar not in sat_summary_res_keys:
+            sat_summary_res_keys.append(extra_ar)
     for extra_rk in ("cpu", "memory"):
         if extra_rk in a.cluster_cap and extra_rk not in sat_summary_res_keys:
             sat_summary_res_keys.append(extra_rk)
@@ -898,14 +941,28 @@ def _render_workload_analysis_section(
     )
 
     has_accel = bool(a.primary_accel_resource and a.total_wf_accel > 0)
+    prim_sat = a.primary_sat_resource
+
+    def _offered_col_hdr(rk: str, *, short: bool = False) -> str:
+        if rk == "cpu":
+            return "Offered Core-Hours"
+        if rk == "memory":
+            return "Offered GiB-h" if short else "Offered GiB-Hours"
+        return f"Offered `{rk}`-h" if short else f"Offered `{rk}`-Hours"
+
+    def _fmt_sat_cell(val: float | None, *, bold: bool) -> str:
+        if val is None:
+            return "n/a"
+        return f"**{val:.2f}%**" if bold else f"{val:.2f}%"
+
     if has_accel:
         md.append(
-            f"| Priority Class | Priority Value | Workloads | Share | Total Pods | Gang Size (`min / P50 / P90 / max`) | Duration (`P50 / AVG / P90 / P99`) | Offered `{a.primary_accel_resource}`-Hours | `{a.primary_accel_resource}` Saturation | `cpu` Saturation | `memory` Saturation |"
+            f"| Priority Class | Priority Value | Workloads | Share | Total Pods | Gang Size (`min / P50 / P90 / max`) | Duration (`P50 / AVG / P90 / P99`) | {_offered_col_hdr(prim_sat)} | `{a.primary_accel_resource}` Saturation | `cpu` Saturation | `memory` Saturation |"
         )
         md.append("| :--- | ---: | ---: | ---: | ---: | :---: | :---: | ---: | ---: | ---: | ---: |")
     else:
         md.append(
-            "| Priority Class | Priority Value | Workloads | Share | Total Pods | Gang Size (`min / P50 / P90 / max`) | Duration (`P50 / AVG / P90 / P99`) | Offered Core-Hours | `cpu` Saturation | `memory` Saturation |"
+            f"| Priority Class | Priority Value | Workloads | Share | Total Pods | Gang Size (`min / P50 / P90 / max`) | Duration (`P50 / AVG / P90 / P99`) | {_offered_col_hdr(prim_sat)} | `cpu` Saturation | `memory` Saturation |"
         )
         md.append("| :--- | ---: | ---: | ---: | ---: | :---: | :---: | ---: | ---: | ---: |")
 
@@ -916,25 +973,24 @@ def _render_workload_analysis_section(
         d_st = calc_summary_stats([w.duration_sec for w in subset])
         gang_str = f"`{int(p_st['min'])} / {int(p_st['p50'])} / {int(p_st['p90'])} / {int(p_st['max'])}`"
         dur_str = f"`{d_st['p50']:.0f}s / {d_st['avg']:.0f}s / {d_st['p90']:.0f}s / {d_st['p99']:.0f}s`"
+        prim_hrs = sum(w.total_requests.get(prim_sat, 0.0) * w.duration_sec for w in subset) / 3600.0
         c_sat = a.saturation_pct(subset, "cpu")
         m_sat = a.saturation_pct(subset, "memory")
-        c_sat_s = f"**{c_sat:.2f}%**" if (c_sat is not None and bold_total) else (f"{c_sat:.2f}%" if c_sat is not None else "n/a")
-        m_sat_s = f"**{m_sat:.2f}%**" if (m_sat is not None and bold_total) else (f"{m_sat:.2f}%" if m_sat is not None else "n/a")
+        c_sat_s = _fmt_sat_cell(c_sat, bold=(prim_sat == "cpu" or bold_total))
+        m_sat_s = _fmt_sat_cell(m_sat, bold=(prim_sat == "memory" or bold_total))
 
         if has_accel and a.primary_accel_resource is not None:
-            acc_hrs = sum(w.total_requests.get(a.primary_accel_resource, 0.0) * w.duration_sec for w in subset) / 3600.0
             a_sat = a.saturation_pct(subset, a.primary_accel_resource)
-            a_sat_s = f"**{a_sat:.2f}%**" if a_sat is not None else "n/a"
+            a_sat_s = _fmt_sat_cell(a_sat, bold=(prim_sat == a.primary_accel_resource or bold_total))
             return (
                 f"| {label_str} | {prio_val_str} | {'**' if bold_total else ''}{w_cnt:,}{'**' if bold_total else ''} | "
                 f"{w_share:.1f}% | {int(p_st['sum']):,} | {gang_str} | {dur_str} | "
-                f"{acc_hrs:,.1f} | {a_sat_s} | {c_sat_s} | {m_sat_s} |"
+                f"{prim_hrs:,.1f} | {a_sat_s} | {c_sat_s} | {m_sat_s} |"
             )
-        core_hrs = sum(w.total_requests.get("cpu", 0.0) * w.duration_sec for w in subset) / 3600.0
         return (
             f"| {label_str} | {prio_val_str} | {'**' if bold_total else ''}{w_cnt:,}{'**' if bold_total else ''} | "
             f"{w_share:.1f}% | {int(p_st['sum']):,} | {gang_str} | {dur_str} | "
-            f"{core_hrs:,.1f} | {c_sat_s} | {m_sat_s} |"
+            f"{prim_hrs:,.1f} | {c_sat_s} | {m_sat_s} |"
         )
 
     for p_name in ordered_priorities:
@@ -956,16 +1012,15 @@ def _render_workload_analysis_section(
         key=lambda k: (-len(wfs_by_lq.get(k, [])), k[0], k[1]),
     )
 
-    if has_accel:
-        md.append(
-            f"| LocalQueue (`ns/name`) | Target `ClusterQueue` | Workloads | Share | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Offered `{a.primary_accel_resource}`-h | Cluster `{a.primary_accel_resource}` Saturation | Target CQ Nominal Quota Saturation | Priority Breakdown (Count) |"
-        )
-        md.append("| :--- | :--- | ---: | ---: | ---: | :---: | ---: | ---: | ---: | :--- |")
-    else:
-        md.append(
-            "| LocalQueue (`ns/name`) | Target `ClusterQueue` | Workloads | Share | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Offered Core-Hours | Cluster `cpu` Saturation | Target CQ Nominal `cpu` Saturation | Priority Breakdown (Count) |"
-        )
-        md.append("| :--- | :--- | ---: | ---: | ---: | :---: | ---: | ---: | ---: | :--- |")
+    lq_cq_sat_hdr = (
+        f"Target CQ Nominal `{prim_sat}` Saturation"
+        if prim_sat in ("cpu", "memory")
+        else "Target CQ Nominal Quota Saturation"
+    )
+    md.append(
+        f"| LocalQueue (`ns/name`) | Target `ClusterQueue` | Workloads | Share | Total Pods | Duration (`P50 / AVG / P90 / P99`) | {_offered_col_hdr(prim_sat, short=True)} | Cluster `{prim_sat}` Saturation | {lq_cq_sat_hdr} | Priority Breakdown (Count) |"
+    )
+    md.append("| :--- | :--- | ---: | ---: | ---: | :---: | ---: | ---: | ---: | :--- |")
 
     for lq_ns, lq_name in ordered_lq_keys:
         subset = wfs_by_lq.get((lq_ns, lq_name), [])
@@ -988,43 +1043,33 @@ def _render_workload_analysis_section(
             f"`{p}`:{prio_c[p]}" for p in ordered_priorities if prio_c.get(p, 0) > 0
         ) or "none"
 
-        if has_accel and a.primary_accel_resource is not None:
-            offered_sec = sum(w.total_requests.get(a.primary_accel_resource, 0.0) * w.duration_sec for w in subset)
-            cl_sat = a.saturation_pct(subset, a.primary_accel_resource)
-            cq_q_val = cq_nom.get(a.primary_accel_resource, 0.0)
-            cq_sat = (
-                (100.0 * offered_sec / (a.test_length_sec * cq_q_val))
-                if (a.test_length_sec > 0 and cq_q_val > 0)
-                else None
-            )
-            md.append(
-                f"| `{lq_ns}/{lq_name}` | `{target_cq}` | **{w_cnt:,}** | {w_share:.1f}% | "
-                f"{int(p_st['sum']):,} | {dur_str} | {offered_sec / 3600.0:,.1f} | "
-                f"**{cl_sat:.2f}%** | {f'**{cq_sat:.2f}%**' if cq_sat is not None else 'n/a'} | {prio_brk} |"
-                if cl_sat is not None
-                else f"| `{lq_ns}/{lq_name}` | `{target_cq}` | **{w_cnt:,}** | {w_share:.1f}% | "
-                f"{int(p_st['sum']):,} | {dur_str} | {offered_sec / 3600.0:,.1f} | n/a | n/a | {prio_brk} |"
-            )
-        else:
-            offered_sec = sum(w.total_requests.get("cpu", 0.0) * w.duration_sec for w in subset)
-            cl_sat = a.saturation_pct(subset, "cpu")
-            cq_q_val = cq_nom.get("cpu", 0.0)
-            cq_sat = (
-                (100.0 * offered_sec / (a.test_length_sec * cq_q_val))
-                if (a.test_length_sec > 0 and cq_q_val > 0)
-                else None
-            )
-            md.append(
-                f"| `{lq_ns}/{lq_name}` | `{target_cq}` | **{w_cnt:,}** | {w_share:.1f}% | "
-                f"{int(p_st['sum']):,} | {dur_str} | {offered_sec / 3600.0:,.1f} | "
-                f"{f'**{cl_sat:.2f}%**' if cl_sat is not None else 'n/a'} | "
-                f"{f'**{cq_sat:.2f}%**' if cq_sat is not None else 'n/a'} | {prio_brk} |"
-            )
+        offered_sec = sum(w.total_requests.get(prim_sat, 0.0) * w.duration_sec for w in subset)
+        cl_sat = a.saturation_pct(subset, prim_sat)
+        cq_q_val = cq_nom.get(prim_sat, 0.0)
+        cq_sat = (
+            (100.0 * offered_sec / (a.test_length_sec * cq_q_val))
+            if (a.test_length_sec > 0 and cq_q_val > 0)
+            else None
+        )
+        md.append(
+            f"| `{lq_ns}/{lq_name}` | `{target_cq}` | **{w_cnt:,}** | {w_share:.1f}% | "
+            f"{int(p_st['sum']):,} | {dur_str} | {offered_sec / 3600.0:,.1f} | "
+            f"{f'**{cl_sat:.2f}%**' if cl_sat is not None else 'n/a'} | "
+            f"{f'**{cq_sat:.2f}%**' if cq_sat is not None else 'n/a'} | {prio_brk} |"
+        )
     md.append("")
 
     if ordered_lq_keys and a.unadmitted_wfs:
         md.append("#### Detailed Per-`LocalQueue` × Priority Dissection")
         md.append("")
+        if has_accel and a.primary_accel_resource is not None:
+            if prim_sat == a.primary_accel_resource:
+                det_col1, det_col2 = a.primary_accel_resource, "cpu"
+            else:
+                det_col1, det_col2 = prim_sat, a.primary_accel_resource
+        else:
+            det_col1, det_col2 = ("memory", "cpu") if prim_sat == "memory" else ("cpu", "memory")
+
         for lq_ns, lq_name in ordered_lq_keys:
             subset = wfs_by_lq.get((lq_ns, lq_name), [])
             if not subset:
@@ -1036,16 +1081,10 @@ def _render_workload_analysis_section(
                 f"<summary><b>LocalQueue <code>{lq_ns}/{lq_name}</code> → ClusterQueue <code>{target_cq}</code></b> ({len(subset):,} workloads)</summary>"
             )
             md.append("")
-            if has_accel:
-                md.append(
-                    f"| Priority Class | Priority Value | Workloads | Share of LQ | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Cluster `{a.primary_accel_resource}` Saturation | Cluster `cpu` Saturation |"
-                )
-                md.append("| :--- | ---: | ---: | ---: | ---: | :---: | ---: | ---: |")
-            else:
-                md.append(
-                    "| Priority Class | Priority Value | Workloads | Share of LQ | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Cluster `cpu` Saturation | Cluster `memory` Saturation |"
-                )
-                md.append("| :--- | ---: | ---: | ---: | ---: | :---: | ---: | ---: |")
+            md.append(
+                f"| Priority Class | Priority Value | Workloads | Share of LQ | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Cluster `{det_col1}` Saturation | Cluster `{det_col2}` Saturation |"
+            )
+            md.append("| :--- | ---: | ---: | ---: | ---: | :---: | ---: | ---: |")
 
             for p_name in ordered_priorities:
                 p_sub = [w for w in subset if w.priority_class == p_name]
@@ -1054,23 +1093,14 @@ def _render_workload_analysis_section(
                 p_val = a.priority_value_by_name.get(p_name, 0)
                 d_st = calc_summary_stats([w.duration_sec for w in p_sub])
                 dur_s = f"`{d_st['p50']:.0f}s / {d_st['avg']:.0f}s / {d_st['p90']:.0f}s / {d_st['p99']:.0f}s`"
-                c_sat = a.saturation_pct(p_sub, "cpu")
-                if has_accel and a.primary_accel_resource is not None:
-                    a_sat = a.saturation_pct(p_sub, a.primary_accel_resource)
-                    md.append(
-                        f"| `{p_name}` | `{p_val}` | **{len(p_sub):,}** | {100.0 * len(p_sub) / len(subset):.1f}% | "
-                        f"{sum(w.total_pods for w in p_sub):,} | {dur_s} | "
-                        f"{f'{a_sat:.2f}%' if a_sat is not None else 'n/a'} | "
-                        f"{f'{c_sat:.2f}%' if c_sat is not None else 'n/a'} |"
-                    )
-                else:
-                    m_sat = a.saturation_pct(p_sub, "memory")
-                    md.append(
-                        f"| `{p_name}` | `{p_val}` | **{len(p_sub):,}** | {100.0 * len(p_sub) / len(subset):.1f}% | "
-                        f"{sum(w.total_pods for w in p_sub):,} | {dur_s} | "
-                        f"{f'{c_sat:.2f}%' if c_sat is not None else 'n/a'} | "
-                        f"{f'{m_sat:.2f}%' if m_sat is not None else 'n/a'} |"
-                    )
+                sat1 = a.saturation_pct(p_sub, det_col1)
+                sat2 = a.saturation_pct(p_sub, det_col2)
+                md.append(
+                    f"| `{p_name}` | `{p_val}` | **{len(p_sub):,}** | {100.0 * len(p_sub) / len(subset):.1f}% | "
+                    f"{sum(w.total_pods for w in p_sub):,} | {dur_s} | "
+                    f"{f'{sat1:.2f}%' if sat1 is not None else 'n/a'} | "
+                    f"{f'{sat2:.2f}%' if sat2 is not None else 'n/a'} |"
+                )
             md.append("")
             md.append("</details>")
             md.append("")

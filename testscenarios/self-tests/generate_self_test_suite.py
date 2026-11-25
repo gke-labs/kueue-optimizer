@@ -1911,7 +1911,7 @@ def build_all_45_scenarios() -> list[ScenarioSpec]:
                 cpu_quota=64,
                 mem_gi_quota=256,
                 cohort_name="cohort-limits",
-                tpu_lending_limit=8,
+                tpu_lending_limit=12,
             )
         )
     )
@@ -1924,17 +1924,17 @@ def build_all_45_scenarios() -> list[ScenarioSpec]:
             scenario_id="st20",
             slug="borrowing-and-lending-limits-enforced",
             category="4. Multi-CQ & Cohort Borrowing/Reclaim",
-            title="Explicit `borrowingLimit` (`+8` TPUs) & `lendingLimit` (`8` TPUs) Cap Verification",
-            feature_focus="Verifies `cq-capped` stops at exactly `16 + 8 = 24` TPUs (`150%` of nominal, `75%` of cluster) even when `8` TPUs sit free",
+            title="Explicit Asymmetric `borrowingLimit: 8` vs. `lendingLimit: 12` Cap Verification",
+            feature_focus="Verifies `cq-capped` stops at exact `borrowingLimit: 8` (`16 + 8 = 24` TPUs = `150%` of nominal) even though `cq-donor` permits `lendingLimit: 12`",
             recommended_cmd="python3 deploy/scripts/testrunner.py testscenarios/self-tests/st20-borrowing-and-lending-limits-enforced",
-            setup_summary="8-node (`32`-TPU) cluster, `cohort-limits`. `cq-capped` has `nominalQuota=16, borrowingLimit=8`; `cq-donor` has `nominalQuota=16, lendingLimit=8`. 8 single-node (`4`-TPU, `22s`) jobs submitted to `cq-capped` at `t=0s`; `0` jobs in `cq-donor`.",
-            expected_behavior="Wave 1 admits **6 jobs** (`24` TPUs = `16` nominal + `8` borrowed = `150%` of nominal quota), leaving 2 physical nodes (`8` TPUs) reserved/unborrowable and keeping 2 jobs queued for `22s`. Wave 2 runs those last 2 jobs (`8` TPUs) from `22s` to `44s`.",
+            setup_summary="8-node (`32`-TPU) cluster, `cohort-limits`. `cq-capped` has `nominalQuota=16, borrowingLimit=8`; `cq-donor` has `nominalQuota=16, lendingLimit=12` (asymmetric so `borrowingLimit=8` is strictly the binding cap). 8 single-node (`4`-TPU, `22s`) jobs submitted to `cq-capped` at `t=0s`; `0` jobs in `cq-donor`.",
+            expected_behavior="Wave 1 admits **6 jobs** (`24` TPUs = `16` nominal + `8` borrowed = `150%` of nominal quota) because `cq-capped`'s `borrowingLimit: 8` binds strictly below `cq-donor`'s `lendingLimit: 12`, leaving 2 physical nodes (`8` TPUs) idle and keeping 2 jobs queued for `22s`. Wave 2 runs those last 2 jobs (`8` TPUs) from `22s` to `44s`.",
             expected_metrics=[
                 "`Section 5.1 (cq-capped)`: Peak utilization hits **exact `150.0%`** (`24 / 16` TPUs) during Wave 1 and never exceeds `150%`.",
                 "`Section 5.4 (Effective Saturation)`: `8 × 4 × 22 = 704 TPU-s` over `44s × 32 = 1,408 TPU-s` → **`EFFECTIVE SAT ≈ 47%–52%`** (Wave 1 = `75%`, Wave 2 = `25%`, average = `50%`).",
             ],
             must_not_happen=[
-                "`cq-capped` utilization exceeding `150%` (`> 24` TPUs) in `Section 5.1` (would mean `borrowingLimit` / `lendingLimit` was violated).",
+                "`cq-capped` utilization exceeding `150%` (`> 24` TPUs) in `Section 5.1` (would mean `borrowingLimit: 8` was ignored in favor of `lendingLimit: 12`).",
             ],
             sec51_target="cq-capped P90/P99 = 150.0% (24/16 TPUs)",
             sec52_target="6 jobs ~0s, 2 jobs ~22s",
@@ -1952,6 +1952,15 @@ def build_all_45_scenarios() -> list[ScenarioSpec]:
 
     # st21: No Fair Sharing — First-Come Cohort Pool Starvation
     inf, wf, ex = base_cluster_infra(num_nodes=8), [], []
+    inf.insert(
+        0,
+        make_infra_event(
+            {
+                "apiVersion": "config.kueue.x-k8s.io/v1beta2",
+                "kind": "Configuration",
+            }
+        ),
+    )
     inf.append(make_infra_event(make_cohort("cohort-nofs", tpu_quota=32, cpu_quota=128, mem_gi_quota=512)))
     inf.append(make_infra_event(make_cluster_queue("cq-hog", tpu_quota=0, cpu_quota=0, mem_gi_quota=0, cohort_name="cohort-nofs")))
     inf.append(make_infra_event(make_cluster_queue("cq-victim", tpu_quota=0, cpu_quota=0, mem_gi_quota=0, cohort_name="cohort-nofs")))
@@ -1966,18 +1975,18 @@ def build_all_45_scenarios() -> list[ScenarioSpec]:
             scenario_id="st21",
             slug="no-fair-sharing-fcfs-hogging",
             category="5. Fair Sharing & Priority Thresholds",
-            title="Zero-Nominal Shared Pool Without Fair Sharing (First-Mover Monopolization)",
-            feature_focus="Baseline control for `st22`: shared `32`-TPU Cohort pool (`0` CQ nominal quotas, `reclaimWithinCohort: Never`)",
-            recommended_cmd="python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging",
-            setup_summary="8-node (`32`-TPU) cluster. All `32` TPUs live on `Cohort: cohort-nofs`; both `cq-hog` and `cq-victim` have `nominalQuota: 0` and `reclaimWithinCohort: Never`. `cq-hog` submits 8 jobs (`32` TPUs, `28s`) at `t=0s`; `cq-victim` submits 4 jobs (`16` TPUs, `18s`) at `t=4s`.",
-            expected_behavior="`cq-hog` grabs 100% of the shared `32`-TPU cohort pool at `t=0s`. When `cq-victim` arrives at `t=4s`, `reclaimWithinCohort: Never` prevents cohort preemption, so `cq-victim` waits (`0` TPUs) for `24s` until `cq-hog` finishes at `t=28s`.",
+            title="Zero-Nominal Shared Pool Without Fair Sharing (First-Mover Monopolization, `--no-fair-sharing`)",
+            feature_focus="Baseline control for `st22`: global Fair Sharing disabled (`Configuration` omitting `fairSharing` + `--no-fair-sharing`) on a shared `32`-TPU Cohort pool (`0` CQ nominal quotas, `reclaimWithinCohort: Never`)",
+            recommended_cmd="python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging --no-fair-sharing",
+            setup_summary="8-node (`32`-TPU) cluster with global Fair Sharing disabled (`kind: Configuration` omitting `fairSharing` + `--no-fair-sharing`). All `32` TPUs live on `Cohort: cohort-nofs`; both `cq-hog` and `cq-victim` have `nominalQuota: 0` and `reclaimWithinCohort: Never`. `cq-hog` submits 8 jobs (`32` TPUs, `28s`) at `t=0s`; `cq-victim` submits 4 jobs (`16` TPUs, `18s`) at `t=4s`.",
+            expected_behavior="`testrunner.py` deploys `kueue-controller-manager` with Fair Sharing disabled. `cq-hog` grabs 100% of the shared `32`-TPU cohort pool at `t=0s`. When `cq-victim` arrives at `t=4s`, both disabled Fair Sharing and `reclaimWithinCohort: Never` prevent cohort preemption, so `cq-victim` waits (`0` TPUs) for `24s` until `cq-hog` finishes at `t=28s`.",
             expected_metrics=[
                 "`Section 5.1 (Cohort: cohort-nofs)`: `AVG ≈ 80%–95%` (`32/32` from `0s–28s`, `16/32` from `28s–46s`).",
                 "`Section 5.2`: `cq-victim` jobs wait **`~24s`** while `cq-hog` jobs wait `~0s`.",
                 "`Section 5.3`: **`0`** evictions.",
             ],
             must_not_happen=[
-                "`cq-victim` preempting `cq-hog` when both have `0` nominal quota and `reclaimWithinCohort: Never`.",
+                "`cq-victim` preempting `cq-hog` when global Fair Sharing is disabled and both CQs have `0` nominal quota and `reclaimWithinCohort: Never`.",
             ],
             sec51_target="Cohort ~80%–92%",
             sec52_target="cq-victim waits ~24s",
@@ -3254,7 +3263,7 @@ def build_all_45_scenarios() -> list[ScenarioSpec]:
                 cpu_quota=96,
                 mem_gi_quota=384,
                 cohort_name="cohort-t0-lim",
-                tpu_borrowing_limit=8,
+                tpu_borrowing_limit=12,
             )
         )
     )
@@ -3284,7 +3293,7 @@ def build_all_45_scenarios() -> list[ScenarioSpec]:
             cq="cq-capped",
             node_names=[f"st-node-{i:02d}"],
         )
-    # 4 arriving jobs want 16 more TPUs, but borrowingLimit=8 allows ONLY 2 jobs (+8 TPUs -> 24 TPUs = 150% max)!
+    # 4 arriving jobs want 16 more TPUs, but donor lendingLimit=8 (strictly below borrowingLimit=12) allows ONLY 2 jobs (+8 TPUs -> 24 TPUs = 150% max)!
     for i in range(4):
         add_job(wf, ex, name=f"arr-cap-{i}", arrival_sec=0.0, duration_sec=22.0, lq="lq-capped", cq="cq-capped")
     scenarios.append(
@@ -3292,18 +3301,18 @@ def build_all_45_scenarios() -> list[ScenarioSpec]:
             scenario_id="st43",
             slug="t0-borrowing-limit-enforced-with-initial-load",
             category="9. Initial t0 Workloads — Reclaims, Limits & Fair Sharing",
-            title="`borrowingLimit: 8` & `lendingLimit: 8` Enforced on Top of `t0` Nominal Quota Load (`150%` Ceiling)",
-            feature_focus="Verifies `16` TPUs of `t0` nominal usage + `8` TPUs of `t=0s` arrivals hit the exact `24`-TPU (`150.0%`) borrowing ceiling while keeping 2 nodes idle and 2 arrivals queued",
+            title="Asymmetric `borrowingLimit: 12` vs. `lendingLimit: 8` Enforced on Top of `t0` Nominal Quota Load (`150%` Ceiling)",
+            feature_focus="Verifies `16` TPUs of `t0` nominal usage + `8` TPUs capped strictly by donor `lendingLimit: 8` (below `borrowingLimit: 12`) hit the exact `24`-TPU (`150.0%`) ceiling while keeping 2 nodes idle and 2 arrivals queued",
             recommended_cmd="python3 deploy/scripts/testrunner.py testscenarios/self-tests/st43-t0-borrowing-limit-enforced-with-initial-load",
-            setup_summary="8-node (`32`-TPU) cluster, `cohort-t0-lim`. `cq-capped` (`nominalQuota=16, borrowingLimit=8`); `cq-donor` (`nominalQuota=16, lendingLimit=8`). At `t0`, 4 `Admitted` `init-cap-*` jobs (`16` TPUs, `22s`) already fill `cq-capped`'s nominal quota. At `t=0s`, 4 `NotAdmitted` `arr-cap-*` jobs (`16` TPUs, `22s`) arrive.",
-            expected_behavior="Kueue accounts for `init-cap-0..3`'s `16` TPUs, admits **only 2** of the 4 `arr-cap-*` arrivals at `t=0s` (`16 + 8 = 24` TPUs = `150.0%` of nominal, leaving 2 nodes idle), queues the other 2 `arr-cap-*` jobs for `~22s`, and drains them in `22s–44s`.",
+            setup_summary="8-node (`32`-TPU) cluster, `cohort-t0-lim`. `cq-capped` (`nominalQuota=16, borrowingLimit=12`); `cq-donor` (`nominalQuota=16, lendingLimit=8`, asymmetric so `lendingLimit=8` is strictly the binding cap). At `t0`, 4 `Admitted` `init-cap-*` jobs (`16` TPUs, `22s`) already fill `cq-capped`'s nominal quota. At `t=0s`, 4 `NotAdmitted` `arr-cap-*` jobs (`16` TPUs, `22s`) arrive.",
+            expected_behavior="Kueue accounts for `init-cap-0..3`'s `16` TPUs, admits **only 2** of the 4 `arr-cap-*` arrivals at `t=0s` (`16 + 8 = 24` TPUs = `150.0%` of nominal, capped strictly by `cq-donor`'s `lendingLimit: 8` below `cq-capped`'s `borrowingLimit: 12`, leaving 2 nodes idle), queues the other 2 `arr-cap-*` jobs for `~22s`, and drains them in `22s–44s`.",
             expected_metrics=[
-                "`Section 5.1 (cq-capped)`: Peak utilization hits **exact `150.0%`** (`24 / 16` TPUs) and NEVER reaches `200%` (`32 / 16`).",
+                "`Section 5.1 (cq-capped)`: Peak utilization hits **exact `150.0%`** (`24 / 16` TPUs) and NEVER reaches `175%` (`28 / 16`) or `200%` (`32 / 16`).",
                 "`Section 5.2`: 2 immediate arrivals (`<= 1.0s`) + 2 queued arrivals (`~22s`), `AVG ≈ 10s–12s`.",
                 "`Section 5.4`: `Qualifying Workloads: 8 (completed=8 [8 pods])`, **`EFFECTIVE SAT ≈ 46%–52%`** (`704 / 1,408 TPU-s = 50.0%`).",
             ],
             must_not_happen=[
-                "`cq-capped` admitting all 4 `arr-cap-*` jobs at `t=0s` (`32` TPUs = `200%`, which would happen if `init-cap-*`'s `16` TPUs were missing from `cq-capped` quota accounting).",
+                "`cq-capped` admitting 3 or 4 `arr-cap-*` jobs at `t=0s` (`28` or `32` TPUs = `175%`–`200%`, which would happen if `lendingLimit: 8` were ignored in favor of `borrowingLimit: 12` or `init-cap-*`'s `16` TPUs were missing from `cq-capped` quota accounting).",
             ],
             sec51_target="cq-capped P90/P99 = 150.0% (24/16 TPUs)",
             sec52_target="2 jobs ~0s, 2 jobs ~22s (AVG ~11s)",
@@ -3768,16 +3777,16 @@ SCENARIO_PAIRINGS: dict[str, list[dict[str, str]]] = {
     "st20": [
         {
             "peer_id": "st43",
-            "relationship": "Greenfield `borrowingLimit: 8` (`st20`) vs. `t0`-Occupied `borrowingLimit: 8` (`st43`) Pair",
-            "knob_changed": "`st20` submits 8 `NotAdmitted` jobs at `t=0s`, whereas `st43` starts with 4 `t0` `Admitted` jobs (`16` nominal TPUs) and submits 4 `NotAdmitted` jobs at `t=0s`.",
-            "cross_check": "Both runs cap `cq-capped` at **exact `150.0%` (`24/16` TPUs)** in Wave 1 (`6` concurrent jobs = `4` `t0` + `2` arriving in `st43`), leaving 2 nodes idle and 2 jobs queued.",
+            "relationship": "Greenfield `borrowingLimit: 8` (`st20`, `lendingLimit: 12`) vs. `t0`-Occupied `lendingLimit: 8` (`st43`, `borrowingLimit: 12`) Pair",
+            "knob_changed": "`st20` binds on `borrowingLimit: 8` (`< lendingLimit: 12`) with 8 `NotAdmitted` jobs at `t=0s`, whereas `st43` binds on `lendingLimit: 8` (`< borrowingLimit: 12`) with 4 `t0` `Admitted` jobs (`16` nominal TPUs) + 4 `NotAdmitted` jobs at `t=0s`.",
+            "cross_check": "Both runs cap `cq-capped` at **exact `150.0%` (`24/16` TPUs)** in Wave 1 (`6` concurrent jobs = `4` `t0` + `2` arriving in `st43`), leaving 2 nodes idle and 2 jobs queued, proving independent enforcement of both `borrowingLimit` and `lendingLimit`.",
         },
     ],
     "st21": [
         {
             "peer_id": "st22",
-            "relationship": "No Fair Sharing (`st21`) vs. Equal `1:1` Fair Sharing (`st22`) Pair",
-            "knob_changed": "Unweighted shared Cohort pool (`st21`) vs. `fairSharing: {weight: '1'}` on both CQs (`st22`).",
+            "relationship": "No Fair Sharing (`st21`, `--no-fair-sharing`) vs. Equal `1:1` Fair Sharing (`st22`) Pair",
+            "knob_changed": "Global Fair Sharing disabled via declarative `Configuration` + `--no-fair-sharing` (`reclaimWithinCohort: Never` in `st21`) vs. global Fair Sharing enabled with `fairSharing: {weight: '1'}` and `reclaimWithinCohort: Any` on both CQs (`st22`).",
             "cross_check": "In `st21`, first-mover `cq-hog` monopolizes `32/32` TPUs while `cq-victim` waits `~24s`; in `st22`, both teams split the `32`-TPU pool `50/50` (`16` vs. `16` TPUs) across every wave.",
         },
     ],
@@ -4000,9 +4009,9 @@ SCENARIO_PAIRINGS: dict[str, list[dict[str, str]]] = {
     "st43": [
         {
             "peer_id": "st20",
-            "relationship": "`t0`-Loaded `borrowingLimit: 8` (`st43`) vs. Fresh `borrowingLimit: 8` (`st20`) Pair",
-            "knob_changed": "`st43` pre-fills `cq-capped`'s `16` nominal TPUs with 4 `t0` `PodGroup`s before 4 arrivals submit at `t=0s`, whereas `st20` submits all 8 as `NotAdmitted` at `t=0s`.",
-            "cross_check": "Both enforce the exact `24`-TPU (`150.0%`) ceiling in `Sec 5.1` and yield `Sec 5.4 EFFECTIVE SAT ≈ 50.0%` (`2` arrivals admitted immediately + `2` queued `~22s` in `st43`).",
+            "relationship": "`t0`-Loaded `lendingLimit: 8` (`st43`, `borrowingLimit: 12`) vs. Fresh `borrowingLimit: 8` (`st20`, `lendingLimit: 12`) Pair",
+            "knob_changed": "`st43` binds on `lendingLimit: 8` (`< borrowingLimit: 12`) with 4 `t0` `PodGroup`s pre-filling `cq-capped`'s `16` nominal TPUs before 4 arrivals submit at `t=0s`, whereas `st20` binds on `borrowingLimit: 8` (`< lendingLimit: 12`) with all 8 jobs submitted as `NotAdmitted` at `t=0s`.",
+            "cross_check": "Both enforce the exact `24`-TPU (`150.0%`) ceiling in `Sec 5.1` and yield `Sec 5.4 EFFECTIVE SAT ≈ 50.0%` (`2` arrivals admitted immediately + `2` queued `~22s` in `st43`), verifying independent enforcement of both `lendingLimit` and `borrowingLimit`.",
         },
     ],
     "st44": [
@@ -4034,6 +4043,10 @@ def generate_scenario_agents_md(sc: ScenarioSpec, by_id: dict[str, ScenarioSpec]
     pairs = SCENARIO_PAIRINGS.get(sc.scenario_id, [])
     pair_dirs = [by_id[p["peer_id"]].dir_name for p in pairs if p["peer_id"] in by_id]
     pair_badges = ", ".join(f"[`{d}`](../{d}/AGENTS.md)" for d in pair_dirs) if pair_dirs else "None"
+    ordered_scenarios = sorted(by_id.values(), key=lambda s: s.scenario_id)
+    total_scenarios = len(ordered_scenarios)
+    first_sc = ordered_scenarios[0]
+    last_sc = ordered_scenarios[-1]
 
     lines: list[str] = [
         f"# Agent Execution & Cross-Examination Guide — `{sc.dir_name}`",
@@ -4053,7 +4066,7 @@ def generate_scenario_agents_md(sc: ScenarioSpec, by_id: dict[str, ScenarioSpec]
         f"- **Title**: {sc.title}",
         f"- **Primary Verification Target**: {sc.feature_focus}",
         f"- **Dedicated `kueue-optimizer` Chamber Namespace**: `{sc.chamber_namespace}` (`--namespace {sc.chamber_namespace}`)",
-        f"- **Dedicated Local Port Allocation**: KWOK API `--port {sc.apiserver_port}` | Prometheus `{sc.prometheus_port}` (collision-free across all 45 scenarios `st01`–`st45`)",
+        f"- **Dedicated Local Port Allocation**: KWOK API `--port {sc.apiserver_port}` | Prometheus `{sc.prometheus_port}` (collision-free across all {total_scenarios} scenarios `{first_sc.scenario_id}`–`{last_sc.scenario_id}`)",
         f"- **Mandatory Paired Counterpart(s)**: {pair_badges}",
         f"- **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).",
         "",
@@ -4065,7 +4078,7 @@ def generate_scenario_agents_md(sc: ScenarioSpec, by_id: dict[str, ScenarioSpec]
         "",
         "### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers",
         "",
-        "Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:",
+        f"Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`{first_sc.chamber_namespace}` .. `{last_sc.chamber_namespace}`) and non-overlapping port pair (`{first_sc.apiserver_port}/{first_sc.prometheus_port}` .. `{last_sc.apiserver_port}/{last_sc.prometheus_port}`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:",
         "",
         "```bash",
         f"# Launch {sc.scenario_id.upper()} in dedicated kueue-optimizer chamber '{sc.chamber_namespace}' (API port {sc.apiserver_port}, Prom port {sc.prometheus_port}):",
@@ -4318,11 +4331,11 @@ def generate_master_readme(scenarios: list[ScenarioSpec]) -> str:
         "- **Category 2 (`st06`–`st10`)**: Queueing discipline (`StrictFIFO` HoL blocking vs. `BestEffortFIFO` backfill), 4-wave backlog wait-time staircase, non-preemptive priority ordering, and 7-level TAS binary-tree cube packing.",
         "- **Category 3 (`st11`–`st15`)**: Intra-ClusterQueue preemption policies (`Never`, `LowerPriority`, `LowerOrNewerEqualPriority`), 4-tier cascading preemptions, and adversarial late-preemption badput collapse.",
         "- **Category 4 (`st16`–`st20`)**: Multi-CQ quota isolation vs. Cohort borrowing (`200%` of nominal quota), instant Cohort reclaim (`reclaimWithinCohort: Any` vs. `Never`), and explicit `borrowingLimit` / `lendingLimit` ceilings (`150%`).",
-        "- **Category 5 (`st21`–`st25`)**: Fair-sharing spectrum from unweighted monopolization (`st21`) to symmetric `1:1` DRF (`st22`), asymmetric `7:1` DRF (`st23`), 6-CQ geometric hierarchy `1..32` (`st24`), and Classical `borrowWithinCohort.maxPriorityThreshold` gating (`st25`).",
+        "- **Category 5 (`st21`–`st25`)**: Fair-sharing spectrum from Fair-Sharing-disabled monopolization (`st21`, `--no-fair-sharing`) to symmetric `1:1` DRF (`st22`), asymmetric `7:1` DRF (`st23`), 6-CQ geometric hierarchy `1..32` (`st24`), and Classical `borrowWithinCohort.maxPriorityThreshold` gating (`st25`).",
         "- **Category 6 (`st26`–`st30`)**: Real-world Kubernetes/Kueue accounting edge cases — pre-existing `t0` unmanaged pods in `infra-pods` (`st26`), host CPU/RAM bottleneck inversion (`st27`), `initContainers` high-water mark + `spec.overhead` (`st28`), multi-role heterogeneous `JobSet` PodSets (`st29`), and permanently `inadmissible` oversized jobs (`st30`).",
         "- **Category 7 (`st31`–`st35`) — Initial `t0` Workloads: Handling & Accounting**: Pre-admitted `t0` Kueue `PodGroup` quota occupancy & offset-jump remaining duration (`st31`), hybrid `t0` Kueue `PodGroup`s + non-Kueue `infra-pods` separation (`st32`), legacy `--hash-names` Tier-3 matching + Tier-4 missing-pod synthesis (`st33`), multi-role heterogeneous `t0` `PodGroup` divisibility (`st34`), and infinite-duration `t0` `PodGroup` `ACTIVE AT END` / `FULL-DUR SAT` non-inflation (`st35`).",
         "- **Category 8 (`st36`–`st40`) — Initial `t0` Workloads: Preemption & TAS**: Non-preemptive `t0` protection (`st36`) vs. active `LowerPriority` preemption + dynamic parent `JobSet` resubmission without `Workload` name collisions (`st37`), `LowerOrNewerEqualPriority` `t0` seniority protection (`st38`), adversarial `t0` late-preemption badput exclusion (`st39`), and `t0` 7-level TAS topology domain occupancy (`st40`).",
-        "- **Category 9 (`st41`–`st45`) — Initial `t0` Workloads: Reclaims, Limits & Fair Sharing**: Cohort reclamation against `200%` `t0` borrowers (`st41` `Any` vs. `st42` `Never`), `borrowingLimit: 8` / `lendingLimit: 8` enforced on top of `t0` nominal load (`st43`), and `1:1` Cohort Fair-Sharing preemption evicting exact `4` of `8` `t0` monopolizer `PodGroup`s (`st44`) vs. `reclaimWithinCohort: Never` control (`st45`).",
+        "- **Category 9 (`st41`–`st45`) — Initial `t0` Workloads: Reclaims, Limits & Fair Sharing**: Cohort reclamation against `200%` `t0` borrowers (`st41` `Any` vs. `st42` `Never`), asymmetric `borrowingLimit: 12` / `lendingLimit: 8` enforced on top of `t0` nominal load (`st43`), and `1:1` Cohort Fair-Sharing preemption evicting exact `4` of `8` `t0` monopolizer `PodGroup`s (`st44`) vs. `reclaimWithinCohort: Never` control (`st45`).",
         "- **Category 10 (`st46`–`st50`) — Large-Scale Quota-Only Admission (`>100` Nodes, `>1,000` Workloads, No TAS)**: `128`-node `1,056`-workload full saturation (`st46`), `128`-node `1,080`-workload intra-CQ preemption & `64`-job `t0` resubmit (`st47`), `144`-node `1,116`-workload Cohort `200%` borrowing & `72`-job reclaim (`st48`), `160`-node `1,160`-workload 4-CQ Fair Sharing (`st49`), and `128`-node `1,064`-workload multi-API (`JobSet`, `Job`, `PodGroup`, infinite `Deployment`) + `16` `infra-pods` parity (`st50`).",
         "- **Category 11 (`st51`–`st55`) — Large-Scale TAS Packing, Slices & Multi-Pool (`>100` Nodes, `>1,000` Workloads)**: `128`-node `1,088`-workload 7-level TAS packing (`st51`), `160`-node `1,120`-workload `4`/`2`/`1`-node mixed TAS slices (`st52`), `128`-node `1,056`-workload rack-fragmentation blocking & `BestEffortFIFO` backfill (`st53`), `144`-node `1,104`-workload partial vanilla-K8s `t0` TAS binding + `required`/`preferred`/`unconstrained` modes (`st54`), and `256`-node (`2,048`-TPU) `1,200`-workload dual-`ResourceFlavor` TAS stress (`st55`).",
         "- **Category 12 (`st56`–`st60`) — Large-Scale TAS Preemption, Reclaim, Fair Sharing & Hybrid (`>100` Nodes, `>1,000` Workloads)**: `128`-node `1,060`-workload `2x2x2-id` TAS preemption (`st56`), `128`-node `1,088`-workload TAS Cohort `200%` borrowing & `64`-job reclaim (`st57`), `160`-node `1,140`-workload 4-CQ TAS Fair Sharing (`st58`), `128`-node `1,048`-workload TAS `borrowingLimit: 256` (`150%`) cap (`st59`), and `144`-node `1,080`-workload hybrid multi-API TAS + `16` `infra-pods` + `16` infinite `Deployment`s scraper stress (`st60`).",
@@ -4453,7 +4466,7 @@ def _format_jsonl(records: list[dict[str, Any]]) -> str:
 
 def build_expected_suite_files() -> dict[Path, str]:
     """Return exact `{path: expected_utf8_content}` for all 382 generator-owned suite artifacts."""
-    scenarios = build_all_90_scenarios()
+    scenarios = build_all_95_scenarios()
     by_id = {sc.scenario_id: sc for sc in scenarios}
     assert set(SCENARIO_PAIRINGS.keys()) == set(by_id.keys()), (
         f"SCENARIO_PAIRINGS keys mismatch: {set(SCENARIO_PAIRINGS.keys()) ^ set(by_id.keys())}"
@@ -4470,6 +4483,60 @@ def build_expected_suite_files() -> dict[Path, str]:
     expected[SUITE_DIR / "AGENTS.md"] = generate_suite_agents_md(scenarios, by_id)
     expected[SUITE_DIR / "README.md"] = generate_master_readme(scenarios)
     return expected
+
+
+def check_suite_sync(suite_dir: Path | None = None) -> list[str]:
+    """Return list of missing/drifted/extra suite files, including exact per-scenario README.md content checks."""
+    target_suite_dir = suite_dir.resolve() if suite_dir is not None else SUITE_DIR
+    scripts_dir = str(REPO_ROOT / "deploy" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from generate_scenario_readme import generate_readme_for_scenario
+
+    def _disp_path(p: Path) -> str:
+        try:
+            return str(p.relative_to(REPO_ROOT))
+        except ValueError:
+            return str(p)
+
+    expected = build_expected_suite_files()
+    drifted: list[str] = []
+    expected_sc_dirs: set[Path] = set()
+    for orig_path, exp_text in sorted(expected.items()):
+        rel_in_suite = orig_path.relative_to(SUITE_DIR)
+        path = target_suite_dir / rel_in_suite
+        if rel_in_suite.parent != Path("."):
+            expected_sc_dirs.add(path.parent)
+        disp = _disp_path(path)
+        if not path.is_file():
+            drifted.append(f"MISSING: {disp}")
+        elif path.read_text(encoding="utf-8") != exp_text:
+            drifted.append(f"DRIFTED: {disp}")
+
+    disk_sc_dirs = (
+        {p for p in target_suite_dir.iterdir() if p.is_dir() and p.name.startswith("st")}
+        if target_suite_dir.is_dir()
+        else set()
+    )
+    for extra_dir in sorted(disk_sc_dirs - expected_sc_dirs):
+        drifted.append(f"EXTRA SCENARIO DIR: {_disp_path(extra_dir)}")
+
+    expected_sc_files = {"infra.json", "workflows.json", "execution-time.json", "AGENTS.md", "README.md"}
+    for sc_dir in sorted(expected_sc_dirs):
+        rm = sc_dir / "README.md"
+        disp_rm = _disp_path(rm)
+        if not rm.is_file():
+            drifted.append(f"MISSING SCENARIO README: {disp_rm}")
+        elif (sc_dir / "infra.json").is_file():
+            expected_rm = generate_readme_for_scenario(sc_dir)
+            actual_rm = rm.read_text(encoding="utf-8")
+            if actual_rm != expected_rm:
+                drifted.append(f"DRIFTED SCENARIO README: {disp_rm}")
+        if sc_dir.is_dir():
+            for child in sorted(sc_dir.iterdir()):
+                if child.name not in expected_sc_files:
+                    drifted.append(f"EXTRA SCENARIO FILE: {_disp_path(child)}")
+    return drifted
 
 
 def main() -> None:
@@ -4490,16 +4557,7 @@ def main() -> None:
     rel_suite = SUITE_DIR.relative_to(REPO_ROOT)
 
     if args.check:
-        drifted: list[str] = []
-        for path, exp_text in sorted(expected.items()):
-            if not path.is_file():
-                drifted.append(f"MISSING: {path.relative_to(REPO_ROOT)}")
-            elif path.read_text(encoding="utf-8") != exp_text:
-                drifted.append(f"DRIFTED: {path.relative_to(REPO_ROOT)}")
-        for sc_dir in sorted(p for p in SUITE_DIR.iterdir() if p.is_dir() and p.name.startswith("st")):
-            rm = sc_dir / "README.md"
-            if not rm.is_file():
-                drifted.append(f"MISSING SCENARIO README: {rm.relative_to(REPO_ROOT)}")
+        drifted = check_suite_sync(SUITE_DIR)
         if drifted:
             print("Self-test suite synchronization check FAILED:", file=sys.stderr)
             for item in drifted:

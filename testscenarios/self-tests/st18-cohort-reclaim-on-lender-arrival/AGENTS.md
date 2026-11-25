@@ -15,7 +15,7 @@
 - **Title**: Cohort Quota Reclaim When Lending Queue Submits Work (`reclaimWithinCohort: Any`)
 - **Primary Verification Target**: Cross-CQ quota reclaim eviction (`4` borrowed jobs evicted at `t=9s` so `cq-lender` immediately reclaims its `16` nominal TPUs)
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st18` (`--namespace kueue-optimizer-chamber-st18`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16418` | Prometheus `19065` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16418` | Prometheus `19065` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st19-cohort-reclaim-disabled-lender-waits`](../st19-cohort-reclaim-disabled-lender-waits/AGENTS.md), [`st41-t0-cohort-borrowing-reclaim-any`](../st41-t0-cohort-borrowing-reclaim-any/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST18 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st18' (API port 16418, Prom port 19065):

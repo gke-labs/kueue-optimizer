@@ -10,14 +10,14 @@
 | **Raw Event Counts** | `infra.json`: **12** events · `workflows.json`: **8** events · `execution-time.json`: **16** events |
 | **Cluster Capacity** | **8 nodes** · `128 cores` · `512 GiB` · `64` `google.com/tpu` (1 distinct node group) |
 | **Topology Configuration** | **0** `Topology` CRD(s) (none) |
-| **Initial In-Flight Pods at $t_0$** | **0** pods across **0** / 8 nodes (initial `google.com/tpu` utilization: **0.00%**) |
+| **Initial In-Flight Pods at $t_0$** | **0** pods across **0** / 8 nodes (initial `cpu` utilization: **0.00%**) |
 | **Kueue Objects** | **1** `ResourceFlavor`(s) · **0** `Cohort`(s) · **1** `ClusterQueue`(s) · **1** `LocalQueue`(s) · **0** `WorkloadPriorityClass`(es) |
 | **Test Arrival Window ($T_{\text{test}}$)** | **0s** (`2026-06-01T00:00:00Z` $\rightarrow$ `2026-06-01T00:00:00Z`) |
 | **Unadmitted Workloads** | **8** `NotAdmitted` arrivals (8 total pods; gang size min=1, p50=1, p90=1, max=1) + **0** pre-admitted at $t_0$ |
 | **Execution Duration Quantiles** | `min=35s`, `P50=35s`, `AVG=35s`, `P90=35s`, `P99=35s`, `max=35s` |
 | **1. Saturation (Arrival Window $T_{\text{test}}$)** | n/a (instantaneous $t=0$ burst: $T_{\text{test}} = 0$) *(over $T_{\text{test}} = 0.0s$)* |
-| **2. Saturation (Reference `6h` / `21,600s` Window)** | `google.com/tpu`: **0.04%** · `cpu`: **0.16%** · `memory`: **0.16%** *(over $T_{6\text{h}} = 21{,}600\text{s}$)* |
-| **3. Recommended `100%` Saturation Settings (`5m` & `10m`)** | **5m (`300s`)**: `--speedup 0.029 --duration 5m` · **10m (`600s`)**: `--speedup 0.015 --duration 10m` *(bottleneck: `google.com/tpu`, $T_{100\%} = 8.8s$)* |
+| **2. Saturation (Reference `6h` / `21,600s` Window)** | `cpu`: **0.16%** · `memory`: **0.16%** · `google.com/tpu`: **0.04%** *(over $T_{6\text{h}} = 21{,}600\text{s}$)* |
+| **3. Recommended `100%` Saturation Settings (`5m` & `10m`)** | **5m (`300s`)**: `--speedup 0.117 --duration 5m` · **10m (`600s`)**: `--speedup 0.058 --duration 10m` *(bottleneck: `cpu`, $T_{100\%} = 35.0s$)* |
 
 ---
 
@@ -162,44 +162,44 @@ $$\text{Sat}_{\text{window}}(r) = \frac{W(r)}{T_{\text{window}} \times C_{\text{
 
 | Resource ($r$) | Physical Cluster Capacity $C_{\text{cluster}}(r)$ | Total Offered Work ($1.0\text{x}$) | Ideal `100%`-Util Service Time $T_{100\%}(r)$ | (1) Saturation over Arrival Window ($T_{\text{test}} = 0.0s$) | (2) Saturation over Default `6h` ($21{,}600\text{s}$) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **`google.com/tpu`** *(bottleneck)* | 64 | `0.16` `google.com/tpu`-h | `8.8s` | n/a ($T_{\text{test}}=0$) | **0.04%** |
-| `cpu` | 128 cores | `1.24` core-h | `35.0s` | n/a ($T_{\text{test}}=0$) | 0.16% |
+| `google.com/tpu` | 64 | `0.16` `google.com/tpu`-h | `8.8s` | n/a ($T_{\text{test}}=0$) | 0.04% |
+| **`cpu`** *(bottleneck)* | 128 cores | `1.24` core-h | `35.0s` | n/a ($T_{\text{test}}=0$) | **0.16%** |
 | `memory` | 512 GiB | `4.98` GiB-h | `35.0s` | n/a ($T_{\text{test}}=0$) | 0.16% |
 
 #### Part 3 — Recommended `testrunner.py` Settings for `100%` Saturation in `5m` (`300s`) & `10m` (`600s`)
 
 | Target Wall-Clock Window ($T_{\text{target}}$) | Bottleneck Resource ($r^*$) | Recommended `--speedup` ($N_{100\%}$) | Recommended `--duration` | Compressed Arrival Span ($T_{\text{test}} / N_{100\%}$) | Execution & Drain Behavior |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`5m` (`300s`)** | `google.com/tpu` | **`--speedup 0.029`** | **`--duration 5m`** | `0.0s` | All arrivals submit within `0.0s` (≤ `300s`); `--duration 5m` captures `100%` of arrivals and `100.0%` full-cluster work in `5m`. |
-| **`10m` (`600s`)** | `google.com/tpu` | **`--speedup 0.015`** | **`--duration 10m`** | `0.0s` | All arrivals submit within `0.0s` (≤ `600s`); `--duration 10m` captures `100%` of arrivals and `100.0%` full-cluster work in `10m`. |
+| **`5m` (`300s`)** | `cpu` | **`--speedup 0.117`** | **`--duration 5m`** | `0.0s` | All arrivals submit within `0.0s` (≤ `300s`); `--duration 5m` captures `100%` of arrivals and `100.0%` full-cluster work in `5m`. |
+| **`10m` (`600s`)** | `cpu` | **`--speedup 0.058`** | **`--duration 10m`** | `0.0s` | All arrivals submit within `0.0s` (≤ `600s`); `--duration 10m` captures `100%` of arrivals and `100.0%` full-cluster work in `10m`. |
 
 ```bash
-# Run at 100% offered google.com/tpu saturation in a 5-minute (300s) wall-clock window:
-python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st27-cpu-memory-secondary-bottleneck --speedup 0.029 --duration 5m
+# Run at 100% offered cpu saturation in a 5-minute (300s) wall-clock window:
+python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st27-cpu-memory-secondary-bottleneck --speedup 0.117 --duration 5m
 
-# Run at 100% offered google.com/tpu saturation in a 10-minute (600s) wall-clock window:
-python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st27-cpu-memory-secondary-bottleneck --speedup 0.015 --duration 10m
+# Run at 100% offered cpu saturation in a 10-minute (600s) wall-clock window:
+python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st27-cpu-memory-secondary-bottleneck --speedup 0.058 --duration 10m
 ```
 
 ### 7.1 Workload Breakdown & Cluster Saturation by Priority Class
 
-| Priority Class | Priority Value | Workloads | Share | Total Pods | Gang Size (`min / P50 / P90 / max`) | Duration (`P50 / AVG / P90 / P99`) | Offered `google.com/tpu`-Hours | `google.com/tpu` Saturation | `cpu` Saturation | `memory` Saturation |
+| Priority Class | Priority Value | Workloads | Share | Total Pods | Gang Size (`min / P50 / P90 / max`) | Duration (`P50 / AVG / P90 / P99`) | Offered Core-Hours | `google.com/tpu` Saturation | `cpu` Saturation | `memory` Saturation |
 | :--- | ---: | ---: | ---: | ---: | :---: | :---: | ---: | ---: | ---: | ---: |
-| `<default>` | `0` | 8 | 100.0% | 8 | `1 / 1 / 1 / 1` | `35s / 35s / 35s / 35s` | 0.2 | n/a | n/a | n/a |
-| **ALL (Total)** | — | **8** | 100.0% | 8 | `1 / 1 / 1 / 1` | `35s / 35s / 35s / 35s` | 0.2 | n/a | n/a | n/a |
+| `<default>` | `0` | 8 | 100.0% | 8 | `1 / 1 / 1 / 1` | `35s / 35s / 35s / 35s` | 1.2 | n/a | n/a | n/a |
+| **ALL (Total)** | — | **8** | 100.0% | 8 | `1 / 1 / 1 / 1` | `35s / 35s / 35s / 35s` | 1.2 | n/a | n/a | n/a |
 
 ### 7.2 Workload Dissection per `LocalQueue` (and Target `ClusterQueue`)
 
-| LocalQueue (`ns/name`) | Target `ClusterQueue` | Workloads | Share | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Offered `google.com/tpu`-h | Cluster `google.com/tpu` Saturation | Target CQ Nominal Quota Saturation | Priority Breakdown (Count) |
+| LocalQueue (`ns/name`) | Target `ClusterQueue` | Workloads | Share | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Offered Core-Hours | Cluster `cpu` Saturation | Target CQ Nominal `cpu` Saturation | Priority Breakdown (Count) |
 | :--- | :--- | ---: | ---: | ---: | :---: | ---: | ---: | ---: | :--- |
-| `st-workloads/lq-membnd` | `cq-membnd` | **8** | 100.0% | 8 | `35s / 35s / 35s / 35s` | 0.2 | n/a | n/a | `<default>`:8 |
+| `st-workloads/lq-membnd` | `cq-membnd` | **8** | 100.0% | 8 | `35s / 35s / 35s / 35s` | 1.2 | n/a | n/a | `<default>`:8 |
 
 #### Detailed Per-`LocalQueue` × Priority Dissection
 
 <details>
 <summary><b>LocalQueue <code>st-workloads/lq-membnd</code> → ClusterQueue <code>cq-membnd</code></b> (8 workloads)</summary>
 
-| Priority Class | Priority Value | Workloads | Share of LQ | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Cluster `google.com/tpu` Saturation | Cluster `cpu` Saturation |
+| Priority Class | Priority Value | Workloads | Share of LQ | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Cluster `cpu` Saturation | Cluster `google.com/tpu` Saturation |
 | :--- | ---: | ---: | ---: | ---: | :---: | ---: | ---: |
 | `<default>` | `0` | **8** | 100.0% | 8 | `35s / 35s / 35s / 35s` | n/a | n/a |
 

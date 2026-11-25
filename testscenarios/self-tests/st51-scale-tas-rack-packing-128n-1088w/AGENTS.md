@@ -15,7 +15,7 @@
 - **Title**: 128-Node, 1,088-Workload 7-Level TAS Pair & Host Packing with `64` `t0` TAS Jobs
 - **Primary Verification Target**: Validates 7-level TAS `topologyAssignment` seeding across `64` `2`-node `t0` TAS `PodGroup`s (`512` TPUs) and `1,024` arriving TAS jobs on `128` nodes
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st51` (`--namespace kueue-optimizer-chamber-st51`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16451` | Prometheus `19098` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16451` | Prometheus `19098` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st46-scale-quota-saturation-128n-1056w`](../st46-scale-quota-saturation-128n-1056w/AGENTS.md), [`st55-scale-tas-dual-flavor-256n-1200w`](../st55-scale-tas-dual-flavor-256n-1200w/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST51 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st51' (API port 16451, Prom port 19098):

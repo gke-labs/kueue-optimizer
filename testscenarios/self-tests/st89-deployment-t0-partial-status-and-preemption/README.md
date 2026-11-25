@@ -96,7 +96,7 @@ No `kueue.x-k8s.io/Topology` CRD is defined in `infra.json` (Topology-Aware Sche
 ## 4. Initial Running Pods & Initial Cluster Utilization at $t_0$
 
 At scenario start ($t_0 = 2026-06-01T00:00:00Z$), **`8`** running `Pod` objects are pre-placed across **`4`** of the **`4`** cluster nodes (`100.0%` of nodes occupied; `0` nodes completely free).
-Additionally, `workflows.json` records **`3`** pre-existing `Admitted` `JobSet` warmup workflow object(s) at $t_0$.
+Additionally, `workflows.json` records **`3`** pre-existing `Admitted` `Deployment` warmup workflow object(s) at $t_0$.
 
 ### 4.1 Initial Cluster Utilization Breakdown
 

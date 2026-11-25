@@ -15,7 +15,7 @@
 - **Title**: 4-Tier Cascading Preemption Chain (`tier-1 -> tier-2 -> tier-3 -> tier-4`)
 - **Primary Verification Target**: Multi-wave cascading preemptions (`12` total evictions across 3 distinct priority transitions) and time-to-eviction histogram accuracy
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st14` (`--namespace kueue-optimizer-chamber-st14`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16414` | Prometheus `19061` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16414` | Prometheus `19061` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st12-preempt-within-cq-lower-priority`](../st12-preempt-within-cq-lower-priority/AGENTS.md), [`st15-preemption-badput-collapse-stress`](../st15-preemption-badput-collapse-stress/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST14 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st14' (API port 16414, Prom port 19061):
