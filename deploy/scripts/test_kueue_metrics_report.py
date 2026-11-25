@@ -1232,5 +1232,736 @@ class TestRegressionFixesForDiscrepanciesD1ToD10(unittest.TestCase):
         self.assertIn("Unadmitted: 0", subtitle)
 
 
+class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
+    """Table-driven tests for Section 5.4 fixes M1-M4, count=0 PodSets, and dynamic capacity integration."""
+
+    T0 = 1700000000.0
+    TPU = "google.com/tpu"
+    ANN_DUR = "kueue-optimizer.gke.io/pod-execution-time-seconds"
+    ANN_INF = "kueue-optimizer.gke.io/infinite-duration"
+
+    @classmethod
+    def _ts(cls, offset_sec: float) -> str:
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(cls.T0 + offset_sec, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @classmethod
+    def _node(
+        cls,
+        name: str,
+        alloc: dict[str, str],
+        *,
+        created_off: float | None = None,
+        deleted_off: float | None = None,
+    ) -> dict:
+        meta: dict = {"name": name}
+        if created_off is not None:
+            meta["creationTimestamp"] = cls._ts(created_off)
+        if deleted_off is not None:
+            meta["deletionTimestamp"] = cls._ts(deleted_off)
+        return {"metadata": meta, "status": {"allocatable": dict(alloc)}}
+
+    @classmethod
+    def _podset(
+        cls,
+        name: str,
+        count: int,
+        res: dict[str, str],
+        *,
+        dur: float | None = None,
+        infinite: bool = False,
+        min_count: int | None = None,
+    ) -> dict:
+        tpl: dict = {"spec": {"containers": [{"name": "c", "resources": {"requests": dict(res), "limits": dict(res)}}]}}
+        anns: dict[str, str] = {}
+        if dur is not None:
+            anns[cls.ANN_DUR] = str(dur)
+        if infinite:
+            anns[cls.ANN_INF] = "true"
+        if anns:
+            tpl["metadata"] = {"annotations": anns}
+        ps: dict = {"name": name, "count": count, "template": tpl}
+        if min_count is not None:
+            ps["minCount"] = min_count
+        return ps
+
+    @classmethod
+    def _cond(cls, ctype: str, status: str, offset_sec: float, reason: str = "") -> dict:
+        return {
+            "type": ctype,
+            "status": status,
+            "reason": reason,
+            "lastTransitionTime": cls._ts(offset_sec),
+        }
+
+    @classmethod
+    def _wl(
+        cls,
+        name: str,
+        podsets: list[dict],
+        conds: list[dict],
+        *,
+        admission: dict | None = None,
+        ns: str = "ai-lab",
+    ) -> dict:
+        st: dict = {"conditions": conds}
+        if admission is not None:
+            st["admission"] = admission
+        return {
+            "metadata": {"name": name, "namespace": ns, "creationTimestamp": cls._ts(0)},
+            "spec": {"podSets": podsets},
+            "status": st,
+        }
+
+    def test_M1_per_podset_durations_completed_active_and_infinite(self) -> None:
+        """M1: Each PodSet uses its own configured duration instead of smearing the max duration across all PodSets."""
+        nodes_16_tpu = [self._node(f"n{i}", {self.TPU: "4"}) for i in range(4)]
+        cases = [
+            (
+                "completed_heterogeneous_podsets",
+                self._wl(
+                    "pg-completed",
+                    [
+                        self._podset("short", 2, {self.TPU: "4"}, dur=100),
+                        self._podset("long", 2, {self.TPU: "4"}, dur=1000),
+                    ],
+                    [
+                        self._cond("QuotaReserved", "True", 0),
+                        self._cond("Admitted", "True", 0),
+                        self._cond("Finished", "True", 1000, "Succeeded"),
+                    ],
+                ),
+                [],
+                "55.00%",
+                "55.00%",
+                "0.00%",
+                "55.00%",
+            ),
+            (
+                "active_at_end_heterogeneous_podsets",
+                self._wl(
+                    "pg-active",
+                    [
+                        self._podset("short", 2, {self.TPU: "4"}, dur=100),
+                        self._podset("long", 2, {self.TPU: "4"}, dur=5000),
+                    ],
+                    [
+                        self._cond("QuotaReserved", "True", 0),
+                        self._cond("Admitted", "True", 0),
+                    ],
+                ),
+                [],
+                "55.00%",
+                "0.00%",
+                "55.00%",
+                "255.00%",
+            ),
+            (
+                "per_podset_infinite_annotation",
+                self._wl(
+                    "pg-mixed-inf",
+                    [
+                        self._podset("short", 2, {self.TPU: "4"}, dur=100),
+                        self._podset("long", 2, {self.TPU: "4"}, infinite=True),
+                    ],
+                    [
+                        self._cond("QuotaReserved", "True", 0),
+                        self._cond("Admitted", "True", 0),
+                    ],
+                ),
+                [],
+                "55.00%",
+                "0.00%",
+                "55.00%",
+                "55.00%",
+            ),
+            (
+                "per_podset_duration_from_assoc_pods",
+                self._wl(
+                    "pg-pod-durs",
+                    [
+                        self._podset("short", 2, {self.TPU: "4"}),
+                        self._podset("long", 2, {self.TPU: "4"}),
+                    ],
+                    [
+                        self._cond("QuotaReserved", "True", 0),
+                        self._cond("Admitted", "True", 0),
+                        self._cond("Finished", "True", 1000, "Succeeded"),
+                    ],
+                ),
+                [
+                    {
+                        "metadata": {
+                            "name": f"short-{i}",
+                            "namespace": "ai-lab",
+                            "labels": {"kueue.x-k8s.io/prebuilt-workload-name": "pg-pod-durs", "kueue.x-k8s.io/podset": "short"},
+                            "annotations": {self.ANN_DUR: "100"},
+                        },
+                        "status": {"phase": "Succeeded", "startTime": self._ts(0)},
+                    }
+                    for i in range(2)
+                ]
+                + [
+                    {
+                        "metadata": {
+                            "name": f"long-{i}",
+                            "namespace": "ai-lab",
+                            "labels": {"kueue.x-k8s.io/prebuilt-workload-name": "pg-pod-durs", "kueue.x-k8s.io/podset": "long"},
+                            "annotations": {self.ANN_DUR: "1000"},
+                        },
+                        "status": {"phase": "Succeeded", "startTime": self._ts(0)},
+                    }
+                    for i in range(2)
+                ],
+                "55.00%",
+                "55.00%",
+                "0.00%",
+                "55.00%",
+            ),
+        ]
+        for label, wl, pods, exp_eff, exp_comp, exp_act, exp_full in cases:
+            with self.subTest(case=label):
+                snap = {"nodes": nodes_16_tpu, "workloads": [wl], "pods": pods}
+                rows, _ = kmr.report_effective_uninterrupted_saturation(snap, self.T0, self.T0 + 1000.0)
+                by_res = _rows_by_key(rows, 0)
+                self.assertEqual(by_res[self.TPU][2], exp_eff)
+                self.assertEqual(by_res[self.TPU][3], exp_comp)
+                self.assertEqual(by_res[self.TPU][4], exp_act)
+                self.assertEqual(by_res[self.TPU][5], exp_full)
+
+    def test_M2_dynamic_cluster_capacity_timeline_and_timestamp_fallback(self) -> None:
+        """M2: Cluster capacity integrates time-varying nodeCapacityTimeline and creation/deletion timestamps."""
+        cases = [
+            (
+                "timeline_node_deleted_mid_run",
+                {
+                    "nodes": [self._node("n-a", {self.TPU: "4"})],
+                    "nodeCapacityTimeline": [
+                        {"epoch": self.T0, "capacity": {self.TPU: 8.0}},
+                        {"epoch": self.T0 + 1800.0, "capacity": {self.TPU: 4.0}},
+                    ],
+                    "workloads": [
+                        self._wl(
+                            "w1",
+                            [self._podset("m", 2, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 0), self._cond("Finished", "True", 1800, "Succeeded")],
+                        ),
+                        self._wl(
+                            "w2",
+                            [self._podset("m", 1, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 1800), self._cond("Finished", "True", 3600, "Succeeded")],
+                        ),
+                    ],
+                    "pods": [],
+                },
+                "100.00%",
+                "6",
+            ),
+            (
+                "timeline_node_added_late",
+                {
+                    "nodes": [self._node("n-a", {self.TPU: "4"}), self._node("n-late", {self.TPU: "4"})],
+                    "nodeCapacityTimeline": [
+                        {"epoch": self.T0, "capacity": {self.TPU: 4.0}},
+                        {"epoch": self.T0 + 3540.0, "capacity": {self.TPU: 8.0}},
+                    ],
+                    "workloads": [
+                        self._wl(
+                            "w1",
+                            [self._podset("m", 1, {self.TPU: "4"}, dur=3600)],
+                            [self._cond("Admitted", "True", 0), self._cond("Finished", "True", 3600, "Succeeded")],
+                        ),
+                    ],
+                    "pods": [],
+                },
+                "98.36%",
+                "4.07",
+            ),
+            (
+                "timeline_ignores_post_end_and_uses_last_same_epoch_entry",
+                {
+                    "nodes": [],
+                    "nodeCapacityTimeline": [
+                        {"epoch": self.T0 - 10.0, "capacity": {self.TPU: 12.0}},
+                        {"epoch": self.T0, "capacity": {self.TPU: 8.0}},
+                        {"epoch": self.T0 + 1800.0, "capacity": {self.TPU: 6.0}},
+                        {"epoch": self.T0 + 1800.0, "capacity": {self.TPU: 4.0}},
+                        {"epoch": self.T0 + 3605.0, "capacity": {}},
+                    ],
+                    "workloads": [
+                        self._wl(
+                            "w1",
+                            [self._podset("m", 2, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 0), self._cond("Finished", "True", 1800, "Succeeded")],
+                        ),
+                        self._wl(
+                            "w2",
+                            [self._podset("m", 1, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 1800), self._cond("Finished", "True", 3600, "Succeeded")],
+                        ),
+                    ],
+                    "pods": [],
+                },
+                "100.00%",
+                "6",
+            ),
+            (
+                "timeline_zero_capacity_at_t0_then_added",
+                {
+                    "nodes": [self._node("n-added", {self.TPU: "4"})],
+                    "nodeCapacityTimeline": [
+                        {"epoch": self.T0, "capacity": {}},
+                        {"epoch": self.T0 + 1800.0, "capacity": {self.TPU: 4.0}},
+                    ],
+                    "workloads": [
+                        self._wl(
+                            "w2",
+                            [self._podset("m", 1, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 1800), self._cond("Finished", "True", 3600, "Succeeded")],
+                        ),
+                    ],
+                    "pods": [],
+                },
+                "100.00%",
+                "2",
+            ),
+            (
+                "nodes_creation_timestamp_fallback_without_timeline",
+                {
+                    "nodes": [
+                        self._node("n-a", {self.TPU: "4"}, created_off=-60.0),
+                        self._node("n-late", {self.TPU: "4"}, created_off=3540.0),
+                        self._node("n-after-end", {self.TPU: "4"}, created_off=3610.0),
+                    ],
+                    "workloads": [
+                        self._wl(
+                            "w1",
+                            [self._podset("m", 1, {self.TPU: "4"}, dur=3600)],
+                            [self._cond("Admitted", "True", 0), self._cond("Finished", "True", 3600, "Succeeded")],
+                        ),
+                    ],
+                    "pods": [],
+                },
+                "98.36%",
+                "4.07",
+            ),
+            (
+                "nodes_deletion_timestamp_fallback_without_timeline",
+                {
+                    "nodes": [
+                        self._node("n-a", {self.TPU: "4"}, created_off=-60.0),
+                        self._node("n-b", {self.TPU: "4"}, created_off=-60.0, deleted_off=1800.0),
+                    ],
+                    "workloads": [
+                        self._wl(
+                            "w1",
+                            [self._podset("m", 2, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 0), self._cond("Finished", "True", 1800, "Succeeded")],
+                        ),
+                        self._wl(
+                            "w2",
+                            [self._podset("m", 1, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 1800), self._cond("Finished", "True", 3600, "Succeeded")],
+                        ),
+                    ],
+                    "pods": [],
+                },
+                "100.00%",
+                "6",
+            ),
+        ]
+        for label, snap, exp_eff, exp_avg_cap in cases:
+            with self.subTest(case=label):
+                rows, _ = kmr.report_effective_uninterrupted_saturation(snap, self.T0, self.T0 + 3600.0)
+                by_res = _rows_by_key(rows, 0)
+                self.assertEqual(by_res[self.TPU][2], exp_eff)
+                self.assertEqual(by_res[self.TPU][1], exp_avg_cap)
+
+    def test_M3_partial_admission_and_zero_count_podsets(self) -> None:
+        """M3 & S4d: Partial admission uses authoritative podSetAssignments count/usage; count=0 PodSets contribute 0."""
+        cases = [
+            (
+                "single_podset_partial_admission_with_resource_usage",
+                [self._node("n0", {"cpu": "10", "pods": "110"})],
+                self._wl(
+                    "partial-1",
+                    [self._podset("main", 10, {"cpu": "1"}, dur=1000, min_count=2)],
+                    [
+                        self._cond("QuotaReserved", "True", 0),
+                        self._cond("Admitted", "True", 0),
+                        self._cond("Finished", "True", 1000, "Succeeded"),
+                    ],
+                    admission={
+                        "clusterQueue": "cq",
+                        "podSetAssignments": [{"name": "main", "count": 4, "resourceUsage": {"cpu": "4"}}],
+                    },
+                ),
+                {"cpu": "40.00%"},
+                "completed=1 [4 pods]",
+            ),
+            (
+                "single_podset_partial_admission_without_resource_usage_scales_template",
+                [self._node("n0", {"cpu": "10", "pods": "110"})],
+                self._wl(
+                    "partial-no-usage",
+                    [self._podset("main", 10, {"cpu": "1"}, dur=1000, min_count=2)],
+                    [
+                        self._cond("QuotaReserved", "True", 0),
+                        self._cond("Admitted", "True", 0),
+                        self._cond("Finished", "True", 1000, "Succeeded"),
+                    ],
+                    admission={
+                        "clusterQueue": "cq",
+                        "podSetAssignments": [{"name": "main", "count": 4}],
+                    },
+                ),
+                {"cpu": "40.00%"},
+                "completed=1 [4 pods]",
+            ),
+            (
+                "multi_podset_partial_admission",
+                [self._node("n0", {"cpu": "10", self.TPU: "32", "pods": "110"})],
+                self._wl(
+                    "partial-multi",
+                    [
+                        self._podset("driver", 1, {"cpu": "2"}, dur=1000),
+                        self._podset("worker", 10, {"cpu": "1", self.TPU: "4"}, dur=1000, min_count=2),
+                    ],
+                    [
+                        self._cond("QuotaReserved", "True", 0),
+                        self._cond("Admitted", "True", 0),
+                        self._cond("Finished", "True", 1000, "Succeeded"),
+                    ],
+                    admission={
+                        "clusterQueue": "cq",
+                        "podSetAssignments": [
+                            {"name": "driver", "count": 1, "resourceUsage": {"cpu": "2"}},
+                            {"name": "worker", "count": 4, "resourceUsage": {"cpu": "4", self.TPU: "16"}},
+                        ],
+                    },
+                ),
+                {"cpu": "60.00%", self.TPU: "50.00%"},
+                "completed=1 [5 pods]",
+            ),
+            (
+                "zero_count_podset_contributes_zero_pods_and_zero_tpus",
+                [self._node("n0", {"cpu": "2", self.TPU: "8", "pods": "110"})],
+                self._wl(
+                    "zero-ps",
+                    [
+                        self._podset("driver", 1, {"cpu": "1"}, dur=1000),
+                        self._podset("workers", 0, {self.TPU: "4"}, dur=1000),
+                    ],
+                    [
+                        self._cond("Admitted", "True", 0),
+                        self._cond("Finished", "True", 1000, "Succeeded"),
+                    ],
+                ),
+                {"cpu": "50.00%", self.TPU: "0.00%"},
+                "completed=1 [1 pods]",
+            ),
+        ]
+        for label, nodes, wl, exp_pcts, exp_sub in cases:
+            with self.subTest(case=label):
+                snap = {"nodes": nodes, "workloads": [wl], "pods": []}
+                rows, subtitle = kmr.report_effective_uninterrupted_saturation(snap, self.T0, self.T0 + 1000.0)
+                by_res = _rows_by_key(rows, 0)
+                for rk, exp_pct in exp_pcts.items():
+                    self.assertEqual(by_res[rk][2], exp_pct)
+                self.assertIn(exp_sub, subtitle)
+
+        # Direct check on extract_workload_podset_slices for count=0 PodSet
+        zero_slices = kmr.extract_workload_podset_slices(
+            self._wl(
+                "zero-direct",
+                [self._podset("driver", 1, {"cpu": "1"}, dur=100), self._podset("empty", 0, {self.TPU: "4"}, dur=100)],
+                [],
+            )
+        )
+        self.assertEqual([(s.name, s.pod_count, s.resources) for s in zero_slices], [
+            ("driver", 1, {"cpu": 1.0, "pods": 1.0}),
+            ("empty", 0, {}),
+        ])
+
+    def test_M4_and_S4_classification_seam_table(self) -> None:
+        """M4 & S4a-S4c: Pure classify_workload_for_saturation seam handles AdmissionChecks, Pending pods, and re-admission."""
+        nodes = [self._node("n0", {self.TPU: "4"}), self._node("n1", {self.TPU: "4"})]
+        pending_pods = [
+            {
+                "metadata": {"name": f"p{i}", "namespace": "ai-lab", "labels": {"kueue.x-k8s.io/pod-group-name": "stuck"}},
+                "spec": {"containers": [{"name": "c", "resources": {"requests": {self.TPU: "4"}}}]},
+                "status": {"phase": "Pending"},
+            }
+            for i in range(2)
+        ]
+        cases = [
+            (
+                "quota_reserved_only_admitted_false",
+                self._wl(
+                    "waiting-ac",
+                    [self._podset("m", 2, {self.TPU: "4"}, dur=5000)],
+                    [
+                        self._cond("QuotaReserved", "True", 0),
+                        self._cond("Admitted", "False", 0, "UnsatisfiedAdmissionChecks"),
+                    ],
+                    admission={"clusterQueue": "cq", "podSetAssignments": [{"name": "m", "count": 2}]},
+                ),
+                [],
+                "pending",
+                "0.00%",
+                "active_at_end=0 [0 pods]",
+                "Excluded (preempted/reclaimed/failed): 0 [0 pods] | Unadmitted: 1 [2 pods]",
+            ),
+            (
+                "quota_reserved_only_no_admitted_condition",
+                self._wl(
+                    "waiting-ac-no-admitted",
+                    [self._podset("m", 2, {self.TPU: "4"}, dur=5000)],
+                    [self._cond("QuotaReserved", "True", 0)],
+                ),
+                [],
+                "pending",
+                "0.00%",
+                "active_at_end=0 [0 pods]",
+                "Excluded (preempted/reclaimed/failed): 0 [0 pods] | Unadmitted: 1 [2 pods]",
+            ),
+            (
+                "admitted_but_pods_pending_never_interrupted",
+                self._wl(
+                    "stuck",
+                    [self._podset("m", 2, {self.TPU: "4"}, dur=600)],
+                    [self._cond("QuotaReserved", "True", 100), self._cond("Admitted", "True", 100)],
+                    admission={"clusterQueue": "cq", "podSetAssignments": [{"name": "m", "count": 2}]},
+                ),
+                pending_pods,
+                "pending",
+                "0.00%",
+                "active_at_end=0 [0 pods]",
+                "Excluded (preempted/reclaimed/failed): 0 [0 pods] | Unadmitted: 1 [2 pods]",
+            ),
+            (
+                "evicted_then_readmitted_then_finished",
+                self._wl(
+                    "readmitted",
+                    [self._podset("m", 2, {self.TPU: "4"}, dur=400)],
+                    [
+                        self._cond("QuotaReserved", "True", 500, "QuotaReserved"),
+                        self._cond("Admitted", "True", 500, "Admitted"),
+                        self._cond("Evicted", "False", 500, "QuotaReserved"),
+                        self._cond("Preempted", "False", 500, "QuotaReserved"),
+                        self._cond("Requeued", "True", 300, "Preempted"),
+                        self._cond("Finished", "True", 900, "Succeeded"),
+                    ],
+                ),
+                [],
+                "completed",
+                "40.00%",
+                "completed=1 [2 pods]",
+                "Excluded (preempted/reclaimed/failed): 0 [0 pods] | Unadmitted: 0",
+            ),
+            (
+                "finished_after_eval_window_counted_active_at_end",
+                self._wl(
+                    "late-finish",
+                    [self._podset("m", 2, {self.TPU: "4"}, dur=1010)],
+                    [
+                        self._cond("Admitted", "True", 0),
+                        self._cond("Finished", "True", 1010, "Succeeded"),
+                    ],
+                ),
+                [],
+                "active_at_end",
+                "100.00%",
+                "active_at_end=1 [2 pods]",
+                "Excluded (preempted/reclaimed/failed): 0 [0 pods] | Unadmitted: 0",
+            ),
+            (
+                "evicted_true_classified_as_excluded_interrupted",
+                self._wl(
+                    "evicted-wl",
+                    [self._podset("m", 2, {self.TPU: "4"}, dur=600)],
+                    [
+                        self._cond("Admitted", "False", 300, "Evicted"),
+                        self._cond("Evicted", "True", 300, "Preempted"),
+                    ],
+                ),
+                [],
+                "excluded_interrupted",
+                "0.00%",
+                "active_at_end=0 [0 pods]",
+                "Excluded (preempted/reclaimed/failed): 1 [2 pods] | Unadmitted: 0",
+            ),
+        ]
+        for label, wl, pods, exp_outcome, exp_tpu_pct, exp_sub_part1, exp_sub_part2 in cases:
+            with self.subTest(case=label):
+                cls_res = kmr.classify_workload_for_saturation(wl, pods, self.T0, self.T0 + 1000.0)
+                self.assertEqual(cls_res.outcome, exp_outcome)
+                snap = {"nodes": nodes, "workloads": [wl], "pods": pods}
+                rows, subtitle = kmr.report_effective_uninterrupted_saturation(snap, self.T0, self.T0 + 1000.0)
+                by_res = _rows_by_key(rows, 0)
+                self.assertEqual(by_res[self.TPU][2], exp_tpu_pct)
+                self.assertIn(exp_sub_part1, subtitle)
+                self.assertIn(exp_sub_part2, subtitle)
+
+    def test_M2_replay_and_snapshot_capture_records_node_capacity_timeline(self) -> None:
+        """run_scenario_replay tracks Node capacity transitions and capture_cluster_saturation_snapshot exports them."""
+        import json
+        from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot
+        from runner.loader import ExecutionTimeIndex, ScenarioBundle, ScheduledInfraEvent
+        from runner.replay import run_scenario_replay
+
+        n0 = self._node("n-0", {self.TPU: "4", "cpu": "16"})
+        n1 = self._node("n-1", {self.TPU: "4", "cpu": "16"})
+        n2 = self._node("n-2", {self.TPU: "8", "cpu": "32"})
+
+        def _make_bundle(infra_events: list[ScheduledInfraEvent]) -> ScenarioBundle:
+            return ScenarioBundle(
+                scenario_dir=Path("/tmp/fake-scenario"),
+                infra_path=Path("/tmp/fake-scenario/infra.json"),
+                workflows_path=Path("/tmp/fake-scenario/workflows.json"),
+                execution_time_path=Path("/tmp/fake-scenario/execution_time.json"),
+                exec_index=ExecutionTimeIndex({}, {}),
+                t0_epoch=self.T0,
+                t0_iso=self._ts(0),
+                effective_start_epoch=self.T0,
+                effective_start_iso=self._ts(0),
+                initial_jump_raw_sec=0.0,
+                initial_jump_wall_sec=0.0,
+                expired_initial_pods_count=0,
+                t_end_epoch=self.T0 + 5.0,
+                t_end_iso=self._ts(5),
+                infra_event_count=len(infra_events),
+                workflow_event_count=0,
+                nodes=[n0, n1],
+                namespaces=[],
+                prereq_and_queue_docs=[],
+                initial_pods=[],
+                scheduled_workflows=[],
+                skipped_already_admitted_workflows=[],
+                skipped_child_workflows=0,
+                workload_namespaces=["default"],
+                primary_workload_namespace="default",
+                infra_pods_namespace="infra-pods",
+                cluster_queue_names=[],
+                queueing_strategy="BestEffortFIFO",
+                scheduled_infra_events=infra_events,
+            )
+
+        # 1. Dynamic scenario: Delete n-1, no-op Update n-0 (same allocatable), Add n-2 -> 3 timeline entries.
+        bundle_dyn = _make_bundle(
+            [
+                ScheduledInfraEvent(
+                    target_wall_offset_sec=0.0,
+                    seq=1,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=self._ts(0),
+                    event_type="Deleted",
+                    object_kind="Node",
+                    name="n-1",
+                    manifest={},
+                ),
+                ScheduledInfraEvent(
+                    target_wall_offset_sec=0.0,
+                    seq=2,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=self._ts(0),
+                    event_type="Update",
+                    object_kind="Node",
+                    name="n-0",
+                    manifest=n0,
+                ),
+                ScheduledInfraEvent(
+                    target_wall_offset_sec=0.0,
+                    seq=3,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=self._ts(0),
+                    event_type="New",
+                    object_kind="Node",
+                    name="n-2",
+                    manifest=n2,
+                ),
+            ]
+        )
+
+        mgr = ChamberManager(chamber_namespace="kueue-optimizer-chamber-m2-test", apiserver_port=16498)
+        try:
+            empty_status = ClusterStatusSnapshot(
+                workloads_admitted=0,
+                workloads_pending=0,
+                workloads_finished=0,
+                pods_running=0,
+                pods_pending=0,
+                pods_succeeded=0,
+                pods_failed=0,
+                jobsets_completed=0,
+                jobsets_failed=0,
+                cq_summary=[],
+                workloads_query_ok=True,
+            )
+
+            def fake_api_request(method: str, path: str, **_kwargs: object) -> tuple[int, bytes]:
+                if path == "/api/v1/nodes" and method == "GET":
+                    return 200, json.dumps({"items": [n0, n2]}).encode("utf-8")
+                if path == "/apis/kueue.x-k8s.io/v1beta2/workloads" and method == "GET":
+                    return 200, b'{"items": []}'
+                if path == "/api/v1/pods" and method == "GET":
+                    return 200, b'{"items": []}'
+                return 200, b'{"items": []}'
+
+            with (
+                patch.object(mgr, "ensure_kwok_connection", return_value=None),
+                patch.object(mgr, "api_request", side_effect=fake_api_request),
+                patch.object(mgr, "ssa_apply_doc", return_value=None),
+                patch("runner.replay.query_cluster_status", return_value=empty_status),
+            ):
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle_dyn,
+                    speedup=1.0,
+                    max_run_seconds=5.0,
+                    status_interval_sec=0.5,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+                snap_dyn = mgr.capture_cluster_saturation_snapshot()
+
+            self.assertIsNotNone(snap_dyn)
+            assert snap_dyn is not None
+            timeline = snap_dyn.get("nodeCapacityTimeline")
+            self.assertIsInstance(timeline, list)
+            assert isinstance(timeline, list)
+            # Initial (8 TPU) -> after deleting n-1 (4 TPU) -> after adding n-2 (12 TPU); unchanged Update skipped!
+            self.assertEqual(len(timeline), 3)
+            self.assertEqual([e["capacity"][self.TPU] for e in timeline], [8.0, 4.0, 12.0])
+
+            # 2. Static scenario (no Node capacity changes): nodeCapacityTimeline is omitted from snapshot.
+            bundle_static = _make_bundle([])
+            with (
+                patch.object(mgr, "ensure_kwok_connection", return_value=None),
+                patch.object(mgr, "api_request", side_effect=fake_api_request),
+                patch("runner.replay.query_cluster_status", return_value=empty_status),
+            ):
+                run_scenario_replay(
+                    mgr=mgr,
+                    bundle=bundle_static,
+                    speedup=1.0,
+                    max_run_seconds=5.0,
+                    status_interval_sec=0.5,
+                    wait_for_completion=True,
+                    initial_state_already_bootstrapped=True,
+                )
+                snap_static = mgr.capture_cluster_saturation_snapshot()
+
+            self.assertIsNotNone(snap_static)
+            assert snap_static is not None
+            self.assertNotIn("nodeCapacityTimeline", snap_static)
+        finally:
+            mgr.close()
+
+
 if __name__ == "__main__":
     unittest.main()
