@@ -29,6 +29,8 @@ from chamber.constants import (
     DEFAULT_FALLBACK_EXEC_SEC,
     DEFAULT_INFRA_PODS_NAMESPACE,
     DEFAULT_PAUSE_IMAGE,
+    DNS_LABEL_RE,
+    DNS_SUBDOMAIN_RE,
     ROOT_DIR,
     validate_dns_label,
     validate_dns_subdomain,
@@ -1063,10 +1065,6 @@ def _parse_infra_resources(
     t0_epoch: float,
     initial_window_sec: float,
     speedup: float,
-    min_pod_duration_sec: float = 0.1,
-    infinite_pod_duration_sec: float = DEFAULT_INFINITE_POD_DURATION_SEC,
-    pause_image_override: str | None = None,
-    infra_pods_namespace: str = DEFAULT_INFRA_PODS_NAMESPACE,
     override_workload_namespace: str | None,
     override_queueing_strategy: str | None,
     override_cq_fair_sharing_preemption: bool,
@@ -1391,6 +1389,152 @@ def _extract_pod_resource_requests(pl: dict[str, Any]) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
     return {str(rk): str(rv) for rk, rv in raw.items() if rk != "ephemeral-storage"}
+
+
+def _allocate_k8s_name(
+    raw_name: str,
+    used_names: set[str],
+    *,
+    prefix: str = "p",
+    allow_dots: bool = True,
+) -> str:
+    """Sanitize and deduplicate a Kubernetes object name to <= 63 chars starting with an ASCII letter.
+
+    Mutates `used_names` in place by adding the returned name.
+    """
+    valid_re = DNS_SUBDOMAIN_RE if allow_dots else DNS_LABEL_RE
+    if (
+        raw_name
+        and len(raw_name) <= MAX_K8S_NAME_LEN
+        and raw_name[0].isascii()
+        and raw_name[0].isalpha()
+        and valid_re.fullmatch(raw_name)
+    ):
+        base_k8s_name = raw_name
+    else:
+        sanitized = sanitize_k8s_name(raw_name, max_len=MAX_K8S_NAME_LEN)
+        if not (sanitized[0].isascii() and sanitized[0].isalpha()):
+            pfx = f"{prefix}-"
+            sanitized = f"{pfx}{sanitize_k8s_name(sanitized, max_len=MAX_K8S_NAME_LEN - len(pfx))}"
+        base_k8s_name = sanitized
+
+    k8s_name = base_k8s_name
+    dedup = 1
+    while k8s_name in used_names:
+        suf = f"-{dedup}"
+        trunc = base_k8s_name[: MAX_K8S_NAME_LEN - len(suf)].rstrip("-.")
+        if not trunc or not (trunc[0].isascii() and trunc[0].isalpha()):
+            pfx = f"{prefix}-"
+            trunc = f"{pfx}{sanitize_k8s_name(base_k8s_name, max_len=MAX_K8S_NAME_LEN - len(pfx) - len(suf))}"
+        k8s_name = f"{trunc}{suf}"
+        dedup += 1
+    used_names.add(k8s_name)
+    return k8s_name
+
+
+def _build_kwok_pause_pod_spec(
+    pause_img: str,
+    reqs: dict[str, str],
+    placement: str = "",
+) -> dict[str, Any]:
+    """Build a KWOK-compatible pause PodSpec with matching requests and limits."""
+    pod_spec: dict[str, Any] = {
+        "restartPolicy": "Never",
+        "tolerations": [
+            {
+                "key": "kwok.x-k8s.io/node",
+                "operator": "Equal",
+                "value": "fake",
+                "effect": "NoSchedule",
+            }
+        ],
+        "containers": [
+            {
+                "name": "pause",
+                "image": pause_img,
+                "resources": {
+                    "requests": dict(reqs),
+                    "limits": dict(reqs),
+                },
+            }
+        ],
+    }
+    if placement:
+        pod_spec["nodeName"] = placement
+    return pod_spec
+
+
+def _build_kwok_pause_pod_manifest(
+    *,
+    name: str,
+    namespace: str,
+    labels: dict[str, str],
+    annotations: dict[str, str],
+    pause_img: str,
+    reqs: dict[str, str],
+    placement: str = "",
+) -> dict[str, Any]:
+    """Build a complete v1/Pod manifest backed by the KWOK pause container."""
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": dict(labels),
+            "annotations": dict(annotations),
+        },
+        "spec": _build_kwok_pause_pod_spec(pause_img, reqs, placement=placement),
+    }
+
+
+def _compute_initial_age_sec(
+    cand: _AdmittedInitialCandidate,
+    effective_start_epoch: float,
+    speedup: float,
+) -> float:
+    """Compute a t0 candidate's seniority age (in compressed seconds) relative to effective_start_epoch."""
+    if speedup <= 0:
+        raise ValueError(f"speedup must be > 0 (got {speedup!r}).")
+    orig_ref_ep: float | None = None
+    if cand.exec_info and cand.exec_info.admitted_epochs:
+        orig_ref_ep = min(cand.exec_info.admitted_epochs)
+    if cand.creation_epoch is not None and (orig_ref_ep is None or orig_ref_ep >= effective_start_epoch - 1e-6):
+        orig_ref_ep = min(orig_ref_ep, cand.creation_epoch) if orig_ref_ep is not None else cand.creation_epoch
+    if orig_ref_ep is None:
+        return 0.0
+    return max(0.0, (effective_start_epoch - orig_ref_ep) / speedup)
+
+
+def _resolve_candidate_priority(
+    cand: _AdmittedInitialCandidate,
+    parsed_infra: _ParsedInfra,
+    *,
+    labels: dict[str, Any],
+    annotations: dict[str, Any],
+    fallback_when_named: int | None = None,
+) -> tuple[str, int | None]:
+    """Resolve `(priority_class_name, numeric_priority)` for a t0 candidate from labels, annotations, and exec_index."""
+    pc_name_raw = (
+        str(labels.get("kueue.x-k8s.io/priority-class") or "")
+        or (cand.exec_info.priority_class_name if cand.exec_info else "")
+    )
+    pc_name = validate_dns_subdomain(pc_name_raw, "kueue.x-k8s.io/priority-class") if pc_name_raw else ""
+
+    prio_val: int | None = cand.exec_info.priority if cand.exec_info else None
+    if prio_val is None and annotations.get("kueue-optimizer.gke.io/priority") is not None:
+        try:
+            prio_val = int(annotations["kueue-optimizer.gke.io/priority"])
+        except (TypeError, ValueError):
+            prio_val = None
+    if prio_val is None and pc_name and pc_name in parsed_infra.priority_classes_by_name:
+        try:
+            prio_val = int(parsed_infra.priority_classes_by_name[pc_name].get("value") or 0)
+        except (TypeError, ValueError):
+            prio_val = 0
+    if pc_name and prio_val is None and fallback_when_named is not None:
+        prio_val = fallback_when_named
+    return pc_name, prio_val
 
 
 def _canonical_resource_profile(reqs: dict[str, Any]) -> tuple[tuple[str, float], ...]:
@@ -1757,103 +1901,202 @@ def _resolve_podset_assignment_for_group(
     return psa, uses_tas
 
 
-def _build_initial_workloads_and_pods(
+@dataclass(frozen=True)
+class _InitialBuildOptions:
+    """Read-only timing, sizing, and override options shared across initial-state builders."""
+
+    effective_start_epoch: float
+    t0_epoch: float = 0.0
+    initial_window_sec: float = 1.0
+    speedup: float = 1.0
+    min_pod_duration_sec: float = 0.1
+    infinite_pod_duration_sec: float = DEFAULT_INFINITE_POD_DURATION_SEC
+    default_exec_sec: float = DEFAULT_FALLBACK_EXEC_SEC
+    pause_image_override: str | None = None
+    override_workload_namespace: str | None = None
+    infra_pods_namespace: str = DEFAULT_INFRA_PODS_NAMESPACE
+    interrupted_duration_multiplier: float | None = None
+    interrupted_duration_override: InterruptedDurationOverride | None = None
+    manage_jobs_without_queue_name: bool = False
+
+    def __post_init__(self) -> None:
+        if self.speedup <= 0:
+            raise ValueError(f"speedup must be > 0 (got {self.speedup!r}).")
+        if self.min_pod_duration_sec <= 0:
+            raise ValueError(f"min_pod_duration_sec must be > 0 (got {self.min_pod_duration_sec!r}).")
+
+    @property
+    def pause_img(self) -> str:
+        return self.pause_image_override or DEFAULT_PAUSE_IMAGE
+
+
+def _first_cq_flavor_doc(cq_doc: dict[str, Any], parsed_infra: _ParsedInfra) -> dict[str, Any] | None:
+    """Return the first ResourceFlavor manifest referenced by `cq_doc`, if present in `parsed_infra`."""
+    for rg in (cq_doc.get("spec") or {}).get("resourceGroups") or []:
+        for flv in rg.get("flavors") or []:
+            if isinstance(flv, dict) and flv.get("name"):
+                return parsed_infra.flavors_by_name.get(str(flv["name"]))
+    return None
+
+
+def _pick_fitting_node_for_pod(
     parsed_infra: _ParsedInfra,
+    rem_node_alloc: dict[str, dict[str, float]],
+    reqs: dict[str, str],
+    *,
+    flv_doc: dict[str, Any] | None,
+    used_nodes: set[str],
+    allowed_ta_domains: dict[str, set[str]] | None = None,
+) -> str:
+    """Pick a node matching flavor/topology constraints with sufficient remaining allocatable capacity.
+
+    Mutates `rem_node_alloc` in place by subtracting `reqs` from the chosen node when a fitting node is found.
+    Falls back to the first node in `parsed_infra.nodes_by_name` if none fits.
+    """
+    search_passes = (
+        [(True, True), (True, False), (False, False)]
+        if allowed_ta_domains
+        else [(False, True), (False, False)]
+    )
+    for require_ta, prefer_unused in search_passes:
+        for n_name, n_doc in parsed_infra.nodes_by_name.items():
+            if prefer_unused and n_name in used_nodes:
+                continue
+            if not _node_Matches_flavor(n_doc, flv_doc):
+                continue
+            if require_ta and allowed_ta_domains:
+                n_lbls = ((n_doc.get("metadata") or {}).get("labels")) or {}
+                if not all(
+                    str(n_lbls.get(lk) or "") in allowed_vals
+                    for lk, allowed_vals in allowed_ta_domains.items()
+                ):
+                    continue
+            fits = all(
+                rem_node_alloc.get(n_name, {}).get(rk, 0.0) + 1e-6 >= parse_k8s_quantity(rv, rk)
+                for rk, rv in reqs.items()
+                if rk in rem_node_alloc.get(n_name, {})
+            )
+            if fits:
+                for rk, rv in reqs.items():
+                    if rk in rem_node_alloc[n_name]:
+                        rem_node_alloc[n_name][rk] -= parse_k8s_quantity(rv, rk)
+                return n_name
+    if parsed_infra.nodes_by_name:
+        return next(iter(parsed_infra.nodes_by_name.keys()))
+    return ""
+
+
+def _resolve_t0_pod_end_epoch(
+    cand: _AdmittedInitialCandidate,
+    pod_del_ep: float | None,
+    *,
+    opts: _InitialBuildOptions,
+    wf_true_dur: float | None,
+    wf_mult: float | None,
+    past_full_fallback: str = "min_duration",
+    allow_annotation_fallback: bool = False,
+) -> float | None:
+    """Resolve the uninterrupted end epoch for a t0 pod, accounting for interruptions and full-run records."""
+    eff_del_ep = pod_del_ep
+    exec_info = cand.exec_info
+    if exec_info:
+        had_interruption = bool(exec_info.preempted_epochs or exec_info.interrupted_epochs)
+        if exec_info.full_duration_sec is not None and exec_info.full_duration_sec > 0 and had_interruption:
+            adm_ep = min(exec_info.admitted_epochs) if exec_info.admitted_epochs else opts.t0_epoch
+            end_from_full = adm_ep + exec_info.full_duration_sec
+            if end_from_full <= opts.effective_start_epoch:
+                end_from_full = (
+                    opts.effective_start_epoch + exec_info.full_duration_sec
+                    if past_full_fallback == "full_duration"
+                    else opts.effective_start_epoch + opts.min_pod_duration_sec
+                )
+            if eff_del_ep is None or end_from_full > eff_del_ep:
+                eff_del_ep = end_from_full
+        elif (
+            eff_del_ep is None
+            and exec_info.full_end_epoch is not None
+            and exec_info.full_end_epoch > opts.effective_start_epoch
+        ):
+            eff_del_ep = exec_info.full_end_epoch
+        elif (
+            eff_del_ep is None
+            and exec_info.full_duration_sec is not None
+            and exec_info.full_duration_sec > 0
+        ):
+            adm_ep = min(exec_info.admitted_epochs) if exec_info.admitted_epochs else opts.t0_epoch
+            end_from_full = adm_ep + exec_info.full_duration_sec
+            if end_from_full > opts.effective_start_epoch:
+                eff_del_ep = end_from_full
+        elif exec_info.is_interrupted_only:
+            adm_ep = min(exec_info.admitted_epochs) if exec_info.admitted_epochs else opts.t0_epoch
+            resolved_tot = exec_info.resolved_duration_sec(
+                default_sec=opts.default_exec_sec,
+                interrupted_duration_multiplier=opts.interrupted_duration_multiplier,
+                interrupted_duration_override=opts.interrupted_duration_override,
+                workflow_true_duration_sec=wf_true_dur,
+                workflow_missing_multiplier=wf_mult,
+            )
+            unint_end_ep = adm_ep + resolved_tot
+            if eff_del_ep is None or unint_end_ep > eff_del_ep:
+                eff_del_ep = unint_end_ep
+    if allow_annotation_fallback and eff_del_ep is None and cand.raw_obj:
+        existing_ann_dur = _extract_existing_pod_exec_seconds(cand.raw_obj)
+        if existing_ann_dur is not None and existing_ann_dur > 0:
+            eff_del_ep = opts.effective_start_epoch + existing_ann_dur
+    return eff_del_ep
+
+
+def _partition_admitted_candidates(
     admitted_candidates: list[_AdmittedInitialCandidate],
-    scheduled_workflows: list[ScheduledWorkflowItem],
-    scheduled_deletions: list[ScheduledWorkflowDeletion],
-    earliest_admit_by_ns: dict[str, float],
+    scheduled_not_admitted_owners: set[tuple[str, str]],
     exec_index: ExecutionTimeIndex,
     *,
-    t0_epoch: float,
-    effective_start_epoch: float,
-    initial_window_sec: float,
-    speedup: float,
-    min_pod_duration_sec: float,
-    infinite_pod_duration_sec: float,
-    default_exec_sec: float,
-    pause_image_override: str | None,
-    override_workload_namespace: str | None,
-    infra_pods_namespace: str,
-    interrupted_duration_multiplier: float | None = None,
-    interrupted_duration_override: InterruptedDurationOverride | None = None,
-    manage_jobs_without_queue_name: bool = False,
-) -> tuple[list[InitialWorkloadPodGroup], list[InitialPodSpec], list[ScheduledWorkflowItem], int]:
-    """Partition t0 running state into pre-admitted Kueue `PodGroup` workloads and non-Kueue `infra-pods`."""
-    not_admitted_wf_names = [
-        (w.namespace, w.name) for w in scheduled_workflows if w.trigger_reason == "initial_not_admitted"
-    ]
-    qualifying_initial_pods, expired_initial_pods_count = filter_initial_running_pods(
-        parsed_infra.pod_new_events,
-        parsed_infra.pod_delete_epochs,
-        t0_epoch=t0_epoch,
-        effective_start_epoch=effective_start_epoch,
-        initial_window_sec=initial_window_sec,
-        not_admitted_workflow_names=not_admitted_wf_names,
-        earliest_admit_by_ns=earliest_admit_by_ns,
-        strict_timestamps=True,
-        pod_incarnations=parsed_infra.pod_incarnations or None,
-    )
-
-    pause_img = pause_image_override or DEFAULT_PAUSE_IMAGE
-
-    scheduled_not_admitted_owners: set[tuple[str, str]] = set()
-    for sw in scheduled_workflows:
-        if sw.trigger_reason == "initial_not_admitted":
-            scheduled_not_admitted_owners.add((sw.namespace, sw.name))
-            if sw.object_kind == "Pod":
-                pg_n = _get_pod_meta_annotation_or_label(
-                    sw.manifest.get("metadata"),
-                    "kueue.x-k8s.io/pod-group-name",
-                )
-                if pg_n:
-                    scheduled_not_admitted_owners.add((sw.namespace, pg_n))
-
-    # Filter workflow candidates to those genuinely active at `effective_start_epoch`.
-    # Any Kueue workflow first seen Admitted strictly AFTER `effective_start_epoch + initial_window_sec`
-    # (and not admitted before/at `effective_start_epoch`) is scheduled at its post-t0 arrival time
-    # rather than teleported backwards to t0.
+    next_post_t0_seq: int,
+    opts: _InitialBuildOptions,
+) -> tuple[list[_AdmittedInitialCandidate], list[ScheduledWorkflowItem], set[int]]:
+    """Split admitted candidates into t0-active candidates, post-t0 fast-admitted arrivals, and superseded preempt seqs."""
     active_candidates: list[_AdmittedInitialCandidate] = []
+    post_t0_items: list[ScheduledWorkflowItem] = []
     known_wl_keys: set[tuple[str, str]] = set()
     known_owner_keys: set[tuple[str, str]] = set()
     superseded_preempt_seqs: set[int] = set()
-    next_post_t0_seq = (max((w.seq for w in scheduled_workflows), default=0) + 1)
 
-    jumped_past_t0 = effective_start_epoch > (t0_epoch + 1e-6)
+    jumped_past_t0 = opts.effective_start_epoch > (opts.t0_epoch + 1e-6)
     for cand in admitted_candidates:
         if jumped_past_t0:
             # When effective_start_epoch jumped past t0, a workflow created at or after effective_start_epoch
             # (or first seen at/after effective_start_epoch without an earlier admission strictly before it)
             # is a post-t0 arrival at effective_start_epoch, not a pre-existing running workload.
             created_after_eff_start = (
-                cand.creation_epoch is not None and cand.creation_epoch >= (effective_start_epoch - 1e-6)
+                cand.creation_epoch is not None and cand.creation_epoch >= (opts.effective_start_epoch - 1e-6)
             )
             admitted_before_eff_start = bool(
                 cand.incarnation_index == 0
                 and cand.exec_info
                 and cand.exec_info.admitted_epochs
-                and min(cand.exec_info.admitted_epochs) < (effective_start_epoch - 1e-6)
+                and min(cand.exec_info.admitted_epochs) < (opts.effective_start_epoch - 1e-6)
             )
             admitted_by_t0 = not created_after_eff_start and (
-                cand.first_seen_epoch < (effective_start_epoch - 1e-6)
+                cand.first_seen_epoch < (opts.effective_start_epoch - 1e-6)
                 or admitted_before_eff_start
                 or (
                     cand.creation_epoch is not None
-                    and cand.creation_epoch < (effective_start_epoch - 1e-6)
-                    and cand.first_seen_epoch <= (effective_start_epoch + initial_window_sec + 1e-6)
+                    and cand.creation_epoch < (opts.effective_start_epoch - 1e-6)
+                    and cand.first_seen_epoch <= (opts.effective_start_epoch + opts.initial_window_sec + 1e-6)
                 )
             )
         else:
             created_after_eff_start = (
-                cand.creation_epoch is not None and cand.creation_epoch > (effective_start_epoch + 1e-6)
+                cand.creation_epoch is not None and cand.creation_epoch > (opts.effective_start_epoch + 1e-6)
             )
             admitted_by_t0 = not created_after_eff_start and (
-                cand.first_seen_epoch <= (effective_start_epoch + initial_window_sec + 1e-6)
+                cand.first_seen_epoch <= (opts.effective_start_epoch + opts.initial_window_sec + 1e-6)
                 or bool(
                     cand.incarnation_index == 0
                     and cand.exec_info
                     and cand.exec_info.admitted_epochs
-                    and min(cand.exec_info.admitted_epochs) <= (effective_start_epoch + initial_window_sec + 1e-6)
+                    and min(cand.exec_info.admitted_epochs)
+                    <= (opts.effective_start_epoch + opts.initial_window_sec + 1e-6)
                 )
             )
         if not admitted_by_t0:
@@ -1864,49 +2107,49 @@ def _build_initial_workloads_and_pods(
                 and (
                     _has_kueue_queue_or_domain(cand.raw_obj, cand.local_queue_name)
                     or cand.exec_info is not None
-                    or (manage_jobs_without_queue_name and cand.orig_namespace not in SYSTEM_NAMESPACES)
+                    or (opts.manage_jobs_without_queue_name and cand.orig_namespace not in SYSTEM_NAMESPACES)
                 )
             ):
                 if cand.preempt_item is not None:
                     superseded_preempt_seqs.add(cand.preempt_item.seq)
                 arr_ep = (
                     cand.creation_epoch
-                    if (cand.creation_epoch is not None and cand.creation_epoch >= t0_epoch)
+                    if (cand.creation_epoch is not None and cand.creation_epoch >= opts.t0_epoch)
                     else cand.first_seen_epoch
                 )
                 existing_ann = _extract_existing_pod_exec_seconds(cand.raw_obj)
                 has_explicit_ann = existing_ann is not None
-                fb_dur = existing_ann or default_exec_sec
+                fb_dur = existing_ann or opts.default_exec_sec
                 wf_td, wf_mm = _extract_workflow_true_duration_and_multiplier(cand.raw_obj)
                 raw_dur_late, found_late = exec_index.resolve_duration_sec(
                     namespace=cand.orig_namespace,
                     object_kind=cand.kind,
                     name=cand.name,
                     fallback_sec=fb_dur,
-                    interrupted_duration_multiplier=interrupted_duration_multiplier,
-                    interrupted_duration_override=interrupted_duration_override,
+                    interrupted_duration_multiplier=opts.interrupted_duration_multiplier,
+                    interrupted_duration_override=opts.interrupted_duration_override,
                     workflow_true_duration_sec=wf_td,
                     workflow_missing_multiplier=wf_mm,
                     creation_epoch=cand.creation_epoch,
                     incarnation_index=cand.incarnation_index,
                 )
-                comp_late = max(min_pod_duration_sec, raw_dur_late / speedup)
-                exec_str_late = format_pod_execution_seconds(comp_late, min_seconds=min_pod_duration_sec)
+                comp_late = max(opts.min_pod_duration_sec, raw_dur_late / opts.speedup)
+                exec_str_late = format_pod_execution_seconds(comp_late, min_seconds=opts.min_pod_duration_sec)
                 late_manifest, late_pods = _inject_pod_execution_time_and_sanitize_workflow(
                     raw_obj=cand.raw_obj,
                     exec_str=exec_str_late,
                     raw_duration_sec=raw_dur_late,
                     compressed_duration_sec=comp_late,
-                    pause_image_override=pause_image_override,
-                    override_namespace=override_workload_namespace,
-                    speedup=speedup,
+                    pause_image_override=opts.pause_image_override,
+                    override_namespace=opts.override_workload_namespace,
+                    speedup=opts.speedup,
                     scale_by_waves=bool(found_late or not has_explicit_ann),
-                    min_pod_duration_sec=min_pod_duration_sec,
+                    min_pod_duration_sec=opts.min_pod_duration_sec,
                 )
-                raw_off_late = max(0.0, arr_ep - t0_epoch)
-                wall_off_late = raw_off_late / speedup
+                raw_off_late = max(0.0, arr_ep - opts.t0_epoch)
+                wall_off_late = raw_off_late / opts.speedup
                 arr_iso = datetime.fromtimestamp(arr_ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                scheduled_workflows.append(
+                post_t0_items.append(
                     ScheduledWorkflowItem(
                         target_wall_offset_sec=wall_off_late,
                         seq=next_post_t0_seq,
@@ -1931,20 +2174,20 @@ def _build_initial_workloads_and_pods(
                 )
                 next_post_t0_seq += 1
             continue
-        if cand.deleted_epoch is not None and cand.deleted_epoch <= effective_start_epoch + 1e-6:
+        if cand.deleted_epoch is not None and cand.deleted_epoch <= opts.effective_start_epoch + 1e-6:
             continue
         if cand.preempt_item is not None:
-            preempt_abs_ep = t0_epoch + cand.preempt_item.raw_offset_from_t0_sec
-            if preempt_abs_ep <= effective_start_epoch + 1e-6:
+            preempt_abs_ep = opts.t0_epoch + cand.preempt_item.raw_offset_from_t0_sec
+            if preempt_abs_ep <= opts.effective_start_epoch + 1e-6:
                 # Already preempted before or at `effective_start_epoch`: leave in `scheduled_workflows`.
                 continue
         if cand.exec_info and cand.exec_info.full_end_epoch is not None:
-            if cand.exec_info.full_end_epoch <= effective_start_epoch + 1e-6:
+            if cand.exec_info.full_end_epoch <= opts.effective_start_epoch + 1e-6:
                 continue
         if (
             cand.exec_info
             and cand.exec_info.terminal_end_epoch is not None
-            and cand.exec_info.terminal_end_epoch <= effective_start_epoch + 1e-6
+            and cand.exec_info.terminal_end_epoch <= opts.effective_start_epoch + 1e-6
             and not (
                 cand.exec_info.admitted_epochs
                 and max(cand.exec_info.admitted_epochs) > cand.exec_info.terminal_end_epoch + 1e-6
@@ -1959,7 +2202,7 @@ def _build_initial_workloads_and_pods(
     # Also discover any t0-admitted Workloads in execution-time.json (or PodGroup pods in infra.json)
     # whose parent object was not recorded in workflows.json (e.g. PodGroup or custom CRDs).
     for (orig_ns, wl_name), w_info in sorted(exec_index.by_workload_name.items()):
-        eff_ns = override_workload_namespace or orig_ns
+        eff_ns = opts.override_workload_namespace or orig_ns
         if (
             (eff_ns, wl_name) in known_wl_keys
             or (eff_ns, wl_name) in scheduled_not_admitted_owners
@@ -1967,17 +2210,17 @@ def _build_initial_workloads_and_pods(
             or (w_info.owner_name and (eff_ns, w_info.owner_name) in scheduled_not_admitted_owners)
         ):
             continue
-        if not w_info.admitted_epochs or min(w_info.admitted_epochs) > effective_start_epoch + initial_window_sec:
+        if not w_info.admitted_epochs or min(w_info.admitted_epochs) > opts.effective_start_epoch + opts.initial_window_sec:
             continue
-        if w_info.full_end_epoch is not None and w_info.full_end_epoch <= effective_start_epoch + 1e-6:
+        if w_info.full_end_epoch is not None and w_info.full_end_epoch <= opts.effective_start_epoch + 1e-6:
             continue
         if (
             w_info.terminal_end_epoch is not None
-            and w_info.terminal_end_epoch <= effective_start_epoch + 1e-6
+            and w_info.terminal_end_epoch <= opts.effective_start_epoch + 1e-6
             and not (w_info.admitted_epochs and max(w_info.admitted_epochs) > w_info.terminal_end_epoch + 1e-6)
         ):
             continue
-        if w_info.preempted_epochs and min(w_info.preempted_epochs) <= effective_start_epoch + 1e-6:
+        if w_info.preempted_epochs and min(w_info.preempted_epochs) <= opts.effective_start_epoch + 1e-6:
             continue
         active_candidates.append(
             _AdmittedInitialCandidate(
@@ -1994,6 +2237,28 @@ def _build_initial_workloads_and_pods(
         )
         known_wl_keys.add((eff_ns, wl_name))
 
+    return active_candidates, post_t0_items, superseded_preempt_seqs
+
+
+def _match_initial_pods_to_candidates(
+    active_candidates: list[_AdmittedInitialCandidate],
+    qualifying_initial_pods: list[tuple[str, str, float, dict[str, Any], float | None]],
+    parsed_infra: _ParsedInfra,
+    exec_index: ExecutionTimeIndex,
+    scheduled_not_admitted_owners: set[tuple[str, str]],
+    *,
+    opts: _InitialBuildOptions,
+) -> tuple[
+    list[_AdmittedInitialCandidate],
+    dict[int, list[tuple[str, str, float, dict[str, Any], float | None]]],
+    set[int],
+]:
+    """Bind qualifying t0 pods to candidates via Tiers 1 (linkage), 2 (prefix), and 3 (profile/topology).
+
+    Returns `(updated_candidates, matched_pods_by_cand, claimed_pod_indices)` without mutating
+    `active_candidates`; `updated_candidates` includes any ad-hoc PodGroups discovered in Tier 1.
+    """
+    candidates = list(active_candidates)
     has_enriched_pod_linkage = any(
         bool(pl.get("workloadName") or pl.get("ownerName"))
         for (_p_ns, _p_name, _ev_ep, pl, _del_ep) in qualifying_initial_pods
@@ -2002,7 +2267,7 @@ def _build_initial_workloads_and_pods(
     cand_by_wl: dict[tuple[str, str], int] = {}
     cand_by_owner_kind: dict[tuple[str, str, str], int] = {}
     cand_by_owner: dict[tuple[str, str], int] = {}
-    for c_idx, cand in enumerate(active_candidates):
+    for c_idx, cand in enumerate(candidates):
         if cand.exec_info and cand.exec_info.workload_name:
             cand_by_wl[(cand.namespace, cand.exec_info.workload_name)] = c_idx
         if cand.kind and cand.name:
@@ -2011,7 +2276,7 @@ def _build_initial_workloads_and_pods(
             cand_by_owner.setdefault((cand.namespace, cand.name), c_idx)
 
     matched_pods_by_cand: dict[int, list[tuple[str, str, float, dict[str, Any], float | None]]] = {
-        i: [] for i in range(len(active_candidates))
+        i: [] for i in range(len(candidates))
     }
     claimed_pod_indices: set[int] = set()
 
@@ -2034,9 +2299,9 @@ def _build_initial_workloads_and_pods(
             not p_oname or (p_ns, p_oname) not in scheduled_not_admitted_owners
         ):
             # Create ad-hoc PodGroup candidate when pod carries explicit workloadName without workflows.json entry.
-            new_c_idx = len(active_candidates)
+            new_c_idx = len(candidates)
             w_info = exec_index.by_workload_name.get((p_ns, p_wl))
-            active_candidates.append(
+            candidates.append(
                 _AdmittedInitialCandidate(
                     namespace=p_ns,
                     orig_namespace=p_ns,
@@ -2058,9 +2323,9 @@ def _build_initial_workloads_and_pods(
             claimed_pod_indices.add(p_idx)
 
     # Tiers 2 & 3: Legacy fallback matchers when trace predates scraper pod-workload linkage.
-    if not has_enriched_pod_linkage and active_candidates and qualifying_initial_pods:
+    if not has_enriched_pod_linkage and candidates and qualifying_initial_pods:
         # Tier 2: Plain-name prefix matching (`<wf_name>-*` or `== <wf_name>`).
-        for c_idx, cand in enumerate(active_candidates):
+        for c_idx, cand in enumerate(candidates):
             if matched_pods_by_cand[c_idx] or not cand.name:
                 continue
             if cand.name.startswith("h-") and len(cand.name) == 34:
@@ -2097,11 +2362,11 @@ def _build_initial_workloads_and_pods(
         )
 
         # Tier 3: Resource-profile + topology-contiguous matching for hashed/translated traces.
-        for c_idx, cand in enumerate(active_candidates):
+        for c_idx, cand in enumerate(candidates):
             if matched_pods_by_cand[c_idx] or not cand.raw_obj:
                 continue
             lq_chk, cq_chk = _resolve_cq_and_lq_for_candidate(
-                cand, parsed_infra, manage_jobs_without_queue_name=manage_jobs_without_queue_name
+                cand, parsed_infra, manage_jobs_without_queue_name=opts.manage_jobs_without_queue_name
             )
             if not lq_chk or not cq_chk:
                 continue
@@ -2146,7 +2411,801 @@ def _build_initial_workloads_and_pods(
                     matched_pods_by_cand[c_idx].append(qualifying_initial_pods[p_idx])
                     claimed_pod_indices.add(p_idx)
 
-    # Track remaining allocatable resources per node so synthetic missing-pod placement (Tier 4) fits cleanly.
+    return candidates, matched_pods_by_cand, claimed_pod_indices
+
+
+def _bootstrap_initial_deployment(
+    cand: _AdmittedInitialCandidate,
+    cand_pods: list[tuple[str, str, float, dict[str, Any], float | None]],
+    *,
+    lq_name: str,
+    cq_name: str,
+    parsed_infra: _ParsedInfra,
+    rem_node_alloc: dict[str, dict[str, float]],
+    opts: _InitialBuildOptions,
+) -> InitialDeploymentBootstrap:
+    """Materialize a t0 apps/v1 Deployment candidate into an InitialDeploymentBootstrap.
+
+    Mutates `rem_node_alloc` in place when picking synthetic placements for unmatched admitted replicas.
+    """
+    dep_spec_raw = cand.raw_obj.get("spec") or {}
+    raw_rep_val = dep_spec_raw.get("replicas")
+    desired_replicas = max(0, int(raw_rep_val)) if raw_rep_val is not None else 1
+    if cand.ready_replicas is not None:
+        k_admitted = min(desired_replicas, max(0, int(cand.ready_replicas)))
+        if k_admitted == 0 and cand_pods:
+            k_admitted = min(desired_replicas, len(cand_pods))
+    elif cand_pods:
+        k_admitted = min(desired_replicas, len(cand_pods))
+    else:
+        k_admitted = desired_replicas
+
+    ps_groups_dep = _extract_workflow_podset_templates(cand.raw_obj, "Deployment")
+    if not ps_groups_dep and desired_replicas == 0 and isinstance(cand.raw_obj, dict):
+        raw_dep_one = dict(cand.raw_obj)
+        raw_dep_one["spec"] = {**(cand.raw_obj.get("spec") or {}), "replicas": 1}
+        ps_groups_dep = _extract_workflow_podset_templates(raw_dep_one, "Deployment")
+    dep_per_pod_reqs: dict[str, str] = (
+        dict(ps_groups_dep[0][2]) if ps_groups_dep else {"cpu": "1", "memory": "1Gi"}
+    )
+    dep_is_tas = bool(ps_groups_dep[0][3]) if ps_groups_dep else False
+
+    cq_doc_dep = parsed_infra.cqs_by_name[cq_name]
+    flv_doc_dep = _first_cq_flavor_doc(cq_doc_dep, parsed_infra)
+
+    dep_placements = [str(pt[3].get("placement") or "") for pt in cand_pods[:k_admitted]]
+    while len(dep_placements) < k_admitted:
+        used_dep_nodes = {plc for plc in dep_placements if plc}
+        chosen_node_dep = _pick_fitting_node_for_pod(
+            parsed_infra,
+            rem_node_alloc,
+            dep_per_pod_reqs,
+            flv_doc=flv_doc_dep,
+            used_nodes=used_dep_nodes,
+        )
+        dep_placements.append(chosen_node_dep)
+
+    dep_manifest, _ = _inject_pod_execution_time_and_sanitize_workflow(
+        raw_obj=cand.raw_obj,
+        exec_str="1",
+        raw_duration_sec=1.0,
+        compressed_duration_sec=1.0,
+        pause_image_override=opts.pause_image_override,
+        override_namespace=opts.override_workload_namespace,
+        speedup=opts.speedup,
+        min_pod_duration_sec=opts.min_pod_duration_sec,
+    )
+    dep_meta = dep_manifest.setdefault("metadata", {})
+    dep_labels = dict(dep_meta.get("labels") or {})
+    if lq_name and not dep_labels.get("kueue.x-k8s.io/queue-name"):
+        dep_labels["kueue.x-k8s.io/queue-name"] = lq_name
+    dep_meta["labels"] = dep_labels
+    applied_dep_name = str(dep_meta.get("name") or cand.name)
+
+    raw_anns_dep = (cand.raw_obj.get("metadata") or {}).get("annotations") or {}
+    pc_name_dep, prio_val_dep = _resolve_candidate_priority(
+        cand,
+        parsed_infra,
+        labels=dep_labels,
+        annotations=raw_anns_dep,
+    )
+    orig_age_dep = _compute_initial_age_sec(cand, opts.effective_start_epoch, opts.speedup)
+
+    return InitialDeploymentBootstrap(
+        namespace=cand.namespace,
+        name=cand.name,
+        applied_name=applied_dep_name,
+        local_queue_name=lq_name,
+        cluster_queue_name=cq_name,
+        desired_replicas=desired_replicas,
+        admitted_replicas=k_admitted,
+        paused=bool((dep_manifest.get("spec") or {}).get("paused", False)),
+        original_age_sec=orig_age_dep,
+        placements=dep_placements,
+        per_pod_requests=dep_per_pod_reqs,
+        priority_class_name=pc_name_dep,
+        priority=prio_val_dep,
+        is_tas=dep_is_tas,
+        manifest=dep_manifest,
+        cq_doc=cq_doc_dep,
+        flavors_by_name=dict(parsed_infra.flavors_by_name),
+        topologies_by_name=dict(parsed_infra.topologies_by_name),
+        nodes_by_name=dict(parsed_infra.nodes_by_name),
+        scraped_pod_set_assignments=list(cand.exec_info.pod_set_assignments if cand.exec_info else []),
+        incarnation_index=cand.incarnation_index,
+    )
+
+
+def _synthesize_missing_t0_pods(
+    cand: _AdmittedInitialCandidate,
+    cand_pods: list[tuple[str, str, float, dict[str, Any], float | None]],
+    *,
+    lq_name: str,
+    cq_name: str,
+    parsed_infra: _ParsedInfra,
+    rem_node_alloc: dict[str, dict[str, float]],
+    opts: _InitialBuildOptions,
+) -> list[tuple[str, str, float, dict[str, Any], float | None]]:
+    """Tier 4: Return `cand_pods` plus any synthesized missing t0 pods without mutating `cand_pods`.
+
+    Mutates `rem_node_alloc` in place as synthesized pods reserve remaining node capacity.
+    """
+    out_pods = list(cand_pods)
+    if cand.from_workflows_json and lq_name and cq_name:
+        if cand.kind == "PodGroup":
+            ps_groups_raw: dict[tuple[str, tuple[tuple[str, float], ...]], tuple[str, int, dict[str, str], bool]] = {}
+            for m_obj in cand.member_objs:
+                for m_ps, m_cnt, m_reqs, m_tas in _extract_workflow_podset_templates(m_obj, "Pod"):
+                    gk_m = (m_ps, _canonical_resource_profile(m_reqs))
+                    if gk_m in ps_groups_raw:
+                        prev_ps, prev_cnt, prev_reqs, prev_tas = ps_groups_raw[gk_m]
+                        ps_groups_raw[gk_m] = (prev_ps, prev_cnt + m_cnt, prev_reqs, prev_tas or m_tas)
+                    else:
+                        ps_groups_raw[gk_m] = (m_ps, m_cnt, m_reqs, m_tas)
+            ps_groups = list(ps_groups_raw.values())
+            if len(ps_groups) == 1 and cand.member_objs:
+                pg_tot_str = _get_pod_meta_annotation_or_label(
+                    cand.member_objs[0].get("metadata"),
+                    "kueue.x-k8s.io/pod-group-total-count",
+                )
+                try:
+                    pg_tot = int(pg_tot_str)
+                except ValueError:
+                    pg_tot = 0
+                if pg_tot > ps_groups[0][1]:
+                    ps_groups = [(ps_groups[0][0], pg_tot, ps_groups[0][2], ps_groups[0][3])]
+        elif cand.raw_obj:
+            ps_groups = _extract_workflow_podset_templates(cand.raw_obj, cand.kind)
+        else:
+            ps_groups = []
+    else:
+        ps_groups = []
+
+    expected_total_pods = sum(cnt for (_n, cnt, _r, _t) in ps_groups)
+    if not (ps_groups and len(out_pods) < expected_total_pods):
+        return out_pods
+
+    flv_doc_tmp = _first_cq_flavor_doc(parsed_infra.cqs_by_name[cq_name], parsed_infra)
+
+    allowed_ta_domains: dict[str, set[str]] = {}
+    for s_psa in (cand.exec_info.pod_set_assignments if cand.exec_info else []):
+        ta_obj = s_psa.get("topologyAssignment") if isinstance(s_psa, dict) else None
+        if not isinstance(ta_obj, dict):
+            continue
+        ta_levels = [str(x) for x in (ta_obj.get("levels") or [])]
+        for sl_obj in ta_obj.get("slices") or []:
+            if not isinstance(sl_obj, dict):
+                continue
+            for l_idx, lv_obj in enumerate(sl_obj.get("valuesPerLevel") or []):
+                if l_idx >= len(ta_levels) or not isinstance(lv_obj, dict):
+                    continue
+                lvl_key = ta_levels[l_idx]
+                if lv_obj.get("universal") is not None:
+                    allowed_ta_domains.setdefault(lvl_key, set()).add(str(lv_obj["universal"]))
+                indiv = lv_obj.get("individual")
+                if isinstance(indiv, dict):
+                    pfx = str(indiv.get("prefix") or "")
+                    sfx = str(indiv.get("suffix") or "")
+                    for rt in indiv.get("roots") or []:
+                        allowed_ta_domains.setdefault(lvl_key, set()).add(f"{pfx}{rt}{sfx}")
+
+    wf_true_cand, wf_mult_cand = _extract_workflow_true_duration_and_multiplier(cand.raw_obj)
+    synth_del_ep = _resolve_t0_pod_end_epoch(
+        cand,
+        None,
+        opts=opts,
+        wf_true_dur=wf_true_cand,
+        wf_mult=wf_mult_cand,
+        past_full_fallback="full_duration",
+        allow_annotation_fallback=True,
+    )
+    # Allocate already-bound pods against ps_groups in two passes:
+    # 1) Exact resource profile matches first,
+    # 2) Remaining unmatched existing pods (e.g., when LimitRange defaults or mutating webhooks
+    #    altered scraped pod requests relative to the workflow template) against remaining deficits
+    #    so Tier 4 never synthesizes more than (expected_total_pods - len(out_pods)) pods.
+    unmatched_existing: list[tuple[str, str, float, dict[str, Any], float | None]] = list(out_pods)
+    group_have: list[int] = [0] * len(ps_groups)
+    group_matched_reqs: list[dict[str, str] | None] = [None] * len(ps_groups)
+    for g_i, (ps_name, cnt, reqs, _is_tas) in enumerate(ps_groups):
+        prof_grp = _canonical_resource_profile(reqs)
+        still_unmatched: list[tuple[str, str, float, dict[str, Any], float | None]] = []
+        for pt_ex in unmatched_existing:
+            if group_have[g_i] < cnt and _canonical_resource_profile(
+                pt_ex[3].get("resourceRequest") or {}
+            ) == prof_grp:
+                group_have[g_i] += 1
+            else:
+                still_unmatched.append(pt_ex)
+        unmatched_existing = still_unmatched
+    for g_i, (ps_name, cnt, reqs, _is_tas) in enumerate(ps_groups):
+        if not unmatched_existing or group_have[g_i] >= cnt:
+            continue
+        accel_grp = _canonical_accel_profile(reqs)
+        # Prefer pods matching podSetName hint or accelerator profile, then any remaining pod.
+        unmatched_existing.sort(
+            key=lambda pt_ex: (
+                0 if str(pt_ex[3].get("podSetName") or "") == ps_name else 1,
+                0
+                if accel_grp
+                and _canonical_accel_profile(pt_ex[3].get("resourceRequest") or {}) == accel_grp
+                else 1,
+            )
+        )
+        take_cnt = min(cnt - group_have[g_i], len(unmatched_existing))
+        if take_cnt > 0:
+            sample_reqs = _extract_pod_resource_requests(unmatched_existing[0][3])
+            if sample_reqs:
+                group_matched_reqs[g_i] = sample_reqs
+            group_have[g_i] += take_cnt
+            del unmatched_existing[:take_cnt]
+
+    synth_idx = len(out_pods)
+    for g_i, (ps_name, cnt, reqs, is_tas) in enumerate(ps_groups):
+        missing_cnt = max(0, cnt - group_have[g_i])
+        eff_reqs = group_matched_reqs[g_i] if group_matched_reqs[g_i] is not None else reqs
+        for _ in range(missing_cnt):
+            used_cand_nodes = {str(pt_c[3].get("placement") or "") for pt_c in out_pods}
+            chosen_node = _pick_fitting_node_for_pod(
+                parsed_infra,
+                rem_node_alloc,
+                eff_reqs,
+                flv_doc=flv_doc_tmp,
+                used_nodes=used_cand_nodes,
+                allowed_ta_domains=allowed_ta_domains or None,
+            )
+            synth_p_name = sanitize_k8s_name(
+                f"{cand.name}-{ps_name}-{synth_idx}", max_len=MAX_K8S_NAME_LEN
+            )
+            synth_idx += 1
+            out_pods.append(
+                (
+                    cand.namespace,
+                    synth_p_name,
+                    opts.t0_epoch,
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": synth_p_name,
+                        "namespace": cand.namespace,
+                        "placement": chosen_node,
+                        "resourceRequest": dict(eff_reqs),
+                        "podSetName": ps_name,
+                        "isTAS": is_tas,
+                    },
+                    synth_del_ep,
+                )
+            )
+    return out_pods
+
+
+def _build_t0_resubmit_item(
+    cand: _AdmittedInitialCandidate,
+    *,
+    c_idx: int,
+    lq_name: str,
+    admit_iso: str,
+    exec_index: ExecutionTimeIndex,
+    opts: _InitialBuildOptions,
+) -> ScheduledWorkflowItem | None:
+    """Build the dynamic `spec.suspend = True` resubmission manifest for a preemptable t0 workflow."""
+    if not (cand.from_workflows_json and cand.raw_obj and cand.kind != "PodGroup"):
+        return None
+    cand_wf_true_dur, cand_wf_mult = _extract_workflow_true_duration_and_multiplier(cand.raw_obj)
+    existing_resub_ann = _extract_existing_pod_exec_seconds(cand.raw_obj)
+    has_explicit_resub_ann = existing_resub_ann is not None
+    fallback_dur = existing_resub_ann or opts.default_exec_sec
+    raw_dur_full, found_idx = exec_index.resolve_duration_sec(
+        namespace=cand.orig_namespace,
+        object_kind=cand.kind,
+        name=cand.name,
+        fallback_sec=fallback_dur,
+        interrupted_duration_multiplier=opts.interrupted_duration_multiplier,
+        interrupted_duration_override=opts.interrupted_duration_override,
+        workflow_true_duration_sec=cand_wf_true_dur,
+        workflow_missing_multiplier=cand_wf_mult,
+        creation_epoch=cand.creation_epoch,
+        incarnation_index=cand.incarnation_index,
+    )
+    comp_dur_full = max(opts.min_pod_duration_sec, raw_dur_full / opts.speedup)
+    exec_str_full = format_pod_execution_seconds(comp_dur_full, min_seconds=opts.min_pod_duration_sec)
+    resub_manifest, resub_pod_cnt = _inject_pod_execution_time_and_sanitize_workflow(
+        raw_obj=cand.raw_obj,
+        exec_str=exec_str_full,
+        raw_duration_sec=raw_dur_full,
+        compressed_duration_sec=comp_dur_full,
+        pause_image_override=opts.pause_image_override,
+        override_namespace=opts.override_workload_namespace,
+        extra_pod_annotations={"kueue-optimizer.gke.io/preempted-t0-resubmit": "true"},
+        speedup=opts.speedup,
+        scale_by_waves=bool(found_idx or not has_explicit_resub_ann),
+        min_pod_duration_sec=opts.min_pod_duration_sec,
+    )
+    return ScheduledWorkflowItem(
+        target_wall_offset_sec=0.0,
+        seq=100000 + c_idx,
+        raw_offset_sec=0.0,
+        raw_offset_from_t0_sec=0.0,
+        event_timestamp=admit_iso,
+        object_kind=cand.kind,
+        name=cand.name,
+        namespace=cand.namespace,
+        local_queue_name=lq_name,
+        workload_state="NotAdmitted",
+        trigger_reason="preempted_after_initial_admission",
+        execution_duration_sec=raw_dur_full,
+        compressed_duration_sec=comp_dur_full,
+        indexed_from_execution_time=found_idx,
+        pod_count=resub_pod_cnt,
+        manifest=resub_manifest,
+        creation_epoch=cand.creation_epoch if cand.creation_epoch is not None else opts.t0_epoch,
+        incarnation_index=cand.incarnation_index,
+        has_explicit_pod_exec_annotation=has_explicit_resub_ann,
+    )
+
+
+@dataclass(frozen=True)
+class _WorkloadChunkContext:
+    """Shared per-chunk context passed from `_materialize_initial_workload_chunks` to `_build_podset_spec_and_members`."""
+
+    wl_k8s_name: str
+    lq_name: str
+    pc_name: str
+    total_group_pods: int
+    total_groups: int
+    cq_doc: dict[str, Any]
+    parsed_infra: _ParsedInfra
+    wf_true_dur: float | None
+    wf_mult: float | None
+    opts: _InitialBuildOptions
+
+
+def _build_podset_spec_and_members(
+    cand: _AdmittedInitialCandidate,
+    pts: list[tuple[str, str, float, dict[str, Any], float | None]],
+    *,
+    role_hash: str,
+    ps_hint: str,
+    group_index: int,
+    ns_used_pods: set[str],
+    ctx: _WorkloadChunkContext,
+) -> tuple[dict[str, Any], dict[str, Any], list[InitialPodSpec], bool]:
+    """Build one PodSet spec, PodSetAssignment, and member InitialPodSpecs for a t0 Workload chunk.
+
+    Mutates `ns_used_pods` in place as pod names are allocated.
+    """
+    ns = cand.namespace
+    opts = ctx.opts
+    rep_reqs = _extract_pod_resource_requests(pts[0][3])
+    placements = [str(pt[3].get("placement") or "") for pt in pts]
+    scraped_psas = cand.exec_info.pod_set_assignments if cand.exec_info else []
+    psa, psa_uses_tas = _resolve_podset_assignment_for_group(
+        role_hash=role_hash,
+        count=len(pts),
+        reqs=rep_reqs,
+        placements=placements,
+        cq_doc=ctx.cq_doc,
+        parsed_infra=ctx.parsed_infra,
+        scraped_psas=scraped_psas,
+        ps_hint=ps_hint,
+        group_index=group_index,
+        total_groups=ctx.total_groups,
+    )
+
+    ps_member_specs: list[InitialPodSpec] = []
+    for p_ns, p_name, _ev_ep, pl, del_ep in pts:
+        eff_del_ep = _resolve_t0_pod_end_epoch(
+            cand,
+            del_ep,
+            opts=opts,
+            wf_true_dur=ctx.wf_true_dur,
+            wf_mult=ctx.wf_mult,
+        )
+        if eff_del_ep is not None and eff_del_ep > opts.effective_start_epoch:
+            rem_raw = eff_del_ep - opts.effective_start_epoch
+            rem_compressed = max(opts.min_pod_duration_sec, rem_raw / opts.speedup)
+            is_inf = False
+        else:
+            rem_compressed = max(opts.min_pod_duration_sec, opts.infinite_pod_duration_sec / opts.speedup)
+            is_inf = True
+
+        exec_str = format_pod_execution_seconds(rem_compressed, min_seconds=opts.min_pod_duration_sec)
+        placement = str(pl.get("placement") or "")
+        k8s_pod_name = _allocate_k8s_name(p_name, ns_used_pods)
+
+        p_labels: dict[str, str] = {
+            "kueue-optimizer.gke.io/initial-pod": "true",
+            "kueue-optimizer.gke.io/testrunner": "true",
+            "kueue.x-k8s.io/managed": "true",
+            "kueue.x-k8s.io/pod-group-name": ctx.wl_k8s_name,
+            "kueue.x-k8s.io/queue-name": ctx.lq_name,
+        }
+        if ctx.pc_name:
+            p_labels["kueue.x-k8s.io/priority-class"] = ctx.pc_name
+
+        p_anns: dict[str, str] = {
+            "kueue.x-k8s.io/pod-group-total-count": str(ctx.total_group_pods),
+            "kueue.x-k8s.io/role-hash": role_hash,
+            "kueue.x-k8s.io/retriable-in-group": "false",
+            "kueue.x-k8s.io/workload": ctx.wl_k8s_name,
+            "kueue-optimizer.gke.io/pod-execution-time-seconds": exec_str,
+            "kueue-optimizer.gke.io/original-name": p_name,
+            "kueue-optimizer.gke.io/original-namespace": p_ns,
+        }
+        if psa_uses_tas:
+            p_anns["kueue.x-k8s.io/podset-unconstrained-topology"] = "true"
+        if is_inf:
+            p_anns["kueue-optimizer.gke.io/infinite-duration"] = "true"
+
+        pod_manifest = _build_kwok_pause_pod_manifest(
+            name=k8s_pod_name,
+            namespace=ns,
+            labels=p_labels,
+            annotations=p_anns,
+            pause_img=opts.pause_img,
+            reqs=rep_reqs,
+            placement=placement,
+        )
+        ps_member_specs.append(
+            InitialPodSpec(
+                name=k8s_pod_name,
+                namespace=ns,
+                placement=placement,
+                resource_request=dict(rep_reqs),
+                remaining_duration_sec=rem_compressed,
+                is_infinite=is_inf,
+                manifest=pod_manifest,
+            )
+        )
+
+    rep_exec_str = format_pod_execution_seconds(
+        max(p.remaining_duration_sec for p in ps_member_specs),
+        min_seconds=opts.min_pod_duration_sec,
+    )
+    tpl_labels = {
+        "kueue.x-k8s.io/managed": "true",
+        "kueue.x-k8s.io/pod-group-name": ctx.wl_k8s_name,
+        "kueue.x-k8s.io/queue-name": ctx.lq_name,
+    }
+    if ctx.pc_name:
+        tpl_labels["kueue.x-k8s.io/priority-class"] = ctx.pc_name
+    tpl_anns = {
+        "kueue.x-k8s.io/pod-group-total-count": str(ctx.total_group_pods),
+        "kueue.x-k8s.io/role-hash": role_hash,
+        "kueue.x-k8s.io/retriable-in-group": "false",
+        "kueue-optimizer.gke.io/pod-execution-time-seconds": rep_exec_str,
+    }
+    if psa_uses_tas:
+        tpl_anns["kueue.x-k8s.io/podset-unconstrained-topology"] = "true"
+    if all(p.is_infinite for p in ps_member_specs):
+        tpl_anns["kueue-optimizer.gke.io/infinite-duration"] = "true"
+
+    ps_spec_entry: dict[str, Any] = {
+        "name": role_hash,
+        "count": len(pts),
+        "template": {
+            "metadata": {
+                "labels": tpl_labels,
+                "annotations": tpl_anns,
+            },
+            "spec": _build_kwok_pause_pod_spec(opts.pause_img, rep_reqs),
+        },
+    }
+    if psa_uses_tas:
+        ps_spec_entry["topologyRequest"] = {"unconstrained": True}
+    return ps_spec_entry, psa, ps_member_specs, psa_uses_tas
+
+
+def _materialize_initial_workload_chunks(
+    cand: _AdmittedInitialCandidate,
+    cand_pods: list[tuple[str, str, float, dict[str, Any], float | None]],
+    *,
+    c_idx: int,
+    lq_name: str,
+    cq_name: str,
+    parsed_infra: _ParsedInfra,
+    used_wl_names_by_ns: dict[str, set[str]],
+    used_pod_names_by_ns: dict[str, set[str]],
+    admit_iso: str,
+    resubmit_item: ScheduledWorkflowItem | None,
+    opts: _InitialBuildOptions,
+) -> list[InitialWorkloadPodGroup]:
+    """Group a t0 candidate's pods into <=8-PodSet InitialWorkloadPodGroups.
+
+    Mutates `used_wl_names_by_ns` and `used_pod_names_by_ns` in place as per-namespace name registries.
+    """
+    ns = cand.namespace
+    cq_doc = parsed_infra.cqs_by_name[cq_name]
+
+    # Group pods by `(podSetName_hint, canonical_reqs)` so every PodSet has strictly homogeneous per-pod requests,
+    # guaranteeing Kueue's `WorkloadWebhook` `resourceUsage % count == 0` invariant.
+    grouped_pods: dict[tuple[str, tuple[tuple[str, float], ...]], list[tuple[str, str, float, dict[str, Any], float | None]]] = {}
+    for pt in cand_pods:
+        pl = pt[3]
+        reqs_raw = _extract_pod_resource_requests(pl)
+        ps_hint = str(pl.get("podSetName") or "main")
+        g_key = (ps_hint, _canonical_resource_profile(reqs_raw))
+        grouped_pods.setdefault(g_key, []).append(pt)
+
+    # Kueue's Workload CRD limits `spec.podSets` to `MaxItems=8`; chunk into <=8-PodSet PodGroups if ever needed.
+    group_entries = list(grouped_pods.items())
+    chunks = [group_entries[i : i + 8] for i in range(0, len(group_entries), 8)]
+
+    raw_meta = (cand.raw_obj.get("metadata") or {}) if isinstance(cand.raw_obj, dict) else {}
+    pc_name, prio_val = _resolve_candidate_priority(
+        cand,
+        parsed_infra,
+        labels=raw_meta.get("labels") or {},
+        annotations=raw_meta.get("annotations") or {},
+        fallback_when_named=1000 - c_idx,
+    )
+
+    if cand.kind == "PodGroup":
+        base_wl_raw = (cand.exec_info.workload_name if cand.exec_info and cand.exec_info.workload_name else "") or (
+            cand.name if cand.name else f"pg-init-{c_idx}"
+        )
+    elif cand.from_workflows_json and cand.raw_obj:
+        base_wl_raw = f"t0pg-{cand.name}" if cand.name else f"t0pg-init-{c_idx}"
+    else:
+        base_wl_raw = (cand.exec_info.workload_name if cand.exec_info and cand.exec_info.workload_name else "") or (
+            f"pg-{cand.name}" if cand.name else f"pg-init-{c_idx}"
+        )
+
+    cand_wf_true_dur, cand_wf_mult = _extract_workflow_true_duration_and_multiplier(cand.raw_obj)
+    out_workloads: list[InitialWorkloadPodGroup] = []
+    orig_age_sec = _compute_initial_age_sec(cand, opts.effective_start_epoch, opts.speedup)
+
+    for chunk_idx, chunk in enumerate(chunks):
+        cand_wl_base = base_wl_raw if len(chunks) == 1 else f"{base_wl_raw}-{chunk_idx}"
+        ns_used_wls = used_wl_names_by_ns.setdefault(ns, set())
+        wl_k8s_name = _allocate_k8s_name(cand_wl_base, ns_used_wls, prefix="pg", allow_dots=False)
+
+        total_group_pods = sum(len(pts) for (_gk, pts) in chunk)
+        pod_sets_spec: list[dict[str, Any]] = []
+        pod_set_assignments: list[dict[str, Any]] = []
+        group_pod_specs: list[InitialPodSpec] = []
+        any_tas_in_wl = False
+        ns_used_pods = used_pod_names_by_ns.setdefault(ns, set())
+
+        chunk_ctx = _WorkloadChunkContext(
+            wl_k8s_name=wl_k8s_name,
+            lq_name=lq_name,
+            pc_name=pc_name,
+            total_group_pods=total_group_pods,
+            total_groups=len(chunk),
+            cq_doc=cq_doc,
+            parsed_infra=parsed_infra,
+            wf_true_dur=cand_wf_true_dur,
+            wf_mult=cand_wf_mult,
+            opts=opts,
+        )
+        for g_idx, ((ps_hint, _prof), pts) in enumerate(chunk):
+            role_hash = hashlib.sha256(f"{g_idx}:{ps_hint}:{_prof!r}".encode("utf-8")).hexdigest()[:8]
+            ps_spec_entry, psa, ps_member_specs, psa_uses_tas = _build_podset_spec_and_members(
+                cand,
+                pts,
+                role_hash=role_hash,
+                ps_hint=ps_hint,
+                group_index=g_idx,
+                ns_used_pods=ns_used_pods,
+                ctx=chunk_ctx,
+            )
+            if psa_uses_tas:
+                any_tas_in_wl = True
+            pod_sets_spec.append(ps_spec_entry)
+            pod_set_assignments.append(psa)
+            group_pod_specs.extend(ps_member_specs)
+
+        wl_labels: dict[str, str] = {
+            "kueue-optimizer.gke.io/initial-workload": "true",
+            "kueue-optimizer.gke.io/testrunner": "true",
+        }
+        if pc_name:
+            wl_labels["kueue.x-k8s.io/priority-class"] = pc_name
+
+        wl_spec: dict[str, Any] = {
+            "active": True,
+            "queueName": lq_name,
+            "priority": int(prio_val if prio_val is not None else 0),
+            "podSets": pod_sets_spec,
+        }
+        if pc_name:
+            wl_spec["priorityClassRef"] = {
+                "group": "kueue.x-k8s.io",
+                "kind": "WorkloadPriorityClass",
+                "name": pc_name,
+            }
+
+        wl_manifest: dict[str, Any] = {
+            "apiVersion": "kueue.x-k8s.io/v1beta2",
+            "kind": "Workload",
+            "metadata": {
+                "name": wl_k8s_name,
+                "namespace": ns,
+                "labels": wl_labels,
+                "annotations": {
+                    "kueue.x-k8s.io/is-group-workload": "true",
+                    "kueue-optimizer.gke.io/original-owner-kind": cand.kind,
+                    "kueue-optimizer.gke.io/original-owner-name": cand.name,
+                },
+            },
+            "spec": wl_spec,
+        }
+        wl_status: dict[str, Any] = {
+            "admission": {
+                "clusterQueue": cq_name,
+                "podSetAssignments": pod_set_assignments,
+            },
+            "conditions": [
+                {
+                    "type": "QuotaReserved",
+                    "status": "True",
+                    "reason": "QuotaReserved",
+                    "message": "Pre-admitted initial running workload at scenario start",
+                    "lastTransitionTime": admit_iso,
+                    "observedGeneration": 1,
+                },
+                {
+                    "type": "Admitted",
+                    "status": "True",
+                    "reason": "Admitted",
+                    "message": "Pre-admitted initial running workload at scenario start",
+                    "lastTransitionTime": admit_iso,
+                    "observedGeneration": 1,
+                },
+                {
+                    "type": "PodsReady",
+                    "status": "True",
+                    "reason": "Started",
+                    "message": "All pods reached readiness and the workload is running",
+                    "lastTransitionTime": admit_iso,
+                    "observedGeneration": 1,
+                },
+            ],
+        }
+
+        out_workloads.append(
+            InitialWorkloadPodGroup(
+                workload_name=wl_k8s_name,
+                namespace=ns,
+                local_queue_name=lq_name,
+                cluster_queue_name=cq_name,
+                owner_kind=cand.kind,
+                owner_name=cand.name,
+                priority_class_name=pc_name,
+                priority=prio_val,
+                is_tas=any_tas_in_wl,
+                pods=group_pod_specs,
+                workload_manifest=wl_manifest,
+                workload_status=wl_status,
+                resubmit_item=resubmit_item if chunk_idx == 0 else None,
+                original_age_sec=orig_age_sec,
+            )
+        )
+
+    return out_workloads
+
+
+def _build_initial_infra_pods(
+    qualifying_initial_pods: list[tuple[str, str, float, dict[str, Any], float | None]],
+    claimed_pod_indices: set[int],
+    *,
+    opts: _InitialBuildOptions,
+) -> list[InitialPodSpec]:
+    """Convert unclaimed qualifying t0 pods into Class 2 non-Kueue infrastructure pods."""
+    initial_infra_pods: list[InitialPodSpec] = []
+    used_infra_pod_names: set[str] = set()
+    for p_idx, (p_ns, p_name, _ev_epoch, pl, del_ep) in enumerate(qualifying_initial_pods):
+        if p_idx in claimed_pod_indices:
+            continue
+        if del_ep is not None and del_ep > opts.effective_start_epoch:
+            rem_raw = del_ep - opts.effective_start_epoch
+            rem_compressed = max(opts.min_pod_duration_sec, rem_raw / opts.speedup)
+            is_inf = False
+        else:
+            rem_compressed = max(opts.min_pod_duration_sec, opts.infinite_pod_duration_sec / opts.speedup)
+            is_inf = True
+
+        exec_str = format_pod_execution_seconds(rem_compressed, min_seconds=opts.min_pod_duration_sec)
+        placement = str(pl.get("placement") or "")
+        reqs = _extract_pod_resource_requests(pl)
+        k8s_pod_name = _allocate_k8s_name(p_name, used_infra_pod_names)
+        pod_manifest = _build_kwok_pause_pod_manifest(
+            name=k8s_pod_name,
+            namespace=opts.infra_pods_namespace,
+            labels={
+                "kueue-optimizer.gke.io/initial-pod": "true",
+                "kueue-optimizer.gke.io/testrunner": "true",
+            },
+            annotations={
+                "kueue-optimizer.gke.io/pod-execution-time-seconds": exec_str,
+                "kueue-optimizer.gke.io/original-name": p_name,
+                "kueue-optimizer.gke.io/original-namespace": p_ns,
+                **({"kueue-optimizer.gke.io/infinite-duration": "true"} if is_inf else {}),
+            },
+            pause_img=opts.pause_img,
+            reqs=reqs,
+            placement=placement,
+        )
+        initial_infra_pods.append(
+            InitialPodSpec(
+                name=k8s_pod_name,
+                namespace=opts.infra_pods_namespace,
+                placement=placement,
+                resource_request=reqs,
+                remaining_duration_sec=rem_compressed,
+                is_infinite=is_inf,
+                manifest=pod_manifest,
+            )
+        )
+    return initial_infra_pods
+
+
+def _build_initial_workloads_and_pods(
+    parsed_infra: _ParsedInfra,
+    admitted_candidates: list[_AdmittedInitialCandidate],
+    scheduled_workflows: list[ScheduledWorkflowItem],
+    scheduled_deletions: list[ScheduledWorkflowDeletion],
+    earliest_admit_by_ns: dict[str, float],
+    exec_index: ExecutionTimeIndex,
+    *,
+    opts: _InitialBuildOptions,
+) -> tuple[
+    list[InitialWorkloadPodGroup],
+    list[InitialDeploymentBootstrap],
+    list[InitialPodSpec],
+    list[ScheduledWorkflowItem],
+    int,
+]:
+    """Partition t0 running state into pre-admitted Kueue workloads/Deployments and non-Kueue infra-pods."""
+    not_admitted_wf_names = [
+        (w.namespace, w.name) for w in scheduled_workflows if w.trigger_reason == "initial_not_admitted"
+    ]
+    qualifying_initial_pods, expired_initial_pods_count = filter_initial_running_pods(
+        parsed_infra.pod_new_events,
+        parsed_infra.pod_delete_epochs,
+        t0_epoch=opts.t0_epoch,
+        effective_start_epoch=opts.effective_start_epoch,
+        initial_window_sec=opts.initial_window_sec,
+        not_admitted_workflow_names=not_admitted_wf_names,
+        earliest_admit_by_ns=earliest_admit_by_ns,
+        strict_timestamps=True,
+        pod_incarnations=parsed_infra.pod_incarnations or None,
+    )
+
+    scheduled_not_admitted_owners: set[tuple[str, str]] = set()
+    for sw in scheduled_workflows:
+        if sw.trigger_reason == "initial_not_admitted":
+            scheduled_not_admitted_owners.add((sw.namespace, sw.name))
+            if sw.object_kind == "Pod":
+                pg_n = _get_pod_meta_annotation_or_label(
+                    sw.manifest.get("metadata"),
+                    "kueue.x-k8s.io/pod-group-name",
+                )
+                if pg_n:
+                    scheduled_not_admitted_owners.add((sw.namespace, pg_n))
+
+    next_post_t0_seq = max((w.seq for w in scheduled_workflows), default=0) + 1
+    active_candidates, post_t0_items, superseded_preempt_seqs = _partition_admitted_candidates(
+        admitted_candidates,
+        scheduled_not_admitted_owners,
+        exec_index,
+        next_post_t0_seq=next_post_t0_seq,
+        opts=opts,
+    )
+    if post_t0_items:
+        scheduled_workflows.extend(post_t0_items)
+
+    active_candidates, matched_pods_by_cand, claimed_pod_indices = _match_initial_pods_to_candidates(
+        active_candidates,
+        qualifying_initial_pods,
+        parsed_infra,
+        exec_index,
+        scheduled_not_admitted_owners,
+        opts=opts,
+    )
+
+    # Track remaining allocatable resources per node so synthetic missing-pod placement fits cleanly.
     rem_node_alloc: dict[str, dict[str, float]] = {}
     for n_name, n_doc in parsed_infra.nodes_by_name.items():
         alloc = ((n_doc.get("status") or {}).get("allocatable")) or {}
@@ -2157,7 +3216,6 @@ def _build_initial_workloads_and_pods(
             for rk, rv in (pl.get("resourceRequest") or {}).items():
                 rem_node_alloc[plc][rk] = rem_node_alloc[plc].get(rk, 0.0) - parse_k8s_quantity(rv, rk)
 
-    # Materialize Class 1 `InitialWorkloadPodGroup`s and `InitialDeploymentBootstrap`s, and collect any preempted items superseded by dynamic resubmit.
     initial_workloads: list[InitialWorkloadPodGroup] = []
     initial_deployments: list[InitialDeploymentBootstrap] = []
     used_wl_names_by_ns: dict[str, set[str]] = {}
@@ -2166,360 +3224,35 @@ def _build_initial_workloads_and_pods(
 
     for c_idx, cand in enumerate(active_candidates):
         lq_name, cq_name = _resolve_cq_and_lq_for_candidate(
-            cand, parsed_infra, manage_jobs_without_queue_name=manage_jobs_without_queue_name
+            cand, parsed_infra, manage_jobs_without_queue_name=opts.manage_jobs_without_queue_name
         )
         cand_pods = list(matched_pods_by_cand.get(c_idx) or [])
 
-        # Bootstrap t0 apps/v1 Deployments natively as real Deployment objects (supporting full or partial t0 readiness,
-        # mid-run ScaleUp/ScaleDown/Upgrade/Pause/Resume,ReplicaSet pod replacement on preemption, and Delete/Recreate).
         if cand.kind == "Deployment" and cand.from_workflows_json and cand.raw_obj and lq_name and cq_name:
-            dep_spec_raw = cand.raw_obj.get("spec") or {}
-            raw_rep_val = dep_spec_raw.get("replicas")
-            desired_replicas = max(0, int(raw_rep_val)) if raw_rep_val is not None else 1
-            if cand.ready_replicas is not None:
-                k_admitted = min(desired_replicas, max(0, int(cand.ready_replicas)))
-                if k_admitted == 0 and cand_pods:
-                    k_admitted = min(desired_replicas, len(cand_pods))
-            elif cand_pods:
-                k_admitted = min(desired_replicas, len(cand_pods))
-            else:
-                k_admitted = desired_replicas
-
-            ps_groups_dep = _extract_workflow_podset_templates(cand.raw_obj, "Deployment")
-            if not ps_groups_dep and desired_replicas == 0 and isinstance(cand.raw_obj, dict):
-                raw_dep_one = dict(cand.raw_obj)
-                raw_dep_one["spec"] = {**(cand.raw_obj.get("spec") or {}), "replicas": 1}
-                ps_groups_dep = _extract_workflow_podset_templates(raw_dep_one, "Deployment")
-            dep_per_pod_reqs: dict[str, str] = (
-                dict(ps_groups_dep[0][2]) if ps_groups_dep else {"cpu": "1", "memory": "1Gi"}
-            )
-            dep_is_tas = bool(ps_groups_dep[0][3]) if ps_groups_dep else False
-
-            cq_doc_dep = parsed_infra.cqs_by_name[cq_name]
-            cq_flvs_dep = [
-                str(f.get("name") or "")
-                for rg in ((cq_doc_dep.get("spec") or {}).get("resourceGroups") or [])
-                for f in (rg.get("flavors") or [])
-                if isinstance(f, dict) and f.get("name")
-            ]
-            flv_doc_dep = parsed_infra.flavors_by_name.get(cq_flvs_dep[0]) if cq_flvs_dep else None
-
-            dep_placements = [str(pt[3].get("placement") or "") for pt in cand_pods[:k_admitted]]
-            while len(dep_placements) < k_admitted:
-                used_dep_nodes = {plc for plc in dep_placements if plc}
-                chosen_node_dep = ""
-                for prefer_unused in (True, False):
-                    for n_name, n_doc in parsed_infra.nodes_by_name.items():
-                        if prefer_unused and n_name in used_dep_nodes:
-                            continue
-                        if not _node_Matches_flavor(n_doc, flv_doc_dep):
-                            continue
-                        fits = all(
-                            rem_node_alloc.get(n_name, {}).get(rk, 0.0) + 1e-6 >= parse_k8s_quantity(rv, rk)
-                            for rk, rv in dep_per_pod_reqs.items()
-                            if rk in rem_node_alloc.get(n_name, {})
-                        )
-                        if fits:
-                            chosen_node_dep = n_name
-                            for rk, rv in dep_per_pod_reqs.items():
-                                if rk in rem_node_alloc[n_name]:
-                                    rem_node_alloc[n_name][rk] -= parse_k8s_quantity(rv, rk)
-                            break
-                    if chosen_node_dep:
-                        break
-                if not chosen_node_dep and parsed_infra.nodes_by_name:
-                    chosen_node_dep = next(iter(parsed_infra.nodes_by_name.keys()))
-                dep_placements.append(chosen_node_dep)
-
-            dep_manifest, _ = _inject_pod_execution_time_and_sanitize_workflow(
-                raw_obj=cand.raw_obj,
-                exec_str="1",
-                raw_duration_sec=1.0,
-                compressed_duration_sec=1.0,
-                pause_image_override=pause_image_override,
-                override_namespace=override_workload_namespace,
-                speedup=speedup,
-                min_pod_duration_sec=min_pod_duration_sec,
-            )
-            dep_meta = dep_manifest.setdefault("metadata", {})
-            dep_labels = dict(dep_meta.get("labels") or {})
-            if lq_name and not dep_labels.get("kueue.x-k8s.io/queue-name"):
-                dep_labels["kueue.x-k8s.io/queue-name"] = lq_name
-            dep_meta["labels"] = dep_labels
-            applied_dep_name = str(dep_meta.get("name") or cand.name)
-
-            raw_anns_dep = (cand.raw_obj.get("metadata") or {}).get("annotations") or {}
-            pc_name_dep_raw = (
-                str(dep_labels.get("kueue.x-k8s.io/priority-class") or "")
-                or (cand.exec_info.priority_class_name if cand.exec_info else "")
-            )
-            pc_name_dep = (
-                validate_dns_subdomain(pc_name_dep_raw, "kueue.x-k8s.io/priority-class") if pc_name_dep_raw else ""
-            )
-            prio_val_dep: int | None = cand.exec_info.priority if cand.exec_info else None
-            if prio_val_dep is None and raw_anns_dep.get("kueue-optimizer.gke.io/priority") is not None:
-                try:
-                    prio_val_dep = int(raw_anns_dep["kueue-optimizer.gke.io/priority"])
-                except (TypeError, ValueError):
-                    prio_val_dep = None
-            if prio_val_dep is None and pc_name_dep and pc_name_dep in parsed_infra.priority_classes_by_name:
-                try:
-                    prio_val_dep = int(parsed_infra.priority_classes_by_name[pc_name_dep].get("value") or 0)
-                except (TypeError, ValueError):
-                    prio_val_dep = 0
-
-            orig_ref_ep_dep: float | None = None
-            if cand.exec_info and cand.exec_info.admitted_epochs:
-                orig_ref_ep_dep = min(cand.exec_info.admitted_epochs)
-            if cand.creation_epoch is not None and (
-                orig_ref_ep_dep is None or orig_ref_ep_dep >= effective_start_epoch - 1e-6
-            ):
-                orig_ref_ep_dep = (
-                    min(orig_ref_ep_dep, cand.creation_epoch) if orig_ref_ep_dep is not None else cand.creation_epoch
-                )
-            orig_age_dep = (
-                max(0.0, (effective_start_epoch - orig_ref_ep_dep) / max(1e-6, speedup))
-                if orig_ref_ep_dep is not None
-                else 0.0
-            )
-
             initial_deployments.append(
-                InitialDeploymentBootstrap(
-                    namespace=cand.namespace,
-                    name=cand.name,
-                    applied_name=applied_dep_name,
-                    local_queue_name=lq_name,
-                    cluster_queue_name=cq_name,
-                    desired_replicas=desired_replicas,
-                    admitted_replicas=k_admitted,
-                    paused=bool((dep_manifest.get("spec") or {}).get("paused", False)),
-                    original_age_sec=orig_age_dep,
-                    placements=dep_placements,
-                    per_pod_requests=dep_per_pod_reqs,
-                    priority_class_name=pc_name_dep,
-                    priority=prio_val_dep,
-                    is_tas=dep_is_tas,
-                    manifest=dep_manifest,
-                    cq_doc=cq_doc_dep,
-                    flavors_by_name=dict(parsed_infra.flavors_by_name),
-                    topologies_by_name=dict(parsed_infra.topologies_by_name),
-                    nodes_by_name=dict(parsed_infra.nodes_by_name),
-                    scraped_pod_set_assignments=list(
-                        cand.exec_info.pod_set_assignments if cand.exec_info else []
-                    ),
-                    incarnation_index=cand.incarnation_index,
+                _bootstrap_initial_deployment(
+                    cand,
+                    cand_pods,
+                    lq_name=lq_name,
+                    cq_name=cq_name,
+                    parsed_infra=parsed_infra,
+                    rem_node_alloc=rem_node_alloc,
+                    opts=opts,
                 )
             )
             if cand.preempt_item is not None:
                 superseded_preempt_seqs.add(cand.preempt_item.seq)
             continue
 
-        # Tier 4: Synthesize missing pods when a scenario or vanilla-K8s t0 scrape specifies an Admitted
-        # workflow in workflows.json with fewer bound Pod events in infra.json than expected (0 or partial binding).
-        if cand.from_workflows_json and lq_name and cq_name:
-            if cand.kind == "PodGroup":
-                ps_groups_raw: dict[tuple[str, tuple[tuple[str, float], ...]], tuple[str, int, dict[str, str], bool]] = {}
-                for m_obj in cand.member_objs:
-                    for m_ps, m_cnt, m_reqs, m_tas in _extract_workflow_podset_templates(m_obj, "Pod"):
-                        gk_m = (m_ps, _canonical_resource_profile(m_reqs))
-                        if gk_m in ps_groups_raw:
-                            prev_ps, prev_cnt, prev_reqs, prev_tas = ps_groups_raw[gk_m]
-                            ps_groups_raw[gk_m] = (prev_ps, prev_cnt + m_cnt, prev_reqs, prev_tas or m_tas)
-                        else:
-                            ps_groups_raw[gk_m] = (m_ps, m_cnt, m_reqs, m_tas)
-                ps_groups = list(ps_groups_raw.values())
-                if len(ps_groups) == 1 and cand.member_objs:
-                    pg_tot_str = _get_pod_meta_annotation_or_label(
-                        cand.member_objs[0].get("metadata"),
-                        "kueue.x-k8s.io/pod-group-total-count",
-                    )
-                    try:
-                        pg_tot = int(pg_tot_str)
-                    except ValueError:
-                        pg_tot = 0
-                    if pg_tot > ps_groups[0][1]:
-                        ps_groups = [(ps_groups[0][0], pg_tot, ps_groups[0][2], ps_groups[0][3])]
-            elif cand.raw_obj:
-                ps_groups = _extract_workflow_podset_templates(cand.raw_obj, cand.kind)
-            else:
-                ps_groups = []
-        else:
-            ps_groups = []
-
-        expected_total_pods = sum(cnt for (_n, cnt, _r, _t) in ps_groups)
-        if ps_groups and len(cand_pods) < expected_total_pods:
-            cq_doc_tmp = parsed_infra.cqs_by_name[cq_name]
-            cq_flvs = [
-                str(f.get("name") or "")
-                for rg in ((cq_doc_tmp.get("spec") or {}).get("resourceGroups") or [])
-                for f in (rg.get("flavors") or [])
-                if isinstance(f, dict) and f.get("name")
-            ]
-            flv_doc_tmp = parsed_infra.flavors_by_name.get(cq_flvs[0]) if cq_flvs else None
-
-            allowed_ta_domains: dict[str, set[str]] = {}
-            for s_psa in (cand.exec_info.pod_set_assignments if cand.exec_info else []):
-                ta_obj = s_psa.get("topologyAssignment") if isinstance(s_psa, dict) else None
-                if not isinstance(ta_obj, dict):
-                    continue
-                ta_levels = [str(x) for x in (ta_obj.get("levels") or [])]
-                for sl_obj in ta_obj.get("slices") or []:
-                    if not isinstance(sl_obj, dict):
-                        continue
-                    for l_idx, lv_obj in enumerate(sl_obj.get("valuesPerLevel") or []):
-                        if l_idx >= len(ta_levels) or not isinstance(lv_obj, dict):
-                            continue
-                        lvl_key = ta_levels[l_idx]
-                        if lv_obj.get("universal") is not None:
-                            allowed_ta_domains.setdefault(lvl_key, set()).add(str(lv_obj["universal"]))
-                        indiv = lv_obj.get("individual")
-                        if isinstance(indiv, dict):
-                            pfx = str(indiv.get("prefix") or "")
-                            sfx = str(indiv.get("suffix") or "")
-                            for rt in indiv.get("roots") or []:
-                                allowed_ta_domains.setdefault(lvl_key, set()).add(f"{pfx}{rt}{sfx}")
-
-            raw_dur_cand = default_exec_sec
-            has_finite_end = False
-            wf_true_cand, wf_mult_cand = _extract_workflow_true_duration_and_multiplier(cand.raw_obj)
-            if cand.exec_info:
-                had_int_cand = bool(cand.exec_info.preempted_epochs or cand.exec_info.interrupted_epochs)
-                if cand.exec_info.full_duration_sec is not None and cand.exec_info.full_duration_sec > 0 and had_int_cand:
-                    adm_ep = min(cand.exec_info.admitted_epochs) if cand.exec_info.admitted_epochs else t0_epoch
-                    rem = (adm_ep + cand.exec_info.full_duration_sec) - effective_start_epoch
-                    raw_dur_cand = rem if rem > 0 else cand.exec_info.full_duration_sec
-                    has_finite_end = True
-                elif cand.exec_info.full_end_epoch is not None and cand.exec_info.full_end_epoch > effective_start_epoch:
-                    raw_dur_cand = cand.exec_info.full_end_epoch - effective_start_epoch
-                    has_finite_end = True
-                elif cand.exec_info.full_duration_sec is not None and cand.exec_info.full_duration_sec > 0:
-                    adm_ep = min(cand.exec_info.admitted_epochs) if cand.exec_info.admitted_epochs else t0_epoch
-                    rem = (adm_ep + cand.exec_info.full_duration_sec) - effective_start_epoch
-                    if rem > 0:
-                        raw_dur_cand = rem
-                        has_finite_end = True
-                elif cand.exec_info.is_interrupted_only:
-                    adm_ep = min(cand.exec_info.admitted_epochs) if cand.exec_info.admitted_epochs else t0_epoch
-                    resolved_tot = cand.exec_info.resolved_duration_sec(
-                        default_sec=default_exec_sec,
-                        interrupted_duration_multiplier=interrupted_duration_multiplier,
-                        interrupted_duration_override=interrupted_duration_override,
-                        workflow_true_duration_sec=wf_true_cand,
-                        workflow_missing_multiplier=wf_mult_cand,
-                    )
-                    rem = (adm_ep + resolved_tot) - effective_start_epoch
-                    if rem > 0:
-                        raw_dur_cand = rem
-                        has_finite_end = True
-            existing_ann_dur = _extract_existing_pod_exec_seconds(cand.raw_obj) if cand.raw_obj else None
-            if not has_finite_end and existing_ann_dur is not None and existing_ann_dur > 0:
-                raw_dur_cand = existing_ann_dur
-                has_finite_end = True
-
-            synth_del_ep = (effective_start_epoch + raw_dur_cand) if has_finite_end else None
-            # Allocate already-bound cand_pods against ps_groups in two passes:
-            # 1) Exact resource profile matches first,
-            # 2) Remaining unmatched existing pods (e.g., when LimitRange defaults or mutating webhooks
-            #    altered scraped pod requests relative to the workflow template) against remaining deficits
-            #    so Tier 4 never synthesizes more than (expected_total_pods - len(cand_pods)) pods.
-            unmatched_existing: list[tuple[str, str, float, dict[str, Any], float | None]] = list(cand_pods)
-            group_have: list[int] = [0] * len(ps_groups)
-            group_matched_reqs: list[dict[str, str] | None] = [None] * len(ps_groups)
-            for g_i, (ps_name, cnt, reqs, _is_tas) in enumerate(ps_groups):
-                prof_grp = _canonical_resource_profile(reqs)
-                still_unmatched: list[tuple[str, str, float, dict[str, Any], float | None]] = []
-                for pt_ex in unmatched_existing:
-                    if group_have[g_i] < cnt and _canonical_resource_profile(
-                        pt_ex[3].get("resourceRequest") or {}
-                    ) == prof_grp:
-                        group_have[g_i] += 1
-                    else:
-                        still_unmatched.append(pt_ex)
-                unmatched_existing = still_unmatched
-            for g_i, (ps_name, cnt, reqs, _is_tas) in enumerate(ps_groups):
-                if not unmatched_existing or group_have[g_i] >= cnt:
-                    continue
-                accel_grp = _canonical_accel_profile(reqs)
-                # Prefer pods matching podSetName hint or accelerator profile, then any remaining pod.
-                unmatched_existing.sort(
-                    key=lambda pt_ex: (
-                        0 if str(pt_ex[3].get("podSetName") or "") == ps_name else 1,
-                        0
-                        if accel_grp
-                        and _canonical_accel_profile(pt_ex[3].get("resourceRequest") or {}) == accel_grp
-                        else 1,
-                    )
-                )
-                take_cnt = min(cnt - group_have[g_i], len(unmatched_existing))
-                if take_cnt > 0:
-                    sample_reqs = _extract_pod_resource_requests(unmatched_existing[0][3])
-                    if sample_reqs:
-                        group_matched_reqs[g_i] = sample_reqs
-                    group_have[g_i] += take_cnt
-                    del unmatched_existing[:take_cnt]
-
-            synth_idx = len(cand_pods)
-            for g_i, (ps_name, cnt, reqs, is_tas) in enumerate(ps_groups):
-                missing_cnt = max(0, cnt - group_have[g_i])
-                eff_reqs = group_matched_reqs[g_i] if group_matched_reqs[g_i] is not None else reqs
-                for _ in range(missing_cnt):
-                    used_cand_nodes = {str(pt_c[3].get("placement") or "") for pt_c in cand_pods}
-                    search_passes = (
-                        [(True, True), (True, False), (False, False)]
-                        if allowed_ta_domains
-                        else [(False, True), (False, False)]
-                    )
-                    chosen_node = ""
-                    for require_ta, prefer_unused in search_passes:
-                        for n_name, n_doc in parsed_infra.nodes_by_name.items():
-                            if prefer_unused and n_name in used_cand_nodes:
-                                continue
-                            if not _node_Matches_flavor(n_doc, flv_doc_tmp):
-                                continue
-                            if require_ta:
-                                n_lbls = ((n_doc.get("metadata") or {}).get("labels")) or {}
-                                if not all(
-                                    str(n_lbls.get(lk) or "") in allowed_vals
-                                    for lk, allowed_vals in allowed_ta_domains.items()
-                                ):
-                                    continue
-                            fits = all(
-                                rem_node_alloc.get(n_name, {}).get(rk, 0.0) + 1e-6 >= parse_k8s_quantity(rv, rk)
-                                for rk, rv in eff_reqs.items()
-                                if rk in rem_node_alloc.get(n_name, {})
-                            )
-                            if fits:
-                                chosen_node = n_name
-                                for rk, rv in eff_reqs.items():
-                                    if rk in rem_node_alloc[n_name]:
-                                        rem_node_alloc[n_name][rk] -= parse_k8s_quantity(rv, rk)
-                                break
-                        if chosen_node:
-                            break
-                    if not chosen_node and parsed_infra.nodes_by_name:
-                        chosen_node = next(iter(parsed_infra.nodes_by_name.keys()))
-                    synth_p_name = sanitize_k8s_name(
-                        f"{cand.name}-{ps_name}-{synth_idx}", max_len=MAX_K8S_NAME_LEN
-                    )
-                    synth_idx += 1
-                    cand_pods.append(
-                        (
-                            cand.namespace,
-                            synth_p_name,
-                            t0_epoch,
-                            {
-                                "apiVersion": "v1",
-                                "kind": "Pod",
-                                "name": synth_p_name,
-                                "namespace": cand.namespace,
-                                "placement": chosen_node,
-                                "resourceRequest": dict(eff_reqs),
-                                "podSetName": ps_name,
-                                "isTAS": is_tas,
-                            },
-                            synth_del_ep,
-                        )
-                    )
+        cand_pods = _synthesize_missing_t0_pods(
+            cand,
+            cand_pods,
+            lq_name=lq_name,
+            cq_name=cq_name,
+            parsed_infra=parsed_infra,
+            rem_node_alloc=rem_node_alloc,
+            opts=opts,
+        )
 
         if not cand_pods or not lq_name or not cq_name:
             # Cannot form a valid ClusterQueue-backed PodGroup: release any claimed pods back to Class 2 infra-pods!
@@ -2530,458 +3263,39 @@ def _build_initial_workloads_and_pods(
                         claimed_pod_indices.discard(p_idx)
             continue
 
-        ns = cand.namespace
-        cq_doc = parsed_infra.cqs_by_name[cq_name]
-
-        # Group pods by `(podSetName_hint, canonical_reqs)` so every PodSet has strictly homogeneous per-pod requests,
-        # guaranteeing Kueue's `WorkloadWebhook` `resourceUsage % count == 0` invariant.
-        grouped_pods: dict[tuple[str, tuple[tuple[str, float], ...]], list[tuple[str, str, float, dict[str, Any], float | None]]] = {}
-        for pt in cand_pods:
-            pl = pt[3]
-            reqs_raw = _extract_pod_resource_requests(pl)
-            ps_hint = str(pl.get("podSetName") or "main")
-            g_key = (ps_hint, _canonical_resource_profile(reqs_raw))
-            grouped_pods.setdefault(g_key, []).append(pt)
-
-        # Kueue's Workload CRD limits `spec.podSets` to `MaxItems=8`; chunk into <=8-PodSet PodGroups if ever needed.
-        group_entries = list(grouped_pods.items())
-        chunks = [group_entries[i : i + 8] for i in range(0, len(group_entries), 8)]
-
-        raw_meta = (cand.raw_obj.get("metadata") or {}) if isinstance(cand.raw_obj, dict) else {}
-        raw_labels = raw_meta.get("labels") or {}
-        raw_anns = raw_meta.get("annotations") or {}
-        pc_name_raw = (
-            str(raw_labels.get("kueue.x-k8s.io/priority-class") or "")
-            or (cand.exec_info.priority_class_name if cand.exec_info else "")
+        resubmit_item = _build_t0_resubmit_item(
+            cand,
+            c_idx=c_idx,
+            lq_name=lq_name,
+            admit_iso=admit_iso,
+            exec_index=exec_index,
+            opts=opts,
         )
-        pc_name = validate_dns_subdomain(pc_name_raw, "kueue.x-k8s.io/priority-class") if pc_name_raw else ""
-
-        prio_val: int | None = cand.exec_info.priority if cand.exec_info else None
-        if prio_val is None and raw_anns.get("kueue-optimizer.gke.io/priority") is not None:
-            try:
-                prio_val = int(raw_anns["kueue-optimizer.gke.io/priority"])
-            except (TypeError, ValueError):
-                prio_val = None
-        if prio_val is None and pc_name and pc_name in parsed_infra.priority_classes_by_name:
-            try:
-                prio_val = int(parsed_infra.priority_classes_by_name[pc_name].get("value") or 0)
-            except (TypeError, ValueError):
-                prio_val = 0
-        if pc_name and prio_val is None:
-            prio_val = 1000 - c_idx
-
-        if cand.kind == "PodGroup":
-            base_wl_raw = (cand.exec_info.workload_name if cand.exec_info and cand.exec_info.workload_name else "") or (
-                cand.name if cand.name else f"pg-init-{c_idx}"
-            )
-        elif cand.from_workflows_json and cand.raw_obj:
-            base_wl_raw = f"t0pg-{cand.name}" if cand.name else f"t0pg-init-{c_idx}"
-        else:
-            base_wl_raw = (cand.exec_info.workload_name if cand.exec_info and cand.exec_info.workload_name else "") or (
-                f"pg-{cand.name}" if cand.name else f"pg-init-{c_idx}"
-            )
-
-        # Build dynamic resubmit item (`spec.suspend = True`) if parent workflow object is available from workflows.json.
-        resubmit_item: ScheduledWorkflowItem | None = None
-        cand_wf_true_dur, cand_wf_mult = _extract_workflow_true_duration_and_multiplier(cand.raw_obj)
-        if cand.from_workflows_json and cand.raw_obj and cand.kind != "PodGroup":
-            existing_resub_ann = _extract_existing_pod_exec_seconds(cand.raw_obj)
-            has_explicit_resub_ann = existing_resub_ann is not None
-            fallback_dur = existing_resub_ann or default_exec_sec
-            raw_dur_full, found_idx = exec_index.resolve_duration_sec(
-                namespace=cand.orig_namespace,
-                object_kind=cand.kind,
-                name=cand.name,
-                fallback_sec=fallback_dur,
-                interrupted_duration_multiplier=interrupted_duration_multiplier,
-                interrupted_duration_override=interrupted_duration_override,
-                workflow_true_duration_sec=cand_wf_true_dur,
-                workflow_missing_multiplier=cand_wf_mult,
-                creation_epoch=cand.creation_epoch,
-                incarnation_index=cand.incarnation_index,
-            )
-            comp_dur_full = max(min_pod_duration_sec, raw_dur_full / speedup)
-            exec_str_full = format_pod_execution_seconds(comp_dur_full, min_seconds=min_pod_duration_sec)
-            resub_manifest, resub_pod_cnt = _inject_pod_execution_time_and_sanitize_workflow(
-                raw_obj=cand.raw_obj,
-                exec_str=exec_str_full,
-                raw_duration_sec=raw_dur_full,
-                compressed_duration_sec=comp_dur_full,
-                pause_image_override=pause_image_override,
-                override_namespace=override_workload_namespace,
-                extra_pod_annotations={"kueue-optimizer.gke.io/preempted-t0-resubmit": "true"},
-                speedup=speedup,
-                scale_by_waves=bool(found_idx or not has_explicit_resub_ann),
-                min_pod_duration_sec=min_pod_duration_sec,
-            )
-            resubmit_item = ScheduledWorkflowItem(
-                target_wall_offset_sec=0.0,
-                seq=100000 + c_idx,
-                raw_offset_sec=0.0,
-                raw_offset_from_t0_sec=0.0,
-                event_timestamp=admit_iso,
-                object_kind=cand.kind,
-                name=cand.name,
-                namespace=ns,
-                local_queue_name=lq_name,
-                workload_state="NotAdmitted",
-                trigger_reason="preempted_after_initial_admission",
-                execution_duration_sec=raw_dur_full,
-                compressed_duration_sec=comp_dur_full,
-                indexed_from_execution_time=found_idx,
-                pod_count=resub_pod_cnt,
-                manifest=resub_manifest,
-                creation_epoch=cand.creation_epoch if cand.creation_epoch is not None else t0_epoch,
-                incarnation_index=cand.incarnation_index,
-                has_explicit_pod_exec_annotation=has_explicit_resub_ann,
-            )
-
-        for chunk_idx, chunk in enumerate(chunks):
-            cand_wl_base = base_wl_raw if len(chunks) == 1 else f"{base_wl_raw}-{chunk_idx}"
-            if not cand_wl_base[0].isalpha():
-                cand_wl_base = f"pg-{cand_wl_base}"
-            wl_k8s_name = sanitize_k8s_name(cand_wl_base, max_len=MAX_K8S_NAME_LEN)
-            ns_used_wls = used_wl_names_by_ns.setdefault(ns, set())
-            dedup = 1
-            while wl_k8s_name in ns_used_wls:
-                suffix = f"-{dedup}"
-                wl_k8s_name = f"{sanitize_k8s_name(cand_wl_base, max_len=MAX_K8S_NAME_LEN - len(suffix))}{suffix}"
-                dedup += 1
-            ns_used_wls.add(wl_k8s_name)
-
-            total_group_pods = sum(len(pts) for (_gk, pts) in chunk)
-            pod_sets_spec: list[dict[str, Any]] = []
-            pod_set_assignments: list[dict[str, Any]] = []
-            group_pod_specs: list[InitialPodSpec] = []
-            any_tas_in_wl = False
-            ns_used_pods = used_pod_names_by_ns.setdefault(ns, set())
-
-            for g_idx, ((ps_hint, _prof), pts) in enumerate(chunk):
-                role_hash = hashlib.sha256(f"{g_idx}:{ps_hint}:{_prof!r}".encode("utf-8")).hexdigest()[:8]
-                rep_reqs = _extract_pod_resource_requests(pts[0][3])
-                placements = [str(pt[3].get("placement") or "") for pt in pts]
-                scraped_psas = cand.exec_info.pod_set_assignments if cand.exec_info else []
-                psa, psa_uses_tas = _resolve_podset_assignment_for_group(
-                    role_hash=role_hash,
-                    count=len(pts),
-                    reqs=rep_reqs,
-                    placements=placements,
-                    cq_doc=cq_doc,
-                    parsed_infra=parsed_infra,
-                    scraped_psas=scraped_psas,
-                    ps_hint=ps_hint,
-                    group_index=g_idx,
-                    total_groups=len(chunk),
-                )
-                if psa_uses_tas:
-                    any_tas_in_wl = True
-                pod_set_assignments.append(psa)
-
-                ps_member_specs: list[InitialPodSpec] = []
-                for p_ns, p_name, _ev_ep, pl, del_ep in pts:
-                    # Fall back to execution-time.json full_end_epoch when individual pod lacked deletionTime,
-                    # prevent preemption deletionTime from truncating a t0 workload that later finished FullExecution,
-                    # and extend all interrupted-only t0 pods (including ScrapeEnded) using resolved_duration_sec.
-                    eff_del_ep = del_ep
-                    had_interruption = bool(
-                        cand.exec_info and (cand.exec_info.preempted_epochs or cand.exec_info.interrupted_epochs)
-                    )
-                    if (
-                        cand.exec_info
-                        and cand.exec_info.full_duration_sec is not None
-                        and cand.exec_info.full_duration_sec > 0
-                        and had_interruption
-                    ):
-                        adm_ep = min(cand.exec_info.admitted_epochs) if cand.exec_info.admitted_epochs else t0_epoch
-                        unint_full_end = max(
-                            adm_ep + cand.exec_info.full_duration_sec,
-                            effective_start_epoch + min_pod_duration_sec,
-                        )
-                        if eff_del_ep is None or unint_full_end > eff_del_ep:
-                            eff_del_ep = unint_full_end
-                    elif (
-                        eff_del_ep is None
-                        and cand.exec_info
-                        and cand.exec_info.full_end_epoch is not None
-                        and cand.exec_info.full_end_epoch > effective_start_epoch
-                    ):
-                        eff_del_ep = cand.exec_info.full_end_epoch
-                    elif cand.exec_info and cand.exec_info.is_interrupted_only:
-                        adm_ep = min(cand.exec_info.admitted_epochs) if cand.exec_info.admitted_epochs else t0_epoch
-                        resolved_tot = cand.exec_info.resolved_duration_sec(
-                            default_sec=default_exec_sec,
-                            interrupted_duration_multiplier=interrupted_duration_multiplier,
-                            interrupted_duration_override=interrupted_duration_override,
-                            workflow_true_duration_sec=cand_wf_true_dur,
-                            workflow_missing_multiplier=cand_wf_mult,
-                        )
-                        unint_end_ep = adm_ep + resolved_tot
-                        if eff_del_ep is None or unint_end_ep > eff_del_ep:
-                            eff_del_ep = unint_end_ep
-
-                    if eff_del_ep is not None and eff_del_ep > effective_start_epoch:
-                        rem_raw = eff_del_ep - effective_start_epoch
-                        rem_compressed = max(min_pod_duration_sec, rem_raw / speedup)
-                        is_inf = False
-                    else:
-                        rem_compressed = max(min_pod_duration_sec, infinite_pod_duration_sec / speedup)
-                        is_inf = True
-
-                    exec_str = format_pod_execution_seconds(rem_compressed, min_seconds=min_pod_duration_sec)
-                    placement = str(pl.get("placement") or "")
-                    base_p_name = p_name[2:] if p_name.startswith("p-") else p_name
-                    k8s_pod_name = (
-                        f"p-{sanitize_k8s_name(base_p_name, max_len=MAX_K8S_NAME_LEN - 2)}"
-                        if (len(p_name) > MAX_K8S_NAME_LEN or not p_name[0].isalpha())
-                        else p_name
-                    )
-                    base_k8s_pod_name = k8s_pod_name
-                    p_dedup = 1
-                    while k8s_pod_name in ns_used_pods:
-                        suf = f"-{p_dedup}"
-                        k8s_pod_name = (
-                            f"{sanitize_k8s_name(base_k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
-                        )
-                        p_dedup += 1
-                    ns_used_pods.add(k8s_pod_name)
-
-                    p_labels: dict[str, str] = {
-                        "kueue-optimizer.gke.io/initial-pod": "true",
-                        "kueue-optimizer.gke.io/testrunner": "true",
-                        "kueue.x-k8s.io/managed": "true",
-                        "kueue.x-k8s.io/pod-group-name": wl_k8s_name,
-                        "kueue.x-k8s.io/queue-name": lq_name,
-                    }
-                    if pc_name:
-                        p_labels["kueue.x-k8s.io/priority-class"] = pc_name
-
-                    p_anns: dict[str, str] = {
-                        "kueue.x-k8s.io/pod-group-total-count": str(total_group_pods),
-                        "kueue.x-k8s.io/role-hash": role_hash,
-                        "kueue.x-k8s.io/retriable-in-group": "false",
-                        "kueue.x-k8s.io/workload": wl_k8s_name,
-                        "kueue-optimizer.gke.io/pod-execution-time-seconds": exec_str,
-                        "kueue-optimizer.gke.io/original-name": p_name,
-                        "kueue-optimizer.gke.io/original-namespace": p_ns,
-                    }
-                    if psa_uses_tas:
-                        p_anns["kueue.x-k8s.io/podset-unconstrained-topology"] = "true"
-                    if is_inf:
-                        p_anns["kueue-optimizer.gke.io/infinite-duration"] = "true"
-
-                    pod_manifest: dict[str, Any] = {
-                        "apiVersion": "v1",
-                        "kind": "Pod",
-                        "metadata": {
-                            "name": k8s_pod_name,
-                            "namespace": ns,
-                            "labels": p_labels,
-                            "annotations": p_anns,
-                        },
-                        "spec": {
-                            "restartPolicy": "Never",
-                            "tolerations": [
-                                {
-                                    "key": "kwok.x-k8s.io/node",
-                                    "operator": "Equal",
-                                    "value": "fake",
-                                    "effect": "NoSchedule",
-                                }
-                            ],
-                            "containers": [
-                                {
-                                    "name": "pause",
-                                    "image": pause_img,
-                                    "resources": {
-                                        "requests": dict(rep_reqs),
-                                        "limits": dict(rep_reqs),
-                                    },
-                                }
-                            ],
-                        },
-                    }
-                    if placement:
-                        pod_manifest["spec"]["nodeName"] = placement
-
-                    ps_member_specs.append(
-                        InitialPodSpec(
-                            name=k8s_pod_name,
-                            namespace=ns,
-                            placement=placement,
-                            resource_request=dict(rep_reqs),
-                            remaining_duration_sec=rem_compressed,
-                            is_infinite=is_inf,
-                            manifest=pod_manifest,
-                        )
-                    )
-
-                rep_exec_str = format_pod_execution_seconds(
-                    max(p.remaining_duration_sec for p in ps_member_specs),
-                    min_seconds=min_pod_duration_sec,
-                )
-                tpl_labels = {
-                    "kueue.x-k8s.io/managed": "true",
-                    "kueue.x-k8s.io/pod-group-name": wl_k8s_name,
-                    "kueue.x-k8s.io/queue-name": lq_name,
-                }
-                if pc_name:
-                    tpl_labels["kueue.x-k8s.io/priority-class"] = pc_name
-                tpl_anns = {
-                    "kueue.x-k8s.io/pod-group-total-count": str(total_group_pods),
-                    "kueue.x-k8s.io/role-hash": role_hash,
-                    "kueue.x-k8s.io/retriable-in-group": "false",
-                    "kueue-optimizer.gke.io/pod-execution-time-seconds": rep_exec_str,
-                }
-                if psa_uses_tas:
-                    tpl_anns["kueue.x-k8s.io/podset-unconstrained-topology"] = "true"
-                if all(p.is_infinite for p in ps_member_specs):
-                    tpl_anns["kueue-optimizer.gke.io/infinite-duration"] = "true"
-
-                ps_spec_entry: dict[str, Any] = {
-                    "name": role_hash,
-                    "count": len(pts),
-                    "template": {
-                        "metadata": {
-                            "labels": tpl_labels,
-                            "annotations": tpl_anns,
-                        },
-                        "spec": {
-                            "restartPolicy": "Never",
-                            "tolerations": [
-                                {
-                                    "key": "kwok.x-k8s.io/node",
-                                    "operator": "Equal",
-                                    "value": "fake",
-                                    "effect": "NoSchedule",
-                                }
-                            ],
-                            "containers": [
-                                {
-                                    "name": "pause",
-                                    "image": pause_img,
-                                    "resources": {
-                                        "requests": dict(rep_reqs),
-                                        "limits": dict(rep_reqs),
-                                    },
-                                }
-                            ],
-                        },
-                    },
-                }
-                if psa_uses_tas:
-                    ps_spec_entry["topologyRequest"] = {"unconstrained": True}
-                pod_sets_spec.append(ps_spec_entry)
-                group_pod_specs.extend(ps_member_specs)
-
-            wl_labels: dict[str, str] = {
-                "kueue-optimizer.gke.io/initial-workload": "true",
-                "kueue-optimizer.gke.io/testrunner": "true",
-            }
-            if pc_name:
-                wl_labels["kueue.x-k8s.io/priority-class"] = pc_name
-
-            wl_spec: dict[str, Any] = {
-                "active": True,
-                "queueName": lq_name,
-                "priority": int(prio_val if prio_val is not None else 0),
-                "podSets": pod_sets_spec,
-            }
-            if pc_name:
-                wl_spec["priorityClassRef"] = {
-                    "group": "kueue.x-k8s.io",
-                    "kind": "WorkloadPriorityClass",
-                    "name": pc_name,
-                }
-
-            wl_manifest: dict[str, Any] = {
-                "apiVersion": "kueue.x-k8s.io/v1beta2",
-                "kind": "Workload",
-                "metadata": {
-                    "name": wl_k8s_name,
-                    "namespace": ns,
-                    "labels": wl_labels,
-                    "annotations": {
-                        "kueue.x-k8s.io/is-group-workload": "true",
-                        "kueue-optimizer.gke.io/original-owner-kind": cand.kind,
-                        "kueue-optimizer.gke.io/original-owner-name": cand.name,
-                    },
-                },
-                "spec": wl_spec,
-            }
-            wl_status: dict[str, Any] = {
-                "admission": {
-                    "clusterQueue": cq_name,
-                    "podSetAssignments": pod_set_assignments,
-                },
-                "conditions": [
-                    {
-                        "type": "QuotaReserved",
-                        "status": "True",
-                        "reason": "QuotaReserved",
-                        "message": "Pre-admitted initial running workload at scenario start",
-                        "lastTransitionTime": admit_iso,
-                        "observedGeneration": 1,
-                    },
-                    {
-                        "type": "Admitted",
-                        "status": "True",
-                        "reason": "Admitted",
-                        "message": "Pre-admitted initial running workload at scenario start",
-                        "lastTransitionTime": admit_iso,
-                        "observedGeneration": 1,
-                    },
-                    {
-                        "type": "PodsReady",
-                        "status": "True",
-                        "reason": "Started",
-                        "message": "All pods reached readiness and the workload is running",
-                        "lastTransitionTime": admit_iso,
-                        "observedGeneration": 1,
-                    },
-                ],
-            }
-
-            orig_ref_ep: float | None = None
-            if cand.exec_info and cand.exec_info.admitted_epochs:
-                orig_ref_ep = min(cand.exec_info.admitted_epochs)
-            if cand.creation_epoch is not None and (orig_ref_ep is None or orig_ref_ep >= effective_start_epoch - 1e-6):
-                orig_ref_ep = min(orig_ref_ep, cand.creation_epoch) if orig_ref_ep is not None else cand.creation_epoch
-            orig_age_sec = (
-                max(0.0, (effective_start_epoch - orig_ref_ep) / max(1e-6, speedup))
-                if orig_ref_ep is not None
-                else 0.0
-            )
-
-            if cand.deleted_epoch is not None and cand.deleted_epoch > effective_start_epoch + 1e-6:
-                for del_ev in scheduled_deletions:
-                    if (
-                        del_ev.namespace == ns
-                        and del_ev.object_kind == cand.kind
-                        and del_ev.name == cand.name
-                        and del_ev.incarnation_index == cand.incarnation_index
-                        and not del_ev.initial_workload_name
-                    ):
-                        del_ev.initial_workload_name = wl_k8s_name
-
-            initial_workloads.append(
-                InitialWorkloadPodGroup(
-                    workload_name=wl_k8s_name,
-                    namespace=ns,
-                    local_queue_name=lq_name,
-                    cluster_queue_name=cq_name,
-                    owner_kind=cand.kind,
-                    owner_name=cand.name,
-                    priority_class_name=pc_name,
-                    priority=prio_val,
-                    is_tas=any_tas_in_wl,
-                    pods=group_pod_specs,
-                    workload_manifest=wl_manifest,
-                    workload_status=wl_status,
-                    resubmit_item=resubmit_item if chunk_idx == 0 else None,
-                    original_age_sec=orig_age_sec,
-                )
-            )
-
+        chunk_wls = _materialize_initial_workload_chunks(
+            cand,
+            cand_pods,
+            c_idx=c_idx,
+            lq_name=lq_name,
+            cq_name=cq_name,
+            parsed_infra=parsed_infra,
+            used_wl_names_by_ns=used_wl_names_by_ns,
+            used_pod_names_by_ns=used_pod_names_by_ns,
+            admit_iso=admit_iso,
+            resubmit_item=resubmit_item,
+            opts=opts,
+        )
+        if cand.deleted_epoch is not None and cand.deleted_epoch > opts.effective_start_epoch + 1e-6 and chunk_wls:
+            first_wl_name = chunk_wls[0].workload_name
+            for del_ev in scheduled_deletions:
+                if (
+                    del_ev.namespace == cand.namespace
+                    and del_ev.object_kind == cand.kind
+                    and del_ev.name == cand.name
+                    and del_ev.incarnation_index == cand.incarnation_index
+                    and not del_ev.initial_workload_name
+                ):
+                    del_ev.initial_workload_name = first_wl_name
+        initial_workloads.extend(chunk_wls)
         if cand.preempt_item is not None:
             superseded_preempt_seqs.add(cand.preempt_item.seq)
 
@@ -3002,90 +3316,11 @@ def _build_initial_workloads_and_pods(
         )
     )
 
-    # Remaining unclaimed initial pods are Class 2 true non-Kueue infrastructure/system pods (`infra-pods`).
-    initial_infra_pods: list[InitialPodSpec] = []
-    used_infra_pod_names: set[str] = set()
-    for p_idx, (p_ns, p_name, _ev_epoch, pl, del_ep) in enumerate(qualifying_initial_pods):
-        if p_idx in claimed_pod_indices:
-            continue
-        if del_ep is not None and del_ep > effective_start_epoch:
-            rem_raw = del_ep - effective_start_epoch
-            rem_compressed = max(min_pod_duration_sec, rem_raw / speedup)
-            is_inf = False
-        else:
-            rem_compressed = max(min_pod_duration_sec, infinite_pod_duration_sec / speedup)
-            is_inf = True
-
-        exec_str = format_pod_execution_seconds(rem_compressed, min_seconds=min_pod_duration_sec)
-        placement = str(pl.get("placement") or "")
-        reqs = _extract_pod_resource_requests(pl)
-        base_p_name = p_name[2:] if p_name.startswith("p-") else p_name
-        k8s_pod_name = (
-            f"p-{sanitize_k8s_name(base_p_name, max_len=MAX_K8S_NAME_LEN - 2)}"
-            if (len(p_name) > MAX_K8S_NAME_LEN or not p_name[0].isalpha())
-            else p_name
-        )
-        base_k8s_pod_name = k8s_pod_name
-        i_dedup = 1
-        while k8s_pod_name in used_infra_pod_names:
-            suf = f"-{i_dedup}"
-            k8s_pod_name = f"{sanitize_k8s_name(base_k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
-            i_dedup += 1
-        used_infra_pod_names.add(k8s_pod_name)
-
-        pod_manifest = {
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": k8s_pod_name,
-                "namespace": infra_pods_namespace,
-                "labels": {
-                    "kueue-optimizer.gke.io/initial-pod": "true",
-                    "kueue-optimizer.gke.io/testrunner": "true",
-                },
-                "annotations": {
-                    "kueue-optimizer.gke.io/pod-execution-time-seconds": exec_str,
-                    "kueue-optimizer.gke.io/original-name": p_name,
-                    "kueue-optimizer.gke.io/original-namespace": p_ns,
-                    **({"kueue-optimizer.gke.io/infinite-duration": "true"} if is_inf else {}),
-                },
-            },
-            "spec": {
-                "restartPolicy": "Never",
-                "tolerations": [
-                    {
-                        "key": "kwok.x-k8s.io/node",
-                        "operator": "Equal",
-                        "value": "fake",
-                        "effect": "NoSchedule",
-                    }
-                ],
-                "containers": [
-                    {
-                        "name": "pause",
-                        "image": pause_img,
-                        "resources": {
-                            "requests": reqs,
-                            "limits": dict(reqs),
-                        },
-                    }
-                ],
-            },
-        }
-        if placement:
-            pod_manifest["spec"]["nodeName"] = placement
-
-        initial_infra_pods.append(
-            InitialPodSpec(
-                name=p_name,
-                namespace=infra_pods_namespace,
-                placement=placement,
-                resource_request=reqs,
-                remaining_duration_sec=rem_compressed,
-                is_infinite=is_inf,
-                manifest=pod_manifest,
-            )
-        )
+    initial_infra_pods = _build_initial_infra_pods(
+        qualifying_initial_pods,
+        claimed_pod_indices,
+        opts=opts,
+    )
 
     return (
         initial_workloads,
@@ -3102,14 +3337,7 @@ def _schedule_post_t0_non_kueue_pods(
     initial_workloads: list[InitialWorkloadPodGroup],
     initial_deployments: list[InitialDeploymentBootstrap] | None = None,
     *,
-    t0_epoch: float,
-    effective_start_epoch: float,
-    initial_window_sec: float,
-    speedup: float,
-    min_pod_duration_sec: float,
-    infinite_pod_duration_sec: float,
-    pause_image_override: str | None,
-    infra_pods_namespace: str,
+    opts: _InitialBuildOptions,
     initial_pods: list[InitialPodSpec] | None = None,
 ) -> None:
     """Schedule post-t0 non-Kueue pods into infra_pods_namespace without duplicating Kueue workflow pods."""
@@ -3146,7 +3374,6 @@ def _schedule_post_t0_non_kueue_pods(
         for ns, names in kueue_wf_names_by_ns.items()
     }
 
-    pause_img = pause_image_override or DEFAULT_PAUSE_IMAGE
     next_seq = max((ie.seq for ie in parsed_infra.scheduled_infra_events), default=-1) + 1
     used_names: set[str] = {
         str((ie.manifest.get("metadata") or {}).get("name") or ie.name)
@@ -3158,7 +3385,7 @@ def _schedule_post_t0_non_kueue_pods(
         if ip_k8s_name:
             used_names.add(ip_k8s_name)
 
-    cutoff = max(t0_epoch + initial_window_sec, effective_start_epoch) + 1e-6
+    cutoff = max(opts.t0_epoch + opts.initial_window_sec, opts.effective_start_epoch) + 1e-6
     for p_ns, p_name, ev_ep, pl, del_ep in sorted(
         pod_entries, key=lambda x: (x[2], x[0], x[1])
     ):
@@ -3195,68 +3422,35 @@ def _schedule_post_t0_non_kueue_pods(
             continue
         if del_ep is not None and del_ep > ev_ep:
             raw_pod_dur = del_ep - ev_ep
-            comp_pod_dur = max(min_pod_duration_sec, raw_pod_dur / max(1e-6, speedup))
+            comp_pod_dur = max(opts.min_pod_duration_sec, raw_pod_dur / opts.speedup)
             is_inf = False
         else:
-            comp_pod_dur = max(min_pod_duration_sec, infinite_pod_duration_sec / max(1e-6, speedup))
+            comp_pod_dur = max(opts.min_pod_duration_sec, opts.infinite_pod_duration_sec / opts.speedup)
             is_inf = True
-        exec_str = format_pod_execution_seconds(comp_pod_dur, min_seconds=min_pod_duration_sec)
+        exec_str = format_pod_execution_seconds(comp_pod_dur, min_seconds=opts.min_pod_duration_sec)
         placement = str(pl.get("placement") or "")
         reqs = _extract_pod_resource_requests(pl)
-        base_p_name = p_name[2:] if p_name.startswith("p-") else p_name
-        k8s_pod_name = (
-            f"p-{sanitize_k8s_name(base_p_name, max_len=MAX_K8S_NAME_LEN - 2)}"
-            if (len(p_name) > MAX_K8S_NAME_LEN or not p_name[0].isalpha())
-            else p_name
-        )
-        base_k8s_pod_name = k8s_pod_name
-        p_dedup = 1
-        while k8s_pod_name in used_names:
-            suf = f"-{p_dedup}"
-            k8s_pod_name = f"{sanitize_k8s_name(base_k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
-            p_dedup += 1
-        used_names.add(k8s_pod_name)
+        k8s_pod_name = _allocate_k8s_name(p_name, used_names)
         ev_ts_iso = datetime.fromtimestamp(ev_ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        pod_doc: dict[str, Any] = {
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": k8s_pod_name,
-                "namespace": infra_pods_namespace,
-                "labels": {
-                    "kueue-optimizer.gke.io/post-t0-infra-pod": "true",
-                    "kueue-optimizer.gke.io/testrunner": "true",
-                },
-                "annotations": {
-                    "kueue-optimizer.gke.io/pod-execution-time-seconds": exec_str,
-                    "kueue-optimizer.gke.io/original-name": p_name,
-                    "kueue-optimizer.gke.io/original-namespace": p_ns,
-                    **({"kueue-optimizer.gke.io/infinite-duration": "true"} if is_inf else {}),
-                },
+        pod_doc = _build_kwok_pause_pod_manifest(
+            name=k8s_pod_name,
+            namespace=opts.infra_pods_namespace,
+            labels={
+                "kueue-optimizer.gke.io/post-t0-infra-pod": "true",
+                "kueue-optimizer.gke.io/testrunner": "true",
             },
-            "spec": {
-                "restartPolicy": "Never",
-                "tolerations": [
-                    {
-                        "key": "kwok.x-k8s.io/node",
-                        "operator": "Equal",
-                        "value": "fake",
-                        "effect": "NoSchedule",
-                    }
-                ],
-                "containers": [
-                    {
-                        "name": "pause",
-                        "image": pause_img,
-                        "resources": {"requests": reqs, "limits": dict(reqs)},
-                    }
-                ],
+            annotations={
+                "kueue-optimizer.gke.io/pod-execution-time-seconds": exec_str,
+                "kueue-optimizer.gke.io/original-name": p_name,
+                "kueue-optimizer.gke.io/original-namespace": p_ns,
+                **({"kueue-optimizer.gke.io/infinite-duration": "true"} if is_inf else {}),
             },
-        }
-        if placement:
-            pod_doc["spec"]["nodeName"] = placement
-        raw_off = max(0.0, ev_ep - t0_epoch)
-        wall_off = raw_off / max(1e-6, speedup)
+            pause_img=opts.pause_img,
+            reqs=reqs,
+            placement=placement,
+        )
+        raw_off = max(0.0, ev_ep - opts.t0_epoch)
+        wall_off = raw_off / opts.speedup
         parsed_infra.scheduled_infra_events.append(
             ScheduledInfraEvent(
                 target_wall_offset_sec=wall_off,
@@ -3267,7 +3461,7 @@ def _schedule_post_t0_non_kueue_pods(
                 event_type="New",
                 object_kind="Pod",
                 name=k8s_pod_name,
-                namespace=infra_pods_namespace,
+                namespace=opts.infra_pods_namespace,
                 manifest=pod_doc,
             )
         )
@@ -3672,10 +3866,6 @@ def load_scenario_bundle(
         t0_epoch=t0_epoch,
         initial_window_sec=initial_window_sec,
         speedup=speedup,
-        min_pod_duration_sec=min_pod_duration_sec,
-        infinite_pod_duration_sec=infinite_pod_duration_sec,
-        pause_image_override=pause_image_override,
-        infra_pods_namespace=infra_pods_namespace,
         override_workload_namespace=override_workload_namespace,
         override_queueing_strategy=override_queueing_strategy,
         override_cq_fair_sharing_preemption=override_cq_fair_sharing_preemption,
@@ -3778,13 +3968,7 @@ def load_scenario_bundle(
         parsed_infra.lqs_by_key.update(base_lqs_by_key)
         sched_wfs_in = [dc_replace(w) for w in base_scheduled_workflows]
         sched_dels_in = [dc_replace(d) for d in base_scheduled_deletions]
-        init_wls, init_deps, init_pods, sched_wfs_out, expired_cnt = _build_initial_workloads_and_pods(
-            parsed_infra,
-            admitted_candidates,
-            sched_wfs_in,
-            sched_dels_in,
-            earliest_admit_by_ns,
-            exec_index,
+        build_opts = _InitialBuildOptions(
             t0_epoch=t0_epoch,
             effective_start_epoch=eff_start_ep,
             initial_window_sec=initial_window_sec,
@@ -3798,6 +3982,15 @@ def load_scenario_bundle(
             interrupted_duration_multiplier=interrupted_duration_multiplier,
             interrupted_duration_override=parsed_override,
             manage_jobs_without_queue_name=manage_without_queue,
+        )
+        init_wls, init_deps, init_pods, sched_wfs_out, expired_cnt = _build_initial_workloads_and_pods(
+            parsed_infra,
+            admitted_candidates,
+            sched_wfs_in,
+            sched_dels_in,
+            earliest_admit_by_ns,
+            exec_index,
+            opts=build_opts,
         )
         live_dep_incarnations = {
             (w.namespace, w.name, w.incarnation_index)
@@ -3826,14 +4019,7 @@ def load_scenario_bundle(
             sched_wfs_out,
             init_wls,
             init_deps,
-            t0_epoch=t0_epoch,
-            effective_start_epoch=eff_start_ep,
-            initial_window_sec=initial_window_sec,
-            speedup=speedup,
-            min_pod_duration_sec=min_pod_duration_sec,
-            infinite_pod_duration_sec=infinite_pod_duration_sec,
-            pause_image_override=pause_image_override,
-            infra_pods_namespace=infra_pods_namespace,
+            opts=build_opts,
             initial_pods=init_pods,
         )
         sched_wfs_out.sort(
