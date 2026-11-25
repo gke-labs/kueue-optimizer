@@ -228,6 +228,7 @@ func TestShouldKeepAnnotation(t *testing.T) {
 		{key: corev1.LastAppliedConfigAnnotation, want: false},
 		{key: "Kubectl.Kubernetes.io/Last-Applied-Configuration", want: false},
 		{key: "kubernetes.io/change-cause", want: false},
+		{key: "kubernetes.io/created-by", want: false},
 		{key: "kubernetes.io/description", want: false},
 		{key: "kubernetes.io/service-account.name", want: false},
 		{key: "kubernetes.io/service-account.uid", want: false},
@@ -237,6 +238,10 @@ func TestShouldKeepAnnotation(t *testing.T) {
 		{key: "pod.beta.kubernetes.io/init-container-statuses", want: false},
 		{key: "csi.volume.kubernetes.io/nodeid", want: false},
 		{key: "alpha.kubernetes.io/provided-node-ip", want: false},
+		{key: "seccomp.security.alpha.kubernetes.io/pod", want: false},
+		{key: "container.seccomp.security.alpha.kubernetes.io/secret-ctr", want: false},
+		{key: "apparmor.security.beta.kubernetes.io/pod", want: false},
+		{key: "container.apparmor.security.beta.kubernetes.io/secret-ctr", want: false},
 
 		// Custom/third-party domains that contain "k8s", "kubernetes", "x-k8s", or "kueue-optimizer" as substrings.
 		{key: "k8s.client-domain.com/owner", want: false},
@@ -379,6 +384,7 @@ func TestSanitizationListsAreLowercase(t *testing.T) {
 		{"deniedNodeLabelKeys", deniedNodeLabelKeys},
 		{"hashedLabelKeys", hashedLabelKeys},
 		{"deniedAnnotationKeys", deniedAnnotationKeys},
+		{"deniedAnnotationPrefixes", deniedAnnotationPrefixes},
 		{"allowedAnnotationDomains", allowedAnnotationDomains},
 	} {
 		for _, item := range list.items {
@@ -387,19 +393,21 @@ func TestSanitizationListsAreLowercase(t *testing.T) {
 			}
 		}
 	}
-	for k := range protectedLabelKeys {
-		if k != strings.ToLower(k) {
-			t.Errorf("protectedLabelKeys key %q must be lowercase", k)
-		}
-	}
-	for k := range labelKeysHoldingWorkloadNames {
-		if k != strings.ToLower(k) {
-			t.Errorf("labelKeysHoldingWorkloadNames key %q must be lowercase", k)
-		}
-	}
-	for k := range annotationKeysHoldingWorkloadNames {
-		if k != strings.ToLower(k) {
-			t.Errorf("annotationKeysHoldingWorkloadNames key %q must be lowercase", k)
+	for _, m := range []struct {
+		name string
+		keys map[string]bool
+	}{
+		{"protectedLabelKeys", protectedLabelKeys},
+		{"labelKeysHoldingWorkloadNames", labelKeysHoldingWorkloadNames},
+		{"labelKeysHoldingPodSetNames", labelKeysHoldingPodSetNames},
+		{"annotationKeysHoldingWorkloadNames", annotationKeysHoldingWorkloadNames},
+		{"annotationKeysHoldingPodSetNames", annotationKeysHoldingPodSetNames},
+		{"fixedPodSetNames", fixedPodSetNames},
+	} {
+		for k := range m.keys {
+			if k != strings.ToLower(k) {
+				t.Errorf("%s key %q must be lowercase", m.name, k)
+			}
 		}
 	}
 }
@@ -409,7 +417,7 @@ func TestSanitizeLabels(t *testing.T) {
 		KueueQueueLabel:         "main-lq",
 		KueueManagedLabel:       "true",
 		KueuePriorityClassLabel: "high-priority",
-		"component":             "trainer",
+		"tier":                  "batch",
 	}
 	hashedWorkloadLabels := []string{
 		"app",
@@ -433,6 +441,17 @@ func TestSanitizeLabels(t *testing.T) {
 		"cost-center",
 		"project",
 		"email",
+		"service",
+		"app.kubernetes.io/part-of",
+		"app.kubernetes.io/component",
+		"app.kubernetes.io/managed-by",
+		"helm.sh/chart",
+		"release",
+		"tenant",
+		"model",
+		"experiment",
+		"workload",
+		"run-id",
 		"custom-unprefixed",
 		"corp.io/owner",
 		"k8s.io/owner",
@@ -5815,5 +5834,326 @@ managedJobsNamespaceSelector:
 	}
 	if s.shouldSkipDeployment(mkDep("team-ml")) {
 		t.Fatalf("expected Deployment in namespace matched by managedJobsNamespaceSelector to be tracked")
+	}
+}
+
+func TestSensitiveDataHardeningL1ToL8(t *testing.T) {
+	hasher := NewSensitiveDataHasher(nil, nil)
+	noop := NewNoopHasher()
+
+	// L1, L2, L8: WorkingDir, Ports, container names, targetContainerName, SecurityContext localhost profiles & WindowsOptions.
+	secretProfile := "profiles/canary-seccomp.json"
+	secretAppArmor := "canary-apparmor-profile"
+	secretGMSA := "canary-gmsa-cred"
+	spec := &corev1.PodSpec{
+		SecurityContext: &corev1.PodSecurityContext{
+			RunAsNonRoot:    ptr.To(true),
+			SeccompProfile:  &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: &secretProfile},
+			AppArmorProfile: &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeLocalhost, LocalhostProfile: &secretAppArmor},
+			WindowsOptions:  &corev1.WindowsSecurityContextOptions{GMSACredentialSpecName: &secretGMSA, RunAsUserName: ptr.To("CORP\\alice")},
+		},
+		Containers: []corev1.Container{
+			{
+				Name:       "canary-ctr-inference",
+				Image:      testSecretImage,
+				WorkingDir: "/home/alice/secret-model",
+				Ports:      []corev1.ContainerPort{{Name: "canary-grpc", ContainerPort: 8080}},
+				SecurityContext: &corev1.SecurityContext{
+					SeccompProfile:  &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: &secretProfile},
+					AppArmorProfile: &corev1.AppArmorProfile{Type: corev1.AppArmorProfileTypeRuntimeDefault},
+					WindowsOptions:  &corev1.WindowsSecurityContextOptions{GMSACredentialSpec: &secretGMSA},
+				},
+			},
+		},
+		InitContainers: []corev1.Container{
+			{
+				Name:       "canary-init-loader",
+				Image:      testSecretImage,
+				WorkingDir: "/opt/secret-init",
+				Ports:      []corev1.ContainerPort{{Name: "init-port", ContainerPort: 9090}},
+			},
+		},
+		EphemeralContainers: []corev1.EphemeralContainer{
+			{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+					Name:       "canary-debug-ctr",
+					Image:      testSecretImage,
+					WorkingDir: "/tmp/secret-debug",
+					Ports:      []corev1.ContainerPort{{Name: "debug-port", ContainerPort: 7070}},
+				},
+				TargetContainerName: "canary-ctr-inference",
+			},
+		},
+	}
+
+	noopSpec := spec.DeepCopy()
+	SanitizePodSpec(noopSpec, DefaultPauseImage, noop)
+	if noopSpec.Containers[0].WorkingDir != "" || noopSpec.InitContainers[0].WorkingDir != "" || noopSpec.EphemeralContainers[0].WorkingDir != "" {
+		t.Errorf("expected WorkingDir to always be stripped even under NoopHasher")
+	}
+	if len(noopSpec.Containers[0].Ports) != 0 || len(noopSpec.InitContainers[0].Ports) != 0 || len(noopSpec.EphemeralContainers[0].Ports) != 0 {
+		t.Errorf("expected container Ports to always be stripped even under NoopHasher")
+	}
+	if noopSpec.Containers[0].Name != "canary-ctr-inference" {
+		t.Errorf("expected NoopHasher to keep container name plain, got %q", noopSpec.Containers[0].Name)
+	}
+
+	SanitizePodSpec(spec, DefaultPauseImage, hasher)
+	if spec.Containers[0].Name != hasher.HashName("canary-ctr-inference") {
+		t.Errorf("expected container name to be hashed, got %q", spec.Containers[0].Name)
+	}
+	if spec.InitContainers[0].Name != hasher.HashName("canary-init-loader") {
+		t.Errorf("expected initContainer name to be hashed, got %q", spec.InitContainers[0].Name)
+	}
+	if spec.EphemeralContainers[0].Name != hasher.HashName("canary-debug-ctr") ||
+		spec.EphemeralContainers[0].TargetContainerName != hasher.HashName("canary-ctr-inference") {
+		t.Errorf("expected ephemeralContainer name and targetContainerName to be hashed, got %q -> %q",
+			spec.EphemeralContainers[0].Name, spec.EphemeralContainers[0].TargetContainerName)
+	}
+	if spec.SecurityContext.SeccompProfile != nil || spec.SecurityContext.AppArmorProfile != nil || spec.SecurityContext.WindowsOptions != nil {
+		t.Errorf("expected Pod localhost SeccompProfile/AppArmorProfile and WindowsOptions to be stripped, got %+v", spec.SecurityContext)
+	}
+	if spec.SecurityContext.RunAsNonRoot == nil || !*spec.SecurityContext.RunAsNonRoot {
+		t.Errorf("expected non-sensitive RunAsNonRoot to be preserved")
+	}
+	if spec.Containers[0].SecurityContext.SeccompProfile != nil || spec.Containers[0].SecurityContext.WindowsOptions != nil {
+		t.Errorf("expected container localhost SeccompProfile and WindowsOptions to be stripped, got %+v", spec.Containers[0].SecurityContext)
+	}
+	if spec.Containers[0].SecurityContext.AppArmorProfile == nil || spec.Containers[0].SecurityContext.AppArmorProfile.Type != corev1.AppArmorProfileTypeRuntimeDefault {
+		t.Errorf("expected non-localhost RuntimeDefault AppArmorProfile to be preserved, got %+v", spec.Containers[0].SecurityContext.AppArmorProfile)
+	}
+
+	// L3: Denied annotations (created-by, seccomp/apparmor prefixes) + hashed kueue.x-k8s.io/podset-group-name.
+	filteredAnn := FilterAnnotations(map[string]string{
+		"kubernetes.io/created-by":                                `{"kind":"CronJob","name":"canary-cron"}`,
+		"seccomp.security.alpha.kubernetes.io/pod":                "localhost/canary-seccomp",
+		"container.seccomp.security.alpha.kubernetes.io/my-ctr":   "localhost/canary-ctr-seccomp",
+		"container.apparmor.security.beta.kubernetes.io/my-ctr":   "localhost/canary-apparmor",
+		KueuePodSetGroupNameAnnot:                                 "canary-ps-group",
+		"jobset.sigs.k8s.io/replicatedjob-name":                   "canary-rj-trainer",
+		"kueue-optimizer.gke.io/pod-execution-time-seconds":       "10",
+	}, hasher)
+	for _, k := range []string{
+		"kubernetes.io/created-by",
+		"seccomp.security.alpha.kubernetes.io/pod",
+		"container.seccomp.security.alpha.kubernetes.io/my-ctr",
+		"container.apparmor.security.beta.kubernetes.io/my-ctr",
+	} {
+		if _, exists := filteredAnn[k]; exists {
+			t.Errorf("expected annotation %q to be stripped, got %q", k, filteredAnn[k])
+		}
+	}
+	if filteredAnn[KueuePodSetGroupNameAnnot] != hasher.HashName("canary-ps-group") {
+		t.Errorf("expected podset-group-name annotation to be hashed, got %q", filteredAnn[KueuePodSetGroupNameAnnot])
+	}
+	if filteredAnn["jobset.sigs.k8s.io/replicatedjob-name"] != hasher.HashPodSetName("canary-rj-trainer") {
+		t.Errorf("expected replicatedjob-name annotation to use HashPodSetName, got %q", filteredAnn["jobset.sigs.k8s.io/replicatedjob-name"])
+	}
+
+	// L4: Consistent short PodSet hashing across JobSet spec, RayCluster workerGroupSpecs, PodSetAssignments, and ScrapedPodPayload.
+	wantTrainerPS := hasher.HashPodSetName("canary-rj-trainer")
+	wantEvalPS := hasher.HashPodSetName("canary-rj-eval")
+	if len(wantTrainerPS) != 10 || !strings.HasPrefix(wantTrainerPS, "r-") {
+		t.Fatalf("expected 10-char r-<8hex> PodSet hash, got %q", wantTrainerPS)
+	}
+	for _, fixed := range []string{"main", "head", "leader", "worker", "submitter", "default", "a1b2c3d4"} {
+		if got := hasher.HashPodSetName(fixed); got != fixed {
+			t.Errorf("expected fixed/role-hash PodSet %q to remain plain, got %q", fixed, got)
+		}
+	}
+
+	js := &jobsetv1alpha2.JobSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "canary-js-name",
+			Namespace: "ai-lab",
+			UID:       "11111111-2222-3333-4444-555555555555",
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "v1", Kind: "Job", Name: "canary-owner", UID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+			},
+		},
+		Spec: jobsetv1alpha2.JobSetSpec{
+			Coordinator:   &jobsetv1alpha2.Coordinator{ReplicatedJob: "canary-rj-trainer", JobIndex: 0, PodIndex: 0},
+			SuccessPolicy: &jobsetv1alpha2.SuccessPolicy{Operator: jobsetv1alpha2.OperatorAll, TargetReplicatedJobs: []string{"canary-rj-trainer"}},
+			FailurePolicy: &jobsetv1alpha2.FailurePolicy{
+				MaxRestarts: 1,
+				Rules: []jobsetv1alpha2.FailurePolicyRule{
+					{
+						Name:                        "CanaryFailureRule",
+						Action:                      jobsetv1alpha2.RestartJob,
+						OnJobFailureMessagePatterns: []string{".*canary-secret-err.*"},
+						TargetReplicatedJobs:        []string{"canary-rj-eval"},
+					},
+				},
+			},
+			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
+				{
+					Name:      "canary-rj-trainer",
+					GroupName: "canary-group",
+					Replicas:  1,
+					Template: batchv1.JobTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								"jobset.sigs.k8s.io/replicatedjob-name": "canary-rj-trainer",
+								"jobset.sigs.k8s.io/group-name":         "canary-group",
+								"kueue.x-k8s.io/podset":                 "canary-rj-trainer",
+							},
+						},
+						Spec: batchv1.JobSpec{
+							Template: corev1.PodTemplateSpec{
+								Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "trainer", Image: "img:1"}}},
+							},
+						},
+					},
+				},
+				{
+					Name:      "canary-rj-eval",
+					GroupName: "default",
+					Replicas:  1,
+					DependsOn: []jobsetv1alpha2.DependsOn{{Name: "canary-rj-trainer", Status: jobsetv1alpha2.DependencyReady}},
+					Template: batchv1.JobTemplateSpec{
+						Spec: batchv1.JobSpec{
+							Template: corev1.PodTemplateSpec{
+								Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "eval", Image: "img:1"}}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	jsMap := SanitizeJobSet(js, DefaultPauseImage, hasher)
+	jsBytes, err := json.Marshal(jsMap)
+	if err != nil {
+		t.Fatalf("marshal sanitized JobSet: %v", err)
+	}
+	jsJSON := string(jsBytes)
+	for _, leak := range []string{
+		"canary-rj-trainer", "canary-rj-eval", "canary-group", "CanaryFailureRule", "canary-secret-err",
+		"11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	} {
+		if strings.Contains(jsJSON, leak) {
+			t.Errorf("SanitizeJobSet leaked %q in %s", leak, jsJSON)
+		}
+	}
+	// Verify FailurePolicyRule.Name matches JobSet regex ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$ (no hyphens).
+	wantRuleName := strings.ReplaceAll(hasher.HashName("CanaryFailureRule"), "-", "_")
+	if !strings.Contains(jsJSON, `"`+wantRuleName+`"`) {
+		t.Errorf("expected hyphen-free hashed FailurePolicyRule.Name %q in %s", wantRuleName, jsJSON)
+	}
+	if !strings.Contains(jsJSON, `"`+wantTrainerPS+`"`) || !strings.Contains(jsJSON, `"`+wantEvalPS+`"`) {
+		t.Errorf("expected hashed ReplicatedJob names %q and %q in %s", wantTrainerPS, wantEvalPS, jsJSON)
+	}
+	if !strings.Contains(jsJSON, `"groupName":"default"`) {
+		t.Errorf("expected default ReplicatedJob.GroupName to remain 'default' in %s", jsJSON)
+	}
+	if strings.Contains(jsJSON, `"coordinator"`) {
+		t.Errorf("expected JobSet.spec.coordinator to be cleared under --hash-names (avoids >63-byte coordinator label error), got %s", jsJSON)
+	}
+
+	// Verify PodSetAssignments and ScrapedPodPayload match JobSet's hashed ReplicatedJob name.
+	psas := SanitizePodSetAssignments([]kueuev1beta2.PodSetAssignment{
+		{Name: "canary-rj-trainer"},
+		{Name: "main"},
+	}, hasher)
+	if string(psas[0].Name) != wantTrainerPS || string(psas[1].Name) != "main" {
+		t.Errorf("unexpected sanitized PodSetAssignment names: %q, %q", psas[0].Name, psas[1].Name)
+	}
+	podPayload := BuildScrapedPodPayloadWithLinkage(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "ai-lab"}},
+		time.Now(), nil,
+		PodWorkloadLinkage{RawWorkloadName: "wl1", OwnerKind: "JobSet", RawOwnerName: "canary-js-name", PodSetName: "canary-rj-trainer"},
+		hasher,
+	)
+	if podPayload.PodSetName != wantTrainerPS {
+		t.Errorf("expected ScrapedPodPayload.PodSetName %q, got %q", wantTrainerPS, podPayload.PodSetName)
+	}
+
+	// Verify RayCluster workerGroupSpecs[].groupName and ray.io/group label stay consistent.
+	wantRayGroup := hasher.HashPodSetName("canary-gpu-workers")
+	rc := &rayv1.RayCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "canary-rc", Namespace: "ai-lab"},
+		Spec: rayv1.RayClusterSpec{
+			WorkerGroupSpecs: []rayv1.WorkerGroupSpec{
+				{
+					GroupName: "canary-gpu-workers",
+					Labels:    map[string]string{"ray.io/group": "canary-gpu-workers"},
+					Template:  corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "ray-worker", Image: "img:1"}}}},
+				},
+			},
+		},
+	}
+	rcBytes, _ := json.Marshal(SanitizeRayCluster(rc, DefaultPauseImage, hasher))
+	if strings.Contains(string(rcBytes), "canary-gpu-workers") || !strings.Contains(string(rcBytes), wantRayGroup) {
+		t.Errorf("expected RayCluster groupName and ray.io/group label to hash to %q, got %s", wantRayGroup, string(rcBytes))
+	}
+
+	// L6: Node.Status.Conditions[].Message and ExecutionTimePayload.Message redacted under --hash-names, preserved under NoopHasher.
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-0", UID: "99999999-8888-7777-6666-555555555555"},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "KubeletReady", Message: "kubelet on secret-host-10.1.2.3 is ready"},
+			},
+		},
+	}
+	nodeHashedBytes, _ := json.Marshal(SanitizeNode(node, hasher))
+	if strings.Contains(string(nodeHashedBytes), "secret-host-10.1.2.3") || strings.Contains(string(nodeHashedBytes), "99999999-8888-7777-6666-555555555555") {
+		t.Errorf("expected SanitizeNode with hasher to redact condition message and UID, got %s", string(nodeHashedBytes))
+	}
+	if !strings.Contains(string(nodeHashedBytes), "KubeletReady") {
+		t.Errorf("expected SanitizeNode with hasher to preserve condition Reason, got %s", string(nodeHashedBytes))
+	}
+	nodePlainBytes, _ := json.Marshal(SanitizeNode(node, noop))
+	if !strings.Contains(string(nodePlainBytes), "secret-host-10.1.2.3") {
+		t.Errorf("expected SanitizeNode with NoopHasher to preserve condition message, got %s", string(nodePlainBytes))
+	}
+
+	// Verify ExecutionTimePayload.Message is redacted when HashNames=true and preserved when HashNames=false.
+	t0 := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	runWL := func(hashNames bool) []ExecutionTimeEvent {
+		s := newTestScraper(t, Config{HashNames: hashNames}, nil, nil, nil)
+		wl := &kueuev1beta2.Workload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "wl-msg-test",
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(t0),
+				OwnerReferences:   []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: "job-msg", Controller: ptr.To(true)}},
+			},
+			Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq"},
+			Status: kueuev1beta2.WorkloadStatus{
+				Admission: &kueuev1beta2.Admission{ClusterQueue: "cq"},
+				Conditions: []metav1.Condition{
+					{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", Message: "admitted secret-uid-1", LastTransitionTime: metav1.NewTime(t0.Add(time.Second))},
+				},
+			},
+		}
+		s.handleWorkloadWatchEvent(watch.Added, wl)
+		wl2 := wl.DeepCopy()
+		wl2.Status.Conditions = []metav1.Condition{
+			{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionFalse, Reason: "NoReservation", LastTransitionTime: metav1.NewTime(t0.Add(5 * time.Second))},
+			{Type: kueuev1beta2.WorkloadPreempted, Status: metav1.ConditionTrue, Reason: kueuev1beta2.InClusterQueueReason, Message: "Preempted to accommodate UID: secret-uid-2", LastTransitionTime: metav1.NewTime(t0.Add(5 * time.Second))},
+		}
+		s.handleWorkloadWatchEvent(watch.Modified, wl2)
+		raw, err := os.ReadFile(s.cfg.ExecutionTimeFile)
+		if err != nil {
+			t.Fatalf("read execution-time.json: %v", err)
+		}
+		return readJSONLines[ExecutionTimeEvent](t, raw)
+	}
+	hashedEvs := runWL(true)
+	if len(hashedEvs) != 2 {
+		t.Fatalf("expected 2 hashed events, got %d", len(hashedEvs))
+	}
+	for i, ev := range hashedEvs {
+		if ev.Payload.Message != "" {
+			t.Errorf("hashed event[%d] expected redacted Message, got %q", i, ev.Payload.Message)
+		}
+		if ev.Payload.Reason == "" {
+			t.Errorf("hashed event[%d] expected Reason preserved", i)
+		}
+	}
+	plainEvs := runWL(false)
+	if len(plainEvs) != 2 || plainEvs[1].Payload.Message == "" {
+		t.Errorf("expected plain events to preserve Message, got %+v", plainEvs)
 	}
 }

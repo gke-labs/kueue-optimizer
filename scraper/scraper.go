@@ -3437,7 +3437,7 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 					TrueDurationSeconds:       st.trueDurationSeconds,
 					MissingDurationMultiplier: st.missingDurationMultiplier,
 					Reason:                    admittedCond.Reason,
-					Message:                   admittedCond.Message,
+					Message:                   s.sanitizeConditionMessage(admittedCond.Message),
 				},
 			})
 		}
@@ -3531,7 +3531,7 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 						TrueDurationSeconds:       st.trueDurationSeconds,
 						MissingDurationMultiplier: st.missingDurationMultiplier,
 						Reason:                    interruptReason,
-						Message:                   interruptMsg,
+						Message:                   s.sanitizeConditionMessage(interruptMsg),
 					},
 				})
 			} else {
@@ -3633,7 +3633,7 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 				TrueDurationSeconds:       st.trueDurationSeconds,
 				MissingDurationMultiplier: st.missingDurationMultiplier,
 				Reason:                    finishedCond.Reason,
-				Message:                   finishedCond.Message,
+				Message:                   s.sanitizeConditionMessage(finishedCond.Message),
 			},
 		})
 	}
@@ -3649,6 +3649,16 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 			log.Printf("ERROR writing Workload execution event to %s: %v", s.cfg.ExecutionTimeFile, err)
 		}
 	}
+}
+
+// sanitizeConditionMessage omits free-form Kubernetes/Kueue condition messages when
+// --hash-names is enabled because messages can embed raw UIDs, JobUIDs, pod/node names,
+// or application error strings while structured Reason and InterruptionReason stay intact.
+func (s *Scraper) sanitizeConditionMessage(msg string) string {
+	if s.hasher != nil && s.hasher.IsEnabled() {
+		return ""
+	}
+	return msg
 }
 
 func parsePositiveFloatAnnotation(ann map[string]string, key string) *float64 {

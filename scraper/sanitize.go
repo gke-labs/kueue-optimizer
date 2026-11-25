@@ -60,6 +60,7 @@ const (
 	KueuePodSetUnconstrainedTopologyAnnot = "kueue.x-k8s.io/podset-unconstrained-topology"
 	KueuePodSetSliceRequiredTopologyAnnot = "kueue.x-k8s.io/podset-slice-required-topology"
 	KueuePodSetSliceConstraintsAnnot      = "kueue.x-k8s.io/podset-slice-required-topology-constraints"
+	KueuePodSetGroupNameAnnot             = "kueue.x-k8s.io/podset-group-name"
 	KueueJobUIDLabel                      = "kueue.x-k8s.io/job-uid"
 	KueueOptimizerTemplateHashAnnot       = "kueue-optimizer.gke.io/template-hash"
 )
@@ -86,6 +87,7 @@ var labelKeysHoldingWorkloadNames = map[string]bool{
 	"job-name":                                true,
 	"batch.kubernetes.io/job-name":            true,
 	"jobset.sigs.k8s.io/jobset-name":          true,
+	"jobset.sigs.k8s.io/jobset-uid":           true,
 	"jobset.sigs.k8s.io/coordinator":          true,
 	"alpha.jobset.sigs.k8s.io/namespaced-job": true,
 	"leaderworkerset.sigs.k8s.io/name":        true,
@@ -93,6 +95,36 @@ var labelKeysHoldingWorkloadNames = map[string]bool{
 	"ray.io/cluster":                          true,
 	KueuePrebuiltWorkloadLabel:                true,
 	KueuePodGroupNameLabel:                    true,
+	KueueJobUIDLabel:                          true,
+}
+
+// labelKeysHoldingPodSetNames lists label keys (all lowercase) whose values hold user-chosen
+// PodSet / ReplicatedJob / Ray worker-group names that must be hashed with HashPodSetName so they
+// match sanitized JobSet.spec.replicatedJobs[].name and Ray workerGroupSpecs[].groupName.
+var labelKeysHoldingPodSetNames = map[string]bool{
+	"jobset.sigs.k8s.io/replicatedjob-name": true,
+	"jobset.sigs.k8s.io/group-name":         true,
+	"kueue.x-k8s.io/podset":                 true,
+	"ray.io/group":                          true,
+}
+
+// annotationKeysHoldingPodSetNames lists annotation keys (all lowercase) whose values hold
+// user-chosen PodSet / ReplicatedJob names hashed with HashPodSetName.
+var annotationKeysHoldingPodSetNames = map[string]bool{
+	"jobset.sigs.k8s.io/replicatedjob-name": true,
+	"jobset.sigs.k8s.io/group-name":         true,
+	"kueue.x-k8s.io/podset":                 true,
+}
+
+// fixedPodSetNames lists standard controller-generated PodSet role names that carry no
+// user/business identity and must remain plain so Kueue/LWS/Ray/Job semantics stay intact.
+var fixedPodSetNames = map[string]bool{
+	"main":      true,
+	"head":      true,
+	"leader":    true,
+	"worker":    true,
+	"submitter": true,
+	"default":   true,
 }
 
 // annotationKeysHoldingWorkloadNames lists annotation keys (all lowercase) whose values represent
@@ -104,7 +136,9 @@ var annotationKeysHoldingWorkloadNames = map[string]bool{
 	KueueWorkloadAnnot:                           true,
 	KueueWorkloadSliceNameAnnot:                  true,
 	KueueWorkloadSliceReplacementForAnnot:        true,
+	KueuePodSetGroupNameAnnot:                    true,
 	"jobset.sigs.k8s.io/jobset-name":             true,
+	"jobset.sigs.k8s.io/jobset-uid":              true,
 	"jobset.sigs.k8s.io/coordinator":             true,
 	"alpha.jobset.sigs.k8s.io/namespaced-job":    true,
 	"leaderworkerset.sigs.k8s.io/leader-name":    true,
@@ -134,11 +168,12 @@ var allowedAnnotationDomains = []string{
 
 // deniedAnnotationKeys lists specific annotation keys within allowed domains that must always
 // be stripped because they can embed unsanitized manifests, CLI commands, container specs,
-// cloud project/volume identifiers, or internal node IP addresses.
+// serialized owner references, host security profiles, cloud project/volume identifiers, or internal node IPs.
 var deniedAnnotationKeys = []string{
 	strings.ToLower(corev1.LastAppliedConfigAnnotation), // kubectl.kubernetes.io/last-applied-configuration
 	"deployment.kubernetes.io/revision",
 	"kubernetes.io/change-cause",
+	"kubernetes.io/created-by",
 	"kubernetes.io/description",
 	"kubernetes.io/service-account.name",
 	"kubernetes.io/service-account.uid",
@@ -148,6 +183,16 @@ var deniedAnnotationKeys = []string{
 	"pod.beta.kubernetes.io/init-container-statuses",
 	"csi.volume.kubernetes.io/nodeid",
 	"alpha.kubernetes.io/provided-node-ip",
+	"seccomp.security.alpha.kubernetes.io/pod",
+}
+
+// deniedAnnotationPrefixes lists annotation key prefixes (all lowercase) within allowed domains
+// whose keys or values can embed container names or custom localhost security profile paths.
+var deniedAnnotationPrefixes = []string{
+	"seccomp.security.alpha.kubernetes.io/",
+	"container.seccomp.security.alpha.kubernetes.io/",
+	"apparmor.security.beta.kubernetes.io/",
+	"container.apparmor.security.beta.kubernetes.io/",
 }
 
 // deniedNodeLabelKeys lists cloud-provider and cluster-identifying Node label keys (all lowercase)
@@ -192,6 +237,19 @@ var hashedLabelKeys = []string{
 	"billing",
 	"project",
 	"account",
+	"service",
+	"part-of",
+	"component",
+	"managed-by",
+	"chart",
+	"release",
+	"tenant",
+	"model",
+	"experiment",
+	"workload",
+	"run",
+	"run-id",
+	"run_id",
 }
 
 // protectedLabelKeys lists Kueue control-plane label keys (all lowercase) whose values must never
@@ -230,7 +288,9 @@ func NewRandomHashSalt() []byte {
 // SensitiveDataHasher anonymizes workload/pod/job names and sensitive or workload-referencing
 // label values across scraped infrastructure, workflow, and execution-time records.
 type SensitiveDataHasher interface {
+	IsEnabled() bool
 	HashName(val string) string
+	HashPodSetName(val string) string
 	HashNameForKind(kind, name string) string
 	ShouldHashLabel(key string) bool
 	ShouldHashWorkloadLabel(key string) bool
@@ -244,7 +304,15 @@ func NewNoopHasher() SensitiveDataHasher {
 	return NoopHasher{}
 }
 
+func (NoopHasher) IsEnabled() bool {
+	return false
+}
+
 func (NoopHasher) HashName(val string) string {
+	return val
+}
+
+func (NoopHasher) HashPodSetName(val string) string {
 	return val
 }
 
@@ -322,6 +390,10 @@ func (h hmacSensitiveDataHasher) hmacSum(val string) [32]byte {
 	return sum
 }
 
+func (h hmacSensitiveDataHasher) IsEnabled() bool {
+	return true
+}
+
 // HashName returns a deterministic, Kubernetes-valid HMAC-SHA256 digest ("h-" + 32 hex chars,
 // 34 chars total <= 63-char Kubernetes DNS/label limit) used consistently for both resource names
 // and label values.
@@ -331,6 +403,32 @@ func (h hmacSensitiveDataHasher) HashName(val string) string {
 	}
 	sum := h.hmacSum(val)
 	return "h-" + hex.EncodeToString(sum[:16])
+}
+
+func isLowerHex8(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// HashPodSetName returns a short, deterministic, Kubernetes DNS-valid salted digest ("r-" + 8 hex
+// chars, 10 chars total) for user-chosen PodSet / ReplicatedJob / Ray worker-group names so child
+// JobSet pod names (<jobset-34>-<rj-10>-<idx>-<pod>-<5char>) stay well within the 63-char DNS label
+// limit. Fixed controller role names ("main", "head", "leader", "worker", "submitter", "default")
+// and 8-char lowercase hex Kueue PodGroup role-hashes are preserved verbatim.
+func (h hmacSensitiveDataHasher) HashPodSetName(val string) string {
+	if val == "" || fixedPodSetNames[strings.ToLower(val)] || isLowerHex8(val) {
+		return val
+	}
+	sum := h.hmacSum("podset:" + val)
+	return "r-" + hex.EncodeToString(sum[:4])
 }
 
 // HashNameForKind hashes name only if kind is a workload/pod/job/jobset/etc.
@@ -382,11 +480,16 @@ func (h hmacSensitiveDataHasher) ShouldHashWorkloadLabel(key string) bool {
 
 // ShouldKeepAnnotation returns true iff key is a domain-prefixed annotation ("<domain>/<name>")
 // whose domain is kubernetes.io, k8s.io, x-k8s.io, or kueue-optimizer.gke.io (or a subdomain thereof),
-// and key is not on the sensitive annotation denylist (e.g. kubectl.kubernetes.io/last-applied-configuration).
+// and key is not on the sensitive annotation denylist or denied prefix list.
 func ShouldKeepAnnotation(key string) bool {
 	lower := strings.ToLower(key)
 	if slices.Contains(deniedAnnotationKeys, lower) {
 		return false
+	}
+	for _, pfx := range deniedAnnotationPrefixes {
+		if strings.HasPrefix(lower, pfx) {
+			return false
+		}
 	}
 	domain, name, hasSlash := strings.Cut(lower, "/")
 	if !hasSlash || domain == "" || name == "" || strings.Contains(name, "/") {
@@ -397,7 +500,7 @@ func ShouldKeepAnnotation(key string) bool {
 
 // FilterAnnotations retains only allowed Kubernetes, SIG (x-k8s.io / k8s.io), and kueue-optimizer
 // domain annotations (excluding sensitive keys like kubectl.kubernetes.io/last-applied-configuration),
-// and hashes any annotation value that holds a workload/job/pod name via hasher.
+// and hashes any annotation value that holds a workload/job/pod or PodSet name via hasher.
 func FilterAnnotations(annotations map[string]string, hasher SensitiveDataHasher) map[string]string {
 	if len(annotations) == 0 {
 		return nil
@@ -407,7 +510,10 @@ func FilterAnnotations(annotations map[string]string, hasher SensitiveDataHasher
 		if !ShouldKeepAnnotation(k) {
 			continue
 		}
-		if annotationKeysHoldingWorkloadNames[strings.ToLower(k)] && v != "" {
+		lowerKey := strings.ToLower(k)
+		if annotationKeysHoldingPodSetNames[lowerKey] && v != "" {
+			v = hasher.HashPodSetName(v)
+		} else if annotationKeysHoldingWorkloadNames[lowerKey] && v != "" {
 			v = hasher.HashName(v)
 		}
 		filtered[k] = v
@@ -436,12 +542,16 @@ func FilterLabels(labels map[string]string, deniedKeys []string) map[string]stri
 	return out
 }
 
-func sanitizeLabelsFunc(labels map[string]string, shouldHash func(string) bool, hasher SensitiveDataHasher) map[string]string {
+func sanitizeLabelsFunc(labels map[string]string, shouldHash func(string) bool, hashPodSets bool, hasher SensitiveDataHasher) map[string]string {
 	if len(labels) == 0 {
 		return nil
 	}
 	out := make(map[string]string, len(labels))
 	for k, v := range labels {
+		if hashPodSets && labelKeysHoldingPodSetNames[strings.ToLower(k)] {
+			out[k] = hasher.HashPodSetName(v)
+			continue
+		}
 		if shouldHash(k) {
 			out[k] = hasher.HashName(v)
 			continue
@@ -455,17 +565,23 @@ func sanitizeLabelsFunc(labels map[string]string, shouldHash func(string) bool, 
 // workload/job/pod/deployment-referencing label values via hasher while keeping all label keys intact.
 // Queue names (kueue.x-k8s.io/queue-name) are never hashed.
 func SanitizeLabels(labels map[string]string, hasher SensitiveDataHasher) map[string]string {
-	return sanitizeLabelsFunc(labels, hasher.ShouldHashWorkloadLabel, hasher)
+	return sanitizeLabelsFunc(labels, hasher.ShouldHashWorkloadLabel, true, hasher)
 }
 
-func sanitizeLabelSelectorFunc(sel *metav1.LabelSelector, shouldHash func(string) bool, hasher SensitiveDataHasher) *metav1.LabelSelector {
+func sanitizeLabelSelectorFunc(sel *metav1.LabelSelector, shouldHash func(string) bool, hashPodSets bool, hasher SensitiveDataHasher) *metav1.LabelSelector {
 	if sel == nil {
 		return nil
 	}
 	cp := sel.DeepCopy()
-	cp.MatchLabels = sanitizeLabelsFunc(cp.MatchLabels, shouldHash, hasher)
+	cp.MatchLabels = sanitizeLabelsFunc(cp.MatchLabels, shouldHash, hashPodSets, hasher)
 	for i := range cp.MatchExpressions {
 		expr := &cp.MatchExpressions[i]
+		if hashPodSets && labelKeysHoldingPodSetNames[strings.ToLower(expr.Key)] {
+			for j, v := range expr.Values {
+				expr.Values[j] = hasher.HashPodSetName(v)
+			}
+			continue
+		}
 		if shouldHash(expr.Key) {
 			for j, v := range expr.Values {
 				expr.Values[j] = hasher.HashName(v)
@@ -478,18 +594,18 @@ func sanitizeLabelSelectorFunc(sel *metav1.LabelSelector, shouldHash func(string
 // SanitizeLabelSelector hashes MatchLabels and MatchExpressions values on a LabelSelector via hasher so
 // sensitive and workload-referencing label selectors remain non-empty and consistent.
 func SanitizeLabelSelector(sel *metav1.LabelSelector, hasher SensitiveDataHasher) *metav1.LabelSelector {
-	return sanitizeLabelSelectorFunc(sel, hasher.ShouldHashWorkloadLabel, hasher)
+	return sanitizeLabelSelectorFunc(sel, hasher.ShouldHashWorkloadLabel, true, hasher)
 }
 
 // SanitizeInfraLabels hashes sensitive label values (hashedLabelKeys plus --extra-hash-labels) on infrastructure objects via hasher.
 func SanitizeInfraLabels(labels map[string]string, hasher SensitiveDataHasher) map[string]string {
-	return sanitizeLabelsFunc(labels, hasher.ShouldHashLabel, hasher)
+	return sanitizeLabelsFunc(labels, hasher.ShouldHashLabel, false, hasher)
 }
 
 // SanitizeInfraLabelSelector hashes sensitive MatchLabels and MatchExpressions values on an infrastructure
 // LabelSelector (such as ClusterQueue.spec.namespaceSelector or PodAffinityTerm.namespaceSelector) via hasher.
 func SanitizeInfraLabelSelector(sel *metav1.LabelSelector, hasher SensitiveDataHasher) *metav1.LabelSelector {
-	return sanitizeLabelSelectorFunc(sel, hasher.ShouldHashLabel, hasher)
+	return sanitizeLabelSelectorFunc(sel, hasher.ShouldHashLabel, false, hasher)
 }
 
 // SanitizeNodeLabels strips cloud/cluster-identifying node labels (deniedNodeLabelKeys) and hashes
@@ -615,7 +731,8 @@ func SanitizeAffinity(aff *corev1.Affinity, hasher SensitiveDataHasher) *corev1.
 	return cp
 }
 
-// SanitizeOwnerReferences copies owner references and hashes non-infrastructure owner names via hasher.
+// SanitizeOwnerReferences copies owner references, hashes non-infrastructure owner names via hasher,
+// and clears owner UIDs when hashing is enabled so traces cannot be linked to cluster audit logs.
 func SanitizeOwnerReferences(refs []metav1.OwnerReference, hasher SensitiveDataHasher) []metav1.OwnerReference {
 	if len(refs) == 0 {
 		return nil
@@ -624,6 +741,9 @@ func SanitizeOwnerReferences(refs []metav1.OwnerReference, hasher SensitiveDataH
 	for i, r := range refs {
 		out[i] = r
 		out[i].Name = hasher.HashNameForKind(r.Kind, r.Name)
+		if hasher.IsEnabled() {
+			out[i].UID = ""
+		}
 	}
 	return out
 }
@@ -631,6 +751,9 @@ func SanitizeOwnerReferences(refs []metav1.OwnerReference, hasher SensitiveDataH
 // SanitizeWorkflowObjectMeta sanitizes top-level ObjectMeta on workflow objects.
 func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hasher SensitiveDataHasher) {
 	meta.ManagedFields = nil
+	if hasher.IsEnabled() {
+		meta.UID = ""
+	}
 	meta.Name = hasher.HashName(meta.Name)
 	if meta.GenerateName != "" {
 		meta.GenerateName = hasher.HashName(meta.GenerateName)
@@ -640,9 +763,37 @@ func SanitizeWorkflowObjectMeta(meta *metav1.ObjectMeta, hasher SensitiveDataHas
 	meta.OwnerReferences = SanitizeOwnerReferences(meta.OwnerReferences, hasher)
 }
 
-// SanitizePodSpec strips business-specific fields and hashes sensitive label selectors in a PodSpec:
-//   - Replaces container images with pauseImage and clears Command and Args
+func sanitizePodSecurityContext(sc *corev1.PodSecurityContext) {
+	if sc == nil {
+		return
+	}
+	if sc.SeccompProfile != nil && (sc.SeccompProfile.Type == corev1.SeccompProfileTypeLocalhost || sc.SeccompProfile.LocalhostProfile != nil) {
+		sc.SeccompProfile = nil
+	}
+	if sc.AppArmorProfile != nil && (sc.AppArmorProfile.Type == corev1.AppArmorProfileTypeLocalhost || sc.AppArmorProfile.LocalhostProfile != nil) {
+		sc.AppArmorProfile = nil
+	}
+	sc.WindowsOptions = nil
+}
+
+func sanitizeContainerSecurityContext(sc *corev1.SecurityContext) {
+	if sc == nil {
+		return
+	}
+	if sc.SeccompProfile != nil && (sc.SeccompProfile.Type == corev1.SeccompProfileTypeLocalhost || sc.SeccompProfile.LocalhostProfile != nil) {
+		sc.SeccompProfile = nil
+	}
+	if sc.AppArmorProfile != nil && (sc.AppArmorProfile.Type == corev1.AppArmorProfileTypeLocalhost || sc.AppArmorProfile.LocalhostProfile != nil) {
+		sc.AppArmorProfile = nil
+	}
+	sc.WindowsOptions = nil
+}
+
+// SanitizePodSpec strips business-specific fields and hashes sensitive label selectors and container names in a PodSpec:
+//   - Replaces container images with pauseImage and clears Command, Args, WorkingDir, and Ports
+//   - Hashes container names (and ephemeral targetContainerName) when --hash-names is enabled
 //   - Removes container probes (LivenessProbe, ReadinessProbe, StartupProbe) and Lifecycle hooks
+//   - Clears localhost SeccompProfile/AppArmorProfile paths and WindowsOptions on Pod and container SecurityContexts
 //   - Clears ServiceAccountName (and DeprecatedServiceAccount), Hostname, HostnameOverride, Subdomain, HostAliases, and DNSConfig
 //   - Removes Volumes, VolumeMounts, and VolumeDevices
 //   - Removes Secrets (ImagePullSecrets, secret env/volumes)
@@ -664,6 +815,7 @@ func SanitizePodSpec(spec *corev1.PodSpec, pauseImage string, hasher SensitiveDa
 	spec.Subdomain = ""
 	spec.HostAliases = nil
 	spec.DNSConfig = nil
+	sanitizePodSecurityContext(spec.SecurityContext)
 	spec.NodeSelector = SanitizeNodeLabels(spec.NodeSelector, hasher)
 	spec.Affinity = SanitizeAffinity(spec.Affinity, hasher)
 	for i := range spec.TopologySpreadConstraints {
@@ -672,20 +824,23 @@ func SanitizePodSpec(spec *corev1.PodSpec, pauseImage string, hasher SensitiveDa
 	}
 
 	for i := range spec.Containers {
-		sanitizeContainer(&spec.Containers[i], pauseImage)
+		sanitizeContainer(&spec.Containers[i], pauseImage, hasher)
 	}
 	for i := range spec.InitContainers {
-		sanitizeContainer(&spec.InitContainers[i], pauseImage)
+		sanitizeContainer(&spec.InitContainers[i], pauseImage, hasher)
 	}
 	for i := range spec.EphemeralContainers {
-		sanitizeEphemeralContainer(&spec.EphemeralContainers[i], pauseImage)
+		sanitizeEphemeralContainer(&spec.EphemeralContainers[i], pauseImage, hasher)
 	}
 }
 
-func sanitizeContainer(c *corev1.Container, pauseImage string) {
+func sanitizeContainer(c *corev1.Container, pauseImage string, hasher SensitiveDataHasher) {
+	c.Name = hasher.HashName(c.Name)
 	c.Image = pauseImage
 	c.Command = nil
 	c.Args = nil
+	c.WorkingDir = ""
+	c.Ports = nil
 	c.Env = nil
 	c.EnvFrom = nil
 	c.VolumeMounts = nil
@@ -694,12 +849,19 @@ func sanitizeContainer(c *corev1.Container, pauseImage string) {
 	c.ReadinessProbe = nil
 	c.StartupProbe = nil
 	c.Lifecycle = nil
+	sanitizeContainerSecurityContext(c.SecurityContext)
 }
 
-func sanitizeEphemeralContainer(c *corev1.EphemeralContainer, pauseImage string) {
+func sanitizeEphemeralContainer(c *corev1.EphemeralContainer, pauseImage string, hasher SensitiveDataHasher) {
+	c.Name = hasher.HashName(c.Name)
+	if c.TargetContainerName != "" {
+		c.TargetContainerName = hasher.HashName(c.TargetContainerName)
+	}
 	c.Image = pauseImage
 	c.Command = nil
 	c.Args = nil
+	c.WorkingDir = ""
+	c.Ports = nil
 	c.Env = nil
 	c.EnvFrom = nil
 	c.VolumeMounts = nil
@@ -708,6 +870,7 @@ func sanitizeEphemeralContainer(c *corev1.EphemeralContainer, pauseImage string)
 	c.ReadinessProbe = nil
 	c.StartupProbe = nil
 	c.Lifecycle = nil
+	sanitizeContainerSecurityContext(c.SecurityContext)
 }
 
 // SanitizePodTemplateSpec sanitizes both the template ObjectMeta and PodSpec.
@@ -716,6 +879,9 @@ func SanitizePodTemplateSpec(tpl *corev1.PodTemplateSpec, pauseImage string, has
 		return
 	}
 	tpl.ObjectMeta.ManagedFields = nil
+	if hasher.IsEnabled() {
+		tpl.ObjectMeta.UID = ""
+	}
 	if tpl.ObjectMeta.Name != "" {
 		tpl.ObjectMeta.Name = hasher.HashName(tpl.ObjectMeta.Name)
 	}
@@ -972,8 +1138,9 @@ func IsTASPod(pod *corev1.Pod) bool {
 	return false
 }
 
-// SanitizePodSetAssignments returns a deep copy of Kueue PodSetAssignments with any sensitive
-// topology domain label values hashed via hasher so node labels and topology assignments stay consistent.
+// SanitizePodSetAssignments returns a deep copy of Kueue PodSetAssignments with user-chosen
+// PodSet names hashed via HashPodSetName and any sensitive topology domain label values hashed
+// via hasher so node labels, JobSet/Ray specs, and topology assignments stay consistent.
 func SanitizePodSetAssignments(in []kueuev1beta2.PodSetAssignment, hasher SensitiveDataHasher) []kueuev1beta2.PodSetAssignment {
 	if len(in) == 0 {
 		return nil
@@ -981,8 +1148,7 @@ func SanitizePodSetAssignments(in []kueuev1beta2.PodSetAssignment, hasher Sensit
 	out := make([]kueuev1beta2.PodSetAssignment, len(in))
 	for i := range in {
 		out[i] = *in[i].DeepCopy()
-		// If PodSet name came from a PodGroup role-hash or standard role name ("main", "worker", etc.),
-		// leave plain; only sanitize topology domain values for sensitive label keys.
+		out[i].Name = kueuev1beta2.PodSetReference(hasher.HashPodSetName(string(out[i].Name)))
 		ta := out[i].TopologyAssignment
 		if ta == nil {
 			continue
@@ -1059,13 +1225,16 @@ func BuildScrapedPodPayloadWithLinkage(
 		WorkloadName:    wlName,
 		OwnerKind:       linkage.OwnerKind,
 		OwnerName:       ownerName,
-		PodSetName:      linkage.PodSetName,
+		PodSetName:      hasher.HashPodSetName(linkage.PodSetName),
 		IsTAS:           linkage.IsTAS,
 	}
 }
 
 func sanitizeInfraObjectMeta(meta *metav1.ObjectMeta, hasher SensitiveDataHasher) {
 	meta.ManagedFields = nil
+	if hasher.IsEnabled() {
+		meta.UID = ""
+	}
 	meta.Annotations = FilterAnnotations(meta.Annotations, hasher)
 	meta.Labels = SanitizeInfraLabels(meta.Labels, hasher)
 }
@@ -1073,7 +1242,8 @@ func sanitizeInfraObjectMeta(meta *metav1.ObjectMeta, hasher SensitiveDataHasher
 // SanitizeNode prepares a Node for infra.json, retaining only scheduling-relevant spec fields
 // (taints, unschedulable) and status fields (capacity, allocatable, conditions, phase), stripping
 // zero-valued nodeInfo and daemonEndpoints from status, filtering annotations, stripping
-// cloud/cluster-identifying node labels, and hashing sensitive/--extra-hash-labels values via hasher.
+// cloud/cluster-identifying node labels, hashing sensitive/--extra-hash-labels values via hasher,
+// and redacting free-form Node condition messages and metadata UID when --hash-names is enabled.
 func SanitizeNode(node *corev1.Node, hasher SensitiveDataHasher) map[string]any {
 	if node == nil {
 		return nil
@@ -1081,16 +1251,25 @@ func SanitizeNode(node *corev1.Node, hasher SensitiveDataHasher) map[string]any 
 	cp := node.DeepCopy()
 	cp.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Node"}
 	cp.ManagedFields = nil
+	if hasher.IsEnabled() {
+		cp.UID = ""
+	}
 	cp.Annotations = FilterAnnotations(cp.Annotations, hasher)
 	cp.Labels = SanitizeNodeLabels(cp.Labels, hasher)
 	cp.Spec = corev1.NodeSpec{
 		Taints:        cp.Spec.Taints,
 		Unschedulable: cp.Spec.Unschedulable,
 	}
+	conds := cp.Status.Conditions
+	if hasher.IsEnabled() && len(conds) > 0 {
+		for i := range conds {
+			conds[i].Message = ""
+		}
+	}
 	cp.Status = corev1.NodeStatus{
 		Capacity:    cp.Status.Capacity,
 		Allocatable: cp.Status.Allocatable,
-		Conditions:  cp.Status.Conditions,
+		Conditions:  conds,
 		Phase:       cp.Status.Phase,
 	}
 	raw, err := json.Marshal(cp)
@@ -1245,9 +1424,47 @@ func SanitizeJobSet(js *jobsetv1alpha2.JobSet, pauseImage string, hasher Sensiti
 	if cp.Spec.Network != nil {
 		cp.Spec.Network.Subdomain = ""
 	}
+	if cp.Spec.Coordinator != nil {
+		if hasher.IsEnabled() {
+			// JobSet's coordinator label "<jobset>-<rj>-<j>-<p>.<jobset>" must be <= 63 bytes,
+			// which a 34-char h-<32-hex> JobSet name cannot satisfy (2*34 > 63). Coordinator is
+			// purely an app-networking endpoint annotation and unused by Kueue scheduling.
+			cp.Spec.Coordinator = nil
+		}
+	}
+	if cp.Spec.SuccessPolicy != nil {
+		for i, name := range cp.Spec.SuccessPolicy.TargetReplicatedJobs {
+			cp.Spec.SuccessPolicy.TargetReplicatedJobs[i] = hasher.HashPodSetName(name)
+		}
+	}
+	if cp.Spec.FailurePolicy != nil {
+		for i := range cp.Spec.FailurePolicy.Rules {
+			rule := &cp.Spec.FailurePolicy.Rules[i]
+			if hasher.IsEnabled() {
+				if rule.Name != "" {
+					// JobSet FailurePolicyRule.Name requires ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$ (no hyphens).
+					rule.Name = strings.ReplaceAll(hasher.HashName(rule.Name), "-", "_")
+				}
+				rule.OnJobFailureMessagePatterns = nil
+			}
+			for j, name := range rule.TargetReplicatedJobs {
+				rule.TargetReplicatedJobs[j] = hasher.HashPodSetName(name)
+			}
+		}
+	}
 	for i := range cp.Spec.ReplicatedJobs {
 		rj := &cp.Spec.ReplicatedJobs[i]
+		rj.Name = hasher.HashPodSetName(rj.Name)
+		if rj.GroupName != "" {
+			rj.GroupName = hasher.HashPodSetName(rj.GroupName)
+		}
+		for j := range rj.DependsOn {
+			rj.DependsOn[j].Name = hasher.HashPodSetName(rj.DependsOn[j].Name)
+		}
 		rj.Template.ObjectMeta.ManagedFields = nil
+		if hasher.IsEnabled() {
+			rj.Template.ObjectMeta.UID = ""
+		}
 		rj.Template.ObjectMeta.Annotations = FilterAnnotations(rj.Template.ObjectMeta.Annotations, hasher)
 		rj.Template.ObjectMeta.Labels = SanitizeLabels(rj.Template.ObjectMeta.Labels, hasher)
 		rj.Template.Spec.Selector = SanitizeLabelSelector(rj.Template.Spec.Selector, hasher)
@@ -1387,6 +1604,7 @@ func sanitizeRayClusterSpec(spec *rayv1.RayClusterSpec, pauseImage string, hashe
 	SanitizePodTemplateSpec(&spec.HeadGroupSpec.Template, pauseImage, hasher)
 	for i := range spec.WorkerGroupSpecs {
 		w := &spec.WorkerGroupSpecs[i]
+		w.GroupName = hasher.HashPodSetName(w.GroupName)
 		w.RayStartParams = nil
 		w.Labels = SanitizeLabels(w.Labels, hasher)
 		SanitizePodTemplateSpec(&w.Template, pauseImage, hasher)
