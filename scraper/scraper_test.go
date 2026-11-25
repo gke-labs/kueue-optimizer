@@ -22,11 +22,14 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	"log"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -182,15 +185,15 @@ func TestStartupBanner(t *testing.T) {
 		"infra.json",
 		"workflows.json",
 		"execution-time.json",
-		"Nodes (v1/Node)",
-		"Namespaces (v1/Namespace)",
-		"RuntimeClasses (node.k8s.io/v1)",
-		"ClusterQueues",
-		"Cohorts",
-		"LocalQueues",
-		"ResourceFlavors",
-		"Topologies",
-		"WorkloadPriorityClasses",
+		"Nodes (v1/Node)                                        : Sanitized scheduling-relevant spec & status (watch)",
+		"Namespaces (v1/Namespace)                              : Sanitized object information without status (periodic)",
+		"RuntimeClasses (node.k8s.io/v1)                        : Sanitized object information without status (periodic)",
+		"ClusterQueues (kueue.x-k8s.io/v1beta2)                 : Sanitized object information without status (watch)",
+		"Cohorts (kueue.x-k8s.io/v1beta2)                       : Sanitized object information without status (watch)",
+		"LocalQueues (kueue.x-k8s.io/v1beta2)                   : Sanitized object information without status (watch)",
+		"ResourceFlavors (kueue.x-k8s.io/v1beta2)               : Sanitized object information without status (watch)",
+		"Topologies (kueue.x-k8s.io/v1beta2)                    : Sanitized object information without status (watch)",
+		"WorkloadPriorityClasses (kueue.x-k8s.io/v1beta2)       : Sanitized object information without status (watch)",
 		"Scheduled & Running Pods",
 		"Information Omitted / Sanitized",
 		"SHA-256 Name Replacement",
@@ -3209,7 +3212,7 @@ func TestRunStartupBarrierLinksKueuePodsAndSeparatesInfraPods(t *testing.T) {
 			Namespace:         "ai-lab",
 			CreationTimestamp: t0,
 			Labels: map[string]string{
-				"batch.kubernetes.io/job-name":       secretJobName,
+				"batch.kubernetes.io/job-name":          secretJobName,
 				"jobset.sigs.k8s.io/replicatedjob-name": "worker",
 			},
 			OwnerReferences: []metav1.OwnerReference{{
@@ -3560,9 +3563,9 @@ func TestVanillaAndChamberT0ParityBoundPendingAndTerminalPodDeletion(t *testing.
 			Namespace:         "team-ns",
 			CreationTimestamp: metav1.NewTime(t0.Add(-10 * time.Second)),
 			Labels: map[string]string{
-				"job-name":                 "vanilla-job",
-				"kueue.x-k8s.io/managed":   "true",
-				KueueQueueLabel:            "team-lq",
+				"job-name":               "vanilla-job",
+				"kueue.x-k8s.io/managed": "true",
+				KueueQueueLabel:          "team-lq",
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{APIVersion: "batch/v1", Kind: "Job", Name: "vanilla-job", Controller: ptr.To(true)},
@@ -3576,8 +3579,8 @@ func TestVanillaAndChamberT0ParityBoundPendingAndTerminalPodDeletion(t *testing.
 					Image: "gcr.io/corp/secret:v1",
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:           resource.MustParse("4"),
-							corev1.ResourceMemory:        resource.MustParse("16Gi"),
+							corev1.ResourceCPU:                    resource.MustParse("4"),
+							corev1.ResourceMemory:                 resource.MustParse("16Gi"),
 							corev1.ResourceName("google.com/tpu"): resource.MustParse("4"),
 						},
 					},
@@ -3596,9 +3599,9 @@ func TestVanillaAndChamberT0ParityBoundPendingAndTerminalPodDeletion(t *testing.
 			Namespace:         "team-ns",
 			CreationTimestamp: metav1.NewTime(t0.Add(-5 * time.Second)),
 			Labels: map[string]string{
-				KueueManagedLabel:      "true",
-				KueueQueueLabel:        "team-lq",
-				KueuePodGroupNameLabel: "t0pg-init-0",
+				KueueManagedLabel:                    "true",
+				KueueQueueLabel:                      "team-lq",
+				KueuePodGroupNameLabel:               "t0pg-init-0",
 				"kueue-optimizer.gke.io/initial-pod": "true",
 			},
 		},
@@ -3610,7 +3613,7 @@ func TestVanillaAndChamberT0ParityBoundPendingAndTerminalPodDeletion(t *testing.
 					Image: DefaultPauseImage,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:           resource.MustParse("4"),
+							corev1.ResourceCPU:                    resource.MustParse("4"),
 							corev1.ResourceName("google.com/tpu"): resource.MustParse("4"),
 						},
 					},
@@ -6571,4 +6574,1573 @@ func TestPR19ReviewCompletenessGaps(t *testing.T) {
 	if strings.Contains(rcJSON, "acme-secret") || !strings.Contains(rcJSON, wantTenantHash) || !strings.Contains(rcJSON, "h100-80gb") {
 		t.Errorf("SanitizeRuntimeClass taint/label hashing mismatch: %s", rcJSON)
 	}
+}
+
+func TestRunWatchLoopHandles410BookmarksAndClosedChannels(t *testing.T) {
+	tests := []struct {
+		name      string
+		initialRV string
+		scenario  func(t *testing.T, cancel context.CancelFunc) (relist func(context.Context) (string, error), watchFn func(context.Context, metav1.ListOptions) (watch.Interface, error), wantRelists int, wantWatchRVs []string, wantEvents int)
+	}{
+		{
+			name:      "410 Gone returned as watch error triggers relist and resumes from new RV",
+			initialRV: "10",
+			scenario: func(t *testing.T, cancel context.CancelFunc) (func(context.Context) (string, error), func(context.Context, metav1.ListOptions) (watch.Interface, error), int, []string, int) {
+				var relistCalls int
+				var watchCalls int
+				relist := func(ctx context.Context) (string, error) {
+					relistCalls++
+					return "20", nil
+				}
+				watchFn := func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+					watchCalls++
+					if watchCalls == 1 {
+						return nil, apierrors.NewGone("too old resource version: 10 (20)")
+					}
+					fw := watch.NewFake()
+					go func() {
+						fw.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", ResourceVersion: "21"}})
+						cancel()
+					}()
+					return fw, nil
+				}
+				return relist, watchFn, 1, []string{"10", "20"}, 1
+			},
+		},
+		{
+			name:      "410 Gone delivered as watch.Error status event triggers relist",
+			initialRV: "10",
+			scenario: func(t *testing.T, cancel context.CancelFunc) (func(context.Context) (string, error), func(context.Context, metav1.ListOptions) (watch.Interface, error), int, []string, int) {
+				var watchCalls int
+				relist := func(ctx context.Context) (string, error) {
+					return "30", nil
+				}
+				watchFn := func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+					watchCalls++
+					fw := watch.NewFake()
+					if watchCalls == 1 {
+						go func() {
+							status := apierrors.NewResourceExpired("too old resource version").Status()
+							fw.Error(&status)
+						}()
+						return fw, nil
+					}
+					go func() {
+						fw.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p2", ResourceVersion: "31"}})
+						cancel()
+					}()
+					return fw, nil
+				}
+				return relist, watchFn, 1, []string{"10", "30"}, 1
+			},
+		},
+		{
+			name:      "bookmark advances RV and closed channel reconnects without relist",
+			initialRV: "10",
+			scenario: func(t *testing.T, cancel context.CancelFunc) (func(context.Context) (string, error), func(context.Context, metav1.ListOptions) (watch.Interface, error), int, []string, int) {
+				var watchCalls int
+				relist := func(ctx context.Context) (string, error) {
+					t.Errorf("unexpected relist on bookmark + clean channel close")
+					return "99", nil
+				}
+				watchFn := func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+					watchCalls++
+					fw := watch.NewFake()
+					if watchCalls == 1 {
+						go func() {
+							fw.Action(watch.Bookmark, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "15"}})
+							fw.Stop() // closes ResultChan cleanly
+						}()
+						return fw, nil
+					}
+					go func() {
+						fw.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p3", ResourceVersion: "16"}})
+						cancel()
+					}()
+					return fw, nil
+				}
+				return relist, watchFn, 0, []string{"10", "15"}, 1
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			baseRelist, baseWatch, wantRelists, wantWatchRVs, wantEvents := tc.scenario(t, cancel)
+			var gotRelists int
+			var gotWatchRVs []string
+			var gotEvents int
+
+			runWatchLoop(ctx, watchLoopConfig{
+				name:         "TestPods",
+				initialRV:    tc.initialRV,
+				retryBackoff: time.Millisecond,
+				sleep:        func(context.Context, time.Duration) {},
+				relist: func(ctx context.Context) (string, error) {
+					gotRelists++
+					return baseRelist(ctx)
+				},
+				watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+					gotWatchRVs = append(gotWatchRVs, opts.ResourceVersion)
+					return baseWatch(ctx, opts)
+				},
+				handleEvent: func(ev watch.Event) {
+					gotEvents++
+				},
+			})
+
+			if gotRelists != wantRelists {
+				t.Errorf("relist count = %d, want %d", gotRelists, wantRelists)
+			}
+			if !slices.Equal(gotWatchRVs, wantWatchRVs) {
+				t.Errorf("watch RVs = %v, want %v", gotWatchRVs, wantWatchRVs)
+			}
+			if gotEvents != wantEvents {
+				t.Errorf("handled events = %d, want %d", gotEvents, wantEvents)
+			}
+		})
+	}
+}
+
+func TestPodRelistAfter410ReconcilesStandaloneDeletionAndRecreate(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 7, 53, 14, 0, time.UTC)
+
+	mkStandaloneRunningPod := func(uid string, created time.Time) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "trainer-0",
+				Namespace:         "ai-lab",
+				UID:               k8stypes.UID(uid),
+				CreationTimestamp: metav1.NewTime(created),
+				Labels: map[string]string{
+					KueueQueueLabel:   "lq-main",
+					KueueManagedLabel: "true",
+				},
+			},
+			Spec: corev1.PodSpec{
+				NodeName:   "node-0",
+				Containers: []corev1.Container{{Name: "c", Image: "pause:3.10"}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+	}
+
+	tests := []struct {
+		name string
+		uid1 string
+		uid2 string
+	}{
+		{name: "distinct UIDs on recreate", uid1: "uid-1", uid2: "uid-2"},
+		{name: "empty UIDs on recreate", uid1: "", uid2: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			kubeClient := kubefake.NewSimpleClientset()
+			s := newTestScraper(t, Config{}, kubeClient, nil, nil)
+
+			// 1. Standalone Kueue Pod starts running before watch gap.
+			pod1 := mkStandaloneRunningPod(tc.uid1, t0)
+			s.handlePodWatchEventAt(watch.Added, pod1, t0, false)
+
+			// 2. Pod disappears during 410 watch gap -> relist with empty cluster Pod list.
+			if _, err := s.relistPodsAt(context.Background(), t0.Add(time.Hour)); err != nil {
+				t.Fatalf("relistPodsAt failed: %v", err)
+			}
+
+			// 3. Same-name Pod is re-created after relist -> must emit New in both workflows.json and infra.json.
+			pod2 := mkStandaloneRunningPod(tc.uid2, t0.Add(time.Hour+5*time.Second))
+			s.handlePodWatchEventAt(watch.Added, pod2, t0.Add(time.Hour+5*time.Second), false)
+
+			rawWf, err := os.ReadFile(s.cfg.WorkflowsFile)
+			if err != nil {
+				t.Fatalf("read workflows.json: %v", err)
+			}
+			wfEvs := readJSONLines[WorkflowEvent](t, rawWf)
+			wantWfTypes := []EventType{EventNew, EventDeleted, EventNew}
+			if len(wfEvs) != len(wantWfTypes) {
+				t.Fatalf("workflows.json got %d events, want %d:\n%s", len(wfEvs), len(wantWfTypes), string(rawWf))
+			}
+			for i, want := range wantWfTypes {
+				if wfEvs[i].EventType != want {
+					t.Errorf("workflows.json[%d].EventType = %q, want %q", i, wfEvs[i].EventType, want)
+				}
+			}
+
+			rawInfra, err := os.ReadFile(s.cfg.InfraFile)
+			if err != nil {
+				t.Fatalf("read infra.json: %v", err)
+			}
+			infEvs := readJSONLines[InfraEvent](t, rawInfra)
+			wantInfTypes := []EventType{EventNew, EventDeleted, EventNew}
+			if len(infEvs) != len(wantInfTypes) {
+				t.Fatalf("infra.json got %d events, want %d:\n%s", len(infEvs), len(wantInfTypes), string(rawInfra))
+			}
+			for i, want := range wantInfTypes {
+				if infEvs[i].EventType != want {
+					t.Errorf("infra.json[%d].EventType = %q, want %q", i, infEvs[i].EventType, want)
+				}
+			}
+		})
+	}
+}
+
+func TestStaleListDoesNotOverwriteNewerWatchState(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 7, 53, 14, 0, time.UTC)
+
+	t.Run("stale Pod list does not resurrect Pod deleted by watch", func(t *testing.T) {
+		s := newTestScraper(t, Config{}, nil, nil, nil)
+		p1 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "p1",
+				Namespace:       "ai-lab",
+				UID:             "uid-p1",
+				ResourceVersion: "10",
+			},
+			Spec: corev1.PodSpec{
+				NodeName:   "n1",
+				Containers: []corev1.Container{{Name: "c", Image: "pause:3.10"}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+
+		// Pod added at t0, then deleted by watch at t0+31s.
+		s.handlePodWatchEventAt(watch.Added, p1, t0, false)
+		s.handlePodWatchEventAt(watch.Deleted, p1, t0.Add(31*time.Second), false)
+
+		// Stale in-flight List() taken at t0+30s arrives after the watch delete.
+		s.scrapeScheduledAndRunningPodsWithList(context.Background(), t0.Add(30*time.Second), []corev1.Pod{*p1})
+		// Next tick at t0+90s sees empty cluster.
+		s.scrapeScheduledAndRunningPodsWithList(context.Background(), t0.Add(90*time.Second), []corev1.Pod{})
+
+		rawInfra, err := os.ReadFile(s.cfg.InfraFile)
+		if err != nil {
+			t.Fatalf("read infra.json: %v", err)
+		}
+		evs := readJSONLines[InfraEvent](t, rawInfra)
+		if len(evs) != 2 || evs[0].EventType != EventNew || evs[1].EventType != EventDeleted {
+			t.Fatalf("expected strictly [New, Deleted] for p1, got %d events:\n%s", len(evs), string(rawInfra))
+		}
+	})
+
+	t.Run("stale Node list does not resurrect deleted Node or drop newly watched Node", func(t *testing.T) {
+		s := newTestScraper(t, Config{}, nil, nil, nil)
+		mkNode := func(name, rv string) *corev1.Node {
+			return &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: rv},
+				Status:     corev1.NodeStatus{Phase: corev1.NodeRunning},
+			}
+		}
+		n1 := mkNode("n1", "10")
+		n2 := mkNode("n2", "12")
+
+		// n1 exists at t0; at t0+31s watch deletes n1 and adds n2.
+		s.handleNodeWatchEventAt(watch.Added, n1, t0)
+		s.handleNodeWatchEventAt(watch.Deleted, n1, t0.Add(31*time.Second))
+		s.handleNodeWatchEventAt(watch.Added, n2, t0.Add(31*time.Second))
+
+		// Stale Node list from t0+30s containing only n1 arrives late.
+		n1Payload := SanitizeNode(n1, s.hasher)
+		s.reconcileInfraKind("Node", t0.Add(30*time.Second), map[string]cachedObject{
+			"n1": {name: "n1", digest: canonicalDigest(n1Payload), payload: n1Payload},
+		})
+
+		rawInfra, err := os.ReadFile(s.cfg.InfraFile)
+		if err != nil {
+			t.Fatalf("read infra.json: %v", err)
+		}
+		evs := readJSONLines[InfraEvent](t, rawInfra)
+		if len(evs) != 3 || evs[0].EventType != EventNew || evs[1].EventType != EventDeleted || evs[2].EventType != EventNew {
+			t.Fatalf("expected strictly [New n1, Deleted n1, New n2], got %d events:\n%s", len(evs), string(rawInfra))
+		}
+		s.mu.Lock()
+		_, n1Cached := s.infraCache["Node"]["n1"]
+		_, n2Cached := s.infraCache["Node"]["n2"]
+		s.mu.Unlock()
+		if n1Cached || !n2Cached {
+			t.Fatalf("expected cache={n2}, got n1Cached=%v n2Cached=%v", n1Cached, n2Cached)
+		}
+	})
+
+	t.Run("Run periodic tick does not re-list actively watched Nodes or Pods", func(t *testing.T) {
+		kubeClient := kubefake.NewSimpleClientset()
+		var nodeListCount, podListCount, nsListCount int
+		var mu sync.Mutex
+		kubeClient.PrependReactor("list", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			nodeListCount++
+			mu.Unlock()
+			return false, nil, nil
+		})
+		kubeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			podListCount++
+			mu.Unlock()
+			return false, nil, nil
+		})
+		kubeClient.PrependReactor("list", "namespaces", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			mu.Lock()
+			nsListCount++
+			mu.Unlock()
+			return false, nil, nil
+		})
+
+		s := newTestScraper(t, Config{Interval: 15 * time.Millisecond}, kubeClient, nil, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Millisecond)
+		defer cancel()
+		if err := s.Run(ctx); err != nil {
+			t.Fatalf("Run returned unexpected error: %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if nodeListCount != 1 {
+			t.Errorf("expected exactly 1 initial Node List (no periodic re-list), got %d", nodeListCount)
+		}
+		if podListCount > 2 {
+			// Startup preindex + syncInitialPods = 2 Lists, zero periodic re-lists.
+			t.Errorf("expected at most 2 startup Pod Lists (no periodic re-list), got %d", podListCount)
+		}
+		if nsListCount < 2 {
+			t.Errorf("expected periodic Namespace List ticks (>=2), got %d", nsListCount)
+		}
+	})
+}
+
+func TestWorkloadSliceReplacedRecordedAsPartialExecution(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 8, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		finishedReason string
+		wantEventType  ExecutionEventType
+		wantIntReason  string
+	}{
+		{
+			name:           "WorkloadSliceReplaced emits PartialExecution not FullExecution",
+			finishedReason: kueuev1beta2.WorkloadSliceReplaced,
+			wantEventType:  ExecutionEventPartial,
+			wantIntReason:  InterruptionReasonSliceReplaced,
+		},
+		{
+			name:           "Succeeded still emits FullExecution",
+			finishedReason: kueuev1beta2.WorkloadFinishedReasonSucceeded,
+			wantEventType:  ExecutionEventFull,
+			wantIntReason:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestScraper(t, Config{}, nil, nil, nil)
+			wl := &kueuev1beta2.Workload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "job-elastic-1a2b3",
+					Namespace:         "ai-lab",
+					CreationTimestamp: metav1.NewTime(t0),
+					OwnerReferences: []metav1.OwnerReference{
+						{APIVersion: "batch/v1", Kind: "Job", Name: "elastic", Controller: ptr.To(true)},
+					},
+				},
+				Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+				Status: kueuev1beta2.WorkloadStatus{
+					Admission: &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+					Conditions: []metav1.Condition{
+						{
+							Type:               kueuev1beta2.WorkloadAdmitted,
+							Status:             metav1.ConditionTrue,
+							Reason:             "Admitted",
+							LastTransitionTime: metav1.NewTime(t0),
+						},
+					},
+				},
+			}
+			s.handleWorkloadWatchEventAt(watch.Added, wl, t0)
+
+			wlDone := wl.DeepCopy()
+			wlDone.Status.Conditions = append(wlDone.Status.Conditions, metav1.Condition{
+				Type:               kueuev1beta2.WorkloadFinished,
+				Status:             metav1.ConditionTrue,
+				Reason:             tc.finishedReason,
+				Message:            "Workload finished with " + tc.finishedReason,
+				LastTransitionTime: metav1.NewTime(t0.Add(20 * time.Second)),
+			})
+			s.handleWorkloadWatchEventAt(watch.Modified, wlDone, t0.Add(20*time.Second))
+			// Shutdown flush must NOT emit a duplicate ScrapeEnded for finished/replaced slice.
+			s.flushInFlightWorkloadsAsPartial(t0.Add(60 * time.Second))
+
+			rawExec, err := os.ReadFile(s.cfg.ExecutionTimeFile)
+			if err != nil {
+				t.Fatalf("read execution-time.json: %v", err)
+			}
+			evs := readJSONLines[ExecutionTimeEvent](t, rawExec)
+			if len(evs) != 2 {
+				t.Fatalf("expected 2 events [Admitted, %s], got %d:\n%s", tc.wantEventType, len(evs), string(rawExec))
+			}
+			if evs[1].EventType != tc.wantEventType {
+				t.Errorf("evs[1].EventType = %q, want %q", evs[1].EventType, tc.wantEventType)
+			}
+			if evs[1].Payload.InterruptionReason != tc.wantIntReason {
+				t.Errorf("evs[1].Payload.InterruptionReason = %q, want %q", evs[1].Payload.InterruptionReason, tc.wantIntReason)
+			}
+			if evs[1].Payload.Reason != tc.finishedReason {
+				t.Errorf("evs[1].Payload.Reason = %q, want %q", evs[1].Payload.Reason, tc.finishedReason)
+			}
+			if evs[1].Payload.Preempted {
+				t.Errorf("expected Preempted=false for %s", tc.finishedReason)
+			}
+		})
+	}
+}
+
+func TestLeaderWorkerSetMultiGroupAggregateWorkloadState(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 8, 30, 0, 0, time.UTC)
+
+	mkGroupWl := func(name string, admitted, quotaReserved bool) *kueuev1beta2.Workload {
+		var conds []metav1.Condition
+		if admitted {
+			conds = append(conds, metav1.Condition{
+				Type:               kueuev1beta2.WorkloadAdmitted,
+				Status:             metav1.ConditionTrue,
+				Reason:             "Admitted",
+				LastTransitionTime: metav1.NewTime(t0),
+			})
+		}
+		if quotaReserved {
+			conds = append(conds, metav1.Condition{
+				Type:               kueuev1beta2.WorkloadQuotaReserved,
+				Status:             metav1.ConditionTrue,
+				Reason:             "QuotaReserved",
+				LastTransitionTime: metav1.NewTime(t0),
+			})
+		}
+		return &kueuev1beta2.Workload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(t0),
+				Annotations: map[string]string{
+					KueueIsGroupWorkloadAnnotation: "true",
+					KueueJobOwnerGVKAnnotation:     "leaderworkerset.x-k8s.io/v1, Kind=LeaderWorkerSet",
+					KueueJobOwnerNameAnnotation:    "serve",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "leaderworkerset.x-k8s.io/v1", Kind: "LeaderWorkerSet", Name: "serve"},
+				},
+			},
+			Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+			Status: kueuev1beta2.WorkloadStatus{
+				Conditions: conds,
+			},
+		}
+	}
+
+	mkLWS := func(ready, replicas int32) *leaderworkersetv1.LeaderWorkerSet {
+		return &leaderworkersetv1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "serve",
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(t0),
+				Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+			},
+			Spec: leaderworkersetv1.LeaderWorkerSetSpec{
+				Replicas: ptr.To(replicas),
+			},
+			Status: leaderworkersetv1.LeaderWorkerSetStatus{
+				Replicas:      replicas,
+				ReadyReplicas: ready,
+			},
+		}
+	}
+
+	tests := []struct {
+		name          string
+		group0Admit   bool
+		group0Reserve bool
+		group1Admit   bool
+		group1Reserve bool
+		deleteGroup1  bool
+		readyReplicas int32
+		wantState     WorkloadState
+	}{
+		{
+			name:          "group 0 Admitted and group 1 NotAdmitted stays Admitted",
+			group0Admit:   true,
+			group1Admit:   false,
+			readyReplicas: 1,
+			wantState:     WorkloadStateAdmitted,
+		},
+		{
+			name:          "group 0 NotAdmitted and group 1 AdmissionInProgress is AdmissionInProgress",
+			group0Admit:   false,
+			group1Reserve: true,
+			readyReplicas: 0,
+			wantState:     WorkloadStateAdmissionInProgress,
+		},
+		{
+			name:          "all groups NotAdmitted is NotAdmitted",
+			group0Admit:   false,
+			group1Admit:   false,
+			readyReplicas: 0,
+			wantState:     WorkloadStateNotAdmitted,
+		},
+		{
+			name:          "deleting group 1 preserves group 0 Admitted state",
+			group0Admit:   true,
+			group1Admit:   false,
+			deleteGroup1:  true,
+			readyReplicas: 1,
+			wantState:     WorkloadStateAdmitted,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestScraper(t, Config{}, nil, nil, nil)
+			wl0 := mkGroupWl("lws-serve-0", tc.group0Admit, tc.group0Reserve)
+			wl1 := mkGroupWl("lws-serve-1", tc.group1Admit, tc.group1Reserve)
+			s.handleWorkloadWatchEventAt(watch.Added, wl0, t0)
+			s.handleWorkloadWatchEventAt(watch.Added, wl1, t0.Add(time.Second))
+			if tc.deleteGroup1 {
+				s.handleWorkloadWatchEventAt(watch.Deleted, wl1, t0.Add(2*time.Second))
+			}
+
+			s.handleLeaderWorkerSetWatchEventAt(watch.Added, mkLWS(tc.readyReplicas, 2), t0.Add(3*time.Second))
+
+			rawWf, err := os.ReadFile(s.cfg.WorkflowsFile)
+			if err != nil {
+				t.Fatalf("read workflows.json: %v", err)
+			}
+			evs := readJSONLines[WorkflowEvent](t, rawWf)
+			if len(evs) != 1 || evs[0].EventType != EventNew {
+				t.Fatalf("expected 1 New LWS event, got %+v", evs)
+			}
+			if evs[0].WorkloadState != tc.wantState {
+				t.Errorf("LWS workloadState = %q, want %q", evs[0].WorkloadState, tc.wantState)
+			}
+		})
+	}
+}
+
+func TestEmptyKueueNamespaceOrConfigMapDisablesConfigurationScraping(t *testing.T) {
+	tests := []struct {
+		name             string
+		args             []string
+		wantNamespace    string
+		wantConfigMap    string
+		wantDisabled     bool
+		wantConfigEvents int
+	}{
+		{
+			name:             "default flags scrape kueue-system/kueue-manager-config",
+			args:             nil,
+			wantNamespace:    DefaultKueueNamespace,
+			wantConfigMap:    DefaultKueueConfigMapName,
+			wantDisabled:     false,
+			wantConfigEvents: 1,
+		},
+		{
+			name:             "explicit empty --kueue-namespace disables Configuration scraping",
+			args:             []string{"--kueue-namespace="},
+			wantNamespace:    "",
+			wantConfigMap:    DefaultKueueConfigMapName,
+			wantDisabled:     true,
+			wantConfigEvents: 0,
+		},
+		{
+			name:             "explicit empty --kueue-configmap disables Configuration scraping",
+			args:             []string{"--kueue-configmap="},
+			wantNamespace:    DefaultKueueNamespace,
+			wantConfigMap:    "",
+			wantDisabled:     true,
+			wantConfigEvents: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var errBuf bytes.Buffer
+			fullArgs := append([]string{"--output-dir", t.TempDir()}, tc.args...)
+			cfg, _, _, err := parseFlags("cluster-scraper", fullArgs, &errBuf)
+			if err != nil {
+				t.Fatalf("parseFlags(%v) error: %v", tc.args, err)
+			}
+			if cfg.KueueNamespace != tc.wantNamespace || cfg.KueueConfigMapName != tc.wantConfigMap || cfg.DisableKueueConfigScrape != tc.wantDisabled {
+				t.Fatalf("parsed cfg = {ns:%q cm:%q disabled:%v}, want {ns:%q cm:%q disabled:%v}",
+					cfg.KueueNamespace, cfg.KueueConfigMapName, cfg.DisableKueueConfigScrape,
+					tc.wantNamespace, tc.wantConfigMap, tc.wantDisabled)
+			}
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: DefaultKueueConfigMapName, Namespace: DefaultKueueNamespace},
+				Data: map[string]string{
+					"controller_manager_config.yaml": "apiVersion: config.kueue.x-k8s.io/v1beta2\nkind: Configuration\nmanageJobsWithoutQueueName: true\n",
+				},
+			}
+			kubeClient := kubefake.NewSimpleClientset(cm)
+			s := newTestScraper(t, cfg, kubeClient, nil, nil)
+			if s.cfg.KueueNamespace != tc.wantNamespace {
+				t.Fatalf("NewScraper mutated KueueNamespace to %q, want %q", s.cfg.KueueNamespace, tc.wantNamespace)
+			}
+
+			s.scrapeKueueConfiguration(context.Background(), time.Date(2026, 11, 25, 9, 0, 0, 0, time.UTC))
+
+			rawInfra, err := os.ReadFile(s.cfg.InfraFile)
+			if err != nil {
+				t.Fatalf("read infra.json: %v", err)
+			}
+			evs := readJSONLines[InfraEvent](t, rawInfra)
+			if len(evs) != tc.wantConfigEvents {
+				t.Fatalf("expected %d Configuration events, got %d:\n%s", tc.wantConfigEvents, len(evs), string(rawInfra))
+			}
+		})
+	}
+}
+
+func TestSuppressOrphanDeletedForUnseenPreT0TerminalWorkflows(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 9, 15, 0, 0, time.UTC)
+
+	tests := []struct {
+		name string
+		run  func(s *Scraper)
+	}{
+		{
+			name: "pre-t0 terminal Job deleted later emits no orphan Deleted",
+			run: func(s *Scraper) {
+				job := &batchv1.Job{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "old-finished",
+						Namespace:         "ai-lab",
+						CreationTimestamp: metav1.NewTime(t0.Add(-time.Hour)),
+						Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+					},
+					Spec: batchv1.JobSpec{
+						Suspend: ptr.To(false),
+						Template: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers:    []corev1.Container{{Name: "c", Image: "pause:3.10"}},
+							},
+						},
+					},
+					Status: batchv1.JobStatus{
+						Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+					},
+				}
+				// Skipped during initial sync, then GC'd later via watch.Deleted.
+				s.handleJobWatchEventAt(watch.Added, job, t0, true)
+				s.handleJobWatchEventAt(watch.Deleted, job, t0.Add(10*time.Second), false)
+			},
+		},
+		{
+			name: "unseen Deployment deleted via watch emits no orphan Deleted",
+			run: func(s *Scraper) {
+				deploy := &appsv1.Deployment{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              "unseen-deploy",
+						Namespace:         "ai-lab",
+						CreationTimestamp: metav1.NewTime(t0),
+						Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+					},
+					Spec: appsv1.DeploymentSpec{
+						Replicas: ptr.To[int32](1),
+						Template: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: "c", Image: "pause:3.10"}},
+							},
+						},
+					},
+				}
+				s.handleDeploymentWatchEventAt(watch.Deleted, deploy, t0.Add(5*time.Second))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestScraper(t, Config{}, nil, nil, nil)
+			tc.run(s)
+
+			rawWf, err := os.ReadFile(s.cfg.WorkflowsFile)
+			if err != nil {
+				t.Fatalf("read workflows.json: %v", err)
+			}
+			evs := readJSONLines[WorkflowEvent](t, rawWf)
+			if len(evs) != 0 {
+				t.Fatalf("expected 0 workflow events (no orphan Deleted), got %d:\n%s", len(evs), string(rawWf))
+			}
+		})
+	}
+}
+
+func TestRunPropagatesOutputLogWriteSyncAndCloseIOErrors(t *testing.T) {
+	t.Run("mid-run watch write error triggers cancelRun and aborts Run promptly", func(t *testing.T) {
+		kubeClient := kubefake.NewSimpleClientset()
+		fw := watch.NewFake()
+		watchReady := make(chan struct{})
+		var readyOnce sync.Once
+		kubeClient.PrependWatchReactor("nodes", func(action k8stesting.Action) (bool, watch.Interface, error) {
+			readyOnce.Do(func() { close(watchReady) })
+			return true, fw, nil
+		})
+
+		s := newTestScraper(t, Config{Interval: time.Hour}, kubeClient, nil, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- s.Run(ctx)
+		}()
+
+		select {
+		case <-watchReady:
+		case err := <-runDone:
+			t.Fatalf("Run exited prematurely during startup before watchers became live: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for node watcher to start")
+		}
+
+		if err := s.ioError(); err != nil {
+			t.Fatalf("expected healthy startup with nil ioError, got %v", err)
+		}
+
+		// Break infraLog fd ONLY after startup succeeded and watchers are live.
+		s.infraLog.mu.Lock()
+		closeErr := s.infraLog.file.Close()
+		s.infraLog.mu.Unlock()
+		if closeErr != nil {
+			t.Fatalf("close underlying infraLog fd: %v", closeErr)
+		}
+
+		// Emit a live watch event; the resulting Append failure must call cancelRun() and abort Run().
+		fw.Add(&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-io-fail", ResourceVersion: "10"},
+			Status:     corev1.NodeStatus{Phase: corev1.NodeRunning},
+		})
+
+		select {
+		case err := <-runDone:
+			if err == nil {
+				t.Fatalf("expected Run to return non-nil I/O error when mid-run watch write fails, got nil")
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("expected Run to abort via internal cancelRun before parent ctx expired, got ctx.Err()=%v", ctx.Err())
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("Run did not abort promptly after mid-run watch write failure")
+		}
+	})
+
+	t.Run("post-startup shutdown syncLogs error propagates from Run", func(t *testing.T) {
+		kubeClient := kubefake.NewSimpleClientset()
+		fw := watch.NewFake()
+		watchReady := make(chan struct{})
+		var readyOnce sync.Once
+		kubeClient.PrependWatchReactor("nodes", func(action k8stesting.Action) (bool, watch.Interface, error) {
+			readyOnce.Do(func() { close(watchReady) })
+			return true, fw, nil
+		})
+
+		s := newTestScraper(t, Config{Interval: time.Hour}, kubeClient, nil, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- s.Run(ctx)
+		}()
+
+		select {
+		case <-watchReady:
+		case err := <-runDone:
+			t.Fatalf("Run exited prematurely during startup before watchers became live: %v", err)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for node watcher to start")
+		}
+
+		if err := s.ioError(); err != nil {
+			t.Fatalf("expected healthy startup with nil ioError, got %v", err)
+		}
+
+		// Break execTimeLog fd after startup succeeded, right before cancelling ctx so shutdown syncLogs() fails.
+		s.execTimeLog.mu.Lock()
+		closeErr := s.execTimeLog.file.Close()
+		s.execTimeLog.mu.Unlock()
+		if closeErr != nil {
+			t.Fatalf("close underlying execTimeLog fd: %v", closeErr)
+		}
+
+		cancel()
+
+		select {
+		case err := <-runDone:
+			if err == nil {
+				t.Fatalf("expected Run to return non-nil I/O error when shutdown syncLogs fails, got nil")
+			}
+			if !strings.Contains(err.Error(), "sync") {
+				t.Fatalf("expected shutdown sync error mentioning sync, got: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("Run did not exit promptly after context cancellation")
+		}
+	})
+
+	t.Run("JSONEventLog Close returns underlying sync/close error", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "close-err.json")
+		l, err := NewJSONEventLog(logPath)
+		if err != nil {
+			t.Fatalf("NewJSONEventLog: %v", err)
+		}
+		// Close underlying fd so JSONEventLog.Close() hits both Sync() and Close() OS errors.
+		if err := l.file.Close(); err != nil {
+			t.Fatalf("close underlying fd: %v", err)
+		}
+		if err := l.Close(); err == nil {
+			t.Fatalf("expected JSONEventLog.Close() to return non-nil error on broken fd")
+		}
+		if l.Err() == nil {
+			t.Fatalf("expected JSONEventLog.Err() to record close error")
+		}
+		// Subsequent Close() is idempotent.
+		if err := l.Close(); err != nil {
+			t.Fatalf("expected second Close() to be nil, got %v", err)
+		}
+	})
+}
+
+func TestTombstonePruningAndAbsentDeletedPodEviction(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+
+	t.Run("scrapePeriodicOnly prunes expired deletedPods and deletedInfra tombstones while keeping fresh ones", func(t *testing.T) {
+		s := newTestScraper(t, Config{}, kubefake.NewSimpleClientset(), nil, nil)
+		s.tombstoneRetention = 5 * time.Minute
+
+		s.mu.Lock()
+		s.deletedPods["ai-lab/old-pod"] = podDeletionTombstone{uid: "u-old", deletedAt: t0, rv: 10}
+		s.deletedPods["ai-lab/fresh-pod"] = podDeletionTombstone{uid: "u-fresh", deletedAt: t0.Add(4 * time.Minute), rv: 20}
+		s.deletedInfra["Node"] = map[string]infraTombstone{
+			"old-node":   {deletedAt: t0, rv: 11},
+			"fresh-node": {deletedAt: t0.Add(4 * time.Minute), rv: 21},
+		}
+		s.deletedInfra["ClusterQueue"] = map[string]infraTombstone{
+			"old-cq": {deletedAt: t0, rv: 12},
+		}
+		s.mu.Unlock()
+
+		// Tick at t0+6m: cutoff is t0+1m -> old-* expired, fresh-* retained, empty ClusterQueue map deleted.
+		s.scrapePeriodicOnly(context.Background(), t0.Add(6*time.Minute))
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if _, exists := s.deletedPods["ai-lab/old-pod"]; exists {
+			t.Errorf("expected expired deletedPods entry ai-lab/old-pod to be pruned")
+		}
+		if _, exists := s.deletedPods["ai-lab/fresh-pod"]; !exists {
+			t.Errorf("expected fresh deletedPods entry ai-lab/fresh-pod to be retained")
+		}
+		if _, exists := s.deletedInfra["Node"]["old-node"]; exists {
+			t.Errorf("expected expired deletedInfra[Node][old-node] to be pruned")
+		}
+		if _, exists := s.deletedInfra["Node"]["fresh-node"]; !exists {
+			t.Errorf("expected fresh deletedInfra[Node][fresh-node] to be retained")
+		}
+		if _, exists := s.deletedInfra["ClusterQueue"]; exists {
+			t.Errorf("expected empty deletedInfra[ClusterQueue] map to be deleted after pruning")
+		}
+	})
+
+	t.Run("size guard prunes expired tombstones when map exceeds threshold", func(t *testing.T) {
+		s := newTestScraper(t, Config{}, nil, nil, nil)
+		s.tombstoneRetention = 5 * time.Minute
+
+		s.mu.Lock()
+		for i := range tombstonePruneThreshold {
+			s.deletedPods[fmt.Sprintf("ai-lab/expired-%d", i)] = podDeletionTombstone{
+				uid:       fmt.Sprintf("u-%d", i),
+				deletedAt: t0,
+				rv:        uint64(i + 1),
+			}
+		}
+		s.mu.Unlock()
+
+		// Deleting one more pod at t0+10m pushes len(deletedPods) > tombstonePruneThreshold and triggers pruning.
+		freshPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "fresh-del", Namespace: "ai-lab", UID: "u-fresh", ResourceVersion: "9999"},
+			Spec:       corev1.PodSpec{NodeName: "n1"},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		s.handlePodWatchEventAt(watch.Deleted, freshPod, t0.Add(10*time.Minute), false)
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if len(s.deletedPods) != 1 {
+			t.Fatalf("expected size-guard pruning to leave only 1 fresh tombstone, got %d", len(s.deletedPods))
+		}
+		if _, ok := s.deletedPods["ai-lab/fresh-del"]; !ok {
+			t.Errorf("expected ai-lab/fresh-del tombstone to remain")
+		}
+	})
+
+	t.Run("absent st.deleted Pod is evicted from podStates during fresh relist and bounded by tombstone TTL", func(t *testing.T) {
+		s := newTestScraper(t, Config{}, nil, nil, nil)
+		s.tombstoneRetention = 5 * time.Minute
+
+		podRunning := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "term-pod", Namespace: "ai-lab", UID: "uid-term", ResourceVersion: "10"},
+			Spec:       corev1.PodSpec{NodeName: "n1", Containers: []corev1.Container{{Name: "c", Image: "pause:3.10"}}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		podSucceeded := podRunning.DeepCopy()
+		podSucceeded.ResourceVersion = "20"
+		podSucceeded.Status.Phase = corev1.PodSucceeded
+
+		// 1. Pod runs then transitions to Succeeded via watch -> stays in podStates with st.deleted=true.
+		s.handlePodWatchEventAt(watch.Added, podRunning, t0, false)
+		s.handlePodWatchEventAt(watch.Modified, podSucceeded, t0.Add(10*time.Second), false)
+
+		// 2. Stale empty snapshot (listRV=15 < st.lastRV=20) must NOT evict st from podStates.
+		s.scrapeScheduledAndRunningPodsWithSnapshot(context.Background(), t0.Add(15*time.Second), t0.Add(15*time.Second), 15, []corev1.Pod{})
+		s.mu.Lock()
+		if st, ok := s.podStates["ai-lab/term-pod"]; !ok || !st.deleted {
+			s.mu.Unlock()
+			t.Fatalf("expected stale snapshot not to evict st.deleted pod from podStates")
+		}
+		s.mu.Unlock()
+
+		// 3. Fresh snapshot still containing Succeeded pod keeps st.deleted in podStates without duplicate Deleted.
+		s.scrapeScheduledAndRunningPodsWithSnapshot(context.Background(), t0.Add(20*time.Second), t0.Add(20*time.Second), 25, []corev1.Pod{*podSucceeded})
+		s.mu.Lock()
+		if st, ok := s.podStates["ai-lab/term-pod"]; !ok || !st.deleted {
+			s.mu.Unlock()
+			t.Fatalf("expected terminal pod still in etcd to remain in podStates as deleted")
+		}
+		s.mu.Unlock()
+
+		// 4. Pod is GC'd during a 410 gap -> fresh relist with empty list evicts st from podStates and records tombstone.
+		s.scrapeScheduledAndRunningPodsWithSnapshot(context.Background(), t0.Add(30*time.Second), t0.Add(30*time.Second), 30, []corev1.Pod{})
+		s.mu.Lock()
+		if _, exists := s.podStates["ai-lab/term-pod"]; exists {
+			s.mu.Unlock()
+			t.Fatalf("expected absent st.deleted pod to be evicted from podStates on fresh relist")
+		}
+		tomb, hasTomb := s.deletedPods["ai-lab/term-pod"]
+		s.mu.Unlock()
+		if !hasTomb || tomb.uid != "uid-term" || tomb.rv != 30 {
+			t.Fatalf("expected tombstone {uid:uid-term, rv:30}, got hasTomb=%v %+v", hasTomb, tomb)
+		}
+
+		// 5. After TTL expires, tombstone is pruned too.
+		s.scrapePeriodicOnly(context.Background(), t0.Add(10*time.Minute))
+		s.mu.Lock()
+		_, stillTomb := s.deletedPods["ai-lab/term-pod"]
+		s.mu.Unlock()
+		if stillTomb {
+			t.Errorf("expected expired tombstone for ai-lab/term-pod to be pruned")
+		}
+
+		// 6. Exactly [New, Deleted] emitted in infra.json (no duplicate Deleted).
+		rawInfra, err := os.ReadFile(s.cfg.InfraFile)
+		if err != nil {
+			t.Fatalf("read infra.json: %v", err)
+		}
+		evs := readJSONLines[InfraEvent](t, rawInfra)
+		if len(evs) != 2 || evs[0].EventType != EventNew || evs[1].EventType != EventDeleted {
+			t.Fatalf("expected strictly [New, Deleted], got %d events:\n%s", len(evs), string(rawInfra))
+		}
+	})
+}
+
+func TestIsSnapshotStaleRVPrecedenceAndStaleUIDRejection(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 10, 30, 0, 0, time.UTC)
+
+	t.Run("isSnapshotStale prioritizes positive RVs over wall-clock skew", func(t *testing.T) {
+		tests := []struct {
+			name          string
+			listStartedAt time.Time
+			listRV        uint64
+			eventTime     time.Time
+			eventRV       uint64
+			want          bool
+		}{
+			{
+				name:          "newer listRV overrides earlier listStartedAt",
+				listStartedAt: t0,
+				listRV:        200,
+				eventTime:     t0.Add(5 * time.Second),
+				eventRV:       100,
+				want:          false,
+			},
+			{
+				name:          "older listRV overrides later listStartedAt",
+				listStartedAt: t0.Add(5 * time.Second),
+				listRV:        100,
+				eventTime:     t0,
+				eventRV:       200,
+				want:          true,
+			},
+			{
+				name:          "equal RVs fall back to wall-clock (stale)",
+				listStartedAt: t0,
+				listRV:        100,
+				eventTime:     t0.Add(time.Second),
+				eventRV:       100,
+				want:          true,
+			},
+			{
+				name:          "equal RVs fall back to wall-clock (fresh)",
+				listStartedAt: t0.Add(time.Second),
+				listRV:        100,
+				eventTime:     t0,
+				eventRV:       100,
+				want:          false,
+			},
+			{
+				name:          "zero listRV falls back to wall-clock (stale)",
+				listStartedAt: t0,
+				listRV:        0,
+				eventTime:     t0.Add(time.Second),
+				eventRV:       100,
+				want:          true,
+			},
+			{
+				name:          "zero eventRV falls back to wall-clock (fresh)",
+				listStartedAt: t0.Add(time.Second),
+				listRV:        100,
+				eventTime:     t0,
+				eventRV:       0,
+				want:          false,
+			},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := isSnapshotStale(tc.listStartedAt, tc.listRV, tc.eventTime, tc.eventRV); got != tc.want {
+					t.Errorf("isSnapshotStale(%v, %d, %v, %d) = %v, want %v",
+						tc.listStartedAt, tc.listRV, tc.eventTime, tc.eventRV, got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("stale older-UID Pod snapshot is rejected after newer-UID tombstone or active replacement", func(t *testing.T) {
+		mkPod := func(uid, rv string) *corev1.Pod {
+			return &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "worker-0",
+					Namespace:       "ai-lab",
+					UID:             k8stypes.UID(uid),
+					ResourceVersion: rv,
+				},
+				Spec: corev1.PodSpec{
+					NodeName:   "n1",
+					Containers: []corev1.Container{{Name: "c", Image: "pause:3.10"}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning},
+			}
+		}
+
+		s := newTestScraper(t, Config{}, nil, nil, nil)
+		p1 := mkPod("uid-1", "10")
+		p2 := mkPod("uid-2", "20")
+
+		// 1. uid-1 starts and is deleted; uid-2 starts at RV=20.
+		s.handlePodWatchEventAt(watch.Added, p1, t0, false)
+		s.handlePodWatchEventAt(watch.Deleted, p1, t0.Add(5*time.Second), false)
+		s.handlePodWatchEventAt(watch.Added, p2, t0.Add(10*time.Second), false)
+
+		// 2. Stale snapshot (RV=10) carrying uid-1 arrives while uid-2 (RV=20) is active -> must be ignored.
+		s.scrapeScheduledAndRunningPodsWithSnapshot(context.Background(), t0.Add(2*time.Second), t0.Add(2*time.Second), 10, []corev1.Pod{*p1})
+
+		// 3. uid-2 is deleted at RV=25 -> tombstone records uid-2, rv=25.
+		p2Del := p2.DeepCopy()
+		p2Del.ResourceVersion = "25"
+		s.handlePodWatchEventAt(watch.Deleted, p2Del, t0.Add(20*time.Second), false)
+
+		// 4. Stale snapshot (RV=10) carrying older uid-1 arrives after uid-2 tombstone -> must NOT resurrect uid-1!
+		s.scrapeScheduledAndRunningPodsWithSnapshot(context.Background(), t0.Add(2*time.Second), t0.Add(2*time.Second), 10, []corev1.Pod{*p1})
+
+		rawInfra, err := os.ReadFile(s.cfg.InfraFile)
+		if err != nil {
+			t.Fatalf("read infra.json: %v", err)
+		}
+		evs := readJSONLines[InfraEvent](t, rawInfra)
+		wantTypes := []EventType{EventNew, EventDeleted, EventNew, EventDeleted}
+		if len(evs) != len(wantTypes) {
+			t.Fatalf("expected strictly 4 events [New(1), Deleted(1), New(2), Deleted(2)], got %d:\n%s", len(evs), string(rawInfra))
+		}
+		for i, want := range wantTypes {
+			if evs[i].EventType != want {
+				t.Errorf("evs[%d].EventType = %q, want %q", i, evs[i].EventType, want)
+			}
+		}
+	})
+}
+
+func TestWorkloadSliceReplacedPredecessorAndLatchedPreempted(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 11, 0, 0, 0, time.UTC)
+
+	mkSlice := func(name string, conds ...metav1.Condition) *kueuev1beta2.Workload {
+		return &kueuev1beta2.Workload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(t0),
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "batch/v1", Kind: "Job", Name: "elastic-job", Controller: ptr.To(true)},
+				},
+			},
+			Spec: kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+			Status: kueuev1beta2.WorkloadStatus{
+				Admission:  &kueuev1beta2.Admission{ClusterQueue: "cq-main"},
+				Conditions: conds,
+			},
+		}
+	}
+
+	t.Run("predecessor WorkloadSliceReplaced and GC delete do not clobber active replacement slice", func(t *testing.T) {
+		s := newTestScraper(t, Config{}, nil, nil, nil)
+		oKey := "Job/ai-lab/elastic-job"
+
+		// 1. slice1 is admitted, then replacement slice2 is admitted first (standard Kueue elastic handoff).
+		slice1 := mkSlice("job-elastic-slice1", metav1.Condition{
+			Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0),
+		})
+		slice2 := mkSlice("job-elastic-slice2", metav1.Condition{
+			Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0.Add(15 * time.Second)),
+		})
+		s.handleWorkloadWatchEventAt(watch.Added, slice1, t0)
+		s.handleWorkloadWatchEventAt(watch.Added, slice2, t0.Add(15*time.Second))
+
+		// 2. slice1 transitions to Finished=True (WorkloadSliceReplaced) AFTER slice2 is already Admitted.
+		slice1Replaced := slice1.DeepCopy()
+		slice1Replaced.Status.Conditions = append(slice1Replaced.Status.Conditions, metav1.Condition{
+			Type:               kueuev1beta2.WorkloadFinished,
+			Status:             metav1.ConditionTrue,
+			Reason:             kueuev1beta2.WorkloadSliceReplaced,
+			Message:            "Replaced by slice2",
+			LastTransitionTime: metav1.NewTime(t0.Add(16 * time.Second)),
+		})
+		s.handleWorkloadWatchEventAt(watch.Modified, slice1Replaced, t0.Add(16*time.Second))
+
+		s.mu.Lock()
+		gotWl := s.ownerToWorkload[oKey]
+		gotState := s.ownerStates[oKey]
+		s.mu.Unlock()
+		if gotWl != "job-elastic-slice2" || gotState != WorkloadStateAdmitted {
+			t.Fatalf("after predecessor WorkloadSliceReplaced: ownerToWorkload=%q ownerState=%q, want job-elastic-slice2 / Admitted", gotWl, gotState)
+		}
+
+		// 3. GC deletes slice1 -> must NOT wipe slice2's ownerToWorkload or ownerStates.
+		s.handleWorkloadWatchEventAt(watch.Deleted, slice1Replaced, t0.Add(20*time.Second))
+
+		s.mu.Lock()
+		gotWl = s.ownerToWorkload[oKey]
+		gotState = s.ownerStates[oKey]
+		s.mu.Unlock()
+		if gotWl != "job-elastic-slice2" || gotState != WorkloadStateAdmitted {
+			t.Fatalf("after predecessor GC delete: ownerToWorkload=%q ownerState=%q, want job-elastic-slice2 / Admitted", gotWl, gotState)
+		}
+
+		rawExec, err := os.ReadFile(s.cfg.ExecutionTimeFile)
+		if err != nil {
+			t.Fatalf("read execution-time.json: %v", err)
+		}
+		evs := readJSONLines[ExecutionTimeEvent](t, rawExec)
+		if len(evs) != 3 {
+			t.Fatalf("expected 3 events [Admitted(slice1), Admitted(slice2), PartialExecution(slice1)], got %d:\n%s", len(evs), string(rawExec))
+		}
+		if evs[2].EventType != ExecutionEventPartial || evs[2].Payload.InterruptionReason != InterruptionReasonSliceReplaced || evs[2].Payload.WorkloadName != "job-elastic-slice1" {
+			t.Errorf("evs[2] = %+v, want PartialExecution(WorkloadSliceReplaced) for slice1", evs[2])
+		}
+	})
+
+	t.Run("latched Preempted=True does not suppress terminal WorkloadSliceReplaced or leak ScrapeEnded", func(t *testing.T) {
+		s := newTestScraper(t, Config{}, nil, nil, nil)
+
+		// 1. Initial admission at t0.
+		slice1 := mkSlice("job-elastic-latched", metav1.Condition{
+			Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0),
+		})
+		s.handleWorkloadWatchEventAt(watch.Added, slice1, t0)
+
+		// 2. Preempted at t0+10s.
+		preemptCond := metav1.Condition{
+			Type:               kueuev1beta2.WorkloadPreempted,
+			Status:             metav1.ConditionTrue,
+			Reason:             kueuev1beta2.InClusterQueueReason,
+			Message:            "Preempted in ClusterQueue",
+			LastTransitionTime: metav1.NewTime(t0.Add(10 * time.Second)),
+		}
+		slice1Preempted := mkSlice("job-elastic-latched",
+			metav1.Condition{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionFalse, Reason: kueuev1beta2.WorkloadAdmittedReasonNoReservation, LastTransitionTime: metav1.NewTime(t0.Add(10 * time.Second))},
+			preemptCond,
+		)
+		s.handleWorkloadWatchEventAt(watch.Modified, slice1Preempted, t0.Add(10*time.Second))
+
+		// 3. Re-admitted at t0+20s (Preempted cleared on re-admission).
+		slice1Readmitted := mkSlice("job-elastic-latched",
+			metav1.Condition{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0.Add(20 * time.Second))},
+		)
+		s.handleWorkloadWatchEventAt(watch.Modified, slice1Readmitted, t0.Add(20*time.Second))
+
+		// 4. Finished=True (WorkloadSliceReplaced) at t0+35s while old Preempted=True (t0+10s) is still latched.
+		slice1Replaced := mkSlice("job-elastic-latched",
+			metav1.Condition{Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0.Add(20 * time.Second))},
+			preemptCond,
+			metav1.Condition{
+				Type:               kueuev1beta2.WorkloadFinished,
+				Status:             metav1.ConditionTrue,
+				Reason:             kueuev1beta2.WorkloadSliceReplaced,
+				Message:            "Superseded by scaled slice",
+				LastTransitionTime: metav1.NewTime(t0.Add(35 * time.Second)),
+			},
+		)
+		s.handleWorkloadWatchEventAt(watch.Modified, slice1Replaced, t0.Add(35*time.Second))
+
+		// 5. Shutdown flush must NOT emit a bogus ScrapeEnded.
+		s.flushInFlightWorkloadsAsPartial(t0.Add(60 * time.Second))
+
+		rawExec, err := os.ReadFile(s.cfg.ExecutionTimeFile)
+		if err != nil {
+			t.Fatalf("read execution-time.json: %v", err)
+		}
+		evs := readJSONLines[ExecutionTimeEvent](t, rawExec)
+		if len(evs) != 4 {
+			t.Fatalf("expected 4 events [Admitted, Partial(Preempted), Admitted, Partial(WorkloadSliceReplaced)], got %d:\n%s", len(evs), string(rawExec))
+		}
+		last := evs[3]
+		if last.EventType != ExecutionEventPartial || last.Payload.InterruptionReason != InterruptionReasonSliceReplaced {
+			t.Errorf("evs[3] = %+v, want PartialExecution(WorkloadSliceReplaced)", last)
+		}
+		if last.Payload.Preempted {
+			t.Errorf("expected Preempted=false on WorkloadSliceReplaced override, got true")
+		}
+		if last.Payload.PreemptionCount != 1 || last.Payload.InterruptionCount != 2 {
+			t.Errorf("expected preemptionCount=1 interruptionCount=2, got %d / %d", last.Payload.PreemptionCount, last.Payload.InterruptionCount)
+		}
+		if last.Payload.ExecutionDurationSeconds == nil || *last.Payload.ExecutionDurationSeconds != 15.0 {
+			t.Errorf("expected 15s duration for second slice run, got %v", last.Payload.ExecutionDurationSeconds)
+		}
+	})
+}
+
+func TestRelistPodsAtEmptyClusterAndUIDReplacement(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 11, 30, 0, 0, time.UTC)
+
+	t.Run("empty cluster issues strictly 1 Pods List call", func(t *testing.T) {
+		kubeClient := kubefake.NewSimpleClientset()
+		var listCalls int
+		kubeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			listCalls++
+			return true, &corev1.PodList{
+				ListMeta: metav1.ListMeta{ResourceVersion: "50"},
+				Items:    nil, // explicit nil slice to verify normalization
+			}, nil
+		})
+		s := newTestScraper(t, Config{}, kubeClient, nil, nil)
+
+		rv, err := s.relistPodsAt(context.Background(), t0)
+		if err != nil {
+			t.Fatalf("relistPodsAt failed: %v", err)
+		}
+		if rv != "50" {
+			t.Errorf("relistPodsAt RV = %q, want 50", rv)
+		}
+		if listCalls != 1 {
+			t.Fatalf("expected strictly 1 Pods().List() call on empty cluster, got %d", listCalls)
+		}
+	})
+
+	t.Run("same-name Pod UID replacement across 410 gap emits Deleted for old UID and New for new UID", func(t *testing.T) {
+		pod1 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "worker-0", Namespace: "ai-lab", UID: "uid-1", ResourceVersion: "10"},
+			Spec:       corev1.PodSpec{NodeName: "n1", Containers: []corev1.Container{{Name: "c", Image: "pause:3.10"}}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		pod2 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "worker-0", Namespace: "ai-lab", UID: "uid-2", ResourceVersion: "25"},
+			Spec:       corev1.PodSpec{NodeName: "n2", Containers: []corev1.Container{{Name: "c", Image: "pause:3.10"}}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+
+		kubeClient := kubefake.NewSimpleClientset()
+		kubeClient.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &corev1.PodList{
+				ListMeta: metav1.ListMeta{ResourceVersion: "30"},
+				Items:    []corev1.Pod{*pod2},
+			}, nil
+		})
+		s := newTestScraper(t, Config{}, kubeClient, nil, nil)
+
+		// 1. Old pod uid-1 observed live via watch.
+		s.handlePodWatchEventAt(watch.Added, pod1, t0, false)
+
+		// 2. 410 relist returns same-name pod with uid-2 on node n2.
+		if _, err := s.relistPodsAt(context.Background(), t0.Add(time.Minute)); err != nil {
+			t.Fatalf("relistPodsAt failed: %v", err)
+		}
+
+		rawInfra, err := os.ReadFile(s.cfg.InfraFile)
+		if err != nil {
+			t.Fatalf("read infra.json: %v", err)
+		}
+		evs := readJSONLines[InfraEvent](t, rawInfra)
+		if len(evs) != 3 || evs[0].EventType != EventNew || evs[1].EventType != EventDeleted || evs[2].EventType != EventNew {
+			t.Fatalf("expected strictly [New(uid-1), Deleted(uid-1), New(uid-2)], got %d events:\n%s", len(evs), string(rawInfra))
+		}
+		s.mu.Lock()
+		st := s.podStates["ai-lab/worker-0"]
+		s.mu.Unlock()
+		if st == nil || st.uid != "uid-2" || st.lastPayload.Placement != "n2" {
+			t.Fatalf("expected tracked podState on uid-2/n2, got %+v", st)
+		}
+	})
+}
+
+func TestLeaderWorkerSetRejectsStaleOwnerNotFoundAfterDeletion(t *testing.T) {
+	t0 := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+
+	mkLWS := func() *leaderworkersetv1.LeaderWorkerSet {
+		return &leaderworkersetv1.LeaderWorkerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "serve",
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(t0),
+				Labels:            map[string]string{KueueQueueLabel: "lq-main"},
+			},
+			Spec:   leaderworkersetv1.LeaderWorkerSetSpec{Replicas: ptr.To[int32](1)},
+			Status: leaderworkersetv1.LeaderWorkerSetStatus{Replicas: 1, ReadyReplicas: 1},
+		}
+	}
+	mkLWSWl := func(name string, conds ...metav1.Condition) *kueuev1beta2.Workload {
+		return &kueuev1beta2.Workload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         "ai-lab",
+				CreationTimestamp: metav1.NewTime(t0),
+				Annotations: map[string]string{
+					KueueIsGroupWorkloadAnnotation: "true",
+					KueueJobOwnerGVKAnnotation:     "leaderworkerset.x-k8s.io/v1, Kind=LeaderWorkerSet",
+					KueueJobOwnerNameAnnotation:    "serve",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "leaderworkerset.x-k8s.io/v1", Kind: "LeaderWorkerSet", Name: "serve"},
+				},
+			},
+			Spec:   kueuev1beta2.WorkloadSpec{QueueName: "lq-main"},
+			Status: kueuev1beta2.WorkloadStatus{Conditions: conds},
+		}
+	}
+
+	s := newTestScraper(t, Config{}, nil, nil, nil)
+	oKey := "LeaderWorkerSet/ai-lab/serve"
+
+	// 1. LWS and its group Workload are active and Admitted.
+	s.handleWorkloadWatchEventAt(watch.Added, mkLWSWl("lws-serve-0", metav1.Condition{
+		Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0),
+	}), t0)
+	s.handleLeaderWorkerSetWatchEventAt(watch.Added, mkLWS(), t0)
+
+	// 2. LWS is deleted via watch -> all owner/lws maps and workflowState cleared atomically.
+	s.handleLeaderWorkerSetWatchEventAt(watch.Deleted, mkLWS(), t0.Add(10*time.Second))
+
+	s.mu.Lock()
+	if _, ok := s.lwsWlStates[oKey]; ok {
+		s.mu.Unlock()
+		t.Fatalf("expected lwsWlStates[%s] cleared on LWS delete", oKey)
+	}
+	if _, ok := s.ownerStates[oKey]; ok {
+		s.mu.Unlock()
+		t.Fatalf("expected ownerStates[%s] cleared on LWS delete", oKey)
+	}
+	if _, ok := s.ownerToWorkload[oKey]; ok {
+		s.mu.Unlock()
+		t.Fatalf("expected ownerToWorkload[%s] cleared on LWS delete", oKey)
+	}
+	s.mu.Unlock()
+
+	// 3. Stale Finished=True (OwnerNotFound) Workload arrives after LWS deletion -> must NOT repopulate maps.
+	staleWl := mkLWSWl("lws-serve-0", metav1.Condition{
+		Type:               kueuev1beta2.WorkloadFinished,
+		Status:             metav1.ConditionTrue,
+		Reason:             kueuev1beta2.WorkloadFinishedReasonOwnerNotFound,
+		LastTransitionTime: metav1.NewTime(t0.Add(12 * time.Second)),
+	})
+	s.handleWorkloadWatchEventAt(watch.Modified, staleWl, t0.Add(12*time.Second))
+
+	s.mu.Lock()
+	_, hasLWSMap := s.lwsWlStates[oKey]
+	_, hasOwnerState := s.ownerStates[oKey]
+	_, hasOwnerWl := s.ownerToWorkload[oKey]
+	s.mu.Unlock()
+	if hasLWSMap || hasOwnerState || hasOwnerWl {
+		t.Fatalf("stale OwnerNotFound Workload repopulated LWS maps: lwsWlStates=%v ownerStates=%v ownerToWorkload=%v",
+			hasLWSMap, hasOwnerState, hasOwnerWl)
+	}
+
+	// 4. Recreated same-name LWS gets active Workload lws-serve-new-0; another stale OwnerNotFound Workload must not pollute it.
+	s.handleWorkloadWatchEventAt(watch.Added, mkLWSWl("lws-serve-new-0", metav1.Condition{
+		Type: kueuev1beta2.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.NewTime(t0.Add(20 * time.Second)),
+	}), t0.Add(20*time.Second))
+	s.handleWorkloadWatchEventAt(watch.Modified, mkLWSWl("lws-serve-old-1", metav1.Condition{
+		Type:               kueuev1beta2.WorkloadFinished,
+		Status:             metav1.ConditionTrue,
+		Reason:             kueuev1beta2.WorkloadFinishedReasonOwnerNotFound,
+		LastTransitionTime: metav1.NewTime(t0.Add(21 * time.Second)),
+	}), t0.Add(21*time.Second))
+
+	s.mu.Lock()
+	gotWl := s.ownerToWorkload[oKey]
+	gotState := s.ownerStates[oKey]
+	_, pollutedOld := s.lwsWlStates[oKey]["lws-serve-old-1"]
+	s.mu.Unlock()
+	if gotWl != "lws-serve-new-0" || gotState != WorkloadStateAdmitted || pollutedOld {
+		t.Fatalf("unexpected LWS state after stale OwnerNotFound: ownerWl=%q state=%q pollutedOld=%v", gotWl, gotState, pollutedOld)
+	}
+}
+
+func TestRunWatchLoopBackoffAndNon410WatchError(t *testing.T) {
+	t.Run("non-410 watch.Error logs WARN unless silentWatchErr and backs off before reconnect", func(t *testing.T) {
+		for _, silent := range []bool{false, true} {
+			t.Run(fmt.Sprintf("silentWatchErr=%v", silent), func(t *testing.T) {
+				var logBuf bytes.Buffer
+				origOut := log.Writer()
+				log.SetOutput(&logBuf)
+				defer log.SetOutput(origOut)
+
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				var watchCalls int
+				var sleeps []time.Duration
+				runWatchLoop(ctx, watchLoopConfig{
+					name:           "TestNodes",
+					initialRV:      "10",
+					retryBackoff:   10 * time.Millisecond,
+					silentWatchErr: silent,
+					sleep: func(_ context.Context, d time.Duration) {
+						sleeps = append(sleeps, d)
+					},
+					relist: func(context.Context) (string, error) {
+						t.Errorf("unexpected relist on non-410 watch.Error")
+						return "99", nil
+					},
+					watch: func(_ context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+						watchCalls++
+						fw := watch.NewFake()
+						if watchCalls == 1 {
+							go func() {
+								st := apierrors.NewInternalError(errors.New("apiserver temporary failure")).Status()
+								fw.Error(&st)
+							}()
+							return fw, nil
+						}
+						go func() {
+							fw.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ok", ResourceVersion: "11"}})
+							cancel()
+						}()
+						return fw, nil
+					},
+					handleEvent: func(watch.Event) {},
+				})
+
+				if len(sleeps) != 1 || sleeps[0] <= 0 {
+					t.Fatalf("expected 1 positive backoff sleep after non-410 watch.Error, got %v", sleeps)
+				}
+				logged := logBuf.String()
+				if silent && strings.Contains(logged, "WARN watch TestNodes received error") {
+					t.Errorf("expected WARN log suppressed when silentWatchErr=true, got:\n%s", logged)
+				}
+				if !silent && !strings.Contains(logged, "WARN watch TestNodes received error") {
+					t.Errorf("expected WARN log on non-410 watch.Error when silentWatchErr=false, got:\n%s", logged)
+				}
+			})
+		}
+	})
+
+	t.Run("immediate empty channel close backs off before reconnecting", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var watchCalls int
+		var sleeps []time.Duration
+		runWatchLoop(ctx, watchLoopConfig{
+			name:         "EmptyClose",
+			initialRV:    "10",
+			retryBackoff: 10 * time.Millisecond,
+			sleep: func(_ context.Context, d time.Duration) {
+				sleeps = append(sleeps, d)
+			},
+			relist: func(context.Context) (string, error) {
+				t.Errorf("unexpected relist on clean channel close")
+				return "99", nil
+			},
+			watch: func(_ context.Context, _ metav1.ListOptions) (watch.Interface, error) {
+				watchCalls++
+				fw := watch.NewFake()
+				if watchCalls <= 2 {
+					fw.Stop() // closes ResultChan immediately with 0 events
+					return fw, nil
+				}
+				go func() {
+					fw.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ok", ResourceVersion: "11"}})
+					cancel()
+				}()
+				return fw, nil
+			},
+			handleEvent: func(watch.Event) {},
+		})
+
+		if len(sleeps) != 2 || sleeps[0] <= 0 || sleeps[1] <= 0 {
+			t.Fatalf("expected 2 backoff sleeps for 2 immediate empty closes, got %v", sleeps)
+		}
+	})
+
+	t.Run("consecutive immediate 410 relists back off starting on second immediate 410", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var watchCalls, relistCalls int
+		var sleeps []time.Duration
+		runWatchLoop(ctx, watchLoopConfig{
+			name:         "Fast410s",
+			initialRV:    "10",
+			retryBackoff: 10 * time.Millisecond,
+			sleep: func(_ context.Context, d time.Duration) {
+				sleeps = append(sleeps, d)
+			},
+			relist: func(context.Context) (string, error) {
+				relistCalls++
+				return fmt.Sprintf("%d", 20+relistCalls), nil
+			},
+			watch: func(_ context.Context, _ metav1.ListOptions) (watch.Interface, error) {
+				watchCalls++
+				fw := watch.NewFake()
+				if watchCalls <= 3 {
+					go func() {
+						st := apierrors.NewResourceExpired("too old RV").Status()
+						fw.Error(&st)
+					}()
+					return fw, nil
+				}
+				go func() {
+					fw.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ok", ResourceVersion: "30"}})
+					cancel()
+				}()
+				return fw, nil
+			},
+			handleEvent: func(watch.Event) {},
+		})
+
+		if relistCalls != 3 {
+			t.Errorf("relistCalls = %d, want 3", relistCalls)
+		}
+		// 1st immediate 410 relists immediately; 2nd and 3rd consecutive immediate 410s must sleep.
+		if len(sleeps) != 2 || sleeps[0] <= 0 || sleeps[1] <= 0 {
+			t.Fatalf("expected 2 backoff sleeps on 2nd and 3rd consecutive immediate 410s, got %v", sleeps)
+		}
+	})
 }
