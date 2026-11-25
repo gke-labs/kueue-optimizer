@@ -1684,6 +1684,115 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
             ("empty", 0, {}),
         ])
 
+    def test_M3_multi_wave_partial_admission_and_indexed_hotswap_dedup(self) -> None:
+        """Multi-wave partially admitted Jobs scale per-pod duration by distinct waves without double-counting Indexed retries."""
+        nodes = [self._node("n0", {self.TPU: "4"}), self._node("n1", {self.TPU: "4"})]  # 8 TPUs
+        # 1. Partial admission Job: parallelism=4, completions=4, min=2 -> admitted count=2 (8 TPU), ran 2 waves of 12s = 24s.
+        wl_2wave = self._wl(
+            "job-partial-2wave",
+            [self._podset("main", 4, {self.TPU: "4"}, dur=12, min_count=2)],
+            [
+                self._cond("QuotaReserved", "True", 0),
+                self._cond("Admitted", "True", 0),
+                self._cond("Finished", "True", 24, "Succeeded"),
+            ],
+            admission={
+                "clusterQueue": "cq",
+                "podSetAssignments": [{"name": "main", "count": 2, "resourceUsage": {self.TPU: "8"}}],
+            },
+        )
+        wl_2wave["metadata"]["ownerReferences"] = [{"kind": "Job", "name": "partial-2wave"}]
+        four_nonindexed_pods = [
+            {
+                "metadata": {
+                    "name": f"partial-2wave-{i}",
+                    "uid": f"uid-{i}",
+                    "namespace": "ai-lab",
+                    "labels": {"batch.kubernetes.io/job-name": "partial-2wave", "kueue.x-k8s.io/podset": "main"},
+                },
+                "status": {"phase": "Succeeded", "startTime": self._ts(0 if i < 2 else 12)},
+            }
+            for i in range(4)
+        ]
+        # Completed after 2 waves (24s): 8 TPU * 24s = 192 / (8 * 24) = 100.00%
+        rows_done, sub_done = kmr.report_effective_uninterrupted_saturation(
+            {"nodes": nodes, "workloads": [wl_2wave], "pods": four_nonindexed_pods},
+            self.T0,
+            self.T0 + 24.0,
+        )
+        self.assertEqual(_rows_by_key(rows_done, 0)[self.TPU][2], "100.00%")
+        self.assertIn("completed=1 [2 pods]", sub_done)
+
+        # Active during wave 1 (8s elapsed, only 2 Running pods): 8 TPU * 8s = 64 / (8 * 8) = 100.00% (NOT 200%!)
+        wl_wave1 = self._wl(
+            "job-partial-wave1",
+            [self._podset("main", 4, {self.TPU: "4"}, dur=12, min_count=2)],
+            [self._cond("QuotaReserved", "True", 0), self._cond("Admitted", "True", 0)],
+            admission={
+                "clusterQueue": "cq",
+                "podSetAssignments": [{"name": "main", "count": 2, "resourceUsage": {self.TPU: "8"}}],
+            },
+        )
+        wl_wave1["metadata"]["ownerReferences"] = [{"kind": "Job", "name": "partial-wave1"}]
+        two_running_pods = [
+            {
+                "metadata": {
+                    "name": f"partial-wave1-{i}",
+                    "uid": f"run-{i}",
+                    "namespace": "ai-lab",
+                    "labels": {"batch.kubernetes.io/job-name": "partial-wave1", "kueue.x-k8s.io/podset": "main"},
+                },
+                "status": {"phase": "Running", "startTime": self._ts(0)},
+            }
+            for i in range(2)
+        ]
+        rows_w1, _ = kmr.report_effective_uninterrupted_saturation(
+            {"nodes": nodes, "workloads": [wl_wave1], "pods": two_running_pods},
+            self.T0,
+            self.T0 + 8.0,
+        )
+        self.assertEqual(_rows_by_key(rows_w1, 0)[self.TPU][2], "100.00%")
+
+        # 2. Indexed JobSet with hot-swapped replacement pod sharing job-completion-index="0": must NOT inflate duration.
+        wl_hotswap = self._wl(
+            "jobset-hs-wl",
+            [self._podset("workers", 2, {self.TPU: "4"}, dur=12)],
+            [
+                self._cond("Admitted", "True", 0),
+                self._cond("Finished", "True", 24, "Succeeded"),
+            ],
+            admission={
+                "clusterQueue": "cq",
+                "podSetAssignments": [{"name": "workers", "count": 2, "resourceUsage": {self.TPU: "8"}}],
+            },
+        )
+        wl_hotswap["metadata"]["ownerReferences"] = [{"kind": "JobSet", "name": "hs"}]
+        hs_pods = [
+            {
+                "metadata": {
+                    "name": f"hs-workers-0-{idx}-{suffix}",
+                    "uid": f"hs-{idx}-{suffix}",
+                    "namespace": "ai-lab",
+                    "labels": {
+                        "jobset.sigs.k8s.io/jobset-name": "hs",
+                        "jobset.sigs.k8s.io/replicatedjob-name": "workers",
+                        "jobset.sigs.k8s.io/job-index": "0",
+                        "batch.kubernetes.io/job-completion-index": str(idx),
+                        "kueue.x-k8s.io/podset": "workers",
+                    },
+                },
+                "status": {"phase": "Succeeded", "startTime": self._ts(0)},
+            }
+            for idx, suffix in ((0, "old"), (0, "new"), (1, "orig"))
+        ]
+        rows_hs, _ = kmr.report_effective_uninterrupted_saturation(
+            {"nodes": nodes, "workloads": [wl_hotswap], "pods": hs_pods},
+            self.T0,
+            self.T0 + 24.0,
+        )
+        # Only 2 distinct indices (0 and 1) -> stays at 12s / 24s = 50.00%, NOT inflated to 75.00%!
+        self.assertEqual(_rows_by_key(rows_hs, 0)[self.TPU][2], "50.00%")
+
     def test_M4_and_S4_classification_seam_table(self) -> None:
         """M4 & S4a-S4c: Pure classify_workload_for_saturation seam handles AdmissionChecks, Pending pods, and re-admission."""
         nodes = [self._node("n0", {self.TPU: "4"}), self._node("n1", {self.TPU: "4"})]

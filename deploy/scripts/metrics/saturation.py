@@ -154,6 +154,64 @@ def _pod_matches_podset(pod: dict, ps_name: str) -> bool:
     )
 
 
+def _distinct_podset_pod_count(
+    assoc_pods: list[dict],
+    ps_name: str,
+    *,
+    is_single_podset: bool,
+    allowed_phases: tuple[str, ...],
+) -> int:
+    """Count distinct pods in `allowed_phases` for one PodSet, deduplicating Indexed hot-swap retries."""
+    seen: set[tuple[str, ...]] = set()
+    for pod in assoc_pods:
+        if not isinstance(pod, dict):
+            continue
+        phase = str((pod.get("status") or {}).get("phase") or "")
+        if phase not in allowed_phases:
+            continue
+        if not is_single_podset and not _pod_matches_podset(pod, ps_name):
+            continue
+        p_meta = pod.get("metadata") or {}
+        p_labels = p_meta.get("labels") or {}
+        comp_idx = p_labels.get("batch.kubernetes.io/job-completion-index")
+        if comp_idx is not None:
+            key = (
+                "idx",
+                str(p_labels.get("jobset.sigs.k8s.io/replicatedjob-name") or ""),
+                str(
+                    p_labels.get("jobset.sigs.k8s.io/job-index")
+                    or p_labels.get("batch.kubernetes.io/job-name")
+                    or ""
+                ),
+                str(comp_idx),
+            )
+        else:
+            key = ("pod", str(p_meta.get("uid") or p_meta.get("name") or id(pod)))
+        seen.add(key)
+    return len(seen)
+
+
+def _wave_adjusted_cfg_dur(
+    ps: PodSetSlice,
+    assoc_pods: list[dict],
+    *,
+    is_single_podset: bool,
+    allowed_phases: tuple[str, ...],
+) -> float | None:
+    """Scale per-pod `cfg_dur_sec` when a PodSet ran multiple sequential completion waves (e.g. partial admission Jobs)."""
+    if ps.cfg_dur_sec is None or ps.cfg_dur_sec <= 0.0 or ps.pod_count <= 0 or not assoc_pods:
+        return ps.cfg_dur_sec
+    distinct_cnt = _distinct_podset_pod_count(
+        assoc_pods,
+        ps.name,
+        is_single_podset=is_single_podset,
+        allowed_phases=allowed_phases,
+    )
+    if distinct_cnt > ps.pod_count:
+        return float(ps.cfg_dur_sec) * (float(distinct_cnt) / float(ps.pod_count))
+    return ps.cfg_dur_sec
+
+
 def extract_workload_podset_slices(
     wl: dict,
     assoc_pods: list[dict] | None = None,
@@ -689,11 +747,15 @@ def classify_workload_for_saturation(
             return WorkloadSaturationClassification(outcome="out_of_window", pod_count=wl_pod_count)
         eff_res_sec: dict[str, float] = {}
         full_res_sec: dict[str, float] = {}
+        is_single_ps = len(slices) == 1
         for ps in slices:
             if not ps.resources:
                 continue
+            ps_cfg_dur = _wave_adjusted_cfg_dur(
+                ps, pods, is_single_podset=is_single_ps, allowed_phases=("Succeeded",)
+            )
             d_eff, d_full = completed_effective_duration(
-                t_admit, t_finish, start_epoch, end_epoch, ps.cfg_dur_sec
+                t_admit, t_finish, start_epoch, end_epoch, ps_cfg_dur
             )
             for rk, r_amt in ps.resources.items():
                 eff_res_sec[rk] = eff_res_sec.get(rk, 0.0) + r_amt * d_eff
@@ -720,12 +782,16 @@ def classify_workload_for_saturation(
         elapsed_uninterrupted = max(0.0, float(end_epoch) - effective_start)
         eff_res_sec = {}
         full_res_sec = {}
+        is_single_ps = len(slices) == 1
         for ps in slices:
             if not ps.resources:
                 continue
-            if ps.cfg_dur_sec is not None and ps.cfg_dur_sec > 0.0:
-                d_eff = min(float(ps.cfg_dur_sec), elapsed_uninterrupted)
-                d_full = float(ps.cfg_dur_sec)
+            ps_cfg_dur = _wave_adjusted_cfg_dur(
+                ps, pods, is_single_podset=is_single_ps, allowed_phases=("Running", "Succeeded")
+            )
+            if ps_cfg_dur is not None and ps_cfg_dur > 0.0:
+                d_eff = min(float(ps_cfg_dur), elapsed_uninterrupted)
+                d_full = float(ps_cfg_dur)
             else:
                 d_eff = elapsed_uninterrupted
                 d_full = elapsed_uninterrupted
