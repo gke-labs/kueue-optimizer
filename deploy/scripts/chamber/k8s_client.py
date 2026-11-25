@@ -85,8 +85,11 @@ class ChamberK8sClientMixin:
                 except Exception:
                     pass
 
-    def _pkill_chamber_port_forward(self, service: str, port_mapping: str | None = None) -> None:
-        """Terminate stale kubectl port-forward processes strictly matching this chamber's exact namespace."""
+    def _pkill_chamber_port_forward(self, service: str, port_mapping: str | None = None) -> bool:
+        """Terminate stale kubectl port-forward processes strictly matching this chamber's exact namespace.
+
+        Returns True if pkill signalled at least one matching process (exit code 0), False otherwise.
+        """
         ns = re.escape(self.chamber_namespace)
         svc = re.escape(service)
         pattern = rf"(^|/)kubectl -n {ns} port-forward svc/{svc}"
@@ -95,14 +98,15 @@ class ChamberK8sClientMixin:
         else:
             pattern += r"( |$)"
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 ["pkill", "-f", pattern],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            return proc.returncode == 0
         except FileNotFoundError:
-            pass
+            return False
 
     def _start_or_restart_apiserver_pf_locked(self, timeout_sec: float = 60.0) -> None:
         """Start (or restart) kubectl port-forward to svc/kwok-kube-apiserver. Caller must hold _pf_lock."""

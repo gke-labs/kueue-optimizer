@@ -34,7 +34,7 @@ from chamber.constants import (
     NODEPORT_MAX,
     NODEPORT_MIN,
 )
-from chamber.lifecycle import ChamberManager
+from chamber.lifecycle import ChamberManager, termination_signal_handlers
 from chamber.parsers import env_bool, env_int, env_str
 
 
@@ -258,25 +258,26 @@ def managed_chamber(
     On exception: calls `mgr.cleanup_chamber()` only if `should_cleanup` is True AND this run created the
     namespace (`mgr.created_namespace_in_this_run`), preserving pre-existing chambers and namespaces.
     """
-    run_succeeded = False
-    try:
-        if not skip_deploy:
-            mgr.deploy_chamber(initial_nodes=initial_nodes)
-        yield mgr
-        run_succeeded = True
-    finally:
-        if should_cleanup and run_succeeded:
-            print("", flush=True)
-            mgr.cleanup_chamber()
-        elif should_cleanup and mgr.created_namespace_in_this_run:
-            print("", flush=True)
-            try:
+    with termination_signal_handlers():
+        run_succeeded = False
+        try:
+            if not skip_deploy:
+                mgr.deploy_chamber(initial_nodes=initial_nodes)
+            yield mgr
+            run_succeeded = True
+        finally:
+            if should_cleanup and run_succeeded:
+                print("", flush=True)
                 mgr.cleanup_chamber()
-            except Exception as cleanup_exc:
-                print(
-                    f"WARNING: Chamber cleanup after error failed for '{mgr.chamber_namespace}': {cleanup_exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        else:
-            mgr.close()
+            elif should_cleanup and mgr.created_namespace_in_this_run:
+                print("", flush=True)
+                try:
+                    mgr.cleanup_chamber()
+                except Exception as cleanup_exc:
+                    print(
+                        f"WARNING: Chamber cleanup after error failed for '{mgr.chamber_namespace}': {cleanup_exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                mgr.close()

@@ -53,7 +53,14 @@ from chamber.constants import (
     validate_dns_label,
     validate_dns_subdomain,
 )
-from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot, query_cluster_status
+from chamber.lifecycle import (
+    ChamberManager,
+    ClusterStatusSnapshot,
+    install_termination_signal_handlers,
+    query_cluster_status,
+    restore_termination_signal_handlers,
+    termination_signal_handlers,
+)
 from chamber.manifests import (
     AdmissionFairSharingConfig,
     DEFAULT_AFS_MIN_SAMPLING_WALL_SEC,
@@ -97,11 +104,13 @@ from chamber.manifests import (
     sanitize_kueue_feature_gates,
 )
 from chamber.parsers import (
+    DockerUnavailableError,
     calc_summary_stats,
     compute_percentile,
     compute_prometheus_port,
     compute_registry_port,
     docker_image_exists_locally,
+    ensure_docker_available,
     env_bool,
     env_int,
     env_str,
@@ -196,6 +205,7 @@ __all__ = [
     "DEPLOY_DIR",
     "DNS_LABEL_RE",
     "DNS_SUBDOMAIN_RE",
+    "DockerUnavailableError",
     "ExecutionTimeIndex",
     "InterruptedDurationOverride",
     "K8S_META_KEY_ORDER",
@@ -238,6 +248,7 @@ __all__ = [
     "discover_kueue_feature_gates_from_source",
     "docker_image_exists_locally",
     "docs_to_pretty_yaml",
+    "ensure_docker_available",
     "ensure_pki_dir",
     "env_bool",
     "env_int",
@@ -260,6 +271,7 @@ __all__ = [
     "generate_adhoc_pki",
     "index_execution_times",
     "inject_ca_bundle_into_manifests",
+    "install_termination_signal_handlers",
     "is_child_workflow_owned_by_tracked_parent",
     "load_jsonl_events",
     "managed_chamber",
@@ -292,9 +304,11 @@ __all__ = [
     "resolve_fair_sharing_arg",
     "resolve_kubeconfig_path",
     "resolve_wait_for_pods_ready_config",
+    "restore_termination_signal_handlers",
     "sanitize_k8s_name",
     "sanitize_kueue_feature_gates",
     "summarize_samples",
+    "termination_signal_handlers",
     "to_clean_yaml",
     "validate_dns_label",
     "validate_dns_subdomain",

@@ -492,9 +492,13 @@ def compute_prometheus_port(apiserver_port: int, explicit_prom_port: int | None 
     if explicit_prom_port is not None:
         return explicit_prom_port
     env_port = os.environ.get("LOCAL_PROMETHEUS_PORT", "").strip()
-    if env_port:
+    if env_port and int(apiserver_port) == DEFAULT_APISERVER_PORT:
         return int(env_port)
-    return DEFAULT_PROMETHEUS_BASE_PORT + apiserver_port - DEFAULT_APISERVER_PORT
+    candidate = DEFAULT_PROMETHEUS_BASE_PORT + int(apiserver_port) - DEFAULT_APISERVER_PORT
+    if 1024 <= candidate <= 65535:
+        return candidate
+    span = 65535 - 1024 + 1
+    return 1024 + ((candidate - 1024) % span)
 
 
 def compute_registry_port(apiserver_port: int, explicit_registry_port: int | None = None) -> int:
@@ -507,7 +511,7 @@ def compute_registry_port(apiserver_port: int, explicit_registry_port: int | Non
             )
         return port
     env_port = os.environ.get("LOCAL_REGISTRY_PORT", "").strip()
-    if env_port:
+    if env_port and int(apiserver_port) == DEFAULT_APISERVER_PORT:
         port = int(env_port)
         if not (NODEPORT_MIN <= port <= NODEPORT_MAX):
             raise ValueError(
@@ -566,19 +570,108 @@ def parse_image_ref(image_ref: str) -> tuple[str, str, str]:
     return registry_host, repo_path, qualifier
 
 
+class DockerUnavailableError(RuntimeError):
+    """Raised when the local Docker CLI is missing or the Docker daemon cannot be reached."""
+
+
+def ensure_docker_available(action: str = "use Docker") -> None:
+    """Verify the local Docker CLI is installed and the Docker daemon is reachable.
+
+    Raises DockerUnavailableError before any cluster resources (such as a chamber namespace
+    or kwok-registry Deployment) are staged.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=15.0,
+        )
+    except FileNotFoundError as exc:
+        raise DockerUnavailableError(
+            f"Docker CLI ('docker') is required to {action}, but 'docker' was not found on PATH."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DockerUnavailableError(
+            f"Timed out verifying Docker daemon availability before attempting to {action}."
+        ) from exc
+    except OSError as exc:
+        raise DockerUnavailableError(
+            f"Failed to execute 'docker info' before attempting to {action}: {exc}"
+        ) from exc
+
+    if proc.returncode != 0:
+        err_msg = (proc.stderr or "").strip()
+        raise DockerUnavailableError(
+            f"Docker daemon is unavailable before attempting to {action} "
+            f"(exit {proc.returncode}): {err_msg or 'no stderr output'}"
+        )
+
+
 def docker_image_exists_locally(image_ref: str) -> bool:
-    """Return True if image_ref exists in the local workstation Docker daemon."""
+    """Return True if image_ref exists in the local workstation Docker daemon.
+
+    Raises DockerUnavailableError when the `docker` binary is missing or the Docker daemon
+    returns a connectivity/permission/timeout error rather than a genuine image-not-found status.
+    """
     try:
         proc = subprocess.run(
             ["docker", "image", "inspect", image_ref],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             check=False,
             timeout=15.0,
         )
-        return proc.returncode == 0
-    except Exception:
+    except FileNotFoundError as exc:
+        raise DockerUnavailableError(
+            "Docker CLI ('docker') was not found on PATH."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DockerUnavailableError(
+            f"Timed out inspecting local Docker image '{image_ref}'."
+        ) from exc
+    except OSError as exc:
+        raise DockerUnavailableError(
+            f"Failed to execute 'docker image inspect {image_ref}': {exc}"
+        ) from exc
+
+    if proc.returncode == 0:
+        return True
+
+    err_msg = (proc.stderr or "").strip()
+    err_lower = err_msg.lower()
+    daemon_err_markers = (
+        "cannot connect to the docker daemon",
+        "is the docker daemon running",
+        "docker daemon",
+        "failed to initialize",
+        "unable to resolve docker endpoint",
+        "failed to connect to the docker api",
+        "cannot connect to podman",
+        "permission denied",
+        "connection refused",
+        "connect: no such file or directory",
+    )
+    not_found_markers = (
+        "no such image",
+        "no such object",
+        "image not known",
+        "image not found",
+        "reference not found",
+    )
+    if any(m in err_lower for m in daemon_err_markers):
+        raise DockerUnavailableError(
+            f"Docker daemon error while inspecting '{image_ref}': {err_msg}"
+        )
+    if any(m in err_lower for m in not_found_markers):
         return False
+    raise DockerUnavailableError(
+        f"Unexpected error from 'docker image inspect {image_ref}' "
+        f"(exit {proc.returncode}): {err_msg or 'no stderr output'}"
+    )
 
 
 def resolve_kubeconfig_path(chamber_namespace: str, explicit_path: str | Path | None = None) -> Path:

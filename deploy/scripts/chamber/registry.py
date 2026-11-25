@@ -21,13 +21,19 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any
 import urllib.request
 
 from chamber.constants import DEPLOY_DIR, NODEPORT_MAX, NODEPORT_MIN
-from chamber.parsers import docker_image_exists_locally, parse_image_ref
+from chamber.parsers import (
+    DockerUnavailableError,
+    docker_image_exists_locally,
+    ensure_docker_available,
+    parse_image_ref,
+)
 
 
 class ChamberRegistryMixin:
@@ -80,6 +86,7 @@ class ChamberRegistryMixin:
                 print(
                     f"    Note: NodePort {prev_port} is in use by '{holder}'; "
                     f"selected free per-chamber registry NodePort {cand} for '{self.chamber_namespace}'.",
+                    file=sys.stderr,
                     flush=True,
                 )
                 return cand
@@ -243,6 +250,7 @@ class ChamberRegistryMixin:
         Returns (pullable_tag_ref, manifest_sha256_digest), e.g.:
           ('localhost:30500/kueue:adhoc', 'sha256:...')
         """
+        ensure_docker_available(f"push local image '{source_image}'")
         self._ensure_registry_staged_or_connected(stage_if_needed=stage_if_needed)
 
         _, _, parsed_qual = parse_image_ref(source_image)
@@ -255,15 +263,20 @@ class ChamberRegistryMixin:
 
         clean_repo = repo.strip("/ ") or "kueue"
         target_ref = f"localhost:{self.registry_port}/{clean_repo}:{clean_tag}"
-        if source_image.strip() != target_ref:
-            subprocess.run(["docker", "tag", source_image.strip(), target_ref], check=True, timeout=60.0)
+        try:
+            if source_image.strip() != target_ref:
+                subprocess.run(["docker", "tag", source_image.strip(), target_ref], check=True, timeout=60.0)
 
-        print(
-            f"==> Pushing '{source_image}' -> per-chamber in-memory registry '{target_ref}' "
-            f"(namespace '{self.chamber_namespace}')...",
-            flush=True,
-        )
-        subprocess.run(["docker", "push", target_ref], check=True, timeout=300.0)
+            print(
+                f"==> Pushing '{source_image}' -> per-chamber in-memory registry '{target_ref}' "
+                f"(namespace '{self.chamber_namespace}')...",
+                flush=True,
+            )
+            subprocess.run(["docker", "push", target_ref], check=True, timeout=300.0)
+        except FileNotFoundError as exc:
+            raise DockerUnavailableError(
+                f"Docker CLI ('docker') is required to push local image '{source_image}' to '{target_ref}'."
+            ) from exc
         digest = ""
         try:
             digest = self.fetch_registry_manifest_digest(clean_repo, clean_tag)
@@ -286,6 +299,7 @@ class ChamberRegistryMixin:
         if not src_path.is_dir():
             raise RuntimeError(f"Kueue build directory does not exist: {src_path}")
 
+        ensure_docker_available(f"build Kueue from '{src_path}'")
         self._ensure_registry_staged_or_connected(stage_if_needed=stage_if_needed)
 
         clean_tag = re.sub(r"[^A-Za-z0-9_.-]+", "-", (tag or "adhoc").strip()).strip(".-") or "adhoc"
@@ -303,13 +317,37 @@ class ChamberRegistryMixin:
             f"==> Building ad-hoc Kueue image from '{src_path}' -> '{local_tag}'...",
             flush=True,
         )
-        subprocess.run(cmd, check=True, timeout=900.0)
+        try:
+            subprocess.run(cmd, check=True, timeout=900.0)
+        except FileNotFoundError as exc:
+            raise DockerUnavailableError(
+                f"Docker CLI ('docker') is required to build Kueue from '{src_path}'."
+            ) from exc
         return self.push_image_to_chamber_registry(
             source_image=local_tag,
             repo="kueue",
             tag=clean_tag,
             stage_if_needed=False,
         )
+
+    def _check_if_kueue_image_is_local(self, raw_img: str, reg_host: str) -> bool:
+        """Return True if raw_img exists in the local Docker daemon, failing fast for unqualified local refs."""
+        try:
+            return docker_image_exists_locally(raw_img)
+        except DockerUnavailableError as exc:
+            if not reg_host:
+                hub_hint = f"docker.io/{raw_img}" if "/" in raw_img else "docker.io/myorg/kueue:v1"
+                raise RuntimeError(
+                    f"Cannot inspect or push local Kueue image '{raw_img}' because Docker is unavailable: {exc}. "
+                    f"If this is a remote Docker Hub image, prefix it with 'docker.io/' (for example, '{hub_hint}')."
+                ) from exc
+            print(
+                f"WARN: Skipping local Docker check for '{raw_img}' ({exc}); "
+                "treating as a remote or already-pushed registry reference.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
 
     def _prepare_adhoc_kueue_image_before_deploy(self) -> None:
         """If kueue_build_dir or a local Docker kueue_image is configured, stage registry & push before deploy."""
@@ -330,7 +368,7 @@ class ChamberRegistryMixin:
         reg_host, repo_path, qual = parse_image_ref(raw_img)
         # If the image exists in the local workstation Docker daemon, push it into THIS chamber's in-memory registry
         # so every GKE worker node can pull it over loopback NodePort (localhost:<registry_port>/...).
-        if docker_image_exists_locally(raw_img):
+        if self._check_if_kueue_image_is_local(raw_img, reg_host):
             leaf_repo = repo_path.split("/")[-1] if repo_path else "kueue"
             target_tag = qual if (qual and not qual.startswith("sha256:")) else "adhoc"
             target_ref, digest = self.push_image_to_chamber_registry(
@@ -343,10 +381,7 @@ class ChamberRegistryMixin:
             return
 
         # Otherwise treat as an already-pushed chamber registry reference or external remote registry image
-        if reg_host.startswith("localhost:"):
-            self._resolved_kueue_image = raw_img
-        else:
-            self._resolved_kueue_image = raw_img
+        self._resolved_kueue_image = raw_img
 
     def update_kueue_image(
         self,
@@ -357,8 +392,8 @@ class ChamberRegistryMixin:
     ) -> str:
         """Push (if local) and hot-swap deployment/kueue-controller-manager in a running chamber."""
         self.kueue_image = kueue_image.strip()
-        if push_if_local and docker_image_exists_locally(self.kueue_image):
-            _, repo_path, qual = parse_image_ref(self.kueue_image)
+        reg_host, repo_path, qual = parse_image_ref(self.kueue_image)
+        if push_if_local and self._check_if_kueue_image_is_local(self.kueue_image, reg_host):
             leaf_repo = repo_path.split("/")[-1] if repo_path else "kueue"
             target_tag = tag or (qual if (qual and not qual.startswith("sha256:")) else "adhoc")
             target_ref, digest = self.push_image_to_chamber_registry(

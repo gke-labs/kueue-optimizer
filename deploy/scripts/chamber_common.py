@@ -81,6 +81,7 @@ from chamber import (  # noqa: F401
     AdmissionFairSharingConfig,
     ChamberManager,
     ClusterStatusSnapshot,
+    DockerUnavailableError,
     ExecutionTimeIndex,
     InterruptedDurationOverride,
     KueueScenarioConfiguration,
@@ -105,6 +106,7 @@ from chamber import (  # noqa: F401
     describe_k8s_obj_header,
     docker_image_exists_locally,
     docs_to_pretty_yaml,
+    ensure_docker_available,
     ensure_pki_dir,
     env_bool,
     env_int,
@@ -127,6 +129,7 @@ from chamber import (  # noqa: F401
     generate_adhoc_pki,
     index_execution_times,
     inject_ca_bundle_into_manifests,
+    install_termination_signal_handlers,
     is_child_workflow_owned_by_tracked_parent,
     load_jsonl_events,
     managed_chamber,
@@ -155,16 +158,18 @@ from chamber import (  # noqa: F401
     resolve_fair_sharing_arg,
     resolve_kubeconfig_path,
     resolve_wait_for_pods_ready_config,
+    restore_termination_signal_handlers,
     sanitize_k8s_name,
     sanitize_kueue_feature_gates,
     summarize_samples,
+    termination_signal_handlers,
     to_clean_yaml,
     validate_dns_label,
     validate_dns_subdomain,
 )
 
 
-def _cli_main() -> int:
+def _cli_main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for Makefile targets (render, apply, delete, local-kubeconfig)."""
     parser = argparse.ArgumentParser(
         description="Chamber PKI & Kustomize staging utility (generates PKI ad-hoc or picks from cluster)."
@@ -174,6 +179,12 @@ def _cli_main() -> int:
     for cmd_name in ("render", "apply"):
         p = sub.add_parser(cmd_name)
         p.add_argument("--namespace", default=env_str("NAMESPACE", DEFAULT_CHAMBER_NAMESPACE))
+        p.add_argument("--port", type=int, default=env_int("LOCAL_APISERVER_PORT", DEFAULT_APISERVER_PORT))
+        p.add_argument("--registry-port", type=int, default=None)
+        p.add_argument(
+            "--registry-memory-limit",
+            default=env_str("REGISTRY_MEMORY_LIMIT", DEFAULT_REGISTRY_MEMORY_LIMIT),
+        )
         p.add_argument("--scrape-interval", default=env_str("PROMETHEUS_SCRAPE_INTERVAL", DEFAULT_SCRAPE_INTERVAL))
         p.add_argument("--with-sample-queues", action="store_true", default=False)
         p.add_argument("--adhoc-only", action="store_true", default=False)
@@ -192,64 +203,71 @@ def _cli_main() -> int:
     p_kc.add_argument("--port", type=int, default=env_int("LOCAL_APISERVER_PORT", DEFAULT_APISERVER_PORT))
     p_kc.add_argument("--out", default=None)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    if args.cmd in ("delete", "cleanup"):
-        mgr = ChamberManager(chamber_namespace=args.namespace)
-        mgr.cleanup_chamber()
-        return 0
+    with termination_signal_handlers():
+        if args.cmd in ("delete", "cleanup"):
+            mgr = ChamberManager(chamber_namespace=args.namespace)
+            mgr.cleanup_chamber()
+            return 0
 
-    if args.cmd == "local-kubeconfig":
+        if args.cmd == "local-kubeconfig":
+            mgr = ChamberManager(
+                chamber_namespace=args.namespace,
+                apiserver_port=args.port,
+                kubeconfig_out=args.out,
+            )
+            try:
+                kc_path = mgr.write_local_kubeconfig(prefer_cluster=True)
+                print(
+                    f"Wrote {kc_path} (PKI source: {mgr._pki_source}, server: https://127.0.0.1:{args.port})"
+                )
+            finally:
+                mgr.close()
+            return 0
+
         mgr = ChamberManager(
             chamber_namespace=args.namespace,
             apiserver_port=args.port,
-            kubeconfig_out=args.out,
+            registry_port=args.registry_port,
+            registry_memory_limit=args.registry_memory_limit,
+            scrape_interval=args.scrape_interval,
+            enable_fair_sharing=args.fair_sharing,
         )
         try:
-            kc_path = mgr.write_local_kubeconfig(prefer_cluster=True)
-            print(
-                f"Wrote {kc_path} (PKI source: {mgr._pki_source}, server: https://127.0.0.1:{args.port})"
+            if args.cmd == "apply":
+                mgr._ensure_namespace_safe_for_apply(record_creation=False)
+            base_dst = mgr.prepare_tmp_deploy_dir(
+                initial_nodes=None,
+                include_overlays=args.with_sample_queues,
+                prefer_cluster_pki=not args.adhoc_only,
+                check_cluster_ports=args.cmd == "apply" or not args.adhoc_only,
             )
+            target_k_dir = base_dst.parent if args.with_sample_queues else base_dst
+            if args.cmd == "render":
+                res = subprocess.run(
+                    ["kubectl", "--kubeconfig=/dev/null", "kustomize", str(target_k_dir)],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                sys.stdout.write(res.stdout)
+            elif args.cmd == "apply":
+                mgr._ensure_namespace_safe_for_apply(record_creation=True)
+                mgr.host_kubectl(
+                    ["apply", "--server-side", "--force-conflicts", "-k", str(target_k_dir)],
+                    stream_output=True,
+                )
         finally:
             mgr.close()
         return 0
-
-    mgr = ChamberManager(
-        chamber_namespace=args.namespace,
-        scrape_interval=args.scrape_interval,
-        enable_fair_sharing=args.fair_sharing,
-    )
-    try:
-        if args.cmd == "apply":
-            mgr._ensure_namespace_safe_for_apply(record_creation=False)
-        base_dst = mgr.prepare_tmp_deploy_dir(
-            initial_nodes=None,
-            include_overlays=args.with_sample_queues,
-            prefer_cluster_pki=not args.adhoc_only,
-        )
-        target_k_dir = base_dst.parent if args.with_sample_queues else base_dst
-        if args.cmd == "render":
-            res = subprocess.run(
-                ["kubectl", "--kubeconfig=/dev/null", "kustomize", str(target_k_dir)],
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            sys.stdout.write(res.stdout)
-        elif args.cmd == "apply":
-            mgr._ensure_namespace_safe_for_apply(record_creation=True)
-            mgr.host_kubectl(
-                ["apply", "--server-side", "--force-conflicts", "-k", str(target_k_dir)],
-                stream_output=True,
-            )
-    finally:
-        mgr.close()
-    return 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(_cli_main())
+    except BrokenPipeError:
+        sys.exit(0)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr, flush=True)
         sys.exit(1)

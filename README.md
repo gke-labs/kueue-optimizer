@@ -51,6 +51,7 @@ Every **`kueue-optimizer` chamber** runs a complete, isolated virtual cluster co
 │       ├── demo.py                                # Synthetic 10-node, 20-JobSet smoke test & demo runner
 │       ├── generate_scenario_readme.py            # Auto-generates per-scenario README.md summaries (--all or single dir)
 │       ├── generate.sh                            # Regenerates embedded manifests from ./kwok, ./kueue, and ./jobset
+│       ├── test_chamber_orchestration.py          # Unit tests for chamber orchestration, PKI, YAML, signals & registry checks
 │       ├── test_chamber_registry.py               # Unit tests for per-chamber OCI registry & NodePort allocation
 │       ├── test_kueue_metrics_report.py           # Unit tests for Sections 5.1–5.4 metrics & saturation accounting
 │       ├── test_loader.py                         # Focused unit tests for scenario loader invariants & time scaling

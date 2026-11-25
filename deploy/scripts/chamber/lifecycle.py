@@ -17,12 +17,16 @@
 from __future__ import annotations
 
 import atexit
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
 import shutil
+import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -66,11 +70,68 @@ from chamber.parsers import (
     compute_prometheus_port,
     compute_registry_port,
     normalize_scrape_interval,
+    parse_duration_seconds,
     resolve_kubeconfig_path,
 )
 from chamber.pki import ensure_pki_dir, inject_ca_bundle_into_manifests
 from chamber.registry import ChamberRegistryMixin
 from chamber.yaml_utils import docs_to_pretty_yaml
+
+
+def _handle_termination_signal(signum: int, _frame: Any) -> None:
+    """Convert SIGTERM/SIGHUP into SystemExit so finally/atexit cleanup runs."""
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+    except Exception:
+        pass
+    raise SystemExit(128 + signum)
+
+
+def install_termination_signal_handlers() -> dict[signal.Signals, Any]:
+    """Install SIGTERM/SIGHUP handlers on the main thread when still set to SIG_DFL.
+
+    Returns a mapping from each modified signal to its previous handler so callers can restore
+    process-global handlers via `restore_termination_signal_handlers()` or use the
+    `termination_signal_handlers()` context manager.
+    """
+    previous: dict[signal.Signals, Any] = {}
+    if threading.current_thread() is not threading.main_thread():
+        return previous
+    for sig_name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            cur = signal.getsignal(sig)
+            if cur is signal.SIG_DFL:
+                signal.signal(sig, _handle_termination_signal)
+                previous[sig] = cur
+        except (ValueError, OSError):
+            pass
+    return previous
+
+
+def restore_termination_signal_handlers(previous: dict[signal.Signals, Any]) -> None:
+    """Restore signal handlers previously returned by `install_termination_signal_handlers()`."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig, handler in previous.items():
+        try:
+            cur = signal.getsignal(sig)
+            if cur in (_handle_termination_signal, signal.SIG_DFL):
+                signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass
+
+
+@contextmanager
+def termination_signal_handlers() -> Iterator[dict[signal.Signals, Any]]:
+    """Install SIGTERM/SIGHUP cleanup handlers for the duration of a block and restore prior handlers on exit."""
+    previous = install_termination_signal_handlers()
+    try:
+        yield previous
+    finally:
+        restore_termination_signal_handlers(previous)
 
 
 class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
@@ -109,6 +170,7 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         self.chamber_namespace = validate_dns_label(chamber_namespace, "chamber namespace")
         self.workload_namespace = validate_dns_label(workload_namespace, "workload namespace")
         self.apiserver_port = apiserver_port
+        self._explicit_prometheus_port = prometheus_port
         self.prometheus_port = compute_prometheus_port(apiserver_port, prometheus_port)
         self._explicit_registry_port = registry_port
         self.registry_port = compute_registry_port(apiserver_port, registry_port)
@@ -269,6 +331,27 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             self._pki_source = source
         return self._tmp_pki_dir
 
+    @staticmethod
+    def _terminate_and_reap_proc(proc: subprocess.Popen[bytes] | None, *, wait_timeout: float = 2.0) -> None:
+        """Terminate (if still running) and reap a child subprocess."""
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=wait_timeout)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=wait_timeout)
+                except Exception:
+                    pass
+        else:
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+
     def close(self) -> None:
         if self._executor is not None:
             try:
@@ -277,15 +360,7 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
                 pass
             self._executor = None
         for proc in (self._apiserver_pf_proc, self._prom_pf_proc, self._registry_pf_proc):
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            self._terminate_and_reap_proc(proc, wait_timeout=3.0)
         self._apiserver_pf_proc = None
         self._prom_pf_proc = None
         self._registry_pf_proc = None
@@ -453,7 +528,7 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
                         "get",
                         "pods",
                         "-l",
-                        "control-plane=controller-manager",
+                        "app.kubernetes.io/component=kueue-controller-manager",
                         "-o",
                         "json",
                     ],
@@ -636,52 +711,117 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
         with self._pf_lock:
             self._start_or_restart_apiserver_pf_locked(timeout_sec=60.0)
 
-    def ensure_prometheus_connection(self) -> None:
+    @staticmethod
+    def _is_local_tcp_port_listening(port: int) -> bool:
+        """Return True if a process is actively accepting TCP connections on 127.0.0.1:<port>."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.25)
+            return sock.connect_ex(("127.0.0.1", int(port))) == 0
+
+    @staticmethod
+    def _allocate_free_local_port() -> int:
+        """Allocate an unused local TCP port on 127.0.0.1."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _probe_prometheus_ready(self, port: int, timeout: float = 1.5) -> bool:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        url = f"http://127.0.0.1:{self.prometheus_port}/-/ready"
+        url = f"http://127.0.0.1:{port}/-/ready"
         try:
-            with opener.open(url, timeout=1.5):
-                return
+            with opener.open(url, timeout=timeout):
+                return True
         except Exception:
-            pass
+            return False
 
-        if self._prom_pf_proc is not None:
-            try:
-                self._prom_pf_proc.terminate()
-                self._prom_pf_proc.wait(timeout=2)
-            except Exception:
-                try:
-                    self._prom_pf_proc.kill()
-                except Exception:
-                    pass
-            self._prom_pf_proc = None
-
-        self._pkill_chamber_port_forward("prometheus", f"{self.prometheus_port}:9090")
-
-        self._prom_pf_proc = subprocess.Popen(
-            [
-                "kubectl",
-                "-n",
-                self.chamber_namespace,
-                "port-forward",
-                "svc/prometheus",
-                f"{self.prometheus_port}:9090",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        for _ in range(15):
-            try:
-                with opener.open(url, timeout=1.5):
+    def ensure_prometheus_connection(self) -> None:
+        with self._pf_lock:
+            if self._prom_pf_proc is not None and self._prom_pf_proc.poll() is None:
+                if self._probe_prometheus_ready(self.prometheus_port, timeout=1.5):
                     return
-            except Exception:
-                time.sleep(1.0)
+                self._terminate_and_reap_proc(self._prom_pf_proc)
+                self._prom_pf_proc = None
+            elif self._prom_pf_proc is not None:
+                self._terminate_and_reap_proc(self._prom_pf_proc)
+                self._prom_pf_proc = None
+
+            killed_stale = self._pkill_chamber_port_forward("prometheus", f"{self.prometheus_port}:9090")
+            if killed_stale is True:
+                clear_deadline = time.monotonic() + 2.0
+                while time.monotonic() < clear_deadline and self._is_local_tcp_port_listening(
+                    self.prometheus_port
+                ):
+                    time.sleep(0.05)
+
+            port_occupied = self._is_local_tcp_port_listening(
+                self.prometheus_port
+            ) or self._probe_prometheus_ready(self.prometheus_port, timeout=0.5)
+            if port_occupied:
+                if self._explicit_prometheus_port is not None:
+                    raise RuntimeError(
+                        f"Requested Prometheus port {self.prometheus_port} is already in use by another process "
+                        f"(not owned by chamber '{self.chamber_namespace}'). Choose an unused --prometheus-port "
+                        "to preserve per-chamber metrics isolation."
+                    )
+                prev_port = self.prometheus_port
+                self.prometheus_port = self._allocate_free_local_port()
+                print(
+                    f"    Note: Local Prometheus port {prev_port} is in use by another process; "
+                    f"selected free local port {self.prometheus_port} for chamber '{self.chamber_namespace}'.",
+                    flush=True,
+                )
+
+            max_attempts = 1 if self._explicit_prometheus_port is not None else 3
+            for attempt in range(max_attempts):
+                self._prom_pf_proc = subprocess.Popen(
+                    [
+                        "kubectl",
+                        "-n",
+                        self.chamber_namespace,
+                        "port-forward",
+                        "svc/prometheus",
+                        f"{self.prometheus_port}:9090",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                for _ in range(15):
+                    if self._prom_pf_proc.poll() is not None:
+                        break
+                    if self._probe_prometheus_ready(self.prometheus_port, timeout=1.5):
+                        if self._prom_pf_proc.poll() is None:
+                            return
+                        break
+                    time.sleep(1.0)
+
+                self._terminate_and_reap_proc(self._prom_pf_proc)
+                self._prom_pf_proc = None
+                if attempt + 1 < max_attempts:
+                    prev_port = self.prometheus_port
+                    self.prometheus_port = self._allocate_free_local_port()
+                    print(
+                        f"    Note: Prometheus port-forward on localhost:{prev_port} failed to become ready; "
+                        f"retrying on free local port {self.prometheus_port} for chamber '{self.chamber_namespace}' "
+                        f"(attempt {attempt + 2}/{max_attempts}).",
+                        flush=True,
+                    )
+
+            raise RuntimeError(
+                f"Failed to establish Prometheus port-forward to svc/prometheus in namespace "
+                f"'{self.chamber_namespace}' on localhost:{self.prometheus_port} after {max_attempts} attempt(s)."
+            )
 
     def wait_for_prometheus_scrape(self, target_epoch: float) -> int:
         """Wait for at least one Prometheus scrape of kueue-metrics at or after target_epoch."""
         self.ensure_prometheus_connection()
-        m = re.match(r"^(\d+)", self.scrape_interval)
-        max_wait = (int(m.group(1)) if m else 10) + 5
+        try:
+            interval_sec = parse_duration_seconds(self.scrape_interval)
+        except ValueError:
+            interval_sec = None
+        if interval_sec is None or interval_sec <= 0:
+            interval_sec = 10.0
+        max_wait = interval_sec + 5.0
+        poll_step = min(1.0, max(0.1, interval_sec))
         path = "/api/v1/query?query=timestamp(up%7Bjob%3D%22kueue-metrics%22%7D)"
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -702,11 +842,16 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
 
         deadline = time.time() + max_wait
         last_ts = 0.0
-        while time.time() < deadline:
+        while True:
+            if time.time() >= deadline:
+                break
             last_ts = _get_last_scrape_ts()
             if last_ts >= target_epoch:
                 break
-            time.sleep(1.0)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_step, remaining))
         return int(max(target_epoch, last_ts, time.time()))
 
     def run_kueue_metrics_report(
@@ -772,7 +917,12 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             if self.kubeconfig_path.is_file():
                 cmd.extend(["--kubeconfig", str(self.kubeconfig_path)])
 
-            subprocess.run(cmd, check=False)
+            proc = subprocess.run(cmd, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"kueue_metrics_report.py failed with exit code {proc.returncode} "
+                    f"for chamber '{self.chamber_namespace}'."
+                )
         finally:
             if snap_path is not None:
                 try:
