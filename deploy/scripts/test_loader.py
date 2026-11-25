@@ -27,7 +27,16 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from runner.loader import load_scenario_bundle  # noqa: E402
+from runner.loader import (  # noqa: E402
+    _InitialBuildOptions,
+    _allocate_k8s_pod_name,
+    _build_initial_infra_pods,
+    _build_kwok_pause_pod_manifest,
+    _build_kwok_pause_pod_spec,
+    _extract_pod_resource_requests,
+    _parse_infra_resources,
+    load_scenario_bundle,
+)
 from runner.validation import _prepare_kueue_or_ns_doc  # noqa: E402
 
 _T0 = datetime(2026, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -971,6 +980,77 @@ class LoaderEdgeCaseBugTests(unittest.TestCase):
         self.assertEqual(len(bundle_combo.scheduled_workflows), 1)
         self.assertEqual(bundle_combo.scheduled_workflows[0].trigger_reason, "post_t0_fast_admitted")
         self.assertAlmostEqual(bundle_combo.scheduled_workflows[0].raw_offset_from_t0_sec, 30.0, places=3)
+
+
+class LoaderRefactorSeamTests(unittest.TestCase):
+    """Direct unit tests for extracted loader seam helpers and cleaned signatures."""
+
+    def test_allocate_k8s_pod_name_sanitizes_and_deduplicates(self) -> None:
+        used: set[str] = set()
+        self.assertEqual(_allocate_k8s_pod_name("web-0", used), "web-0")
+        self.assertEqual(_allocate_k8s_pod_name("web-0", used), "web-0-1")
+        self.assertEqual(_allocate_k8s_pod_name("web-0", used), "web-0-2")
+        self.assertEqual(_allocate_k8s_pod_name("123-numeric", used), "p-123-numeric")
+        long_name = "a" * 70
+        allocated = _allocate_k8s_pod_name(long_name, used)
+        self.assertLessEqual(len(allocated), 63)
+        self.assertTrue(allocated.startswith("p-"))
+
+    def test_kwok_pause_pod_builders_and_request_extraction(self) -> None:
+        self.assertEqual(_extract_pod_resource_requests({"resourceRequest": {}}), {})
+        self.assertEqual(
+            _extract_pod_resource_requests({"resourceRequest": {"cpu": "2", "ephemeral-storage": "5Gi"}}),
+            {"cpu": "2"},
+        )
+        spec_no_node = _build_kwok_pause_pod_spec("pause:3.10", {"cpu": "1"})
+        self.assertNotIn("nodeName", spec_no_node)
+        self.assertEqual(spec_no_node["containers"][0]["resources"]["requests"], {"cpu": "1"})
+
+        manifest = _build_kwok_pause_pod_manifest(
+            name="sys-0",
+            namespace="infra-pods",
+            labels={"app": "sys"},
+            annotations={"k": "v"},
+            pause_img="pause:3.10",
+            reqs={},
+            placement="n1",
+        )
+        self.assertEqual(manifest["metadata"]["name"], "sys-0")
+        self.assertEqual(manifest["spec"]["nodeName"], "n1")
+        self.assertEqual(manifest["spec"]["containers"][0]["resources"], {"requests": {}, "limits": {}})
+
+    def test_build_initial_infra_pods_skips_claimed_and_scales_remaining_duration(self) -> None:
+        qualifying = [
+            ("team", "claimed-0", 0.0, {"placement": "n1", "resourceRequest": {"cpu": "2"}}, 100.0),
+            ("kube-system", "finite-0", 0.0, {"placement": "n1", "resourceRequest": {}}, 120.0),
+            ("kube-system", "infinite-0", 0.0, {"placement": "n2", "resourceRequest": {"cpu": "1"}}, None),
+        ]
+        pods = _build_initial_infra_pods(
+            qualifying,
+            claimed_pod_indices={0},
+            opts=_InitialBuildOptions(
+                t0_epoch=0.0,
+                effective_start_epoch=20.0,
+                speedup=10.0,
+                min_pod_duration_sec=0.5,
+                infinite_pod_duration_sec=864000.0,
+                pause_image_override="pause:3.10",
+                infra_pods_namespace="infra-pods",
+            ),
+        )
+        self.assertEqual([p.name for p in pods], ["finite-0", "infinite-0"])
+        self.assertFalse(pods[0].is_infinite)
+        self.assertAlmostEqual(pods[0].remaining_duration_sec, 10.0, places=6)
+        self.assertEqual(pods[0].resource_request, {})
+        self.assertTrue(pods[1].is_infinite)
+        self.assertEqual(pods[1].manifest["metadata"]["annotations"].get("kueue-optimizer.gke.io/infinite-duration"), "true")
+
+    def test_parse_infra_resources_signature_drops_unused_params(self) -> None:
+        import inspect
+
+        params = set(inspect.signature(_parse_infra_resources).parameters)
+        for dead in ("min_pod_duration_sec", "infinite_pod_duration_sec", "pause_image_override", "infra_pods_namespace"):
+            self.assertNotIn(dead, params)
 
 
 if __name__ == "__main__":
