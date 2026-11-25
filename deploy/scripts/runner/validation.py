@@ -315,11 +315,12 @@ def _prepare_kueue_or_ns_doc(
         raw_ac = cq_spec.pop("admissionChecks", None)
         if isinstance(raw_ac, list):
             stripped_checks.extend(str(x) for x in raw_ac if x)
-        raw_acs = cq_spec.pop("admissionCheckStrategy", None)
-        if isinstance(raw_acs, dict):
-            for entry in raw_acs.get("admissionChecks") or []:
-                if isinstance(entry, dict) and entry.get("name"):
-                    stripped_checks.append(str(entry["name"]))
+        for acs_key in ("admissionChecksStrategy", "admissionCheckStrategy"):
+            raw_acs = cq_spec.pop(acs_key, None)
+            if isinstance(raw_acs, dict):
+                for entry in raw_acs.get("admissionChecks") or []:
+                    if isinstance(entry, dict) and entry.get("name"):
+                        stripped_checks.append(str(entry["name"]))
         if stripped_checks:
             ann = dict(meta.get("annotations") or {})
             ann["kueue-optimizer.gke.io/stripped-admission-checks"] = ",".join(sorted(set(stripped_checks)))

@@ -311,6 +311,7 @@ class _ParsedInfra:
     lqs_by_key: dict[tuple[str, str], dict[str, Any]]
     pod_new_events: dict[tuple[str, str], tuple[float, dict[str, Any]]]
     pod_delete_epochs: dict[tuple[str, str], float]
+    pod_incarnations: list[tuple[str, str, float, dict[str, Any], float | None]] = field(default_factory=list)
     scheduled_infra_events: list[ScheduledInfraEvent] = field(default_factory=list)
     kueue_configuration: KueueScenarioConfiguration | None = None
     k8s_priority_classes_by_name: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -532,6 +533,7 @@ def _schedule_workflows(
 
     incarnations_by_key: dict[tuple[str, str, str], list[_WorkflowIncarnation]] = {}
     active_inc_by_key: dict[tuple[str, str, str], _WorkflowIncarnation] = {}
+    not_admitted_pg_members: dict[tuple[str, str], set[str]] = {}
     skipped_child_count = 0
     seq = 0
     upd_seq = 0
@@ -569,6 +571,11 @@ def _schedule_workflows(
 
         if ev_type == "Deleted":
             if pg_name:
+                pg_ns_key = (ns, pg_name)
+                if pg_ns_key in not_admitted_pg_members:
+                    not_admitted_pg_members[pg_ns_key].discard(name)
+                    if not not_admitted_pg_members[pg_ns_key]:
+                        not_admitted_pg_members.pop(pg_ns_key, None)
                 pg_key = (ns, "PodGroup", pg_name)
                 cur_pg = active_inc_by_key.get(pg_key)
                 if cur_pg is not None:
@@ -604,10 +611,20 @@ def _schedule_workflows(
                 continue
 
         if pg_name:
+            pg_ns_key = (ns, pg_name)
+            if wl_state == "NotAdmitted":
+                not_admitted_pg_members.setdefault(pg_ns_key, set()).add(name)
             pg_key = (ns, "PodGroup", pg_name)
             cur_pg = active_inc_by_key.get(pg_key)
+            existing_pod_inc = active_inc_by_key.get((ns, kind, name))
+            pod_already_not_admitted = (
+                existing_pod_inc is not None and existing_pod_inc.first_seen_state == "NotAdmitted"
+            )
             if (cur_pg is not None and cur_pg.first_seen_state != "NotAdmitted") or (
-                cur_pg is None and wl_state != "NotAdmitted"
+                cur_pg is None
+                and wl_state != "NotAdmitted"
+                and pg_ns_key not in not_admitted_pg_members
+                and not pod_already_not_admitted
             ):
                 if cur_pg is None:
                     pg_list = incarnations_by_key.setdefault(pg_key, [])
@@ -1071,6 +1088,8 @@ def _parse_infra_resources(
     post_t0_lq_keys: set[tuple[str, str]] = set()
     pod_new_events: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
     pod_delete_epochs: dict[tuple[str, str], float] = {}
+    pod_incarnations_mut: list[list[Any]] = []
+    active_pod_inc_by_key: dict[tuple[str, str], list[Any]] = {}
     kueue_configuration: KueueScenarioConfiguration | None = None
 
     def _enqueue_post_t0_infra(
@@ -1314,17 +1333,36 @@ def _parse_infra_resources(
             )
             if pl.get("placement"):
                 validate_dns_label(pl.get("placement"), f"{inf_file} event #{idx_inf} Pod placement")
-            _parse_optional_event_epoch(pl.get("schedulingTime"), inf_file, idx_inf, "Pod schedulingTime")
+            sched_ts = _parse_optional_event_epoch(pl.get("schedulingTime"), inf_file, idx_inf, "Pod schedulingTime")
             _parse_optional_event_epoch(pl.get("firstNoticeTime"), inf_file, idx_inf, "Pod firstNoticeTime")
             del_ts = _parse_optional_event_epoch(pl.get("deletionTime"), inf_file, idx_inf, "Pod deletionTime")
             p_ns = override_workload_namespace or raw_p_ns
             p_key = (p_ns, p_name)
-            if ev_type == "New" and p_key not in pod_new_events:
-                pod_new_events[p_key] = (ev_epoch, pl)
-            elif ev_type == "Deleted" and p_key not in pod_delete_epochs:
-                pod_delete_epochs[p_key] = del_ts if del_ts is not None else ev_epoch
+            if ev_type == "New":
+                if p_key not in pod_new_events:
+                    pod_new_events[p_key] = (ev_epoch, pl)
+                cur_pod_inc = active_pod_inc_by_key.get(p_key)
+                if cur_pod_inc is not None:
+                    prev_sched_ts = cur_pod_inc[5]
+                    if prev_sched_ts is not None and sched_ts is not None and sched_ts > prev_sched_ts + 0.5:
+                        cur_pod_inc[4] = ev_epoch
+                        cur_pod_inc = None
+                if cur_pod_inc is None:
+                    new_pod_inc: list[Any] = [p_ns, p_name, ev_epoch, pl, None, sched_ts]
+                    pod_incarnations_mut.append(new_pod_inc)
+                    active_pod_inc_by_key[p_key] = new_pod_inc
+            elif ev_type == "Deleted":
+                eff_del_ts = del_ts if del_ts is not None else ev_epoch
+                if p_key not in pod_delete_epochs:
+                    pod_delete_epochs[p_key] = eff_del_ts
+                cur_pod_inc = active_pod_inc_by_key.pop(p_key, None)
+                if cur_pod_inc is not None:
+                    cur_pod_inc[4] = eff_del_ts
 
     scheduled_infra_events.sort(key=lambda item: (item.target_wall_offset_sec, item.seq))
+    pod_incarnations: list[tuple[str, str, float, dict[str, Any], float | None]] = [
+        (inc[0], inc[1], inc[2], inc[3], inc[4]) for inc in pod_incarnations_mut
+    ]
     return _ParsedInfra(
         nodes_by_name=nodes_by_name,
         namespaces_by_name=namespaces_by_name,
@@ -1340,9 +1378,18 @@ def _parse_infra_resources(
         post_t0_lq_keys=post_t0_lq_keys,
         pod_new_events=pod_new_events,
         pod_delete_epochs=pod_delete_epochs,
+        pod_incarnations=pod_incarnations,
         scheduled_infra_events=scheduled_infra_events,
         kueue_configuration=kueue_configuration,
     )
+
+
+def _extract_pod_resource_requests(pl: dict[str, Any]) -> dict[str, str]:
+    """Extract non-ephemeral pod resource requests without inventing default CPU/memory for BestEffort pods."""
+    raw = pl.get("resourceRequest")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(rk): str(rv) for rk, rv in raw.items() if rk != "ephemeral-storage"}
 
 
 def _canonical_resource_profile(reqs: dict[str, Any]) -> tuple[tuple[str, float], ...]:
@@ -1744,9 +1791,22 @@ def _build_initial_workloads_and_pods(
         not_admitted_workflow_names=not_admitted_wf_names,
         earliest_admit_by_ns=earliest_admit_by_ns,
         strict_timestamps=True,
+        pod_incarnations=parsed_infra.pod_incarnations or None,
     )
 
     pause_img = pause_image_override or DEFAULT_PAUSE_IMAGE
+
+    scheduled_not_admitted_owners: set[tuple[str, str]] = set()
+    for sw in scheduled_workflows:
+        if sw.trigger_reason == "initial_not_admitted":
+            scheduled_not_admitted_owners.add((sw.namespace, sw.name))
+            if sw.object_kind == "Pod":
+                pg_n = _get_pod_meta_annotation_or_label(
+                    sw.manifest.get("metadata"),
+                    "kueue.x-k8s.io/pod-group-name",
+                )
+                if pg_n:
+                    scheduled_not_admitted_owners.add((sw.namespace, pg_n))
 
     # Filter workflow candidates to those genuinely active at `effective_start_epoch`.
     # Any Kueue workflow first seen Admitted strictly AFTER `effective_start_epoch + initial_window_sec`
@@ -1755,6 +1815,7 @@ def _build_initial_workloads_and_pods(
     active_candidates: list[_AdmittedInitialCandidate] = []
     known_wl_keys: set[tuple[str, str]] = set()
     known_owner_keys: set[tuple[str, str]] = set()
+    superseded_preempt_seqs: set[int] = set()
     next_post_t0_seq = (max((w.seq for w in scheduled_workflows), default=0) + 1)
 
     for cand in admitted_candidates:
@@ -1775,13 +1836,14 @@ def _build_initial_workloads_and_pods(
                 cand.from_workflows_json
                 and cand.raw_obj
                 and cand.kind != "PodGroup"
-                and cand.preempt_item is None
                 and (
                     _has_kueue_queue_or_domain(cand.raw_obj, cand.local_queue_name)
                     or cand.exec_info is not None
                     or (manage_jobs_without_queue_name and cand.orig_namespace not in SYSTEM_NAMESPACES)
                 )
             ):
+                if cand.preempt_item is not None:
+                    superseded_preempt_seqs.add(cand.preempt_item.seq)
                 arr_ep = (
                     cand.creation_epoch
                     if (cand.creation_epoch is not None and cand.creation_epoch >= t0_epoch)
@@ -1863,7 +1925,12 @@ def _build_initial_workloads_and_pods(
     # whose parent object was not recorded in workflows.json (e.g. PodGroup or custom CRDs).
     for (orig_ns, wl_name), w_info in sorted(exec_index.by_workload_name.items()):
         eff_ns = override_workload_namespace or orig_ns
-        if (eff_ns, wl_name) in known_wl_keys or (w_info.owner_name and (eff_ns, w_info.owner_name) in known_owner_keys):
+        if (
+            (eff_ns, wl_name) in known_wl_keys
+            or (eff_ns, wl_name) in scheduled_not_admitted_owners
+            or (w_info.owner_name and (eff_ns, w_info.owner_name) in known_owner_keys)
+            or (w_info.owner_name and (eff_ns, w_info.owner_name) in scheduled_not_admitted_owners)
+        ):
             continue
         if not w_info.admitted_epochs or min(w_info.admitted_epochs) > effective_start_epoch + initial_window_sec:
             continue
@@ -1922,7 +1989,9 @@ def _build_initial_workloads_and_pods(
             target_c_idx = cand_by_owner_kind[(p_ns, p_okind, p_oname)]
         elif p_oname and (p_ns, p_oname) in cand_by_owner:
             target_c_idx = cand_by_owner[(p_ns, p_oname)]
-        elif p_wl:
+        elif p_wl and (p_ns, p_wl) not in scheduled_not_admitted_owners and (
+            not p_oname or (p_ns, p_oname) not in scheduled_not_admitted_owners
+        ):
             # Create ad-hoc PodGroup candidate when pod carries explicit workloadName without workflows.json entry.
             new_c_idx = len(active_candidates)
             w_info = exec_index.by_workload_name.get((p_ns, p_wl))
@@ -2050,7 +2119,6 @@ def _build_initial_workloads_and_pods(
     # Materialize Class 1 `InitialWorkloadPodGroup`s and `InitialDeploymentBootstrap`s, and collect any preempted items superseded by dynamic resubmit.
     initial_workloads: list[InitialWorkloadPodGroup] = []
     initial_deployments: list[InitialDeploymentBootstrap] = []
-    superseded_preempt_seqs: set[int] = set()
     used_wl_names_by_ns: dict[str, set[str]] = {}
     used_pod_names_by_ns: dict[str, set[str]] = {}
     admit_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2379,9 +2447,9 @@ def _build_initial_workloads_and_pods(
         if not cand_pods or not lq_name or not cq_name:
             # Cannot form a valid ClusterQueue-backed PodGroup: release any claimed pods back to Class 2 infra-pods!
             if cand_pods:
-                cand_pod_keys = {(p[0], p[1]) for p in cand_pods}
+                cand_pod_keys = {(p[0], p[1], p[2]) for p in cand_pods}
                 for p_idx, pt in enumerate(qualifying_initial_pods):
-                    if (pt[0], pt[1]) in cand_pod_keys:
+                    if (pt[0], pt[1], pt[2]) in cand_pod_keys:
                         claimed_pod_indices.discard(p_idx)
             continue
 
@@ -2393,7 +2461,7 @@ def _build_initial_workloads_and_pods(
         grouped_pods: dict[tuple[str, tuple[tuple[str, float], ...]], list[tuple[str, str, float, dict[str, Any], float | None]]] = {}
         for pt in cand_pods:
             pl = pt[3]
-            reqs_raw = dict(pl.get("resourceRequest") or {"cpu": "1", "memory": "1Gi"})
+            reqs_raw = _extract_pod_resource_requests(pl)
             ps_hint = str(pl.get("podSetName") or "main")
             g_key = (ps_hint, _canonical_resource_profile(reqs_raw))
             grouped_pods.setdefault(g_key, []).append(pt)
@@ -2513,13 +2581,7 @@ def _build_initial_workloads_and_pods(
 
             for g_idx, ((ps_hint, _prof), pts) in enumerate(chunk):
                 role_hash = hashlib.sha256(f"{g_idx}:{ps_hint}:{_prof!r}".encode("utf-8")).hexdigest()[:8]
-                rep_reqs = {
-                    str(rk): str(rv)
-                    for rk, rv in (pts[0][3].get("resourceRequest") or {"cpu": "1", "memory": "1Gi"}).items()
-                    if rk != "ephemeral-storage"
-                }
-                if not rep_reqs:
-                    rep_reqs = {"cpu": "1", "memory": "1Gi"}
+                rep_reqs = _extract_pod_resource_requests(pts[0][3])
                 placements = [str(pt[3].get("placement") or "") for pt in pts]
                 scraped_psas = cand.exec_info.pod_set_assignments if cand.exec_info else []
                 psa, psa_uses_tas = _resolve_podset_assignment_for_group(
@@ -2596,10 +2658,13 @@ def _build_initial_workloads_and_pods(
                         if (len(p_name) > MAX_K8S_NAME_LEN or not p_name[0].isalpha())
                         else p_name
                     )
+                    base_k8s_pod_name = k8s_pod_name
                     p_dedup = 1
                     while k8s_pod_name in ns_used_pods:
                         suf = f"-{p_dedup}"
-                        k8s_pod_name = f"{sanitize_k8s_name(k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
+                        k8s_pod_name = (
+                            f"{sanitize_k8s_name(base_k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
+                        )
                         p_dedup += 1
                     ns_used_pods.add(k8s_pod_name)
 
@@ -2876,23 +2941,18 @@ def _build_initial_workloads_and_pods(
 
         exec_str = format_pod_execution_seconds(rem_compressed, min_seconds=min_pod_duration_sec)
         placement = str(pl.get("placement") or "")
-        reqs = {
-            str(rk): str(rv)
-            for rk, rv in (pl.get("resourceRequest") or {"cpu": "1", "memory": "1Gi"}).items()
-            if rk != "ephemeral-storage"
-        }
-        if not reqs:
-            reqs = {"cpu": "1", "memory": "1Gi"}
+        reqs = _extract_pod_resource_requests(pl)
         base_p_name = p_name[2:] if p_name.startswith("p-") else p_name
         k8s_pod_name = (
             f"p-{sanitize_k8s_name(base_p_name, max_len=MAX_K8S_NAME_LEN - 2)}"
             if (len(p_name) > MAX_K8S_NAME_LEN or not p_name[0].isalpha())
             else p_name
         )
+        base_k8s_pod_name = k8s_pod_name
         i_dedup = 1
         while k8s_pod_name in used_infra_pod_names:
             suf = f"-{i_dedup}"
-            k8s_pod_name = f"{sanitize_k8s_name(k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
+            k8s_pod_name = f"{sanitize_k8s_name(base_k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
             i_dedup += 1
         used_infra_pod_names.add(k8s_pod_name)
 
@@ -2973,11 +3033,20 @@ def _schedule_post_t0_non_kueue_pods(
     infinite_pod_duration_sec: float,
     pause_image_override: str | None,
     infra_pods_namespace: str,
+    initial_pods: list[InitialPodSpec] | None = None,
 ) -> None:
     """Schedule post-t0 non-Kueue pods into infra_pods_namespace without duplicating Kueue workflow pods."""
+    pod_entries: list[tuple[str, str, float, dict[str, Any], float | None]] = (
+        list(parsed_infra.pod_incarnations)
+        if parsed_infra.pod_incarnations
+        else [
+            (p_ns, p_name, ev_ep, pl, parsed_infra.pod_delete_epochs.get((p_ns, p_name)))
+            for (p_ns, p_name), (ev_ep, pl) in parsed_infra.pod_new_events.items()
+        ]
+    )
     has_any_enriched_linkage = any(
         bool(pl.get("workloadName") or pl.get("ownerName"))
-        for (_ep, pl) in parsed_infra.pod_new_events.values()
+        for (_p_ns, _p_name, _ep, pl, _del_ep) in pod_entries
     )
     kueue_wf_names_by_ns: dict[str, set[str]] = {}
     for sw in scheduled_workflows:
@@ -3007,10 +3076,14 @@ def _schedule_post_t0_non_kueue_pods(
         for ie in parsed_infra.scheduled_infra_events
         if ie.object_kind == "Pod"
     }
+    for ip in initial_pods or []:
+        ip_k8s_name = str((ip.manifest.get("metadata") or {}).get("name") or ip.name)
+        if ip_k8s_name:
+            used_names.add(ip_k8s_name)
 
     cutoff = max(t0_epoch + initial_window_sec, effective_start_epoch) + 1e-6
-    for (p_ns, p_name), (ev_ep, pl) in sorted(
-        parsed_infra.pod_new_events.items(), key=lambda x: (x[1][0], x[0])
+    for p_ns, p_name, ev_ep, pl, del_ep in sorted(
+        pod_entries, key=lambda x: (x[2], x[0], x[1])
     ):
         if ev_ep <= cutoff:
             continue
@@ -3038,7 +3111,6 @@ def _schedule_post_t0_non_kueue_pods(
         if is_kueue_pod:
             continue
 
-        del_ep = parsed_infra.pod_delete_epochs.get((p_ns, p_name))
         if del_ep is not None and del_ep <= ev_ep:
             continue
         if del_ep is not None and del_ep > ev_ep:
@@ -3050,23 +3122,18 @@ def _schedule_post_t0_non_kueue_pods(
             is_inf = True
         exec_str = format_pod_execution_seconds(comp_pod_dur, min_seconds=min_pod_duration_sec)
         placement = str(pl.get("placement") or "")
-        reqs = {
-            str(rk): str(rv)
-            for rk, rv in (pl.get("resourceRequest") or {"cpu": "1", "memory": "1Gi"}).items()
-            if rk != "ephemeral-storage"
-        }
-        if not reqs:
-            reqs = {"cpu": "1", "memory": "1Gi"}
+        reqs = _extract_pod_resource_requests(pl)
         base_p_name = p_name[2:] if p_name.startswith("p-") else p_name
         k8s_pod_name = (
             f"p-{sanitize_k8s_name(base_p_name, max_len=MAX_K8S_NAME_LEN - 2)}"
             if (len(p_name) > MAX_K8S_NAME_LEN or not p_name[0].isalpha())
             else p_name
         )
+        base_k8s_pod_name = k8s_pod_name
         p_dedup = 1
         while k8s_pod_name in used_names:
             suf = f"-{p_dedup}"
-            k8s_pod_name = f"{sanitize_k8s_name(k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
+            k8s_pod_name = f"{sanitize_k8s_name(base_k8s_pod_name, max_len=MAX_K8S_NAME_LEN - len(suf))}{suf}"
             p_dedup += 1
         used_names.add(k8s_pod_name)
         ev_ts_iso = datetime.fromtimestamp(ev_ep, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -3682,6 +3749,7 @@ def load_scenario_bundle(
             infinite_pod_duration_sec=infinite_pod_duration_sec,
             pause_image_override=pause_image_override,
             infra_pods_namespace=infra_pods_namespace,
+            initial_pods=init_pods,
         )
         sched_wfs_out.sort(
             key=lambda item: (
