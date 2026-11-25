@@ -56,6 +56,7 @@ Every **`kueue-optimizer` chamber** runs a complete, isolated virtual cluster co
 │       ├── test_loader.py                         # Focused unit tests for scenario loader invariants & time scaling
 │       ├── test_refactor_packages.py              # Unit tests for chamber, metrics, runner & scenario_readme package boundaries
 │       ├── test_replay_reliability.py             # Unit tests for replay reliability, Node updates, fail-fast HTTP, signals & duration parsing
+│       ├── test_replay_timing_and_health.py       # Unit tests for TTL/deadline scaling, FIFO tier spacing, t0 lag compensation & control-plane health
 │       └── test_testrunner_and_readme.py          # Unit tests for testrunner, generate_scenario_readme & shared helpers
 ├── testscenarios/
 │   ├── demo/                                      # Baseline 3-file scenario bundle (infra.json, workflows.json, execution-time.json, README.md, AGENTS.md)

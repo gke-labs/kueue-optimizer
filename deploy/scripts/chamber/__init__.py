@@ -19,6 +19,7 @@ from chamber.constants import (
     BINARY_SI_FACTORS,
     CA_BUNDLE_MANIFEST_FILES,
     CA_BUNDLE_PLACEHOLDER,
+    CHAMBER_CORE_HEALTH_COMPONENTS,
     CHAMBER_DEPLOYMENTS,
     CHAMBER_NAMESPACE_LABEL_KEY,
     CHAMBER_NAMESPACE_LABEL_VALUE,
@@ -53,7 +54,14 @@ from chamber.constants import (
     validate_dns_label,
     validate_dns_subdomain,
 )
-from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot, query_cluster_status
+from chamber.lifecycle import (
+    ChamberHealthSnapshot,
+    ChamberManager,
+    ClusterStatusSnapshot,
+    ComponentHealthStatus,
+    query_cluster_status,
+    verify_chamber_control_plane_health,
+)
 from chamber.manifests import (
     AdmissionFairSharingConfig,
     DEFAULT_AFS_MIN_SAMPLING_WALL_SEC,
@@ -165,12 +173,15 @@ __all__ = [
     "BINARY_SI_FACTORS",
     "CA_BUNDLE_MANIFEST_FILES",
     "CA_BUNDLE_PLACEHOLDER",
+    "CHAMBER_CORE_HEALTH_COMPONENTS",
     "CHAMBER_DEPLOYMENTS",
     "CHAMBER_NAMESPACE_LABEL_KEY",
     "CHAMBER_NAMESPACE_LABEL_VALUE",
     "CHAMBER_PART_OF_LABEL_VALUE",
+    "ChamberHealthSnapshot",
     "ChamberManager",
     "ClusterStatusSnapshot",
+    "ComponentHealthStatus",
     "DECIMAL_SI_FACTORS",
     "DEFAULT_AFS_MIN_SAMPLING_WALL_SEC",
     "DEFAULT_AFS_SAMPLING_INTERVAL_SEC",
@@ -298,4 +309,5 @@ __all__ = [
     "to_clean_yaml",
     "validate_dns_label",
     "validate_dns_subdomain",
+    "verify_chamber_control_plane_health",
 ]

@@ -130,6 +130,17 @@ CHAMBER_DEPLOYMENTS: tuple[str, ...] = (
     "deployment/prometheus",
 )
 
+CHAMBER_CORE_HEALTH_COMPONENTS: dict[str, str] = {
+    "etcd": "kwok-etcd",
+    "kube-apiserver": "kwok-kube-apiserver",
+    "kube-controller-manager": "kwok-kube-controller-manager",
+    "kube-scheduler": "kwok-kube-scheduler",
+    "kwok-controller": "kwok-controller",
+    "jobset-controller-manager": "jobset-controller-manager",
+    "kueue-controller-manager": "kueue-controller-manager",
+    "prometheus": "prometheus",
+}
+
 REQUIRED_KWOK_CRDS: tuple[str, ...] = (
     "stages.kwok.x-k8s.io",
     "jobsets.jobset.x-k8s.io",

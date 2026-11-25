@@ -589,14 +589,18 @@ def _translate_unsupported_workflow_to_jobset(
             }
         )
 
+    js_spec: dict[str, Any] = {
+        "suspend": True,
+        "replicatedJobs": replicated_jobs,
+    }
+    if kind == "RayJob" and "activeDeadlineSeconds" in spec and spec.get("activeDeadlineSeconds") is not None:
+        js_spec["activeDeadlineSeconds"] = spec["activeDeadlineSeconds"]
+
     js_doc: dict[str, Any] = {
         "apiVersion": "jobset.x-k8s.io/v1alpha2",
         "kind": "JobSet",
         "metadata": meta,
-        "spec": {
-            "suspend": True,
-            "replicatedJobs": replicated_jobs,
-        },
+        "spec": js_spec,
     }
     max_js_len = _max_workflow_name_len(js_doc, "JobSet")
     cur_name = str(meta.get("name") or "workflow")
@@ -606,6 +610,51 @@ def _translate_unsupported_workflow_to_jobset(
         base = cur_name[2:] if cur_name.startswith("w-") else cur_name
         meta["name"] = f"w-{sanitize_k8s_name(base, max_len=max_js_len - 2)}"
     return js_doc
+
+
+def _scale_active_deadline_seconds(
+    target_spec: dict[str, Any],
+    speedup: float,
+    *,
+    raw_duration_sec: float | None = None,
+    compressed_duration_sec: float | None = None,
+) -> None:
+    """Scale Kubernetes activeDeadlineSeconds by 1/speedup with a minimum integer floor of 1 for positive deadlines.
+
+    When `raw_duration_sec` and `compressed_duration_sec` are provided and the original deadline was
+    strictly greater than `raw_duration_sec`, prevents `--min-pod-duration` clamping from inverting a
+    healthy deadline below `ceil(compressed_duration_sec) + 1`.
+    """
+    if not isinstance(target_spec, dict) or "activeDeadlineSeconds" not in target_spec:
+        return
+    raw_val = target_spec.get("activeDeadlineSeconds")
+    if raw_val is None or isinstance(raw_val, bool):
+        return
+    if isinstance(raw_val, int):
+        numeric_val = float(raw_val)
+    elif isinstance(raw_val, float) and math.isfinite(raw_val) and raw_val.is_integer():
+        numeric_val = raw_val
+    else:
+        return
+    if numeric_val < 0:
+        return
+    if numeric_val == 0:
+        target_spec["activeDeadlineSeconds"] = 0
+        return
+    eff_speedup = max(1e-6, float(speedup))
+    scaled = max(1, int(math.ceil((numeric_val / eff_speedup) - 1e-9)))
+    if (
+        raw_duration_sec is not None
+        and compressed_duration_sec is not None
+        and math.isfinite(raw_duration_sec)
+        and math.isfinite(compressed_duration_sec)
+        and raw_duration_sec > 0.0
+        and compressed_duration_sec > 0.0
+        and numeric_val > raw_duration_sec
+    ):
+        min_healthy = int(math.ceil(compressed_duration_sec - 1e-9)) + 1
+        scaled = max(scaled, min_healthy)
+    target_spec["activeDeadlineSeconds"] = scaled
 
 
 def _inject_pod_execution_time_and_sanitize_workflow(
@@ -685,9 +734,20 @@ def _inject_pod_execution_time_and_sanitize_workflow(
 
     spec = obj.setdefault("spec", {})
 
-    def _patch_pod_spec(pod_spec: dict[str, Any]) -> None:
+    def _patch_pod_spec(
+        pod_spec: dict[str, Any],
+        *,
+        dl_raw_dur: float | None = None,
+        dl_comp_dur: float | None = None,
+    ) -> None:
         if not isinstance(pod_spec, dict):
             return
+        _scale_active_deadline_seconds(
+            pod_spec,
+            eff_speedup,
+            raw_duration_sec=dl_raw_dur,
+            compressed_duration_sec=dl_comp_dur,
+        )
         pod_spec.setdefault("restartPolicy", "Never")
         sched_name = str(pod_spec.get("schedulerName") or "").strip()
         if sched_name and sched_name != "default-scheduler":
@@ -728,7 +788,13 @@ def _inject_pod_execution_time_and_sanitize_workflow(
                                     if isinstance(lims_blk, dict) and rk_s not in lims_blk:
                                         lims_blk[rk_s] = rv
 
-    def _patch_pod_template(tpl: dict[str, Any], override_exec_str: str | None = None) -> None:
+    def _patch_pod_template(
+        tpl: dict[str, Any],
+        override_exec_str: str | None = None,
+        *,
+        dl_raw_dur: float | None = None,
+        dl_comp_dur: float | None = None,
+    ) -> None:
         if not isinstance(tpl, dict):
             return
         t_meta = tpl.setdefault("metadata", {})
@@ -749,41 +815,90 @@ def _inject_pod_execution_time_and_sanitize_workflow(
             t_meta["labels"] = t_labels
         elif "labels" in t_meta:
             t_meta.pop("labels", None)
-        _patch_pod_spec(tpl.setdefault("spec", {}))
+        _patch_pod_spec(
+            tpl.setdefault("spec", {}),
+            dl_raw_dur=raw_duration_sec if dl_raw_dur is None else dl_raw_dur,
+            dl_comp_dur=compressed_duration_sec if dl_comp_dur is None else dl_comp_dur,
+        )
 
     total_pods = 0
 
     if kind == "JobSet":
         spec["suspend"] = True
+        spec.pop("ttlSecondsAfterFinished", None)
+        max_js_comp_dur = compressed_duration_sec
         for rj in spec.get("replicatedJobs") or []:
             replicas = max(1, int(rj.get("replicas") or 1))
             job_tpl_spec = (rj.setdefault("template", {})).setdefault("spec", {})
+            job_tpl_spec.pop("ttlSecondsAfterFinished", None)
             parallelism = max(1, int(job_tpl_spec.get("parallelism") or job_tpl_spec.get("completions") or 1))
             completions = max(parallelism, int(job_tpl_spec.get("completions") or parallelism))
             rj_waves = math.ceil(completions / parallelism)
             rj_exec_str = exec_str
+            rj_comp_dur = compressed_duration_sec
+            rj_pod_raw_dur = raw_duration_sec
+            rj_pod_comp_dur = compressed_duration_sec
             if scale_by_waves and rj_waves > 1:
                 per_wave_comp = max(min_pod_duration_sec, compressed_duration_sec / rj_waves)
                 rj_exec_str = format_pod_execution_seconds(per_wave_comp, min_seconds=min_pod_duration_sec)
+                rj_comp_dur = max(compressed_duration_sec, per_wave_comp * rj_waves)
+                rj_pod_raw_dur = raw_duration_sec / rj_waves
+                rj_pod_comp_dur = per_wave_comp
+            max_js_comp_dur = max(max_js_comp_dur, rj_comp_dur)
+            _scale_active_deadline_seconds(
+                job_tpl_spec,
+                eff_speedup,
+                raw_duration_sec=raw_duration_sec,
+                compressed_duration_sec=rj_comp_dur,
+            )
             total_pods += replicas * parallelism
-            _patch_pod_template(job_tpl_spec.setdefault("template", {}), override_exec_str=rj_exec_str)
+            _patch_pod_template(
+                job_tpl_spec.setdefault("template", {}),
+                override_exec_str=rj_exec_str,
+                dl_raw_dur=rj_pod_raw_dur,
+                dl_comp_dur=rj_pod_comp_dur,
+            )
+        _scale_active_deadline_seconds(
+            spec,
+            eff_speedup,
+            raw_duration_sec=raw_duration_sec,
+            compressed_duration_sec=max_js_comp_dur,
+        )
 
     elif kind == "Job":
         spec["suspend"] = True
         # Remove controller-generated UID selectors from scraped Jobs
         spec.pop("selector", None)
         spec.pop("manualSelector", None)
+        spec.pop("ttlSecondsAfterFinished", None)
         parallelism = max(1, int(spec.get("parallelism") or spec.get("completions") or 1))
         completions = max(parallelism, int(spec.get("completions") or parallelism))
         waves = math.ceil(completions / parallelism)
         job_exec_str = exec_str
+        job_comp_dur = compressed_duration_sec
+        pod_raw_dur = raw_duration_sec
+        pod_comp_dur = compressed_duration_sec
         if scale_by_waves and waves > 1:
             per_wave_comp = max(min_pod_duration_sec, compressed_duration_sec / waves)
             job_exec_str = format_pod_execution_seconds(per_wave_comp, min_seconds=min_pod_duration_sec)
             ann["kueue-optimizer.gke.io/pod-execution-time-seconds"] = job_exec_str
             ann["kueue-optimizer.gke.io/pod-waves"] = str(waves)
+            job_comp_dur = max(compressed_duration_sec, per_wave_comp * waves)
+            pod_raw_dur = raw_duration_sec / waves
+            pod_comp_dur = per_wave_comp
+        _scale_active_deadline_seconds(
+            spec,
+            eff_speedup,
+            raw_duration_sec=raw_duration_sec,
+            compressed_duration_sec=job_comp_dur,
+        )
         total_pods += parallelism
-        _patch_pod_template(spec.setdefault("template", {}), override_exec_str=job_exec_str)
+        _patch_pod_template(
+            spec.setdefault("template", {}),
+            override_exec_str=job_exec_str,
+            dl_raw_dur=pod_raw_dur,
+            dl_comp_dur=pod_comp_dur,
+        )
 
     elif kind == "Deployment":
         raw_replicas = spec.get("replicas")
@@ -835,6 +950,13 @@ def _inject_pod_execution_time_and_sanitize_workflow(
 
     elif kind == "RayJob":
         spec["suspend"] = True
+        spec.pop("ttlSecondsAfterFinished", None)
+        _scale_active_deadline_seconds(
+            spec,
+            eff_speedup,
+            raw_duration_sec=raw_duration_sec,
+            compressed_duration_sec=compressed_duration_sec,
+        )
         if "submitterPodTemplate" in spec and isinstance(spec["submitterPodTemplate"], dict):
             _patch_pod_template(spec["submitterPodTemplate"])
             total_pods += 1
@@ -861,6 +983,6 @@ def _inject_pod_execution_time_and_sanitize_workflow(
     elif kind == "Pod":
         total_pods += 1
         spec.pop("nodeName", None)
-        _patch_pod_spec(spec)
+        _patch_pod_spec(spec, dl_raw_dur=raw_duration_sec, dl_comp_dur=compressed_duration_sec)
 
     return obj, (total_pods if kind == "Deployment" else max(1, total_pods))
