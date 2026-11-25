@@ -41,6 +41,7 @@ from chamber.parsers import (  # noqa: F401
 )
 from chamber.scenario import extract_pod_spec_resources as _extract_pod_spec_resources  # noqa: F401
 from metrics import (  # noqa: F401
+    DEFAULT_MAX_QUERY_RANGE_POINTS,
     IGNORED_LABELS,
     KUEUE_METRICS_CATALOG,
     MAX_TERMINAL_WIDTH,
@@ -53,6 +54,8 @@ from metrics import (  # noqa: F401
     build_monotonic_counter_points as _build_monotonic_counter_points,
     classify_workload_for_saturation,
     completed_effective_duration as _completed_effective_duration,
+    compute_effective_step,
+    compute_histogram_deltas_by_group,
     counter_series_total_increase,
     extract_workload_podset_slices,
     extract_workload_resource_size_and_cfg_duration as _extract_workload_resource_size_and_cfg_duration,
@@ -92,7 +95,15 @@ def main() -> int:
     parser.add_argument("--query-end-epoch", type=float, default=0.0, help="Timestamp for final Prometheus query (after final scrape)")
     parser.add_argument("--jobset-count", type=int, required=True, help="Total number of JobSets / Kueue Workloads")
     parser.add_argument("--total-pods", type=int, required=True, help="Total number of Pods across all JobSets")
-    parser.add_argument("--step", type=float, default=1.0, help="Query range resolution step in seconds (default: 1.0)")
+    parser.add_argument(
+        "--step",
+        type=float,
+        default=1.0,
+        help=(
+            "Query range resolution step in seconds (default: 1.0; auto-scaled upward for long "
+            "windows to stay within Prometheus's 11,000-point limit)"
+        ),
+    )
     parser.add_argument(
         "--cluster-snapshot-json",
         default="",
@@ -140,13 +151,20 @@ def main() -> int:
         window_sec = 30.0
         range_start = max(0.0, args.start_epoch - window_sec)
         baseline_time = max(0.0, args.start_epoch - 1.0)
+        effective_step = compute_effective_step(range_start, query_end, args.step)
+        if effective_step > args.step:
+            print(
+                f"  Note: Auto-scaled query step from {args.step:g}s to {effective_step:g}s "
+                f"for {query_end - range_start:.0f}s window (Prometheus 11,000-point limit).",
+                flush=True,
+            )
 
         print("  [2/4] Fetching Gauge & Counter time-series from Prometheus...", flush=True)
         all_range_series = client.query_range(
             '{__name__=~"kueue_.*|multikueue_.*",__name__!~".*_(bucket|sum|count)"}',
             range_start,
             query_end,
-            step=args.step,
+            step=effective_step,
         )
         range_by_name: dict[str, list[dict]] = {}
         for s in all_range_series:
@@ -189,7 +207,12 @@ def main() -> int:
 
     for spec in KUEUE_METRICS_CATALOG:
         if spec.metric_type == MetricType.GAUGE:
-            res = report_gauge(range_by_name.get(spec.name, []), args.start_epoch, end=args.end_epoch)
+            res = report_gauge(
+                range_by_name.get(spec.name, []),
+                args.start_epoch,
+                end=args.end_epoch,
+                step=effective_step,
+            )
             if not res:
                 unrecorded_metrics.append((spec.section, spec.name, spec.metric_type.value))
             for lbl_str, p50, p90, p99, avg in res:
@@ -200,7 +223,7 @@ def main() -> int:
                 range_by_name.get(spec.name, []),
                 args.start_epoch,
                 query_end,
-                step=args.step,
+                step=effective_step,
                 window_sec=window_sec,
             )
             if not res:
@@ -294,10 +317,11 @@ def main() -> int:
 
     print("")
     print("=== 5.2 Wait Time Across All ClusterQueues per Workload Priority (P50, P90, P99, AVG) ===")
+    print("    Note: ADMISSIONS counts every admission observation (including re-admissions after preemption/eviction), not unique workloads.")
     print("")
     if wait_time_prio_rows:
         print_table(
-            ["PRIORITY CLASS", "P50", "P90", "P99", "AVG", "WORKLOADS"],
+            ["PRIORITY CLASS", "P50", "P90", "P99", "AVG", "ADMISSIONS"],
             wait_time_prio_rows,
         )
     else:

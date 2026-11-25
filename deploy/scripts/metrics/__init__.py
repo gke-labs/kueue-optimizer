@@ -15,6 +15,7 @@
 """Modular Kueue Prometheus & saturation metrics reporting package."""
 
 from metrics.aggregations import (
+    compute_histogram_deltas_by_group,
     report_aggregated_evictions_and_reclaims,
     report_aggregated_quota_utilization,
     report_aggregated_wait_time_by_priority,
@@ -33,8 +34,10 @@ from metrics.catalog import (
 )
 from metrics.formatting import MAX_TERMINAL_WIDTH, print_table, wrap_cell
 from metrics.prometheus import (
+    DEFAULT_MAX_QUERY_RANGE_POINTS,
     PrometheusClient,
     build_monotonic_counter_points,
+    compute_effective_step,
     counter_series_total_increase,
     histogram_quantile_from_buckets,
 )
@@ -51,6 +54,7 @@ from metrics.saturation import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_QUERY_RANGE_POINTS",
     "IGNORED_LABELS",
     "KUEUE_METRICS_CATALOG",
     "MAX_TERMINAL_WIDTH",
@@ -63,6 +67,8 @@ __all__ = [
     "build_monotonic_counter_points",
     "classify_workload_for_saturation",
     "completed_effective_duration",
+    "compute_effective_step",
+    "compute_histogram_deltas_by_group",
     "counter_series_total_increase",
     "extract_workload_podset_slices",
     "extract_workload_resource_size_and_cfg_duration",

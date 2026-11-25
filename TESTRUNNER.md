@@ -210,13 +210,13 @@ Below is the detailed interpretation guide for every single block.
 Printed by [`kueue_metrics_report.py`](deploy/scripts/kueue_metrics_report.py) immediately after waiting for one final Prometheus scrape after `end_epoch` (`query_end >= end_epoch`):
 
 - Confirms `Chamber Namespace`, `Workload Namespace`, `Queueing Strategy` (`StrictFIFO` vs. `BestEffortFIFO`), exact UTC & Unix epoch timestamps (`Start Time` = `start_epoch`, `End Time` = `end_epoch`), `Total Duration`, `Total Workloads/JobSets`, and `Total Pods Executed`.
-- **Important timing detail**: `kueue_metrics_report.py` queries Prometheus range vectors over `[start_epoch - 30s, query_end]` at `--step` (default `1.0s`) and subtracts the pre-run baseline at `baseline_time = start_epoch - 1.0s` for every Counter and Histogram. This guarantees that if you reuse a long-lived chamber (`--no-cleanup` + `--skip-chamber-deploy`), **metrics from prior runs are cleanly subtracted** and never contaminate the current test run.
+- **Important timing detail**: `kueue_metrics_report.py` queries Prometheus range vectors over `[start_epoch - 30s, query_end]` at `--step` (default `1.0s`, automatically scaled upward for long multi-hour windows so point counts stay `<= 10,000`, below Prometheus's 11,000-point cap) and subtracts the pre-run baseline at `baseline_time = start_epoch - 1.0s` for every Counter and Histogram (with per-replica reset detection if Kueue restarted mid-run). This guarantees that if you reuse a long-lived chamber (`--no-cleanup` + `--skip-chamber-deploy`), **metrics from prior runs are cleanly subtracted** and never contaminate the current test run.
 
 ---
 
 ### Block C: `=== 1. Kueue Gauge Metrics ===`
 
-Reports `P50`, `P90`, `P99`, and `AVG` over `[start_epoch, query_end]` for every active Gauge in `KUEUE_METRICS_CATALOG`. Memory and ephemeral-storage gauges are formatted in binary SI units (`Ki` / `Mi` / `Gi` / `Ti`).
+Reports `P50`, `P90`, `P99`, and `AVG` over `[start_epoch, end_epoch]` for every active Gauge in `KUEUE_METRICS_CATALOG` (zero-filling missing grid steps for non-static gauges that Kueue deletes at zero, such as `kueue_cohort_subtree_resource_reservations`). Memory and ephemeral-storage gauges are formatted in binary SI units (`Ki` / `Mi` / `Gi` / `Ti`).
 
 | Gauge Metric | What It Measures | Healthy Cluster Value | Bad Sign & Root Cause |
 | :--- | :--- | :--- | :--- |
@@ -306,8 +306,8 @@ This final four-part executive summary distills the entire benchmark run into fo
 
 - **How it is computed**:
   - At every scrape timestamp $t \ge \text{start\_epoch}$:
-    - **`ClusterQueue Quotas (All)`**: Sums `usage` across all `(cluster_queue, flavor)` pairs divided by summed `nominal_quota` across all `(cluster_queue, flavor)` pairs at timestamp $t$:
-      $$U_{\text{all}}(t) = \frac{\sum_{cq, f} \text{usage}_{cq, f}(t)}{\sum_{cq, f} \text{nominal\_quota}_{cq, f}(t)} \times 100\%$$
+    - **`ClusterQueue Quotas (All)`**: Sums `usage` across all `(cluster_queue, flavor)` pairs divided by the total effective quota at timestamp $t$ (standalone ClusterQueue nominal quotas plus root-cohort `kueue_cohort_subtree_quota` for ClusterQueues belonging to a Cohort tree so cohort-owned nominal quota is included without double-counting):
+      $$U_{\text{all}}(t) = \frac{\sum_{cq, f} \text{usage}_{cq, f}(t)}{Q_{\text{effective}}(t)} \times 100\%$$
     - **`ClusterQueue Quotas (Per-CQ, n=K)`** *(shown when $K > 1$ queues have positive nominal quota)*: Computes each individual queue's ratio $\text{usage}_{cq}(t) / \text{nominal\_quota}_{cq}(t) \times 100\%$ across all $(cq, t)$ pairs. **Note**: Individual queues actively borrowing quota from a Cohort will legitimately exceed `100.00%` (e.g., `150.00%` or `200.00%`)!
     - **`Cohort Quotas (All)`**: Sums quota & reservations across **root cohorts only** (using `kueue_cohort_info` `parent_cohort` hierarchy so child cohorts inside a multi-level Cohort tree are never double-counted; falls back to grouping ClusterQueue metrics by `cohort` label if `kueue_cohort_subtree_quota` is absent).
 - **Healthy values**:
@@ -324,8 +324,9 @@ This final four-part executive summary distills the entire benchmark run into fo
 
 ```text
 === 5.2 Wait Time Across All ClusterQueues per Workload Priority (P50, P90, P99, AVG) ===
+    Note: ADMISSIONS counts every admission observation (including re-admissions after preemption/eviction), not unique workloads.
 
-  PRIORITY CLASS              | P50    | P90    | P99     | AVG    | WORKLOADS
+  PRIORITY CLASS              | P50    | P90    | P99     | AVG    | ADMISSIONS
   ----------------------------+--------+--------+---------+--------+-----------
   hero-prod                   | 0.45s  | 1.10s  | 2.20s   | 0.62s  | 12
   high-prio                   | 1.80s  | 6.40s  | 11.50s  | 3.15s  | 38
@@ -334,14 +335,14 @@ This final four-part executive summary distills the entire benchmark run into fo
 ```
 
 - **How it is computed**:
-  - Aggregates histogram bucket deltas (`end - start` per raw replica series, then summed across all `ClusterQueue`s) and exact `_sum` / `_count` deltas grouped by `priority_class` label (using `kueue_admission_wait_time_seconds`, with automatic fallback to `kueue_quota_reserved_wait_time_seconds`), ordered from highest priority tier (`hero`/`urgent`/`critical` $\to$ `high` $\to$ `med`/`mid`/`normal` $\to$ `low`/`bg`/`background` $\to$ other) plus the combined `ALL (Across All Priorities)` rollup row.
+  - Aggregates reset-aware histogram bucket deltas (`end - start` per raw replica series, or full `end` when a controller counter reset is detected, then summed across all `ClusterQueue`s) and exact `_sum` / `_count` deltas grouped by `priority_class` label (using `kueue_admission_wait_time_seconds`, with automatic fallback to `kueue_quota_reserved_wait_time_seconds`), ordered from highest priority tier (`hero`/`urgent`/`critical` $\to$ `high` $\to$ `med`/`mid`/`normal` $\to$ `low`/`bg`/`background` $\to$ other) plus the combined `ALL (Across All Priorities)` rollup row. The `ADMISSIONS` column reports total admission observations (including re-admissions after preemption or eviction), not unique workloads.
 - **Healthy values**:
   - **Strict priority monotonicity invariant**:
     $$\text{P50}(\text{hero}) \le \text{P50}(\text{high}) \le \text{P50}(\text{mid}) \le \text{P50}(\text{low}) \quad \text{and} \quad \text{P90}(\text{hero}) \le \text{P90}(\text{high}) \le \dots$$
   - High/hero priority workloads exhibit near-instant admission (`P50 < 1s–3s`, `P90 < 5s–10s`) even under heavy low-priority background load because preemption/reclamation clears space immediately.
 - **Bad signs**:
   - **Priority inversion** (`AVG` or `P90` of `hero`/`high` **higher** than `low`): `withinClusterQueue: LowerPriority` or `reclaimWithinCohort: Any` preemption is disabled, or `StrictFIFO` is blocking a high-priority job behind a lower/equal-priority unschedulable job.
-  - **`WORKLOADS` count far below submitted count** in a run-to-completion test: many workloads were never admitted at all.
+  - **`ADMISSIONS` count far below submitted count** in a run-to-completion test: many workloads were never admitted at all.
   - **Massive tail divergence (`P99 >> 20 * P50`)** in `high` priority: isolated starvation or topology-block deadlock for large multi-host slices.
 
 ---
@@ -372,8 +373,9 @@ Followed by a detailed per-label breakdown table (`Eviction (by reason/priority)
   - **`Total Preemptions`**:
     - Decomposes all scheduler preemptions into:
       1. `InClusterQueue`: higher-priority workload preempted lower-priority workload inside the **same** `ClusterQueue`.
-      2. `Reclaims`: lending queue reclaimed borrowed quota from another queue in the **same Cohort**.
+      2. `Reclaims`: lending queue reclaimed borrowed quota from another queue in the **same Cohort** (matched strictly on canonical `InCohortReclamation` and `InCohortReclaimWhileBorrowing` causes).
       3. `FairSharing`: cohort fair-sharing evicted over-share borrower workloads (`InCohortFairSharing`).
+      4. `ConfigurablePreemption` (and any other custom preemption reason, displayed whenever non-zero so the breakdown always adds up to `Total Preemptions`).
     - Also inspect the breakdown table's `priority_class` label: victims should overwhelmingly be `low` / `spot` / `bg` priority classes, **never** `hero` / `critical` production workloads.
 
 ---

@@ -134,7 +134,7 @@ Run up to `7` isolated chambers concurrently on distinct `--namespace` and `--po
 
 ### Step 5: Cross-Examine Sections `5.1`–`5.4`
 1. **`Section 5.1` — ClusterQueue & Cohort Quota Utilization**: Inspect aggregate and per-queue/cohort `P50 / P90 / P99 / AVG` and `AVG USED / QUOTA`.
-2. **`Section 5.2` — Wait Time Across All ClusterQueues per Workload Priority**: Compare `P50`, `P90`, `P99`, `AVG`, and `WORKLOADS` across priority classes.
-3. **`Section 5.3` — Total Evictions and Reclaims**: Cross-check `Total Evictions` vs `Unique workloads evicted once` and separate `InClusterQueue`, `InCohortReclamation`, and `FairSharing` reasons.
+2. **`Section 5.2` — Wait Time Across All ClusterQueues per Workload Priority**: Compare `P50`, `P90`, `P99`, `AVG`, and `ADMISSIONS` (total admission observations, including re-admissions) across priority classes.
+3. **`Section 5.3` — Total Evictions and Reclaims**: Cross-check `Total Evictions` vs `Unique workloads evicted once` and separate `InClusterQueue`, `InCohortReclamation` / `InCohortReclaimWhileBorrowing` reclaims, `FairSharing`, and `ConfigurablePreemption` reasons.
 4. **`Section 5.4` — Effective Uninterrupted Physical Cluster Saturation**: Compare `Sec 5.4 EFFECTIVE SAT` against `Sec 5.1 AVG`; in heavy preemption runs, `Sec 5.1 - Sec 5.4` measures wasted compute (badput) from aborted executions.
 5. **Post-Run Hygiene**: Confirm `kubectl get ns | grep kueue-optimizer` is empty and run `make test` when modifying scripts.

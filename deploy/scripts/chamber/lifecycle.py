@@ -71,6 +71,7 @@ from chamber.parsers import (
 from chamber.pki import ensure_pki_dir, inject_ca_bundle_into_manifests
 from chamber.registry import ChamberRegistryMixin
 from chamber.yaml_utils import docs_to_pretty_yaml
+from metrics.prometheus import compute_effective_step
 
 
 class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
@@ -745,6 +746,11 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             else:
                 query_end_epoch = int(max(start_epoch + 1, end_epoch))
 
+            effective_step = compute_effective_step(
+                max(0.0, start_epoch - 30.0),
+                float(query_end_epoch),
+                requested_step=1.0,
+            )
             cmd = [
                 sys.executable,
                 str(SCRIPT_DIR / "kueue_metrics_report.py"),
@@ -762,6 +768,8 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
                 f"{max(start_epoch, end_epoch):.3f}",
                 "--query-end-epoch",
                 str(int(query_end_epoch)),
+                "--step",
+                f"{effective_step:g}",
                 "--jobset-count",
                 str(jobset_count),
                 "--total-pods",

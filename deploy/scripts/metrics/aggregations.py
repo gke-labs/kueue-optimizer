@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections.abc import Callable
 import math
 
 from chamber.parsers import format_num, format_pct, summarize_samples
@@ -27,16 +28,52 @@ from metrics.prometheus import (
     histogram_quantile_from_buckets,
 )
 
+# Static configuration/status gauges whose absence before the first scrape does not mean 0.
+_STATIC_GAUGE_METRICS: frozenset[str] = frozenset({
+    "kueue_build_info",
+    "kueue_cluster_queue_info",
+    "kueue_cohort_info",
+    "kueue_cluster_queue_status",
+    "kueue_local_queue_status",
+    "multikueue_cluster_status",
+    "kueue_cluster_queue_nominal_quota",
+    "kueue_cluster_queue_borrowing_limit",
+    "kueue_cluster_queue_lending_limit",
+    "kueue_cohort_subtree_quota",
+})
+
+# Exact canonical Kueue preemption/eviction reason labels for cohort reclaims and fair sharing.
+_RECLAIM_REASONS: frozenset[str] = frozenset({
+    "InCohortReclamation",
+    "InCohortReclaimWhileBorrowing",
+})
+_FAIR_SHARING_REASONS: frozenset[str] = frozenset({
+    "InCohortFairSharing",
+    "FairSharing",
+})
+
+RawSeriesId = tuple[tuple[str, str], ...]
+
 
 def report_gauge(
     series_list: list[dict],
     start: float,
     end: float | None = None,
+    *,
+    step: float | None = None,
 ) -> list[tuple[str, str, str, str, str]]:
+    """Computes P50, P90, P99, and AVG over [start, end] for Gauge series.
+
+    When both `end` and `step` (> 0) are provided, non-static gauges that Kueue deletes when
+    they drop to 0 (e.g., `kueue_cohort_subtree_resource_reservations`) are zero-filled for
+    missing query grid steps in `[start, end]` so `AVG` and percentiles reflect the true
+    run-wide distribution instead of only active periods.
+    """
     rows: list[tuple[str, str, str, str, str]] = []
     for series in series_list:
         m = series.get("metric", {})
         lbl_str = format_labels(m)
+        metric_name = str(m.get("__name__") or "").strip()
         res_label = str(m.get("resource") or "").strip()
         is_bytes = res_label in ("memory", "ephemeral-storage")
         raw_vals: list[float] = []
@@ -51,13 +88,27 @@ def report_gauge(
                         raw_vals.append(v_val)
             except ValueError:
                 pass
+        used_fallback = False
         if not raw_vals and fallback_vals:
             raw_vals = fallback_vals
+            used_fallback = True
         if not raw_vals:
             continue
         if all(math.isinf(v) for v in raw_vals):
             rows.append((lbl_str, "+Inf", "+Inf", "+Inf", "+Inf"))
             continue
+        if (
+            not used_fallback
+            and end is not None
+            and end > start
+            and step is not None
+            and step > 0
+            and metric_name not in _STATIC_GAUGE_METRICS
+        ):
+            expected_steps = max(len(raw_vals), int(round((end - start) / step)))
+            missing = expected_steps - len(raw_vals)
+            if missing > 0:
+                raw_vals.extend([0.0] * missing)
         stats = summarize_samples(raw_vals)
         if stats is None:
             continue
@@ -126,85 +177,188 @@ def report_counter(
     return sorted(rows, key=lambda r: r[0])
 
 
+def _parse_histogram_bucket_map(items: list[dict]) -> dict[RawSeriesId, dict[float, float]]:
+    out: dict[RawSeriesId, dict[float, float]] = {}
+    for item in items:
+        m = item.get("metric", {})
+        le_str = m.get("le", "")
+        try:
+            le_val = math.inf if le_str == "+Inf" else float(le_str)
+            cnt = float(item["value"][1])
+            if math.isnan(cnt):
+                continue
+            raw_id = raw_series_identity(m, extra_exclude={"le"})
+            out.setdefault(raw_id, {})[le_val] = cnt
+        except (ValueError, KeyError, IndexError, TypeError):
+            pass
+    return out
+
+
+def _parse_histogram_scalar_map(items: list[dict]) -> dict[RawSeriesId, tuple[dict[str, str], float]]:
+    out: dict[RawSeriesId, tuple[dict[str, str], float]] = {}
+    for item in items:
+        m = item.get("metric", {})
+        try:
+            val = float(item["value"][1])
+            if math.isnan(val):
+                continue
+            out[raw_series_identity(m, extra_exclude={"le"})] = (m, val)
+        except (ValueError, KeyError, IndexError, TypeError):
+            pass
+    return out
+
+
+def compute_histogram_deltas_by_group(
+    end_by_name: dict[str, list[dict]],
+    start_by_name: dict[str, list[dict]],
+    metric_name: str,
+    group_key_fn: Callable[[dict[str, str]], str],
+) -> tuple[
+    dict[str, list[tuple[float, float]]],
+    dict[str, float],
+    dict[str, float],
+    list[tuple[float, float]],
+    float,
+    float,
+]:
+    """Compute reset-aware per-group and combined histogram deltas from end/start snapshots.
+
+    Detects counter resets per raw Prometheus series (`raw_series_identity`, preserving replica
+    and instance labels): if `_count`, `_sum`, or any bucket decreased (`end < start - 1e-9`)
+    for a series (e.g., due to a Kueue controller restart on a reused chamber), that series is
+    treated as having reset to 0 so its post-restart observations (`end`) are preserved intact
+    instead of clamping buckets to 0 or mixing pre-restart and post-restart sums.
+    """
+    end_buckets = end_by_name.get(f"{metric_name}_bucket", [])
+    if not end_buckets:
+        return {}, {}, {}, [], 0.0, 0.0
+
+    start_buckets = start_by_name.get(f"{metric_name}_bucket", [])
+    end_sums = end_by_name.get(f"{metric_name}_sum", [])
+    start_sums = start_by_name.get(f"{metric_name}_sum", [])
+    end_counts = end_by_name.get(f"{metric_name}_count", [])
+    start_counts = start_by_name.get(f"{metric_name}_count", [])
+
+    start_b_by_raw = _parse_histogram_bucket_map(start_buckets)
+    end_b_by_raw: dict[RawSeriesId, dict[float, float]] = {}
+    raw_group: dict[RawSeriesId, str] = {}
+    for item in end_buckets:
+        m = item.get("metric", {})
+        le_str = m.get("le", "")
+        try:
+            le_val = math.inf if le_str == "+Inf" else float(le_str)
+            cnt = float(item["value"][1])
+            if math.isnan(cnt):
+                continue
+            raw_id = raw_series_identity(m, extra_exclude={"le"})
+            raw_group.setdefault(raw_id, group_key_fn(m))
+            end_b_by_raw.setdefault(raw_id, {})[le_val] = cnt
+        except (ValueError, KeyError, IndexError, TypeError):
+            pass
+
+    end_sum_by_raw = _parse_histogram_scalar_map(end_sums)
+    start_sum_by_raw = _parse_histogram_scalar_map(start_sums)
+    end_cnt_by_raw = _parse_histogram_scalar_map(end_counts)
+    start_cnt_by_raw = _parse_histogram_scalar_map(start_counts)
+
+    for raw_id, (m, _val) in end_sum_by_raw.items():
+        raw_group.setdefault(raw_id, group_key_fn(m))
+    for raw_id, (m, _val) in end_cnt_by_raw.items():
+        raw_group.setdefault(raw_id, group_key_fn(m))
+
+    group_series_buckets: dict[str, dict[RawSeriesId, dict[float, float]]] = {}
+    group_sums: dict[str, float] = {}
+    group_cnts: dict[str, float] = {}
+    all_sum = 0.0
+    all_cnt = 0.0
+
+    all_raw_ids = set(end_b_by_raw.keys()) | set(end_sum_by_raw.keys()) | set(end_cnt_by_raw.keys())
+    for raw_id in all_raw_ids:
+        gkey = raw_group[raw_id]
+        end_b_map = end_b_by_raw.get(raw_id)
+        start_b_map = start_b_by_raw.get(raw_id, {})
+
+        # A decrease in any bucket, _count, or _sum for this raw series proves a counter reset.
+        is_reset = False
+        if raw_id in end_cnt_by_raw and raw_id in start_cnt_by_raw:
+            if end_cnt_by_raw[raw_id][1] < start_cnt_by_raw[raw_id][1] - 1e-9:
+                is_reset = True
+        if not is_reset and raw_id in end_sum_by_raw and raw_id in start_sum_by_raw:
+            if end_sum_by_raw[raw_id][1] < start_sum_by_raw[raw_id][1] - 1e-9:
+                is_reset = True
+        if not is_reset and end_b_map and start_b_map:
+            for le_val, end_c in end_b_map.items():
+                if le_val in start_b_map and end_c < start_b_map[le_val] - 1e-9:
+                    is_reset = True
+                    break
+
+        if end_b_map:
+            base_b_map = {} if is_reset else start_b_map
+            delta_le_map = {
+                le_val: max(0.0, end_c - base_b_map.get(le_val, 0.0))
+                for le_val, end_c in end_b_map.items()
+            }
+            group_series_buckets.setdefault(gkey, {})[raw_id] = delta_le_map
+
+        if raw_id in end_sum_by_raw:
+            end_s = end_sum_by_raw[raw_id][1]
+            start_s = 0.0 if is_reset else start_sum_by_raw.get(raw_id, ({}, 0.0))[1]
+            delta_s = max(0.0, end_s - start_s)
+            group_sums[gkey] = group_sums.get(gkey, 0.0) + delta_s
+            all_sum += delta_s
+
+        if raw_id in end_cnt_by_raw:
+            end_c = end_cnt_by_raw[raw_id][1]
+            start_c = 0.0 if is_reset else start_cnt_by_raw.get(raw_id, ({}, 0.0))[1]
+            delta_c = max(0.0, end_c - start_c)
+            group_cnts[gkey] = group_cnts.get(gkey, 0.0) + delta_c
+            all_cnt += delta_c
+
+    def _sum_monotonic_series(
+        series_maps: list[dict[float, float]],
+        sorted_les: list[float],
+    ) -> list[tuple[float, float]]:
+        totals = {le_val: 0.0 for le_val in sorted_les}
+        for le_map in series_maps:
+            running_max = 0.0
+            for le_val in sorted_les:
+                if le_val in le_map:
+                    running_max = max(running_max, le_map[le_val])
+                totals[le_val] += running_max
+        return [(le_val, totals[le_val]) for le_val in sorted_les]
+
+    group_buckets: dict[str, list[tuple[float, float]]] = {}
+    all_series_maps: list[dict[float, float]] = []
+    all_le_set: set[float] = set()
+    for gkey, series_dict in group_series_buckets.items():
+        g_maps = list(series_dict.values())
+        g_les = sorted({le_val for le_map in g_maps for le_val in le_map})
+        if g_les:
+            group_buckets[gkey] = _sum_monotonic_series(g_maps, g_les)
+            all_series_maps.extend(g_maps)
+            all_le_set.update(g_les)
+
+    all_buckets = _sum_monotonic_series(all_series_maps, sorted(all_le_set)) if all_le_set else []
+    return group_buckets, group_sums, group_cnts, all_buckets, all_sum, all_cnt
+
+
 def report_histogram(
     end_by_name: dict[str, list[dict]],
     start_by_name: dict[str, list[dict]],
     spec: MetricSpec,
 ) -> list[tuple[str, str, str, str, str, str, str]]:
     """Computes P50, P90, MAX, AVG, COUNT, and bucket breakdown for a Histogram metric."""
-    end_buckets = end_by_name.get(f"{spec.name}_bucket", [])
-    if not end_buckets:
+    group_buckets, agg_sum_by_gkey, agg_cnt_by_gkey, _all_b, _all_s, _all_c = compute_histogram_deltas_by_group(
+        end_by_name,
+        start_by_name,
+        spec.name,
+        lambda m: format_labels(m, extra_exclude={"le"}),
+    )
+    if not group_buckets:
         return []
-    start_buckets = start_by_name.get(f"{spec.name}_bucket", [])
-    end_sums = end_by_name.get(f"{spec.name}_sum", [])
-    start_sums = start_by_name.get(f"{spec.name}_sum", [])
-    end_counts = end_by_name.get(f"{spec.name}_count", [])
-    start_counts = start_by_name.get(f"{spec.name}_count", [])
-
-    def group_key(metric_dict: dict[str, str]) -> str:
-        return format_labels(metric_dict, extra_exclude={"le"})
-
-    start_b_map: dict[tuple[tuple[tuple[str, str], ...], float], float] = {}
-    for item in start_buckets:
-        m = item.get("metric", {})
-        le_str = m.get("le", "")
-        try:
-            le_val = math.inf if le_str == "+Inf" else float(le_str)
-            cnt = float(item["value"][1])
-            start_b_map[(raw_series_identity(m, extra_exclude={"le"}), le_val)] = cnt
-        except (ValueError, KeyError, IndexError):
-            pass
-
-    grouped_bucket_sums: dict[str, dict[float, float]] = {}
-    for item in end_buckets:
-        m = item.get("metric", {})
-        le_str = m.get("le", "")
-        try:
-            le_val = math.inf if le_str == "+Inf" else float(le_str)
-            cnt_end = float(item["value"][1])
-            raw_id = raw_series_identity(m, extra_exclude={"le"})
-            gkey = group_key(m)
-            cnt_start = start_b_map.get((raw_id, le_val), 0.0)
-            delta = max(0.0, cnt_end - cnt_start)
-            le_dict = grouped_bucket_sums.setdefault(gkey, {})
-            le_dict[le_val] = le_dict.get(le_val, 0.0) + delta
-        except (ValueError, KeyError, IndexError):
-            pass
-
-    def extract_raw_scalar_map(items: list[dict]) -> dict[tuple[tuple[str, str], ...], tuple[str, float]]:
-        out: dict[tuple[tuple[str, str], ...], tuple[str, float]] = {}
-        for item in items:
-            m = item.get("metric", {})
-            try:
-                out[raw_series_identity(m)] = (group_key(m), float(item["value"][1]))
-            except (ValueError, KeyError, IndexError):
-                pass
-        return out
-
-    end_sum_raw = extract_raw_scalar_map(end_sums)
-    start_sum_raw = extract_raw_scalar_map(start_sums)
-    end_cnt_raw = extract_raw_scalar_map(end_counts)
-    start_cnt_raw = extract_raw_scalar_map(start_counts)
-
-    agg_sum_by_gkey: dict[str, float] = {}
-    for raw_id, (gkey, end_s) in end_sum_raw.items():
-        start_s = start_sum_raw.get(raw_id, (gkey, 0.0))[1]
-        agg_sum_by_gkey[gkey] = agg_sum_by_gkey.get(gkey, 0.0) + max(0.0, end_s - start_s)
-
-    agg_cnt_by_gkey: dict[str, float] = {}
-    for raw_id, (gkey, end_c) in end_cnt_raw.items():
-        start_c = start_cnt_raw.get(raw_id, (gkey, 0.0))[1]
-        agg_cnt_by_gkey[gkey] = agg_cnt_by_gkey.get(gkey, 0.0) + max(0.0, end_c - start_c)
 
     rows: list[tuple[str, str, str, str, str, str, str]] = []
-    for gkey, le_dict in sorted(grouped_bucket_sums.items()):
-        # Enforce cumulative bucket monotonicity so minor Prometheus float/scrape skew never produces negative diffs
-        raw_sorted = sorted(le_dict.items(), key=lambda x: x[0])
-        b_sorted: list[tuple[float, float]] = []
-        running_max = 0.0
-        for le_val, cum in raw_sorted:
-            running_max = max(running_max, cum)
-            b_sorted.append((le_val, running_max))
+    for gkey, b_sorted in sorted(group_buckets.items()):
         if not b_sorted:
             continue
 
@@ -307,174 +461,48 @@ def _index_quota_series_by_resource(
     return res_map, entities_by_res
 
 
-def _build_cq_quota_rows(
-    cq_quota_map: dict[str, dict[float, dict[tuple[str, str], float]]],
-    cq_usage_map: dict[str, dict[float, dict[tuple[str, str], float]]],
-    cohort_quota_map: dict[str, dict[float, dict[tuple[str, str], float]]],
-    cq_cohort_by_name: dict[str, str],
-) -> list[list[str]]:
-    rows: list[list[str]] = []
-    for res in sorted(cq_quota_map.keys()):
-        is_bytes = res in ("memory", "ephemeral-storage")
-        ts_quota = cq_quota_map[res]
-        ts_usage = cq_usage_map.get(res, {})
-        ts_cohort_quota = cohort_quota_map.get(res, {})
-        total_util_samples: list[float] = []
-        per_cq_util_samples: list[float] = []
-        per_cq_util_by_name: dict[str, list[float]] = {}
-        per_cq_cohort_util_by_name: dict[str, list[float]] = {}
-        per_cq_used_by_name: dict[str, list[float]] = {}
-        per_cq_quota_by_name: dict[str, list[float]] = {}
-        all_cqs_seen_for_res: set[str] = set()
-        active_cqs_for_ratio: set[str] = set()
-        total_used_samples: list[float] = []
-        total_quota_samples: list[float] = []
-
-        for ts in sorted(ts_quota.keys()):
-            q_entries = ts_quota[ts]
-            u_entries = ts_usage.get(ts, {})
-            cq_entries = ts_cohort_quota.get(ts, {})
-            tot_q = sum(q_entries.values())
-            tot_u = sum(u_entries.values())
-            if tot_q > 0:
-                total_util_samples.append((tot_u / tot_q) * 100.0)
-                total_used_samples.append(tot_u)
-                total_quota_samples.append(tot_q)
-
-            # Per-ClusterQueue utilization at timestamp ts
-            q_by_cq: dict[str, float] = {}
-            u_by_cq: dict[str, float] = {}
-            q_by_cohort_ts: dict[str, float] = {}
-            for (cq, _flv), q_val in q_entries.items():
-                q_by_cq[cq] = q_by_cq.get(cq, 0.0) + q_val
-            for (cq, _flv), u_val in u_entries.items():
-                u_by_cq[cq] = u_by_cq.get(cq, 0.0) + u_val
-            for (c_name, _flv), c_val in cq_entries.items():
-                q_by_cohort_ts[c_name] = q_by_cohort_ts.get(c_name, 0.0) + c_val
-            cqs_at_ts = sorted(set(q_by_cq.keys()) | set(u_by_cq.keys()))
-            for cq in cqs_at_ts:
-                all_cqs_seen_for_res.add(cq)
-                cq_q = q_by_cq.get(cq, 0.0)
-                cq_u = u_by_cq.get(cq, 0.0)
-                per_cq_used_by_name.setdefault(cq, []).append(cq_u)
-                per_cq_quota_by_name.setdefault(cq, []).append(cq_q)
-                if cq_q > 0:
-                    active_cqs_for_ratio.add(cq)
-                    ratio = (cq_u / cq_q) * 100.0
-                    per_cq_util_samples.append(ratio)
-                    per_cq_util_by_name.setdefault(cq, []).append(ratio)
-                else:
-                    parent_cohort = cq_cohort_by_name.get(cq, "")
-                    parent_q = q_by_cohort_ts.get(parent_cohort, 0.0) if parent_cohort else 0.0
-                    if parent_q > 0:
-                        per_cq_cohort_util_by_name.setdefault(cq, []).append((cq_u / parent_q) * 100.0)
-
-        stats_total = summarize_samples(total_util_samples)
-        if stats_total is not None:
-            p50, p90, p99, avg = stats_total
-            avg_u = sum(total_used_samples) / len(total_used_samples) if total_used_samples else 0.0
-            avg_q = sum(total_quota_samples) / len(total_quota_samples) if total_quota_samples else 0.0
-            rows.append([
-                "ClusterQueue Quotas (All)",
-                res,
-                format_pct(p50),
-                format_pct(p90),
-                format_pct(p99),
-                format_pct(avg),
-                f"{format_num(avg_u, is_bytes=is_bytes)} / {format_num(avg_q, is_bytes=is_bytes)}",
-            ])
-
-        if len(active_cqs_for_ratio) > 1 and per_cq_util_samples:
-            stats_per_cq = summarize_samples(per_cq_util_samples)
-            if stats_per_cq is not None:
-                p50, p90, p99, avg = stats_per_cq
-                n_cqs = len(active_cqs_for_ratio)
-                rows.append([
-                    f"ClusterQueue Quotas (Per-CQ, n={n_cqs})",
-                    res,
-                    format_pct(p50),
-                    format_pct(p90),
-                    format_pct(p99),
-                    format_pct(avg),
-                    "per-queue ratio",
-                ])
-
-        if all_cqs_seen_for_res:
-            for cq in sorted(all_cqs_seen_for_res):
-                u_list = per_cq_used_by_name.get(cq, [])
-                q_list = per_cq_quota_by_name.get(cq, [])
-                cq_avg_u = sum(u_list) / len(u_list) if u_list else 0.0
-                cq_avg_q = sum(q_list) / len(q_list) if q_list else 0.0
-                cq_ratios = per_cq_util_by_name.get(cq, [])
-                cq_stats = summarize_samples(cq_ratios) if cq_ratios else None
-                if cq_stats is not None:
-                    cq_p50, cq_p90, cq_p99, cq_avg = cq_stats
-                    rows.append([
-                        f"ClusterQueue: {cq}",
-                        res,
-                        format_pct(cq_p50),
-                        format_pct(cq_p90),
-                        format_pct(cq_p99),
-                        format_pct(cq_avg),
-                        f"{format_num(cq_avg_u, is_bytes=is_bytes)} / {format_num(cq_avg_q, is_bytes=is_bytes)}",
-                    ])
-                else:
-                    used_quota_str = (
-                        f"{format_num(cq_avg_u, is_bytes=is_bytes)} / {format_num(cq_avg_q, is_bytes=is_bytes)}"
-                        + (" (borrowed)" if cq_avg_u > 0 else "")
-                    )
-                    cq_cohort_ratios = per_cq_cohort_util_by_name.get(cq, [])
-                    cq_cohort_stats = summarize_samples(cq_cohort_ratios) if cq_cohort_ratios else None
-                    if cq_cohort_stats is not None:
-                        c_p50, c_p90, c_p99, c_avg = cq_cohort_stats
-                        rows.append([
-                            f"ClusterQueue: {cq}",
-                            res,
-                            f"{format_pct(c_p50)} (cohort)",
-                            f"{format_pct(c_p90)} (cohort)",
-                            f"{format_pct(c_p99)} (cohort)",
-                            f"{format_pct(c_avg)} (cohort)",
-                            used_quota_str,
-                        ])
-                    else:
-                        rows.append([
-                            f"ClusterQueue: {cq}",
-                            res,
-                            "N/A (0 quota)",
-                            "N/A (0 quota)",
-                            "N/A (0 quota)",
-                            "N/A (0 quota)",
-                            used_quota_str,
-                        ])
-    return rows
-
-
-def _build_cohort_quota_rows(
-    cohort_quota_map: dict[str, dict[float, dict[tuple[str, str], float]]],
-    cohort_usage_map: dict[str, dict[float, dict[tuple[str, str], float]]],
-    all_cohorts_by_res: dict[str, set[str]],
+def _resolve_root_cohort(
+    cohort_name: str,
     cohort_parent_map: dict[str, str],
-) -> list[list[str]]:
-    rows: list[list[str]] = []
-    for res in sorted(cohort_quota_map.keys()):
-        is_bytes = res in ("memory", "ephemeral-storage")
-        cohorts_for_res = all_cohorts_by_res.get(res, set())
-        root_cohorts = {
-            c for c in cohorts_for_res
-            if not cohort_parent_map.get(c) or cohort_parent_map.get(c) not in cohorts_for_res
-        }
-        if not root_cohorts:
-            root_cohorts = set(cohorts_for_res)
+    known_cohorts: set[str],
+) -> str:
+    """Resolve the highest ancestor cohort present in `known_cohorts` (cycle-safe)."""
+    cur = cohort_name
+    best = cur if cur in known_cohorts else ""
+    visited: set[str] = set()
+    while cur and cur not in visited:
+        visited.add(cur)
+        if cur in known_cohorts:
+            best = cur
+        cur = cohort_parent_map.get(cur, "")
+    return best
 
-        ts_quota = cohort_quota_map[res]
-        ts_usage = cohort_usage_map.get(res, {})
+
+def _build_quota_scope_rows(
+    quota_map: dict[str, dict[float, dict[tuple[str, str], float]]],
+    usage_map: dict[str, dict[float, dict[tuple[str, str], float]]],
+    *,
+    scope_plural: str,
+    per_entity_tag: str,
+    per_entity_note: str,
+    entity_prefix: str,
+    aggregate_totals_fn: Callable[[str, float, dict[str, float], dict[str, float]], tuple[float, float]],
+    zero_quota_fallback_fn: Callable[[str, float, str], float] | None = None,
+) -> list[list[str]]:
+    """Build `(All)`, `(Per-<Entity>, n=K)`, and per-entity utilization rows for CQs or Cohorts."""
+    rows: list[list[str]] = []
+    for res in sorted(quota_map.keys()):
+        is_bytes = res in ("memory", "ephemeral-storage")
+        ts_quota = quota_map[res]
+        ts_usage = usage_map.get(res, {})
         total_util_samples: list[float] = []
-        per_cohort_util_samples: list[float] = []
-        per_cohort_util_by_name: dict[str, list[float]] = {}
-        per_cohort_used_by_name: dict[str, list[float]] = {}
-        per_cohort_quota_by_name: dict[str, list[float]] = {}
-        all_cohorts_seen_for_res: set[str] = set()
-        active_cohorts_for_ratio: set[str] = set()
+        per_entity_util_samples: list[float] = []
+        per_entity_util_by_name: dict[str, list[float]] = {}
+        per_entity_fallback_util_by_name: dict[str, list[float]] = {}
+        per_entity_used_by_name: dict[str, list[float]] = {}
+        per_entity_quota_by_name: dict[str, list[float]] = {}
+        all_entities_seen: set[str] = set()
+        active_entities_for_ratio: set[str] = set()
         total_used_samples: list[float] = []
         total_quota_samples: list[float] = []
 
@@ -482,33 +510,34 @@ def _build_cohort_quota_rows(
             q_entries = ts_quota[ts]
             u_entries = ts_usage.get(ts, {})
 
-            # Sum across root cohorts to avoid double-counting child subtrees
-            tot_q = sum(v for (c, _flv), v in q_entries.items() if c in root_cohorts)
-            tot_u = sum(v for (c, _flv), v in u_entries.items() if c in root_cohorts)
+            q_by_entity: dict[str, float] = {}
+            u_by_entity: dict[str, float] = {}
+            for (entity, _flv), q_val in q_entries.items():
+                q_by_entity[entity] = q_by_entity.get(entity, 0.0) + q_val
+            for (entity, _flv), u_val in u_entries.items():
+                u_by_entity[entity] = u_by_entity.get(entity, 0.0) + u_val
+
+            tot_u, tot_q = aggregate_totals_fn(res, ts, q_by_entity, u_by_entity)
             if tot_q > 0:
                 total_util_samples.append((tot_u / tot_q) * 100.0)
                 total_used_samples.append(tot_u)
                 total_quota_samples.append(tot_q)
 
-            # Per-Cohort subtree utilization at timestamp ts across all cohorts
-            q_by_cohort: dict[str, float] = {}
-            u_by_cohort: dict[str, float] = {}
-            for (c, _flv), q_val in q_entries.items():
-                q_by_cohort[c] = q_by_cohort.get(c, 0.0) + q_val
-            for (c, _flv), u_val in u_entries.items():
-                u_by_cohort[c] = u_by_cohort.get(c, 0.0) + u_val
-            cohorts_at_ts = sorted(set(q_by_cohort.keys()) | set(u_by_cohort.keys()))
-            for c in cohorts_at_ts:
-                all_cohorts_seen_for_res.add(c)
-                c_q = q_by_cohort.get(c, 0.0)
-                c_u = u_by_cohort.get(c, 0.0)
-                per_cohort_used_by_name.setdefault(c, []).append(c_u)
-                per_cohort_quota_by_name.setdefault(c, []).append(c_q)
-                if c_q > 0:
-                    active_cohorts_for_ratio.add(c)
-                    ratio = (c_u / c_q) * 100.0
-                    per_cohort_util_samples.append(ratio)
-                    per_cohort_util_by_name.setdefault(c, []).append(ratio)
+            for entity in sorted(set(q_by_entity.keys()) | set(u_by_entity.keys())):
+                all_entities_seen.add(entity)
+                e_q = q_by_entity.get(entity, 0.0)
+                e_u = u_by_entity.get(entity, 0.0)
+                per_entity_used_by_name.setdefault(entity, []).append(e_u)
+                per_entity_quota_by_name.setdefault(entity, []).append(e_q)
+                if e_q > 0:
+                    active_entities_for_ratio.add(entity)
+                    ratio = (e_u / e_q) * 100.0
+                    per_entity_util_samples.append(ratio)
+                    per_entity_util_by_name.setdefault(entity, []).append(ratio)
+                elif zero_quota_fallback_fn is not None:
+                    fallback_q = zero_quota_fallback_fn(res, ts, entity)
+                    if fallback_q > 0:
+                        per_entity_fallback_util_by_name.setdefault(entity, []).append((e_u / fallback_q) * 100.0)
 
         stats_total = summarize_samples(total_util_samples)
         if stats_total is not None:
@@ -516,7 +545,7 @@ def _build_cohort_quota_rows(
             avg_u = sum(total_used_samples) / len(total_used_samples) if total_used_samples else 0.0
             avg_q = sum(total_quota_samples) / len(total_quota_samples) if total_quota_samples else 0.0
             rows.append([
-                "Cohort Quotas (All)",
+                f"{scope_plural} (All)",
                 res,
                 format_pct(p50),
                 format_pct(p90),
@@ -525,47 +554,60 @@ def _build_cohort_quota_rows(
                 f"{format_num(avg_u, is_bytes=is_bytes)} / {format_num(avg_q, is_bytes=is_bytes)}",
             ])
 
-        if len(active_cohorts_for_ratio) > 1 and per_cohort_util_samples:
-            stats_per_cohort = summarize_samples(per_cohort_util_samples)
-            if stats_per_cohort is not None:
-                p50, p90, p99, avg = stats_per_cohort
-                n_cohorts = len(active_cohorts_for_ratio)
+        if len(active_entities_for_ratio) > 1 and per_entity_util_samples:
+            stats_per_entity = summarize_samples(per_entity_util_samples)
+            if stats_per_entity is not None:
+                p50, p90, p99, avg = stats_per_entity
+                n_entities = len(active_entities_for_ratio)
                 rows.append([
-                    f"Cohort Quotas (Per-Cohort, n={n_cohorts})",
+                    f"{scope_plural} ({per_entity_tag}, n={n_entities})",
                     res,
                     format_pct(p50),
                     format_pct(p90),
                     format_pct(p99),
                     format_pct(avg),
-                    "per-cohort ratio",
+                    per_entity_note,
                 ])
 
-        if all_cohorts_seen_for_res:
-            for c in sorted(all_cohorts_seen_for_res):
-                u_list = per_cohort_used_by_name.get(c, [])
-                q_list = per_cohort_quota_by_name.get(c, [])
-                c_avg_u = sum(u_list) / len(u_list) if u_list else 0.0
-                c_avg_q = sum(q_list) / len(q_list) if q_list else 0.0
-                c_ratios = per_cohort_util_by_name.get(c, [])
-                c_stats = summarize_samples(c_ratios) if c_ratios else None
-                if c_stats is not None:
-                    c_p50, c_p90, c_p99, c_avg = c_stats
+        for entity in sorted(all_entities_seen):
+            u_list = per_entity_used_by_name.get(entity, [])
+            q_list = per_entity_quota_by_name.get(entity, [])
+            e_avg_u = sum(u_list) / len(u_list) if u_list else 0.0
+            e_avg_q = sum(q_list) / len(q_list) if q_list else 0.0
+            e_ratios = per_entity_util_by_name.get(entity, [])
+            e_stats = summarize_samples(e_ratios) if e_ratios else None
+            if e_stats is not None:
+                e_p50, e_p90, e_p99, e_avg = e_stats
+                rows.append([
+                    f"{entity_prefix}: {entity}",
+                    res,
+                    format_pct(e_p50),
+                    format_pct(e_p90),
+                    format_pct(e_p99),
+                    format_pct(e_avg),
+                    f"{format_num(e_avg_u, is_bytes=is_bytes)} / {format_num(e_avg_q, is_bytes=is_bytes)}",
+                ])
+            else:
+                used_quota_str = (
+                    f"{format_num(e_avg_u, is_bytes=is_bytes)} / {format_num(e_avg_q, is_bytes=is_bytes)}"
+                    + (" (borrowed)" if e_avg_u > 0 else "")
+                )
+                fb_ratios = per_entity_fallback_util_by_name.get(entity, [])
+                fb_stats = summarize_samples(fb_ratios) if fb_ratios else None
+                if fb_stats is not None:
+                    fb_p50, fb_p90, fb_p99, fb_avg = fb_stats
                     rows.append([
-                        f"Cohort: {c}",
+                        f"{entity_prefix}: {entity}",
                         res,
-                        format_pct(c_p50),
-                        format_pct(c_p90),
-                        format_pct(c_p99),
-                        format_pct(c_avg),
-                        f"{format_num(c_avg_u, is_bytes=is_bytes)} / {format_num(c_avg_q, is_bytes=is_bytes)}",
+                        f"{format_pct(fb_p50)} (cohort)",
+                        f"{format_pct(fb_p90)} (cohort)",
+                        f"{format_pct(fb_p99)} (cohort)",
+                        f"{format_pct(fb_avg)} (cohort)",
+                        used_quota_str,
                     ])
                 else:
-                    used_quota_str = (
-                        f"{format_num(c_avg_u, is_bytes=is_bytes)} / {format_num(c_avg_q, is_bytes=is_bytes)}"
-                        + (" (borrowed)" if c_avg_u > 0 else "")
-                    )
                     rows.append([
-                        f"Cohort: {c}",
+                        f"{entity_prefix}: {entity}",
                         res,
                         "N/A (0 quota)",
                         "N/A (0 quota)",
@@ -574,6 +616,111 @@ def _build_cohort_quota_rows(
                         used_quota_str,
                     ])
     return rows
+
+
+def _build_cq_quota_rows(
+    cq_quota_map: dict[str, dict[float, dict[tuple[str, str], float]]],
+    cq_usage_map: dict[str, dict[float, dict[tuple[str, str], float]]],
+    cohort_quota_map: dict[str, dict[float, dict[tuple[str, str], float]]],
+    cq_cohort_by_name: dict[str, str],
+    all_cohorts_by_res: dict[str, set[str]],
+    cohort_parent_map: dict[str, str],
+) -> list[list[str]]:
+    cohort_q_by_res_ts: dict[str, dict[float, dict[str, float]]] = {}
+    for res, ts_map in cohort_quota_map.items():
+        res_ts_totals: dict[float, dict[str, float]] = {}
+        for ts, entries in ts_map.items():
+            totals: dict[str, float] = {}
+            for (c_name, _flv), c_val in entries.items():
+                totals[c_name] = totals.get(c_name, 0.0) + c_val
+            res_ts_totals[ts] = totals
+        cohort_q_by_res_ts[res] = res_ts_totals
+
+    def _cq_totals(
+        res: str,
+        ts: float,
+        q_by_cq: dict[str, float],
+        u_by_cq: dict[str, float],
+    ) -> tuple[float, float]:
+        tot_u = sum(u_by_cq.values())
+        known_cohorts = all_cohorts_by_res.get(res, set())
+        q_by_cohort_ts = cohort_q_by_res_ts.get(res, {}).get(ts, {})
+        standalone_q = 0.0
+        cq_q_by_root: dict[str, float] = {}
+        covered_roots: set[str] = set()
+        for cq in set(q_by_cq.keys()) | set(u_by_cq.keys()):
+            c_name = cq_cohort_by_name.get(cq, "")
+            root_c = _resolve_root_cohort(c_name, cohort_parent_map, known_cohorts) if c_name else ""
+            if root_c:
+                covered_roots.add(root_c)
+                cq_q_by_root[root_c] = cq_q_by_root.get(root_c, 0.0) + q_by_cq.get(cq, 0.0)
+            else:
+                standalone_q += q_by_cq.get(cq, 0.0)
+        tot_q = standalone_q + sum(
+            max(q_by_cohort_ts.get(r, 0.0), cq_q_by_root.get(r, 0.0))
+            for r in covered_roots
+        )
+        return tot_u, tot_q
+
+    def _cq_zero_quota_fallback(res: str, ts: float, cq: str) -> float:
+        parent_cohort = cq_cohort_by_name.get(cq, "")
+        if not parent_cohort:
+            return 0.0
+        q_by_cohort_ts = cohort_q_by_res_ts.get(res, {}).get(ts, {})
+        direct_q = q_by_cohort_ts.get(parent_cohort, 0.0)
+        if direct_q > 0:
+            return direct_q
+        root_c = _resolve_root_cohort(parent_cohort, cohort_parent_map, all_cohorts_by_res.get(res, set()))
+        return q_by_cohort_ts.get(root_c, 0.0) if root_c else 0.0
+
+    return _build_quota_scope_rows(
+        cq_quota_map,
+        cq_usage_map,
+        scope_plural="ClusterQueue Quotas",
+        per_entity_tag="Per-CQ",
+        per_entity_note="per-queue ratio",
+        entity_prefix="ClusterQueue",
+        aggregate_totals_fn=_cq_totals,
+        zero_quota_fallback_fn=_cq_zero_quota_fallback,
+    )
+
+
+def _build_cohort_quota_rows(
+    cohort_quota_map: dict[str, dict[float, dict[tuple[str, str], float]]],
+    cohort_usage_map: dict[str, dict[float, dict[tuple[str, str], float]]],
+    all_cohorts_by_res: dict[str, set[str]],
+    cohort_parent_map: dict[str, str],
+) -> list[list[str]]:
+    root_cohorts_by_res: dict[str, set[str]] = {}
+    for res in cohort_quota_map:
+        cohorts_for_res = all_cohorts_by_res.get(res, set())
+        roots = {
+            c for c in cohorts_for_res
+            if not cohort_parent_map.get(c) or cohort_parent_map.get(c) not in cohorts_for_res
+        }
+        root_cohorts_by_res[res] = roots if roots else set(cohorts_for_res)
+
+    def _cohort_totals(
+        res: str,
+        _ts: float,
+        q_by_cohort: dict[str, float],
+        u_by_cohort: dict[str, float],
+    ) -> tuple[float, float]:
+        # Sum across root cohorts to avoid double-counting child subtrees.
+        roots = root_cohorts_by_res.get(res, set())
+        tot_q = sum(v for c, v in q_by_cohort.items() if c in roots)
+        tot_u = sum(v for c, v in u_by_cohort.items() if c in roots)
+        return tot_u, tot_q
+
+    return _build_quota_scope_rows(
+        cohort_quota_map,
+        cohort_usage_map,
+        scope_plural="Cohort Quotas",
+        per_entity_tag="Per-Cohort",
+        per_entity_note="per-cohort ratio",
+        entity_prefix="Cohort",
+        aggregate_totals_fn=_cohort_totals,
+    )
 
 
 def report_aggregated_quota_utilization(
@@ -640,7 +787,14 @@ def report_aggregated_quota_utilization(
     for res, names in all_cohorts_u.items():
         all_cohorts_by_res.setdefault(res, set()).update(names)
 
-    rows = _build_cq_quota_rows(cq_quota_map, cq_usage_map, cohort_quota_map, cq_cohort_by_name)
+    rows = _build_cq_quota_rows(
+        cq_quota_map,
+        cq_usage_map,
+        cohort_quota_map,
+        cq_cohort_by_name,
+        all_cohorts_by_res,
+        cohort_parent_map,
+    )
     rows.extend(_build_cohort_quota_rows(cohort_quota_map, cohort_usage_map, all_cohorts_by_res, cohort_parent_map))
     return rows
 
@@ -651,101 +805,25 @@ def report_aggregated_wait_time_by_priority(
     metric_name: str = "kueue_admission_wait_time_seconds",
 ) -> list[list[str]]:
     """Computes P50, P90, P99, and AVG wait time aggregated across all ClusterQueues per workload priority."""
-    end_buckets = end_by_name.get(f"{metric_name}_bucket", [])
-    start_buckets = start_by_name.get(f"{metric_name}_bucket", [])
-    end_sums = end_by_name.get(f"{metric_name}_sum", [])
-    start_sums = start_by_name.get(f"{metric_name}_sum", [])
-    end_counts = end_by_name.get(f"{metric_name}_count", [])
-    start_counts = start_by_name.get(f"{metric_name}_count", [])
-
-    if not end_buckets and metric_name == "kueue_admission_wait_time_seconds":
+    if not end_by_name.get(f"{metric_name}_bucket") and metric_name == "kueue_admission_wait_time_seconds":
         # Fallback to quota_reserved_wait_time_seconds if admission_wait_time_seconds was not populated
         alt = "kueue_quota_reserved_wait_time_seconds"
         if end_by_name.get(f"{alt}_bucket"):
             return report_aggregated_wait_time_by_priority(end_by_name, start_by_name, metric_name=alt)
         return []
 
-    start_b_map: dict[tuple[tuple[tuple[str, str], ...], float], float] = {}
-    for item in start_buckets:
-        m = item.get("metric", {})
-        le_str = m.get("le", "")
-        try:
-            le_val = math.inf if le_str == "+Inf" else float(le_str)
-            cnt = float(item["value"][1])
-            start_b_map[(raw_series_identity(m, extra_exclude={"le"}), le_val)] = cnt
-        except (ValueError, KeyError, IndexError):
-            pass
-
-    prio_series_buckets: dict[str, dict[tuple[tuple[str, str], ...], dict[float, float]]] = {}
-    all_le_set: set[float] = set()
-
-    for item in end_buckets:
-        m = item.get("metric", {})
-        le_str = m.get("le", "")
-        prio = m.get("priority_class", "").strip() or "<none>"
-        try:
-            le_val = math.inf if le_str == "+Inf" else float(le_str)
-            cnt_end = float(item["value"][1])
-            raw_id = raw_series_identity(m, extra_exclude={"le"})
-            cnt_start = start_b_map.get((raw_id, le_val), 0.0)
-            delta = max(0.0, cnt_end - cnt_start)
-            all_le_set.add(le_val)
-            s_map = prio_series_buckets.setdefault(prio, {}).setdefault(raw_id, {})
-            s_map[le_val] = s_map.get(le_val, 0.0) + delta
-        except (ValueError, KeyError, IndexError):
-            pass
-
-    sorted_all_les = sorted(all_le_set)
-    prio_buckets: dict[str, dict[float, float]] = {}
-    all_buckets: dict[float, float] = {le: 0.0 for le in sorted_all_les}
-
-    for prio, series_dict in prio_series_buckets.items():
-        p_map: dict[float, float] = {le: 0.0 for le in sorted_all_les}
-        for _raw_id, le_map in series_dict.items():
-            prev_cum = 0.0
-            for le in sorted_all_les:
-                if le in le_map:
-                    prev_cum = max(prev_cum, le_map[le])
-                p_map[le] += prev_cum
-                all_buckets[le] += prev_cum
-        prio_buckets[prio] = p_map
-
-    def extract_series_scalar(items: list[dict]) -> dict[tuple[tuple[str, str], ...], tuple[str, float]]:
-        out: dict[tuple[tuple[str, str], ...], tuple[str, float]] = {}
-        for item in items:
-            m = item.get("metric", {})
-            prio = m.get("priority_class", "").strip() or "<none>"
-            try:
-                out[raw_series_identity(m)] = (prio, float(item["value"][1]))
-            except (ValueError, KeyError, IndexError):
-                pass
-        return out
-
-    end_sum_map = extract_series_scalar(end_sums)
-    start_sum_map = extract_series_scalar(start_sums)
-    end_cnt_map = extract_series_scalar(end_counts)
-    start_cnt_map = extract_series_scalar(start_counts)
-
-    prio_sums: dict[str, float] = {}
-    prio_cnts: dict[str, float] = {}
-    all_sum = 0.0
-    all_cnt = 0.0
-
-    for raw_id, (prio, end_s) in end_sum_map.items():
-        start_s = start_sum_map.get(raw_id, (prio, 0.0))[1]
-        delta_s = max(0.0, end_s - start_s)
-        prio_sums[prio] = prio_sums.get(prio, 0.0) + delta_s
-        all_sum += delta_s
-
-    for raw_id, (prio, end_c) in end_cnt_map.items():
-        start_c = start_cnt_map.get(raw_id, (prio, 0.0))[1]
-        delta_c = max(0.0, end_c - start_c)
-        prio_cnts[prio] = prio_cnts.get(prio, 0.0) + delta_c
-        all_cnt += delta_c
+    prio_buckets, prio_sums, prio_cnts, all_buckets, all_sum, all_cnt = compute_histogram_deltas_by_group(
+        end_by_name,
+        start_by_name,
+        metric_name,
+        lambda m: m.get("priority_class", "").strip() or "<none>",
+    )
+    if not prio_buckets:
+        return []
 
     rows: list[list[str]] = []
     for prio in sorted(prio_buckets.keys(), key=priority_sort_key):
-        b_sorted = sorted(prio_buckets[prio].items(), key=lambda x: x[0])
+        b_sorted = prio_buckets[prio]
         if not b_sorted:
             continue
         total_cnt = prio_cnts.get(prio, b_sorted[-1][1])
@@ -766,12 +844,11 @@ def report_aggregated_wait_time_by_priority(
         ])
 
     if len(rows) > 1 and all_buckets:
-        b_sorted = sorted(all_buckets.items(), key=lambda x: x[0])
-        total_cnt = all_cnt if all_cnt > 0 else b_sorted[-1][1]
+        total_cnt = all_cnt if all_cnt > 0 else all_buckets[-1][1]
         if total_cnt > 0:
-            p50 = histogram_quantile_from_buckets(0.50, b_sorted)
-            p90 = histogram_quantile_from_buckets(0.90, b_sorted)
-            p99 = histogram_quantile_from_buckets(0.99, b_sorted)
+            p50 = histogram_quantile_from_buckets(0.50, all_buckets)
+            p90 = histogram_quantile_from_buckets(0.90, all_buckets)
+            p99 = histogram_quantile_from_buckets(0.99, all_buckets)
             avg = all_sum / total_cnt if total_cnt > 0 else math.nan
             rows.append([
                 "ALL (Across All Priorities)",
@@ -798,10 +875,6 @@ def report_aggregated_evictions_and_reclaims(
     evictions_by_reason_cause: dict[tuple[str, str, str], float] = {}
     reclaims_from_evicted = 0.0
 
-    def _is_reclaim(label_val: str) -> bool:
-        low = label_val.lower()
-        return "reclaim" in low or "reclam" in low
-
     for s in evicted_series:
         inc = counter_series_total_increase(s, start)
         if inc <= 0:
@@ -813,7 +886,7 @@ def report_aggregated_evictions_and_reclaims(
         prio = m.get("priority_class", "").strip() or "<none>"
         key = (reason, cause, prio)
         evictions_by_reason_cause[key] = evictions_by_reason_cause.get(key, 0.0) + inc
-        if _is_reclaim(reason) or _is_reclaim(cause):
+        if reason in _RECLAIM_REASONS or cause in _RECLAIM_REASONS:
             reclaims_from_evicted += inc
 
     total_unique_evictions = 0.0
@@ -826,6 +899,8 @@ def report_aggregated_evictions_and_reclaims(
     reclaims_from_preempted = 0.0
     in_cq_preemptions = 0.0
     fair_sharing_preemptions = 0.0
+    configurable_preemptions = 0.0
+    other_preemptions: dict[str, float] = {}
     preemptions_by_reason: dict[str, float] = {}
 
     for s in preempted_series:
@@ -836,12 +911,16 @@ def report_aggregated_evictions_and_reclaims(
         m = s.get("metric", {})
         reason = m.get("reason", "").strip() or "<none>"
         preemptions_by_reason[reason] = preemptions_by_reason.get(reason, 0.0) + inc
-        if _is_reclaim(reason):
+        if reason in _RECLAIM_REASONS:
             reclaims_from_preempted += inc
         elif reason == "InClusterQueue":
             in_cq_preemptions += inc
-        elif "fairsharing" in reason.lower():
+        elif reason in _FAIR_SHARING_REASONS:
             fair_sharing_preemptions += inc
+        elif reason == "ConfigurablePreemption":
+            configurable_preemptions += inc
+        else:
+            other_preemptions[reason] = other_preemptions.get(reason, 0.0) + inc
 
     total_reclaims = max(reclaims_from_preempted, reclaims_from_evicted)
     evicted_in_cohort_reclam = sum(
@@ -863,6 +942,16 @@ def report_aggregated_evictions_and_reclaims(
         evicted_reclaim_while_borrowing,
     )
 
+    preemption_detail_parts = [
+        f"InClusterQueue={int(round(in_cq_preemptions))}",
+        f"Reclaims={int(round(reclaims_from_preempted))}",
+        f"FairSharing={int(round(fair_sharing_preemptions))}",
+    ]
+    if configurable_preemptions > 0:
+        preemption_detail_parts.append(f"ConfigurablePreemption={int(round(configurable_preemptions))}")
+    for reason, cnt in sorted(other_preemptions.items()):
+        preemption_detail_parts.append(f"{reason}={int(round(cnt))}")
+
     summary_rows: list[list[str]] = [
         [
             "Total Evictions",
@@ -883,11 +972,7 @@ def report_aggregated_evictions_and_reclaims(
             "Total Preemptions",
             "kueue_preempted_workloads_total",
             str(int(round(total_preemptions))),
-            (
-                f"InClusterQueue={int(round(in_cq_preemptions))}, "
-                f"Reclaims={int(round(total_reclaims))}, "
-                f"FairSharing={int(round(fair_sharing_preemptions))}"
-            ),
+            ", ".join(preemption_detail_parts),
         ],
     ]
 
