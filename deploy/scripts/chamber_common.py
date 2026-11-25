@@ -60,6 +60,7 @@ from chamber import (  # noqa: F401
     DEFAULT_WAIT_FOR_PODS_READY_TIMEOUT_SEC,
     DEPLOY_DIR,
     DNS_LABEL_RE,
+    DNS_SUBDOMAIN_RE,
     KNOWN_KUEUE_FEATURE_GATES,
     KUEUE_FEATURE_GATE_DEPENDENCIES,
     LOCKED_GA_KUEUE_FEATURE_GATES,
@@ -159,6 +160,7 @@ from chamber import (  # noqa: F401
     summarize_samples,
     to_clean_yaml,
     validate_dns_label,
+    validate_dns_subdomain,
 )
 
 

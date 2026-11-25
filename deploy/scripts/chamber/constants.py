@@ -51,6 +51,7 @@ CHAMBER_NAMESPACE_LABEL_VALUE = "true"
 CHAMBER_PART_OF_LABEL_VALUE = "kueue-optimizer"
 
 DNS_LABEL_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+DNS_SUBDOMAIN_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
 
 
 def validate_dns_label(value: Any, field_desc: str = "Kubernetes name") -> str:
@@ -60,6 +61,18 @@ def validate_dns_label(value: Any, field_desc: str = "Kubernetes name") -> str:
         raise ValueError(
             f"Invalid {field_desc} {value!r}: must be a valid RFC 1123 DNS label "
             "(1..63 lowercase alphanumeric characters or '-', starting and ending with [a-z0-9])."
+        )
+    return s
+
+
+def validate_dns_subdomain(value: Any, field_desc: str = "Kubernetes name") -> str:
+    """Validate that value is a Kubernetes RFC 1123 DNS subdomain (1..253 chars, matching k8s IsDNS1123Subdomain)."""
+    s = str(value if value is not None else "").strip()
+    if not s or len(s) > 253 or not DNS_SUBDOMAIN_RE.fullmatch(s):
+        raise ValueError(
+            f"Invalid {field_desc} {value!r}: must be a valid RFC 1123 DNS subdomain "
+            "(1..253 lowercase alphanumeric characters, '-' or '.', with each dot-separated segment "
+            "starting and ending with [a-z0-9])."
         )
     return s
 
