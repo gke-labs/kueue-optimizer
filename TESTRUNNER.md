@@ -433,7 +433,7 @@ where:
     - On an under-saturated trace (e.g., a raw 6-hour trace whose offered load is `42%` of cluster capacity): **`EFFECTIVE SAT` should match the scenario's theoretical offered saturation (`~40%–42%`) within `1%–3%`**.
   - **Secondary resources (`pods`, `memory`, `cpu`)**: `pods` saturation is naturally low (`0.5%–5%`) on TPU/GPU clusters because each node allows `110` pods while a single TPU pod consumes all `4` or `8` chips on the node — **this is completely normal and expected**. Always judge cluster saturation by the **primary constrained resource** (`google.com/tpu` / `nvidia.com/gpu` on accelerator clusters, or `cpu` / `memory` on CPU-only clusters).
 - **Bad signs**:
-  - **`EFFECTIVE SAT` is `>10%–20%` below `Section 5.1 Quota Utilization AVG`**: High wasted work from preemptions/evictions (`Excluded (preempted/reclaimed/failed)` count in the subtitle will be high) or pods sitting in `Pending` after Kueue admission.
+  - **`EFFECTIVE SAT` is `>10%–20%` below `Section 5.1 Quota Utilization AVG`**: High wasted work from preemptions/evictions (`Excluded (preempted/reclaimed/failed)` count in the subtitle will be high) or pods sitting in `Pending` after Kueue admission (the subtitle then shows a non-zero `Admitted (pending pods)` count).
   - **`COMPLETED ONLY = 0.00%`** in a run that was supposed to complete jobs: `--duration` was shorter than the shortest compressed workload duration, or pods never transitioned to `Succeeded`.
   - **`EFFECTIVE SAT = 0.00%`** with high `Unadmitted`: zero workloads ran.
 
