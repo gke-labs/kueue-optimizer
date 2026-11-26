@@ -2184,6 +2184,18 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
                     name="n-2",
                     manifest=n2,
                 ),
+                ScheduledInfraEvent(
+                    target_wall_offset_sec=0.0,
+                    seq=4,
+                    raw_offset_sec=0.0,
+                    raw_offset_from_t0_sec=0.0,
+                    event_timestamp=self._ts(0),
+                    event_type="Update",
+                    object_kind="Node",
+                    name="n-2",
+                    manifest=self._node("n-2", {self.TPU: "16", "cpu": "32"}),
+                    has_explicit_capacity=True,
+                ),
             ]
         )
 
@@ -2225,7 +2237,6 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
                     max_run_seconds=5.0,
                     status_interval_sec=0.5,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
                 snap_dyn = mgr.capture_cluster_saturation_snapshot()
 
@@ -2234,9 +2245,10 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
             timeline = snap_dyn.get("nodeCapacityTimeline")
             self.assertIsInstance(timeline, list)
             assert isinstance(timeline, list)
-            # Initial (8 TPU) -> after deleting n-1 (4 TPU) -> after adding n-2 (12 TPU); unchanged Update skipped!
-            self.assertEqual(len(timeline), 3)
-            self.assertEqual([e["capacity"][self.TPU] for e in timeline], [8.0, 4.0, 12.0])
+            # Initial (8 TPU) -> delete n-1 (4) -> Update n-0 without raw capacity (ignored) -> add n-2 (12)
+            # -> Update n-2 with raw capacity 16 TPU (20).
+            self.assertEqual(len(timeline), 4)
+            self.assertEqual([e["capacity"][self.TPU] for e in timeline], [8.0, 4.0, 12.0, 20.0])
 
             # 2. Static scenario (no Node capacity changes): nodeCapacityTimeline is omitted from snapshot.
             bundle_static = _make_bundle([])
@@ -2252,7 +2264,6 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
                     max_run_seconds=5.0,
                     status_interval_sec=0.5,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
                 snap_static = mgr.capture_cluster_saturation_snapshot()
 

@@ -603,9 +603,14 @@ def _execute_scheduled_infra_event(
     anns_in = meta_in.get("annotations") if isinstance(meta_in.get("annotations"), dict) else None
     spec_in = dict((ie.manifest.get("spec") or {}) if isinstance(ie.manifest, dict) else {})
     st_in = (ie.manifest.get("status") or {}) if isinstance(ie.manifest, dict) else {}
+    # Apply capacity only when the raw Update payload carried it. Otherwise `ie.manifest` holds the
+    # synthetic default from _prepare_node_manifest(), which must never overwrite a live node.
+    has_explicit_cap = bool(getattr(ie, "has_explicit_capacity", False))
     extra_status = (
         st_in
-        if isinstance(st_in, dict) and any(st_in.get(k) for k in ("allocatable", "capacity", "nodeInfo"))
+        if has_explicit_cap
+        and isinstance(st_in, dict)
+        and any(st_in.get(k) for k in ("allocatable", "capacity", "nodeInfo"))
         else None
     )
     taints_list = [dict(t) for t in (spec_in.get("taints") or []) if isinstance(t, dict)]
@@ -613,6 +618,15 @@ def _execute_scheduled_infra_event(
     if labels_in:
         patch_meta["labels"] = dict(labels_in)
     patch_anns: dict[str, Any] = dict(anns_in) if anns_in else {}
+    if not has_explicit_cap:
+        for res_ann in (
+            "kueue-optimizer.gke.io/node-cpu",
+            "kueue-optimizer.gke.io/node-memory",
+            "kueue-optimizer.gke.io/node-pods",
+            "kueue-optimizer.gke.io/node-accel-resource",
+            "kueue-optimizer.gke.io/node-accel-count",
+        ):
+            patch_anns.pop(res_ann, None)
     if ie.is_not_ready or ie.has_no_execute_taint:
         if ie.is_not_ready and not any(
             t.get("key") == "node.kubernetes.io/not-ready" for t in taints_list
@@ -2369,7 +2383,12 @@ def run_scenario_replay(
                         if ie.event_type == "Deleted":
                             if live_node_alloc.pop(ie.name, None) is not None:
                                 _record_node_capacity_snapshot(time.time())
-                        elif ie.event_type == "New" and isinstance(ie.manifest, dict):
+                        elif isinstance(ie.manifest, dict) and (
+                            ie.event_type == "New"
+                            or (ie.event_type == "Update" and getattr(ie, "has_explicit_capacity", False))
+                        ):
+                            # An Update changes the timeline only when its raw payload carried capacity,
+                            # which is also the only case where replay patches it onto the node.
                             new_alloc = _extract_node_alloc(ie.manifest)
                             if new_alloc and new_alloc != live_node_alloc.get(ie.name):
                                 live_node_alloc[ie.name] = new_alloc

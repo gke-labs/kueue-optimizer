@@ -25,6 +25,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import sys
 import tempfile
@@ -146,6 +147,7 @@ class NodeUpdateAndFailFastTests(unittest.TestCase):
                     has_no_execute_taint=has_no_exec,
                     ready_status=ready_st,
                     manifest=man,
+                    has_explicit_capacity=True,
                 )
                 mgr = _FakeMgr()
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -173,6 +175,94 @@ class NodeUpdateAndFailFastTests(unittest.TestCase):
                     self.assertEqual(s_body["conditions"][0]["status"], ready_st)
                 else:
                     self.assertNotIn("conditions", s_body)
+
+    def test_node_update_without_raw_capacity_never_touches_capacity(self) -> None:
+        """A taint-only or condition-only Node Update must not push the synthetic default capacity."""
+        b61 = _load_bundle("st61-tas-single-node-failure-hotswap-same-rack")
+        ie0 = next(ie for ie in b61.scheduled_infra_events if ie.object_kind == "Node")
+        node0 = next(n for n in b61.nodes if n["metadata"]["name"] == ie0.name)
+        res_anns = (
+            "kueue-optimizer.gke.io/node-cpu",
+            "kueue-optimizer.gke.io/node-memory",
+            "kueue-optimizer.gke.io/node-pods",
+            "kueue-optimizer.gke.io/node-accel-resource",
+            "kueue-optimizer.gke.io/node-accel-count",
+        )
+        cases = [
+            ("healthy_update", False, False, "True"),
+            ("unhealthy_not_ready", True, False, "False"),
+            ("no_execute_taint_only", False, True, "True"),
+        ]
+        for label, is_not_ready, has_no_exec, ready_st in cases:
+            with self.subTest(case=label):
+                scraped = copy.deepcopy(node0)
+                scraped["status"] = {"conditions": [{"type": "Ready", "status": ready_st}]}
+                if has_no_exec:
+                    scraped.setdefault("spec", {})["taints"] = [
+                        {"key": "maintenance", "value": "true", "effect": "NoExecute"}
+                    ]
+                man = _prepare_node_manifest(scraped, 0)
+                # The prepared manifest carries the synthetic default, not the node's real 16 CPU / 4 TPU.
+                self.assertEqual(man["status"]["allocatable"], {"cpu": "4", "memory": "16Gi", "pods": "110"})
+                ie = dataclasses.replace(
+                    ie0,
+                    event_type="Update",
+                    is_not_ready=is_not_ready,
+                    has_no_execute_taint=has_no_exec,
+                    ready_status=ready_st,
+                    manifest=man,
+                    has_explicit_capacity=False,
+                )
+                mgr = _FakeMgr()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _execute_scheduled_infra_event(mgr, b61, ie, 1.0)
+                for m, p, b, _ in mgr.requests:
+                    if m != "PATCH" or not p.startswith(f"/api/v1/nodes/{ie.name}"):
+                        continue
+                    if p.endswith("/status"):
+                        for key in ("allocatable", "capacity", "nodeInfo"):
+                            self.assertNotIn(key, b["status"])
+                    else:
+                        for key in res_anns:
+                            self.assertNotIn(key, (b.get("metadata") or {}).get("annotations") or {})
+
+    def test_loader_marks_explicit_capacity_from_raw_node_payload(self) -> None:
+        """has_explicit_capacity reflects the raw infra.json payload, not the prepared manifest."""
+        src = REPO_ROOT / "testscenarios" / "self-tests" / "st61-tas-single-node-failure-hotswap-same-rack"
+        with tempfile.TemporaryDirectory() as td:
+            dst = Path(td) / "sc"
+            shutil.copytree(src, dst)
+            lines = (dst / "infra.json").read_text(encoding="utf-8").splitlines()
+            node_updates = [
+                i
+                for i, ln in enumerate(lines)
+                if ln.strip()
+                and json.loads(ln).get("eventType") == "Update"
+                and (json.loads(ln).get("payload") or {}).get("kind") == "Node"
+            ]
+            self.assertGreaterEqual(len(node_updates), 1)
+            with_cap = load_scenario_bundle(scenario_dir=dst, speedup=1.0, skip_initial_offset=True)
+            upd_with = [
+                ie for ie in with_cap.scheduled_infra_events if ie.object_kind == "Node" and ie.event_type == "Update"
+            ]
+            self.assertTrue(upd_with and all(ie.has_explicit_capacity for ie in upd_with))
+
+            for i in node_updates:
+                ev = json.loads(lines[i])
+                st = ev["payload"].get("status") or {}
+                st.pop("allocatable", None)
+                st.pop("capacity", None)
+                ev["payload"]["status"] = st
+                lines[i] = json.dumps(ev, separators=(",", ":"))
+            (dst / "infra.json").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            without_cap = load_scenario_bundle(scenario_dir=dst, speedup=1.0, skip_initial_offset=True)
+            upd_without = [
+                ie
+                for ie in without_cap.scheduled_infra_events
+                if ie.object_kind == "Node" and ie.event_type == "Update"
+            ]
+            self.assertTrue(upd_without and not any(ie.has_explicit_capacity for ie in upd_without))
+            self.assertTrue(all((ie.manifest.get("status") or {}).get("allocatable") for ie in upd_without))
 
     def test_node_patch_and_delete_fail_fast_on_non_2xx(self) -> None:
         b61 = _load_bundle("st61-tas-single-node-failure-hotswap-same-rack")
