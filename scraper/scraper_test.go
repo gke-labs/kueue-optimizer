@@ -4910,6 +4910,113 @@ func TestDeploymentLifecycleScrapingAndOwnership(t *testing.T) {
 	}
 }
 
+func TestWorkloadUsesTAS(t *testing.T) {
+	const rack = "corp.io/rack"
+	// Only the middle PodSet gets a topology request or assignment, so a helper
+	// that checks only the first or the last PodSet fails.
+	workload := func(request *kueuev1beta2.PodSetTopologyRequest, admission *kueuev1beta2.Admission) *kueuev1beta2.Workload {
+		return &kueuev1beta2.Workload{
+			Spec: kueuev1beta2.WorkloadSpec{PodSets: []kueuev1beta2.PodSet{
+				{Name: "leader"},
+				{Name: "worker", TopologyRequest: request},
+				{Name: "launcher"},
+			}},
+			Status: kueuev1beta2.WorkloadStatus{Admission: admission},
+		}
+	}
+	admitted := func(assignment *kueuev1beta2.TopologyAssignment) *kueuev1beta2.Admission {
+		return &kueuev1beta2.Admission{PodSetAssignments: []kueuev1beta2.PodSetAssignment{
+			{Name: "leader"},
+			{Name: "worker", TopologyAssignment: assignment},
+			{Name: "launcher"},
+		}}
+	}
+	// Kueue sets these index fields even for Workloads that do not request TAS.
+	indexOnly := &kueuev1beta2.PodSetTopologyRequest{
+		PodIndexLabel:      new(batchv1.JobCompletionIndexAnnotation),
+		SubGroupIndexLabel: new(jobsetv1alpha2.JobIndexKey),
+		SubGroupCount:      new(int32(2)),
+	}
+
+	tests := []struct {
+		name string
+		wl   *kueuev1beta2.Workload
+		want bool
+	}{
+		{
+			name: "nil workload is not TAS",
+			wl:   nil,
+			want: false,
+		},
+		{
+			name: "index-only request is not TAS",
+			wl:   workload(indexOnly, nil),
+			want: false,
+		},
+		{
+			name: "index-only request admitted without a topology assignment is not TAS",
+			wl:   workload(indexOnly, admitted(nil)),
+			want: false,
+		},
+		{
+			// A TAS-only ClusterQueue assigns a topology even when no PodSet requests one.
+			name: "index-only request with a topology assignment is TAS",
+			wl:   workload(indexOnly, admitted(&kueuev1beta2.TopologyAssignment{Levels: []string{rack}})),
+			want: true,
+		},
+		{
+			name: "topology assignment without a request is TAS",
+			wl:   workload(nil, admitted(&kueuev1beta2.TopologyAssignment{Levels: []string{rack}})),
+			want: true,
+		},
+		{
+			name: "required topology is TAS",
+			wl:   workload(&kueuev1beta2.PodSetTopologyRequest{Required: new(rack)}, nil),
+			want: true,
+		},
+		{
+			// Kueue can set status.admission without a TopologyAssignment when the
+			// ClusterQueue has a MultiKueue or ProvisioningRequest AdmissionCheck.
+			name: "required topology with an admission but no topology assignment is TAS",
+			wl:   workload(&kueuev1beta2.PodSetTopologyRequest{Required: new(rack)}, admitted(nil)),
+			want: true,
+		},
+		{
+			name: "preferred topology is TAS",
+			wl:   workload(&kueuev1beta2.PodSetTopologyRequest{Preferred: new(rack)}, nil),
+			want: true,
+		},
+		{
+			name: "unconstrained topology is TAS",
+			wl:   workload(&kueuev1beta2.PodSetTopologyRequest{Unconstrained: new(true)}, nil),
+			want: true,
+		},
+		{
+			name: "slice topology is TAS",
+			wl: workload(&kueuev1beta2.PodSetTopologyRequest{
+				PodSetSliceRequiredTopology: new(rack),
+				PodSetSliceSize:             new(int32(2)),
+			}, nil),
+			want: true,
+		},
+		{
+			name: "slice topology constraints are TAS",
+			wl: workload(&kueuev1beta2.PodSetTopologyRequest{
+				PodsetSliceRequiredTopologyConstraints: []kueuev1beta2.PodsetSliceRequiredTopologyConstraint{{Topology: rack, Size: 2}},
+			}, nil),
+			want: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workloadUsesTAS(tc.wl); got != tc.want {
+				t.Errorf("workloadUsesTAS() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDeploymentOwnerNotFoundNonTASAndReplicaSetRace(t *testing.T) {
 	scraper := newTestScraper(t, Config{}, nil, nil, nil)
 
