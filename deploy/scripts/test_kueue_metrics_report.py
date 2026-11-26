@@ -1430,6 +1430,67 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
                 self.assertEqual(by_res[self.TPU][4], exp_act)
                 self.assertEqual(by_res[self.TPU][5], exp_full)
 
+        # Sibling PodSet pod-level annotations must NOT leak onto an infinite-duration or unannotated PodSet.
+        for long_anns, exp_long_inf in (
+            ({self.ANN_INF: "true"}, True),
+            ({}, False),
+        ):
+            with self.subTest(case=f"no_sibling_dur_leak_inf_{exp_long_inf}"):
+                wl_leak = self._wl(
+                    "pg-no-leak",
+                    [
+                        self._podset("short", 2, {self.TPU: "4"}),
+                        self._podset("long", 2, {self.TPU: "4"}),
+                    ],
+                    [self._cond("QuotaReserved", "True", 0), self._cond("Admitted", "True", 0)],
+                )
+                pods_leak = [
+                    {
+                        "metadata": {
+                            "name": f"short-{i}",
+                            "namespace": "ai-lab",
+                            "labels": {"kueue.x-k8s.io/prebuilt-workload-name": "pg-no-leak", "kueue.x-k8s.io/podset": "short"},
+                            "annotations": {self.ANN_DUR: "100"},
+                        },
+                        "status": {"phase": "Running", "startTime": self._ts(0)},
+                    }
+                    for i in range(2)
+                ] + [
+                    {
+                        "metadata": {
+                            "name": f"long-{i}",
+                            "namespace": "ai-lab",
+                            "labels": {"kueue.x-k8s.io/prebuilt-workload-name": "pg-no-leak", "kueue.x-k8s.io/podset": "long"},
+                            "annotations": dict(long_anns),
+                        },
+                        "status": {"phase": "Running", "startTime": self._ts(0)},
+                    }
+                    for i in range(2)
+                ]
+                slices_leak = kmr.extract_workload_podset_slices(wl_leak, assoc_pods=pods_leak)
+                self.assertEqual(slices_leak[0].cfg_dur_sec, 100.0)
+                self.assertIsNone(slices_leak[1].cfg_dur_sec)
+                self.assertEqual(slices_leak[1].is_infinite, exp_long_inf)
+                rows_leak, _ = kmr.report_effective_uninterrupted_saturation(
+                    {"nodes": nodes_16_tpu, "workloads": [wl_leak], "pods": pods_leak},
+                    self.T0,
+                    self.T0 + 1000.0,
+                )
+                # short: 8 TPU * 100s = 800; long: 8 TPU * 1000s = 8000 -> 8800 / 16000 = 55.00%
+                self.assertEqual(_rows_by_key(rows_leak, 0)[self.TPU][2], "55.00%")
+
+        # Empty/invalid template duration annotation must NOT clear Workload-level infinite-duration.
+        wl_inf_bad_tpl = self._wl(
+            "pg-inf-invalid-tpl",
+            [self._podset("main", 2, {self.TPU: "4"}, dur=None)],
+            [self._cond("Admitted", "True", 0)],
+        )
+        wl_inf_bad_tpl["metadata"]["annotations"] = {self.ANN_INF: "true"}
+        wl_inf_bad_tpl["spec"]["podSets"][0]["template"]["metadata"] = {"annotations": {self.ANN_DUR: "0"}}
+        inf_slices = kmr.extract_workload_podset_slices(wl_inf_bad_tpl)
+        self.assertTrue(inf_slices[0].is_infinite)
+        self.assertIsNone(inf_slices[0].cfg_dur_sec)
+
     def test_M2_dynamic_cluster_capacity_timeline_and_timestamp_fallback(self) -> None:
         """M2: Cluster capacity integrates time-varying nodeCapacityTimeline and creation/deletion timestamps."""
         cases = [
@@ -1488,6 +1549,31 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
                         {"epoch": self.T0 + 1800.0, "capacity": {self.TPU: 6.0}},
                         {"epoch": self.T0 + 1800.0, "capacity": {self.TPU: 4.0}},
                         {"epoch": self.T0 + 3605.0, "capacity": {}},
+                    ],
+                    "workloads": [
+                        self._wl(
+                            "w1",
+                            [self._podset("m", 2, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 0), self._cond("Finished", "True", 1800, "Succeeded")],
+                        ),
+                        self._wl(
+                            "w2",
+                            [self._podset("m", 1, {self.TPU: "4"}, dur=1800)],
+                            [self._cond("Admitted", "True", 1800), self._cond("Finished", "True", 3600, "Succeeded")],
+                        ),
+                    ],
+                    "pods": [],
+                },
+                "100.00%",
+                "6",
+            ),
+            (
+                "timeline_initial_entry_within_1ms_rounding_of_start_epoch",
+                {
+                    "nodes": [self._node("n-a", {self.TPU: "4"}), self._node("n-b", {self.TPU: "4"})],
+                    "nodeCapacityTimeline": [
+                        {"epoch": self.T0 + 0.0004, "capacity": {self.TPU: 8.0}},
+                        {"epoch": self.T0 + 1800.0, "capacity": {self.TPU: 4.0}},
                     ],
                     "workloads": [
                         self._wl(
@@ -1793,6 +1879,82 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
         # Only 2 distinct indices (0 and 1) -> stays at 12s / 24s = 50.00%, NOT inflated to 75.00%!
         self.assertEqual(_rows_by_key(rows_hs, 0)[self.TPU][2], "50.00%")
 
+        # 3. Annotation-only batch.kubernetes.io/job-completion-index also deduplicates hot-swap retries.
+        hs_ann_pods = [
+            {
+                "metadata": {
+                    "name": f"hs-ann-{idx}-{suffix}",
+                    "uid": f"hs-ann-{idx}-{suffix}",
+                    "namespace": "ai-lab",
+                    "labels": {"jobset.sigs.k8s.io/jobset-name": "hs", "kueue.x-k8s.io/podset": "workers"},
+                    "annotations": {"batch.kubernetes.io/job-completion-index": str(idx)},
+                },
+                "status": {"phase": "Succeeded", "startTime": self._ts(0)},
+            }
+            for idx, suffix in ((0, "old"), (0, "new"), (1, "orig"))
+        ]
+        rows_hs_ann, _ = kmr.report_effective_uninterrupted_saturation(
+            {"nodes": nodes, "workloads": [wl_hotswap], "pods": hs_ann_pods},
+            self.T0,
+            self.T0 + 24.0,
+        )
+        self.assertEqual(_rows_by_key(rows_hs_ann, 0)[self.TPU][2], "50.00%")
+
+        # 4. Active-at-end uneven Wave 2 & inter-wave gap: parallelism=4, completions=3, min=2 -> admitted 2 (8 TPU),
+        #    per_pod_dur=12s. Wave 1: 2 Succeeded pods [0..12s] = 96 TPU-s; Wave 2: 1 Running pod [12..18s] = 24 TPU-s
+        #    -> exact 120.0 TPU-s (83.33%), NOT 8 * 18 = 144 TPU-s (100.00%).
+        wl_uneven = self._wl(
+            "job-partial-uneven",
+            [self._podset("main", 4, {self.TPU: "4"}, dur=12, min_count=2)],
+            [self._cond("QuotaReserved", "True", 0), self._cond("Admitted", "True", 0)],
+            admission={
+                "clusterQueue": "cq",
+                "podSetAssignments": [{"name": "main", "count": 2, "resourceUsage": {self.TPU: "8"}}],
+            },
+        )
+        wl_uneven["metadata"]["ownerReferences"] = [{"kind": "Job", "name": "partial-uneven"}]
+        for label_w2, w2_start, exp_eff_tpu, exp_eff_pct in (
+            ("uneven_wave2_no_gap", 12, 120.0, "83.33%"),
+            ("uneven_wave2_with_2s_gap", 14, 112.0, "77.78%"),
+        ):
+            with self.subTest(case=label_w2):
+                w2_pods = [
+                    {
+                        "metadata": {
+                            "name": f"partial-uneven-w1-{i}",
+                            "uid": f"u-w1-{i}",
+                            "namespace": "ai-lab",
+                            "labels": {"batch.kubernetes.io/job-name": "partial-uneven", "kueue.x-k8s.io/podset": "main"},
+                        },
+                        "status": {
+                            "phase": "Succeeded",
+                            "startTime": self._ts(0),
+                            "containerStatuses": [{"state": {"terminated": {"finishedAt": self._ts(12)}}}],
+                        },
+                    }
+                    for i in range(2)
+                ] + [
+                    {
+                        "metadata": {
+                            "name": "partial-uneven-w2-0",
+                            "uid": "u-w2-0",
+                            "namespace": "ai-lab",
+                            "labels": {"batch.kubernetes.io/job-name": "partial-uneven", "kueue.x-k8s.io/podset": "main"},
+                        },
+                        "status": {"phase": "Running", "startTime": self._ts(w2_start)},
+                    }
+                ]
+                cls_w2 = kmr.classify_workload_for_saturation(wl_uneven, w2_pods, self.T0, self.T0 + 18.0)
+                self.assertEqual(cls_w2.outcome, "active_at_end")
+                self.assertAlmostEqual(cls_w2.eff_res_sec[self.TPU], exp_eff_tpu)
+                self.assertAlmostEqual(cls_w2.full_res_sec[self.TPU], 144.0)
+                rows_w2, _ = kmr.report_effective_uninterrupted_saturation(
+                    {"nodes": nodes, "workloads": [wl_uneven], "pods": w2_pods},
+                    self.T0,
+                    self.T0 + 18.0,
+                )
+                self.assertEqual(_rows_by_key(rows_w2, 0)[self.TPU][2], exp_eff_pct)
+
     def test_M4_and_S4_classification_seam_table(self) -> None:
         """M4 & S4a-S4c: Pure classify_workload_for_saturation seam handles AdmissionChecks, Pending pods, and re-admission."""
         nodes = [self._node("n0", {self.TPU: "4"}), self._node("n1", {self.TPU: "4"})]
@@ -1844,10 +2006,37 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
                     admission={"clusterQueue": "cq", "podSetAssignments": [{"name": "m", "count": 2}]},
                 ),
                 pending_pods,
-                "pending",
+                "admitted_pending_pods",
                 "0.00%",
                 "active_at_end=0 [0 pods]",
-                "Excluded (preempted/reclaimed/failed): 0 [0 pods] | Unadmitted: 1 [2 pods]",
+                "Excluded (preempted/reclaimed/failed): 0 [0 pods] | Admitted (pending pods): 1 [2 pods] | Unadmitted: 0",
+            ),
+            (
+                "all_pods_succeeded_ignores_late_admitted_false_timestamp",
+                self._wl(
+                    "all-succ-late-admit-false",
+                    [self._podset("m", 2, {self.TPU: "4"}, dur=400)],
+                    [
+                        self._cond("Admitted", "False", 2000, "Finished"),
+                        self._cond("Finished", "True", 400, "Succeeded"),
+                    ],
+                ),
+                [
+                    {
+                        "metadata": {
+                            "name": f"succ-{i}",
+                            "namespace": "ai-lab",
+                            "labels": {"kueue.x-k8s.io/pod-group-name": "all-succ-late-admit-false"},
+                        },
+                        "spec": {"containers": [{"name": "c", "resources": {"requests": {self.TPU: "4"}}}]},
+                        "status": {"phase": "Succeeded", "startTime": self._ts(0)},
+                    }
+                    for i in range(2)
+                ],
+                "completed",
+                "40.00%",
+                "completed=1 [2 pods]",
+                "Excluded (preempted/reclaimed/failed): 0 [0 pods] | Unadmitted: 0",
             ),
             (
                 "evicted_then_readmitted_then_finished",
@@ -1957,7 +2146,9 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
                 scheduled_infra_events=infra_events,
             )
 
-        # 1. Dynamic scenario: Delete n-1, no-op Update n-0 (same allocatable), Add n-2 -> 3 timeline entries.
+        # 1. Dynamic scenario: Delete n-1, taint-only Update n-0 carrying synthetic fallback allocatable
+        #    (cpu=4, mem=16Gi, 0 TPU from _prepare_node_manifest), Add n-2 -> 3 timeline entries (Update ignored!).
+        n0_taint_update_synthetic_fallback = self._node("n-0", {"cpu": "4", "memory": "16Gi", "pods": "110"})
         bundle_dyn = _make_bundle(
             [
                 ScheduledInfraEvent(
@@ -1980,7 +2171,7 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
                     event_type="Update",
                     object_kind="Node",
                     name="n-0",
-                    manifest=n0,
+                    manifest=n0_taint_update_synthetic_fallback,
                 ),
                 ScheduledInfraEvent(
                     target_wall_offset_sec=0.0,

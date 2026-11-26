@@ -135,7 +135,7 @@ class PodSetSlice:
 class WorkloadSaturationClassification:
     """Pure Section 5.4 classification and resource-second contribution for a single Workload."""
 
-    outcome: str  # "out_of_window" | "completed" | "active_at_end" | "excluded_interrupted" | "pending"
+    outcome: str  # "out_of_window" | "completed" | "active_at_end" | "excluded_interrupted" | "admitted_pending_pods" | "pending"
     pod_count: int
     eff_res_sec: dict[str, float] = field(default_factory=dict)
     full_res_sec: dict[str, float] = field(default_factory=dict)
@@ -154,15 +154,15 @@ def _pod_matches_podset(pod: dict, ps_name: str) -> bool:
     )
 
 
-def _distinct_podset_pod_count(
+def _distinct_podset_pods(
     assoc_pods: list[dict],
     ps_name: str,
     *,
     is_single_podset: bool,
     allowed_phases: tuple[str, ...],
-) -> int:
-    """Count distinct pods in `allowed_phases` for one PodSet, deduplicating Indexed hot-swap retries."""
-    seen: set[tuple[str, ...]] = set()
+) -> list[dict]:
+    """Return distinct pods in `allowed_phases` for one PodSet, deduplicating Indexed hot-swap retries."""
+    by_key: dict[tuple[str, ...], dict] = {}
     for pod in assoc_pods:
         if not isinstance(pod, dict):
             continue
@@ -173,7 +173,10 @@ def _distinct_podset_pod_count(
             continue
         p_meta = pod.get("metadata") or {}
         p_labels = p_meta.get("labels") or {}
+        p_anns = p_meta.get("annotations") or {}
         comp_idx = p_labels.get("batch.kubernetes.io/job-completion-index")
+        if comp_idx is None:
+            comp_idx = p_anns.get("batch.kubernetes.io/job-completion-index")
         if comp_idx is not None:
             key = (
                 "idx",
@@ -187,8 +190,26 @@ def _distinct_podset_pod_count(
             )
         else:
             key = ("pod", str(p_meta.get("uid") or p_meta.get("name") or id(pod)))
-        seen.add(key)
-    return len(seen)
+        prev = by_key.get(key)
+        if prev is None or (
+            str((prev.get("status") or {}).get("phase") or "") != "Succeeded" and phase == "Succeeded"
+        ):
+            by_key[key] = pod
+    return list(by_key.values())
+
+
+def _pod_terminated_finish_epoch(pod: dict) -> float | None:
+    p_meta = pod.get("metadata") or {}
+    p_status = pod.get("status") or {}
+    term_fin_epochs: list[float] = []
+    for cs in p_status.get("containerStatuses") or []:
+        if isinstance(cs, dict):
+            t_fin_cs = parse_rfc3339_epoch((((cs.get("state") or {}).get("terminated") or {}).get("finishedAt")))
+            if t_fin_cs is not None:
+                term_fin_epochs.append(t_fin_cs)
+    if term_fin_epochs:
+        return max(term_fin_epochs)
+    return parse_rfc3339_epoch(p_meta.get("deletionTimestamp"))
 
 
 def _wave_adjusted_cfg_dur(
@@ -201,11 +222,13 @@ def _wave_adjusted_cfg_dur(
     """Scale per-pod `cfg_dur_sec` when a PodSet ran multiple sequential completion waves (e.g. partial admission Jobs)."""
     if ps.cfg_dur_sec is None or ps.cfg_dur_sec <= 0.0 or ps.pod_count <= 0 or not assoc_pods:
         return ps.cfg_dur_sec
-    distinct_cnt = _distinct_podset_pod_count(
-        assoc_pods,
-        ps.name,
-        is_single_podset=is_single_podset,
-        allowed_phases=allowed_phases,
+    distinct_cnt = len(
+        _distinct_podset_pods(
+            assoc_pods,
+            ps.name,
+            is_single_podset=is_single_podset,
+            allowed_phases=allowed_phases,
+        )
     )
     if distinct_cnt > ps.pod_count:
         return float(ps.cfg_dur_sec) * (float(distinct_cnt) / float(ps.pod_count))
@@ -269,20 +292,14 @@ def extract_workload_podset_slices(
         tpl = ps.get("template") or {}
         tpl_meta = tpl.get("metadata") or {}
         tpl_anns = tpl_meta.get("annotations") or {}
+        tpl_dur = parse_positive_duration_annotation(
+            tpl_anns, "kueue-optimizer.gke.io/pod-execution-time-seconds"
+        )
         is_ps_inf = (
             str(tpl_anns.get("kueue-optimizer.gke.io/infinite-duration") or "").lower() == "true"
-            or (wl_is_inf and "kueue-optimizer.gke.io/pod-execution-time-seconds" not in tpl_anns)
+            or (wl_is_inf and tpl_dur is None)
         )
-        ps_dur = (
-            None
-            if is_ps_inf
-            else (
-                parse_positive_duration_annotation(
-                    tpl_anns, "kueue-optimizer.gke.io/pod-execution-time-seconds"
-                )
-                or wl_dur
-            )
-        )
+        ps_dur = None if is_ps_inf else (tpl_dur or wl_dur)
 
         ps_res: dict[str, float] = {}
         if eff_count > 0:
@@ -432,31 +449,48 @@ def extract_workload_podset_slices(
                     for rk, total_v in missing_key_totals.items():
                         new_res[rk] = total_v * weight
                 new_dur = s.cfg_dur_sec
-                if new_dur is None and not s.is_infinite:
-                    matched_durs = [
-                        d
-                        for p in valid_pods
-                        if _pod_matches_podset(p, s.name)
-                        for p_anns in ((p.get("metadata") or {}).get("annotations") or {},)
-                        if str(p_anns.get("kueue-optimizer.gke.io/infinite-duration") or "").lower() != "true"
-                        for d in (
-                            parse_positive_duration_annotation(
+                new_is_inf = s.is_infinite
+                if new_dur is None and not new_is_inf:
+                    matched_pods = [p for p in valid_pods if _pod_matches_podset(p, s.name)]
+                    if matched_pods:
+                        matched_durs: list[float] = []
+                        matched_has_inf = False
+                        for p in matched_pods:
+                            p_anns = (p.get("metadata") or {}).get("annotations") or {}
+                            if str(p_anns.get("kueue-optimizer.gke.io/infinite-duration") or "").lower() == "true":
+                                matched_has_inf = True
+                                continue
+                            d = parse_positive_duration_annotation(
                                 p_anns, "kueue-optimizer.gke.io/pod-execution-time-seconds"
-                            ),
-                        )
-                        if d is not None
-                    ]
-                    if matched_durs:
-                        new_dur = max(matched_durs)
-                    elif all_pod_durs and (len(slices) == 1 or len(set(all_pod_durs)) == 1):
-                        new_dur = max(all_pod_durs)
+                            )
+                            if d is not None:
+                                matched_durs.append(d)
+                        if matched_durs:
+                            new_dur = max(matched_durs)
+                        elif matched_has_inf:
+                            new_is_inf = True
+                    elif len(slices) == 1:
+                        if all_pod_durs:
+                            new_dur = max(all_pod_durs)
+                        elif any(
+                            str(((p.get("metadata") or {}).get("annotations") or {}).get("kueue-optimizer.gke.io/infinite-duration") or "").lower()
+                            == "true"
+                            for p in valid_pods
+                        ):
+                            new_is_inf = True
+                    elif (
+                        all_pod_durs
+                        and len(all_pod_durs) == len(valid_pods)
+                        and len(set(all_pod_durs)) == 1
+                    ):
+                        new_dur = all_pod_durs[0]
                 updated_slices.append(
                     PodSetSlice(
                         name=s.name,
                         pod_count=s.pod_count,
                         resources=new_res,
                         cfg_dur_sec=new_dur,
-                        is_infinite=s.is_infinite,
+                        is_infinite=new_is_inf,
                     )
                 )
             slices = updated_slices
@@ -524,10 +558,12 @@ class _SaturationAccumulator:
     cnt_completed: int = 0
     cnt_active_end: int = 0
     cnt_excluded_interrupted: int = 0
+    cnt_admitted_pending_pods: int = 0
     cnt_pending: int = 0
     pods_completed: int = 0
     pods_active_end: int = 0
     pods_excluded_interrupted: int = 0
+    pods_admitted_pending_pods: int = 0
     pods_pending: int = 0
     cnt_infra_completed: int = 0
     cnt_infra_active: int = 0
@@ -598,6 +634,10 @@ def _integrate_cluster_capacity(
         while idx < len(parsed_timeline) and parsed_timeline[idx][0] <= start_f:
             cur_cap = parsed_timeline[idx][1]
             idx += 1
+        if idx == 0 and parsed_timeline[0][0] <= start_f + 1e-3:
+            # Compensate for 3-decimal --start-epoch CLI formatting rounding down by up to 0.5ms.
+            cur_cap = parsed_timeline[0][1]
+            idx = 1
         prev_t = start_f
         while idx < len(parsed_timeline) and parsed_timeline[idx][0] < end_f:
             next_t, next_cap = parsed_timeline[idx]
@@ -712,7 +752,7 @@ def classify_workload_for_saturation(
     requeue_cnt = int(((st.get("requeueState") or {}).get("count")) or 0)
 
     t_admit = (
-        parse_rfc3339_epoch((c_admitted or {}).get("lastTransitionTime"))
+        (parse_rfc3339_epoch((c_admitted or {}).get("lastTransitionTime")) if is_admitted_true else None)
         or (min(pod_start_epochs) if pod_start_epochs else None)
         or (parse_rfc3339_epoch((c_quota or {}).get("lastTransitionTime")) if is_admitted_true else None)
         or parse_rfc3339_epoch(meta.get("creationTimestamp"))
@@ -786,18 +826,59 @@ def classify_workload_for_saturation(
         for ps in slices:
             if not ps.resources:
                 continue
-            ps_cfg_dur = _wave_adjusted_cfg_dur(
-                ps, pods, is_single_podset=is_single_ps, allowed_phases=("Running", "Succeeded")
+            distinct_active_pods = (
+                _distinct_podset_pods(
+                    pods,
+                    ps.name,
+                    is_single_podset=is_single_ps,
+                    allowed_phases=("Running", "Succeeded"),
+                )
+                if ps.pod_count > 0 and pods
+                else []
             )
-            if ps_cfg_dur is not None and ps_cfg_dur > 0.0:
-                d_eff = min(float(ps_cfg_dur), elapsed_uninterrupted)
-                d_full = float(ps_cfg_dur)
+            if len(distinct_active_pods) > ps.pod_count > 0:
+                # Multi-wave PodSet actively executing a later wave: sum per-pod contributions so
+                # uneven final waves, in-progress pods, and inter-wave gaps are never over-credited.
+                per_pod_res = {rk: rv / float(ps.pod_count) for rk, rv in ps.resources.items()}
+                for pod in distinct_active_pods:
+                    p_meta = pod.get("metadata") or {}
+                    p_status = pod.get("status") or {}
+                    p_phase = str(p_status.get("phase") or "")
+                    pod_start = (
+                        parse_rfc3339_epoch(p_status.get("startTime"))
+                        or parse_rfc3339_epoch(p_meta.get("creationTimestamp"))
+                        or t_admit
+                    )
+                    if p_phase == "Succeeded":
+                        pod_fin = _pod_terminated_finish_epoch(pod)
+                        t_pfin = pod_fin if pod_fin is not None else float(end_epoch)
+                        d_eff_pod, d_full_pod = completed_effective_duration(
+                            pod_start, t_pfin, start_epoch, end_epoch, ps.cfg_dur_sec
+                        )
+                    elif pod_start < float(end_epoch):
+                        eff_pod_start = max(float(start_epoch), min(float(pod_start), float(end_epoch)))
+                        pod_elapsed = max(0.0, float(end_epoch) - eff_pod_start)
+                        if ps.cfg_dur_sec is not None and ps.cfg_dur_sec > 0.0:
+                            d_eff_pod = min(float(ps.cfg_dur_sec), pod_elapsed)
+                            d_full_pod = float(ps.cfg_dur_sec)
+                        else:
+                            d_eff_pod = pod_elapsed
+                            d_full_pod = pod_elapsed
+                    else:
+                        continue
+                    for rk, r_amt in per_pod_res.items():
+                        eff_res_sec[rk] = eff_res_sec.get(rk, 0.0) + r_amt * d_eff_pod
+                        full_res_sec[rk] = full_res_sec.get(rk, 0.0) + r_amt * d_full_pod
             else:
-                d_eff = elapsed_uninterrupted
-                d_full = elapsed_uninterrupted
-            for rk, r_amt in ps.resources.items():
-                eff_res_sec[rk] = eff_res_sec.get(rk, 0.0) + r_amt * d_eff
-                full_res_sec[rk] = full_res_sec.get(rk, 0.0) + r_amt * d_full
+                if ps.cfg_dur_sec is not None and ps.cfg_dur_sec > 0.0:
+                    d_eff = min(float(ps.cfg_dur_sec), elapsed_uninterrupted)
+                    d_full = float(ps.cfg_dur_sec)
+                else:
+                    d_eff = elapsed_uninterrupted
+                    d_full = elapsed_uninterrupted
+                for rk, r_amt in ps.resources.items():
+                    eff_res_sec[rk] = eff_res_sec.get(rk, 0.0) + r_amt * d_eff
+                    full_res_sec[rk] = full_res_sec.get(rk, 0.0) + r_amt * d_full
         return WorkloadSaturationClassification(
             outcome="active_at_end",
             pod_count=wl_pod_count,
@@ -805,7 +886,7 @@ def classify_workload_for_saturation(
             full_res_sec=full_res_sec,
         )
 
-    # Case 3: Interrupted by preemption/reclaim/eviction/failure vs unadmitted/pending
+    # Case 3: Interrupted by preemption/reclaim/eviction/failure vs admitted-with-pending-pods vs unadmitted
     is_resubmitted_t0_preemption = str(
         (meta.get("annotations") or {}).get("kueue-optimizer.gke.io/preempted-t0-resubmit") or ""
     ).lower() == "true" or any(
@@ -827,8 +908,14 @@ def classify_workload_for_saturation(
         or requeue_cnt > 0
         or is_resubmitted_t0_preemption
     )
+    if was_interrupted:
+        outcome = "excluded_interrupted"
+    elif is_admitted_true and not has_active_pods:
+        outcome = "admitted_pending_pods"
+    else:
+        outcome = "pending"
     return WorkloadSaturationClassification(
-        outcome="excluded_interrupted" if was_interrupted else "pending",
+        outcome=outcome,
         pod_count=wl_pod_count,
     )
 
@@ -911,6 +998,9 @@ def _accumulate_kueue_workloads(
         elif result.outcome == "excluded_interrupted":
             acc.cnt_excluded_interrupted += 1
             acc.pods_excluded_interrupted += result.pod_count
+        elif result.outcome == "admitted_pending_pods":
+            acc.cnt_admitted_pending_pods += 1
+            acc.pods_admitted_pending_pods += result.pod_count
         else:
             acc.cnt_pending += 1
             acc.pods_pending += result.pod_count
@@ -950,13 +1040,7 @@ def _accumulate_infra_pods(
             or parse_rfc3339_epoch(p_meta.get("creationTimestamp"))
             or float(start_epoch)
         )
-        term_fin_epochs: list[float] = []
-        for cs in p_status.get("containerStatuses") or []:
-            if isinstance(cs, dict):
-                t_fin_cs = parse_rfc3339_epoch((((cs.get("state") or {}).get("terminated") or {}).get("finishedAt")))
-                if t_fin_cs is not None:
-                    term_fin_epochs.append(t_fin_cs)
-        t_pod_fin = max(term_fin_epochs) if term_fin_epochs else parse_rfc3339_epoch(p_meta.get("deletionTimestamp"))
+        t_pod_fin = _pod_terminated_finish_epoch(pod)
 
         if phase == "Succeeded":
             if (t_pod_fin is not None and t_pod_fin <= float(start_epoch)) or t_start >= float(end_epoch):
@@ -1030,6 +1114,11 @@ def _format_saturation_report(
         if (acc.cnt_infra_completed + acc.cnt_infra_active) > 0
         else ""
     )
+    admitted_pending_part = (
+        f" | Admitted (pending pods): {acc.cnt_admitted_pending_pods} [{acc.pods_admitted_pending_pods} pods]"
+        if acc.cnt_admitted_pending_pods > 0
+        else ""
+    )
     unadmitted_str = (
         f"{acc.cnt_pending} [{acc.pods_pending} pods]"
         if acc.cnt_pending > 0 and acc.pods_pending > 0
@@ -1040,7 +1129,8 @@ def _format_saturation_report(
         f"Qualifying Workloads: {acc.cnt_completed + acc.cnt_active_end} "
         f"(completed={acc.cnt_completed} [{acc.pods_completed} pods], "
         f"active_at_end={acc.cnt_active_end} [{acc.pods_active_end} pods]){infra_part} | "
-        f"Excluded (preempted/reclaimed/failed): {acc.cnt_excluded_interrupted} [{acc.pods_excluded_interrupted} pods] | "
+        f"Excluded (preempted/reclaimed/failed): {acc.cnt_excluded_interrupted} [{acc.pods_excluded_interrupted} pods]"
+        f"{admitted_pending_part} | "
         f"Unadmitted: {unadmitted_str}"
     )
     return rows, subtitle

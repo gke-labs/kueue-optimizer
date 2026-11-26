@@ -2157,7 +2157,7 @@ def run_scenario_replay(
                         if ie.event_type == "Deleted":
                             if live_node_alloc.pop(ie.name, None) is not None:
                                 _record_node_capacity_snapshot(time.time())
-                        elif ie.event_type in ("New", "Update") and isinstance(ie.manifest, dict):
+                        elif ie.event_type == "New" and isinstance(ie.manifest, dict):
                             new_alloc = _extract_node_alloc(ie.manifest)
                             if new_alloc and new_alloc != live_node_alloc.get(ie.name):
                                 live_node_alloc[ie.name] = new_alloc
