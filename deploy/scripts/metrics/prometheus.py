@@ -40,17 +40,19 @@ def compute_effective_step(
 ) -> float:
     """Return a query_range step >= requested_step keeping point count <= max_points.
 
-    Prometheus rejects /api/v1/query_range requests exceeding 11,000 points per series with HTTP 400.
-    Keeping the effective step within 10,000 points leaves headroom while keeping step=1.0s
+    Prometheus returns ``floor((end - start) / step) + 1`` points (inclusive endpoints) and
+    rejects ``/api/v1/query_range`` requests exceeding 11,000 points per series with HTTP 400.
+    Keeping the effective step within 10,000 points leaves headroom while keeping ``step=1.0s``
     unchanged for runs up to ~2.7 hours.
     """
     base_step = requested_step if requested_step > 0 else 1.0
     span = max(0.0, query_end - range_start)
     if max_points <= 0 or span <= 0.0:
         return base_step
-    if span / base_step <= max_points:
+    max_intervals = max(1, max_points - 1)
+    if int(math.floor(span / base_step + 1e-9)) + 1 <= max_points:
         return base_step
-    return max(base_step, float(math.ceil(span / float(max_points))))
+    return max(base_step, float(math.ceil(span / float(max_intervals))))
 
 
 class PrometheusClient:

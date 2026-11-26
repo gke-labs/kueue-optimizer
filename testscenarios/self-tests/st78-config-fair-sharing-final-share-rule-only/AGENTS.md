@@ -111,7 +111,7 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 ### Detailed Metric Checkpoints
 
 - `Section 5.3 (Total Evictions & Preemptions)`: Exact **`2` `FairSharing` preemptions** (`Total Evictions = 2`, `Unique workloads evicted once = 2`, `0` `p-beta-large` evictions — strictly between `0` in `st77` and `3` in `st76`!).
-- `Section 5.2 (Wait Time)`: `p-alpha` shows bimodal wait — `2` jobs `< 2.5s` and `2` jobs `~19s` (**`AVG ≈ 9s–12s`, `P50 <= 2.5s`, `P90 ≈ 18s–25s`**); `p-beta-large` has `WORKLOADS = 1` (`AVG < 1.5s`).
+- `Section 5.2 (Wait Time)`: `p-alpha` shows bimodal wait — `2` jobs `< 2.5s` and `2` jobs `~19s` (**`AVG ≈ 9s–12s`, `P50 <= 2.5s`, `P90 ≈ 18s–25s`**); `p-beta-large` has `ADMISSIONS = 1` (`AVG < 1.5s`).
 - `cluster-scraper`: Preserves `preemptionStrategies: ['LessThanOrEqualToFinalShare']` in `infra.json`.
 
 ### Hard Failure Invariants (What Definitely MUST NOT Happen)

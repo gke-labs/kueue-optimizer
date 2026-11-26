@@ -407,7 +407,7 @@ def build_hashing_5_scenarios(
                     expected_behavior="Loader matches every hashed `JobSet` to its independent hashed `workloadName` via `ownerName`, replays 2 waves of 4 `JobSet`s (`0..10s`, `10..20s`) identically to `st92`, and preserves plaintext queue/priority names in Prometheus metrics.",
                     expected_metrics=[
                         "`Section 5.1`: `AVG ~95%–100%` (`16/16` TPUs across 2 waves).",
-                        "`Section 5.2`: `p-std` `WORKLOADS=8`, Wave 1 `~0s–1s`, Wave 2 `~10s–11s`, `AVG ~5.0s–6.5s`.",
+                        "`Section 5.2`: `p-std` `ADMISSIONS=8`, Wave 1 `~0s–1s`, Wave 2 `~10s–11s`, `AVG ~5.0s–6.5s`.",
                         "`Section 5.3`: **`0`** evictions.",
                         "`Section 5.4`: `Qualifying Workloads: 8 (completed=8)`, `EFFECTIVE SAT ~90%–100%` (matching `st92`).",
                     ],
@@ -437,7 +437,7 @@ def build_hashing_5_scenarios(
                     expected_behavior="Replays identically to `st91` (`2` waves, `~20s`). When run with `--scrape-output-dir /tmp/st92-scraped --scrape-hash-names`, `cluster-scraper` must replace every `batch-train-*` name and sensitive label value with deterministic `h-<32hex>` digests.",
                     expected_metrics=[
                         "`Section 5.1`: `AVG ~95%–100%` (matches `st91`).",
-                        "`Section 5.2`: `p-std` `WORKLOADS=8`, `AVG ~5.0s–6.5s` (matches `st91`).",
+                        "`Section 5.2`: `p-std` `ADMISSIONS=8`, `AVG ~5.0s–6.5s` (matches `st91`).",
                         "`Section 5.3`: **`0`** evictions (matches `st91`).",
                         "`Section 5.4`: `Qualifying Workloads: 8 (completed=8)`, `EFFECTIVE SAT ~90%–100%` (matches `st91`).",
                     ],
@@ -563,7 +563,7 @@ def build_hashing_5_scenarios(
             expected_metrics=[
                 "`Pre-Run Outline`: `Initial Kueue Workloads: 2 (2 pods)`, `Initial Infra Pods: 2`.",
                 "`Section 5.1`: `AVG ~75%–95%` (`12/12` TPUs during `t=2..10s`).",
-                "`Section 5.2`: `p-std` `WORKLOADS=2` (post-`t0`), job 0 `wait < 2s`, job 1 `wait ~10s`, `AVG ~5s`.",
+                "`Section 5.2`: `p-std` `ADMISSIONS=2` (post-`t0`), job 0 `wait < 2s`, job 1 `wait ~10s`, `AVG ~5s`.",
                 "`Section 5.3`: **`0`** evictions.",
                 "`Section 5.4`: `4` Kueue completed workloads + `2` `Initial Infra Pods` (`active_at_end`), `0` double-counted pods.",
             ],

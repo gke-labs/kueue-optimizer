@@ -94,7 +94,7 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 
 - `Pre-Run Outline`: `Initial Kueue Workloads: 2 (2 pods)`, `Initial Infra Pods: 2`.
 - `Section 5.1`: `AVG ~75%–95%` (`12/12` TPUs during `t=2..10s`).
-- `Section 5.2`: `p-std` `WORKLOADS=2` (post-`t0`), job 0 `wait < 2s`, job 1 `wait ~10s`, `AVG ~5s`.
+- `Section 5.2`: `p-std` `ADMISSIONS=2` (post-`t0`), job 0 `wait < 2s`, job 1 `wait ~10s`, `AVG ~5s`.
 - `Section 5.3`: **`0`** evictions.
 - `Section 5.4`: `4` Kueue completed workloads + `2` `Initial Infra Pods` (`active_at_end`), `0` double-counted pods.
 

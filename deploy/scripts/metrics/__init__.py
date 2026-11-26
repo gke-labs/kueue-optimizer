@@ -16,6 +16,7 @@
 
 from metrics.aggregations import (
     compute_histogram_deltas_by_group,
+    extract_observed_gauge_timestamps,
     report_aggregated_evictions_and_reclaims,
     report_aggregated_quota_utilization,
     report_aggregated_wait_time_by_priority,
@@ -70,6 +71,7 @@ __all__ = [
     "compute_effective_step",
     "compute_histogram_deltas_by_group",
     "counter_series_total_increase",
+    "extract_observed_gauge_timestamps",
     "extract_workload_podset_slices",
     "extract_workload_resource_size_and_cfg_duration",
     "format_labels",

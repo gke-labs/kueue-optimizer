@@ -2320,6 +2320,7 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 [(lab_leader, [30.0] * 40)],
                 ("30.00s", "38.00s", "40.00s", "30.00s", "40", "<=40s:40"),
                 ["high", "30.00s", "38.00s", "39.80s", "30.00s", "40"],
+                True,
             ),
             (
                 "partial_reset_only_low_bucket_decreases",
@@ -2327,6 +2328,7 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 [(lab_leader, [3.0] * 60 + [30.0] * 60)],
                 ("5.00s", "36.00s", "40.00s", "16.50s", "120", "<=5s:60, <=40s:60"),
                 ["high", "5.00s", "36.00s", "39.60s", "16.50s", "120"],
+                True,
             ),
             (
                 "ha_leader_restarts_while_follower_is_monotonic",
@@ -2334,18 +2336,33 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 [(lab_leader, [30.0] * 10), (lab_follower, [3.0] * 30)],
                 ("5.00s", "36.00s", "40.00s", "16.50s", "20", "<=5s:10, <=40s:10"),
                 ["high", "5.00s", "36.00s", "39.60s", "16.50s", "20"],
+                True,
+            ),
+            (
+                "monotonic_no_reset_emits_no_warning",
+                [(lab_leader, [3.0] * 10)],
+                [(lab_leader, [3.0] * 10 + [30.0] * 10)],
+                ("30.00s", "38.00s", "40.00s", "30.00s", "10", "<=40s:10"),
+                ["high", "30.00s", "38.00s", "39.80s", "30.00s", "10"],
+                False,
             ),
         ]
-        for case_name, start_series, end_series, expected_s3, expected_s52 in cases:
+        for case_name, start_series, end_series, expected_s3, expected_s52, expect_warn in cases:
             with self.subTest(case=case_name):
                 start_by = self._build_wait_histogram_snapshot(start_series, ts=999.0)
                 end_by = self._build_wait_histogram_snapshot(end_series, ts=2000.0)
-                s3_rows = kmr.report_histogram(end_by, start_by, spec)
+                s3_warns: list[str] = []
+                s3_rows = kmr.report_histogram(end_by, start_by, spec, reset_warnings=s3_warns)
                 self.assertEqual(len(s3_rows), 1)
                 self.assertEqual(s3_rows[0][1:], expected_s3)
+                self.assertEqual(bool(s3_warns), expect_warn)
 
-                s52_rows = kmr.report_aggregated_wait_time_by_priority(end_by, start_by)
+                s52_warns: list[str] = []
+                s52_rows = kmr.report_aggregated_wait_time_by_priority(
+                    end_by, start_by, reset_warnings=s52_warns
+                )
                 self.assertEqual(s52_rows, [expected_s52])
+                self.assertEqual(bool(s52_warns), expect_warn)
 
     def test_M6_section_5_3_exact_reclaim_classification_and_configurable_preemption(self) -> None:
         """M6: Exact reclaim matching avoids substring false positives and accounts for ConfigurablePreemption."""
@@ -2428,6 +2445,30 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 },
                 ("0", "2", "InCohortReclamation=0, InCohortReclaimWhileBorrowing=2", "6",
                  "InClusterQueue=0, Reclaims=2, FairSharing=3, CustomRuleReason=1"),
+            ),
+            (
+                "split_reclaim_reasons_across_preempted_and_evicted_match_detail_sum",
+                {
+                    "kueue_evicted_workloads_total": [
+                        {
+                            "metric": {
+                                "cluster_queue": "cq-a",
+                                "reason": "Preempted",
+                                "underlying_cause": "InCohortReclaimWhileBorrowing",
+                                "priority_class": "low",
+                            },
+                            "values": [[1000.0, "0"], [1050.0, "2"]],
+                        }
+                    ],
+                    "kueue_preempted_workloads_total": [
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-b", "reason": "InCohortReclamation"},
+                            "values": [[1000.0, "0"], [1050.0, "3"]],
+                        }
+                    ],
+                },
+                ("2", "5", "InCohortReclamation=3, InCohortReclaimWhileBorrowing=2", "3",
+                 "InClusterQueue=0, Reclaims=3, FairSharing=0"),
             ),
         ]
         for case_name, rng, expected in cases:
@@ -2531,10 +2572,10 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                     self.assertEqual(by_scope[scope][6], exp_uq)
 
     def test_M9_report_gauge_zero_fills_deleted_at_zero_series_with_step(self) -> None:
-        """M9: Gauge averaging zero-fills absent grid steps when end+step are known without affecting static gauges."""
+        """M9: Gauge averaging anchors to observed scrapes, merges restarts, handles missing __name__, and uses inclusive grid."""
         cases = [
             (
-                "deleted_at_zero_cohort_reservations_over_60s_run",
+                "deleted_at_zero_cohort_reservations_inclusive_61_steps_fallback",
                 [
                     {
                         "metric": {
@@ -2549,10 +2590,52 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 1000.0,
                 1060.0,
                 1.0,
-                ("0.00", "8.00", "8.00", "1.33"),
+                "",
+                None,
+                ("0.00", "8.00", "8.00", "1.31"),
             ),
             (
-                "phase_shifted_full_series_adds_no_spurious_zeros",
+                "anchored_to_observed_scrapes_avoids_pre_first_scrape_startup_bias",
+                [
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                        },
+                        "values": [[1007.0 + i, "8"] for i in range(24)],
+                    }
+                ],
+                1000.0,
+                1030.0,
+                1.0,
+                "kueue_cohort_subtree_resource_reservations",
+                {1007.0 + i for i in range(24)},
+                ("8.00", "8.00", "8.00", "8.00"),
+            ),
+            (
+                "anchored_to_observed_scrapes_zero_fills_only_post_deletion_scrapes",
+                [
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                        },
+                        "values": [[1007.0 + i, "8"] for i in range(12)],
+                    }
+                ],
+                1000.0,
+                1030.0,
+                1.0,
+                "kueue_cohort_subtree_resource_reservations",
+                {1007.0 + i for i in range(24)},
+                ("4.00", "8.00", "8.00", "4.00"),
+            ),
+            (
+                "phase_shifted_full_series_anchored_adds_no_spurious_zeros",
                 [
                     {
                         "metric": {
@@ -2567,14 +2650,46 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 1000.0,
                 1060.0,
                 4.0,
+                "kueue_cohort_subtree_resource_reservations",
+                {1002.0 + 4.0 * i for i in range(15)},
                 ("8.00", "8.00", "8.00", "8.00"),
             ),
             (
-                "static_status_gauge_not_zero_filled_before_first_scrape",
+                "controller_pod_restart_merges_two_instances_into_single_continuous_row",
                 [
                     {
                         "metric": {
-                            "__name__": "kueue_cluster_queue_status",
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                            "instance": "kueue-0:8443",
+                        },
+                        "values": [[1007.0 + i, "8"] for i in range(12)],
+                    },
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                            "instance": "kueue-1:8443",
+                        },
+                        "values": [[1019.0 + i, "8"] for i in range(12)],
+                    },
+                ],
+                1000.0,
+                1030.0,
+                1.0,
+                "kueue_cohort_subtree_resource_reservations",
+                {1007.0 + i for i in range(24)},
+                ("8.00", "8.00", "8.00", "8.00"),
+            ),
+            (
+                "static_status_gauge_without_dunder_name_uses_metric_name_arg",
+                [
+                    {
+                        "metric": {
                             "cluster_queue": "cq-a",
                             "status": "active",
                         },
@@ -2584,6 +2699,8 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 1000.0,
                 1060.0,
                 1.0,
+                "kueue_cluster_queue_status",
+                {1000.0 + i for i in range(61)},
                 ("1.00", "1.00", "1.00", "1.00"),
             ),
             (
@@ -2602,31 +2719,57 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 1000.0,
                 1060.0,
                 None,
+                "",
+                None,
                 ("8.00", "8.00", "8.00", "8.00"),
             ),
         ]
-        for case_name, series, start, end, step, expected_stats in cases:
+        for case_name, series, start, end, step, mname, obs_ts, expected_stats in cases:
             with self.subTest(case=case_name):
-                rows = kmr.report_gauge(series, start, end=end, step=step)
+                rows = kmr.report_gauge(
+                    series,
+                    start,
+                    end=end,
+                    step=step,
+                    metric_name=mname,
+                    observed_timestamps=obs_ts,
+                )
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0][1:], expected_stats)
 
+        # Verify extract_observed_gauge_timestamps anchors on always-emitted Kueue gauges in [start, end]
+        anchor_ts = kmr.extract_observed_gauge_timestamps(
+            {
+                "kueue_build_info": [{"metric": {}, "values": [[995.0, "1"], [1007.0, "1"], [1017.0, "1"], [1035.0, "1"]]}],
+                "kueue_cohort_subtree_resource_reservations": [{"metric": {}, "values": [[1007.0, "8"]]}],
+            },
+            start=1000.0,
+            end=1030.0,
+        )
+        self.assertEqual(anchor_ts, {1007.0, 1017.0})
+
     def test_M8_and_M10_cli_admissions_header_and_long_run_step_auto_scaling(self) -> None:
-        """M8 & M10: compute_effective_step, CLI >3h query_range auto-scaling, ADMISSIONS header, and lifecycle step."""
+        """M8 & M10: inclusive compute_effective_step, CLI >3h auto-scaling, dynamic counter header, reset warning, and lifecycle."""
         step_cases = [
-            ("short_60s", 970.0, 1070.0, 1.0, 1.0),
-            ("exact_10000s_boundary", 0.0, 10000.0, 1.0, 1.0),
-            ("just_over_3h", 970.0, 12410.0, 1.0, 2.0),
-            ("six_hours", 970.0, 22610.0, 1.0, 3.0),
-            ("twenty_four_hours", 970.0, 87410.0, 1.0, 9.0),
-            ("preserves_coarser_requested_step", 970.0, 22610.0, 5.0, 5.0),
-            ("bumps_sub_second_step_when_exceeding_cap", 970.0, 8210.0, 0.5, 1.0),
+            ("short_60s", 970.0, 1070.0, 1.0, 10_000, 1.0),
+            ("exact_10000_points_boundary", 0.0, 9999.0, 1.0, 10_000, 1.0),
+            ("just_over_10000_points_boundary", 0.0, 10000.0, 1.0, 10_000, 2.0),
+            ("exact_11000_cap_needs_step_2_at_11000s", 0.0, 11000.0, 1.0, 11_000, 2.0),
+            ("just_over_3h", 970.0, 12410.0, 1.0, 10_000, 2.0),
+            ("six_hours", 970.0, 22610.0, 1.0, 10_000, 3.0),
+            ("twenty_four_hours", 970.0, 87410.0, 1.0, 10_000, 9.0),
+            ("preserves_coarser_requested_step", 970.0, 22610.0, 5.0, 10_000, 5.0),
+            ("bumps_sub_second_step_when_exceeding_cap", 970.0, 8210.0, 0.5, 10_000, 1.0),
         ]
-        for case_name, r_start, q_end, req_step, exp_step in step_cases:
+        for case_name, r_start, q_end, req_step, max_pts, exp_step in step_cases:
             with self.subTest(step_case=case_name):
-                self.assertEqual(kmr.compute_effective_step(r_start, q_end, req_step), exp_step)
+                got = kmr.compute_effective_step(r_start, q_end, req_step, max_points=max_pts)
+                self.assertEqual(got, exp_step)
+                pts = int(math.floor((q_end - r_start) / got + 1e-9)) + 1
+                self.assertLessEqual(pts, max_pts)
 
         observed_steps: list[float] = []
+        simulate_hist_reset = {"enabled": False}
 
         class _StubPromHandler(BaseHTTPRequestHandler):
             def log_message(self, *_args):
@@ -2645,7 +2788,7 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                     q_end = float(qs["end"][0])
                     q_step = float(qs["step"][0])
                     observed_steps.append(q_step)
-                    if (q_end - q_start) / q_step > 11000:
+                    if int(math.floor((q_end - q_start) / q_step + 1e-9)) + 1 > 11000:
                         body = json.dumps({
                             "status": "error",
                             "errorType": "bad_data",
@@ -2655,7 +2798,17 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                         self.end_headers()
                         self.wfile.write(body)
                         return
-                    body = json.dumps({"status": "success", "data": {"resultType": "matrix", "result": []}}).encode()
+                    matrix_res = [
+                        {
+                            "metric": {
+                                "__name__": "kueue_admitted_workloads_total",
+                                "cluster_queue": "cq-a",
+                                "priority_class": "high",
+                            },
+                            "values": [[q_start, "0"], [q_end, "3"]],
+                        }
+                    ]
+                    body = json.dumps({"status": "success", "data": {"resultType": "matrix", "result": matrix_res}}).encode()
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(body)
@@ -2700,6 +2853,43 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                                 "value": [eval_ts, "3"],
                             },
                         ]
+                    elif simulate_hist_reset["enabled"]:
+                        res = [
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_bucket",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                    "le": "10",
+                                },
+                                "value": [eval_ts, "10"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_bucket",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                    "le": "+Inf",
+                                },
+                                "value": [eval_ts, "10"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_sum",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                },
+                                "value": [eval_ts, "50.0"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_count",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                },
+                                "value": [eval_ts, "10"],
+                            },
+                        ]
                     body = json.dumps({"status": "success", "data": {"resultType": "vector", "result": res}}).encode()
                     self.send_response(200)
                     self.end_headers()
@@ -2716,9 +2906,14 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                 json.dump(snap, tf)
                 snap_path = tf.name
             try:
-                for dur, exp_step in ((3 * 3600, 2.0), (3 * 3600 + 600, 2.0), (6 * 3600, 3.0)):
-                    with self.subTest(cli_duration=dur):
+                for dur, exp_step, exp_win_lbl, do_reset in (
+                    (3 * 3600, 2.0, "30s", False),
+                    (6 * 3600, 3.0, "30s", True),
+                    (4 * 86400, 35.0, "35s", False),
+                ):
+                    with self.subTest(cli_duration=dur, hist_reset=do_reset):
                         observed_steps.clear()
+                        simulate_hist_reset["enabled"] = do_reset
                         start = 1700000000.0
                         argv = [
                             "kueue_metrics_report.py",
@@ -2737,24 +2932,35 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                         out = buf.getvalue()
                         self.assertEqual(rc, 0)
                         self.assertEqual(observed_steps, [exp_step])
+                        self.assertIn(f"Note: Auto-scaled query step from 1s to {exp_step:g}s", out)
                         self.assertIn("=== 1. Kueue Gauge Metrics", out)
+                        self.assertIn(f"AVG of {exp_win_lbl}-window increase", out)
+                        self.assertIn(f"P50({exp_win_lbl})", out)
                         self.assertIn("=== 5.4 Effective Uninterrupted Cluster Saturation", out)
+                        sec3_block = out.split("=== 3. Kueue Histogram Metrics")[1].split("=== 4.")[0]
                         sec52_block = out.split("=== 5.2 Wait Time Across All ClusterQueues")[1].split("=== 5.3")[0]
                         self.assertIn("ADMISSIONS", sec52_block)
                         self.assertNotIn("WORKLOADS", sec52_block)
                         self.assertIn("re-admissions after preemption/eviction", sec52_block)
+                        if do_reset:
+                            self.assertIn("WARNING: Counter reset detected", sec3_block)
+                            self.assertIn("WARNING: Counter reset detected", sec52_block)
+                        else:
+                            self.assertNotIn("WARNING: Counter reset detected", sec3_block)
+                            self.assertNotIn("WARNING: Counter reset detected", sec52_block)
             finally:
                 os.unlink(snap_path)
         finally:
             srv.shutdown()
             srv.server_close()
 
-        # Also verify ChamberManager.run_kueue_metrics_report passes auto-scaled --step to subprocess.run
+        # Verify ChamberManager.run_kueue_metrics_report omits --step so kueue_metrics_report.py
+        # performs auto-scaling in a single place and prints the auto-scale notice.
         from chamber.lifecycle import ChamberManager
 
         mgr = ChamberManager("kueue-optimizer-chamber-step-test")
         try:
-            for dur, exp_step_arg in ((60.0, "1"), (6 * 3600.0, "3")):
+            for dur in (60.0, 6 * 3600.0):
                 with self.subTest(lifecycle_duration=dur):
                     with (
                         patch.object(mgr, "capture_cluster_saturation_snapshot", return_value=None),
@@ -2771,8 +2977,7 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                         )
                     m_run.assert_called_once()
                     cmd = m_run.call_args.args[0]
-                    step_idx = cmd.index("--step")
-                    self.assertEqual(cmd[step_idx + 1], exp_step_arg)
+                    self.assertNotIn("--step", cmd)
         finally:
             mgr.close()
 

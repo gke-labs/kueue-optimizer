@@ -368,7 +368,7 @@ def build_kueue_config_5_scenarios(
             expected_behavior="At `t=5s`, `js-alpha-0` (`0.125 <= 0.875`) and `js-alpha-1` (`0.25 <= 0.75`) satisfy `LessThanOrEqualToFinalShare` and evict `js-beta-small-0/1` (`2` evictions, `2` `p-alpha` jobs start in `< 2s` and hold `8` TPUs until `t=25.5s`). `js-alpha-2/3` (`0.375 > TargetNewShare=0.00`) fail `LessThanOrEqualToFinalShare`, and because `LessThanInitialShare` is disabled in `Configuration`, `js-beta-large-0` (`24` TPUs) runs uninterrupted to `t=24s` (`0` `p-beta-large` evictions) while `js-alpha-2/3` wait `~19s`.",
             expected_metrics=[
                 "`Section 5.3 (Total Evictions & Preemptions)`: Exact **`2` `FairSharing` preemptions** (`Total Evictions = 2`, `Unique workloads evicted once = 2`, `0` `p-beta-large` evictions — strictly between `0` in `st77` and `3` in `st76`!).",
-                "`Section 5.2 (Wait Time)`: `p-alpha` shows bimodal wait — `2` jobs `< 2.5s` and `2` jobs `~19s` (**`AVG ≈ 9s–12s`, `P50 <= 2.5s`, `P90 ≈ 18s–25s`**); `p-beta-large` has `WORKLOADS = 1` (`AVG < 1.5s`).",
+                "`Section 5.2 (Wait Time)`: `p-alpha` shows bimodal wait — `2` jobs `< 2.5s` and `2` jobs `~19s` (**`AVG ≈ 9s–12s`, `P50 <= 2.5s`, `P90 ≈ 18s–25s`**); `p-beta-large` has `ADMISSIONS = 1` (`AVG < 1.5s`).",
                 "`cluster-scraper`: Preserves `preemptionStrategies: ['LessThanOrEqualToFinalShare']` in `infra.json`.",
             ],
             must_not_happen=[

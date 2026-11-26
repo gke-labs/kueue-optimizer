@@ -4304,7 +4304,7 @@ def generate_master_readme(scenarios: list[ScenarioSpec]) -> str:
         "3. **Prometheus metric scraping & catalog coverage** in [`deploy/scripts/kueue_metrics_report.py`](../../deploy/scripts/kueue_metrics_report.py) (Sections `1`–`4`).",
         "4. **All four high-level aggregations** in `AGGREGATED KUEUE METRICS SUMMARY`:",
         "   - **Section `5.1`**: ClusterQueue & Cohort Quota Utilization per Resource Type (`P50`, `P90`, `P99`, `AVG`, `AVG USED / QUOTA`)",
-        "   - **Section `5.2`**: Wait Time Across All ClusterQueues per Workload Priority (`P50`, `P90`, `P99`, `AVG`, `WORKLOADS`)",
+        "   - **Section `5.2`**: Wait Time Across All ClusterQueues per Workload Priority (`P50`, `P90`, `P99`, `AVG`, `ADMISSIONS`)",
         "   - **Section `5.3`**: Total Evictions and Reclaims (`Total Evictions`, `Unique workloads evicted once`, breakdown by reason & priority)",
         "   - **Section `5.4`**: Effective Uninterrupted Cluster Saturation (`COMPLETED ONLY`, `ACTIVE AT END`, `EFFECTIVE SAT`, `FULL-DUR SAT`, `Initial Infra Pods`, and exclusion of preempted/unadmitted work)",
         "",

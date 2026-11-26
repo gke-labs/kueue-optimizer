@@ -42,6 +42,14 @@ _STATIC_GAUGE_METRICS: frozenset[str] = frozenset({
     "kueue_cohort_subtree_quota",
 })
 
+# Always-emitted Kueue gauges used to anchor the observed scrape timestamp grid in [start, end]
+# so pre-first-scrape startup delays are not zero-filled as artificial 0 samples.
+_ANCHOR_GAUGE_METRICS: tuple[str, ...] = (
+    "kueue_build_info",
+    "kueue_cluster_queue_status",
+    "kueue_cluster_queue_nominal_quota",
+)
+
 # Exact canonical Kueue preemption/eviction reason labels for cohort reclaims and fair sharing.
 _RECLAIM_REASONS: frozenset[str] = frozenset({
     "InCohortReclamation",
@@ -55,64 +63,139 @@ _FAIR_SHARING_REASONS: frozenset[str] = frozenset({
 RawSeriesId = tuple[tuple[str, str], ...]
 
 
+def extract_observed_gauge_timestamps(
+    range_by_name: dict[str, list[dict]],
+    start: float,
+    end: float | None = None,
+) -> set[float]:
+    """Collect query_range timestamps in [start, end] where Kueue was actively scraped."""
+    anchor_ts: set[float] = set()
+    for anchor_name in _ANCHOR_GAUGE_METRICS:
+        for series in range_by_name.get(anchor_name, []):
+            for ts, _v in series.get("values", []):
+                try:
+                    ts_val = float(ts)
+                except (ValueError, TypeError):
+                    continue
+                if ts_val >= start and (end is None or ts_val <= end + 1e-9):
+                    anchor_ts.add(ts_val)
+    if anchor_ts:
+        return anchor_ts
+    for series_list in range_by_name.values():
+        for series in series_list:
+            for ts, _v in series.get("values", []):
+                try:
+                    ts_val = float(ts)
+                except (ValueError, TypeError):
+                    continue
+                if ts_val >= start and (end is None or ts_val <= end + 1e-9):
+                    anchor_ts.add(ts_val)
+    return anchor_ts
+
+
 def report_gauge(
     series_list: list[dict],
     start: float,
     end: float | None = None,
     *,
     step: float | None = None,
+    metric_name: str = "",
+    observed_timestamps: set[float] | frozenset[float] | None = None,
 ) -> list[tuple[str, str, str, str, str]]:
     """Computes P50, P90, P99, and AVG over [start, end] for Gauge series.
 
-    When both `end` and `step` (> 0) are provided, non-static gauges that Kueue deletes when
-    they drop to 0 (e.g., `kueue_cohort_subtree_resource_reservations`) are zero-filled for
-    missing query grid steps in `[start, end]` so `AVG` and percentiles reflect the true
-    run-wide distribution instead of only active periods.
+    Raw Prometheus series that share the same normalized labels (`format_labels`, which strips
+    `instance`/`pod`/`replica_role`) are merged by timestamp (`max` on identical timestamps) so
+    controller Pod restarts or HA failovers emit a single continuous row instead of duplicate
+    half-filled rows.
+
+    For non-static gauges that Kueue deletes when they drop to 0 (e.g.,
+    `kueue_cohort_subtree_resource_reservations`):
+    - If `observed_timestamps` is supplied, missing timestamps relative to the anchored Kueue
+      scrape grid in `[start, end]` are zero-filled, avoiding pre-first-scrape startup bias.
+    - Otherwise, when both `end` and `step` (> 0) are supplied, missing inclusive grid points
+      (`floor((end - start) / step) + 1`) are zero-filled.
     """
-    rows: list[tuple[str, str, str, str, str]] = []
+    anchor_ts: set[float] = set()
+    if observed_timestamps:
+        anchor_ts = {
+            ts for ts in observed_timestamps if ts >= start and (end is None or ts <= end + 1e-9)
+        }
+
+    # Merge raw series with identical formatted labels across controller restarts / HA replicas.
+    merged: dict[str, dict] = {}
     for series in series_list:
         m = series.get("metric", {})
         lbl_str = format_labels(m)
-        metric_name = str(m.get("__name__") or "").strip()
+        effective_name = str(m.get("__name__") or metric_name or "").strip()
         res_label = str(m.get("resource") or "").strip()
         is_bytes = res_label in ("memory", "ephemeral-storage")
-        raw_vals: list[float] = []
-        fallback_vals: list[float] = []
+        entry = merged.get(lbl_str)
+        if entry is None:
+            entry = {
+                "metric_name": effective_name,
+                "is_bytes": is_bytes,
+                "in_window": {},
+                "fallback": {},
+            }
+            merged[lbl_str] = entry
+        else:
+            if not entry["metric_name"] and effective_name:
+                entry["metric_name"] = effective_name
+            entry["is_bytes"] = entry["is_bytes"] or is_bytes
+
+        in_window: dict[float, float] = entry["in_window"]
+        fallback: dict[float, float] = entry["fallback"]
         for ts, v_str in series.get("values", []):
             try:
                 ts_val = float(ts)
                 if ts_val >= start:
                     v_val = float(v_str)
-                    fallback_vals.append(v_val)
+                    if math.isnan(v_val):
+                        continue
+                    prev_fb = fallback.get(ts_val)
+                    fallback[ts_val] = v_val if prev_fb is None else max(prev_fb, v_val)
                     if end is None or ts_val <= end + 1e-9:
-                        raw_vals.append(v_val)
-            except ValueError:
+                        prev_w = in_window.get(ts_val)
+                        in_window[ts_val] = v_val if prev_w is None else max(prev_w, v_val)
+            except (ValueError, TypeError):
                 pass
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    for lbl_str, entry in merged.items():
+        in_window = entry["in_window"]
+        fallback = entry["fallback"]
         used_fallback = False
-        if not raw_vals and fallback_vals:
-            raw_vals = fallback_vals
+        if in_window:
+            vals_by_ts = in_window
+        elif fallback:
+            vals_by_ts = fallback
             used_fallback = True
-        if not raw_vals:
+        else:
             continue
+
+        raw_vals = list(vals_by_ts.values())
         if all(math.isinf(v) for v in raw_vals):
             rows.append((lbl_str, "+Inf", "+Inf", "+Inf", "+Inf"))
             continue
-        if (
-            not used_fallback
-            and end is not None
-            and end > start
-            and step is not None
-            and step > 0
-            and metric_name not in _STATIC_GAUGE_METRICS
-        ):
-            expected_steps = max(len(raw_vals), int(round((end - start) / step)))
-            missing = expected_steps - len(raw_vals)
+
+        effective_name = entry["metric_name"]
+        if not used_fallback and effective_name not in _STATIC_GAUGE_METRICS:
+            if anchor_ts:
+                missing = len(anchor_ts - set(vals_by_ts.keys()))
+            elif end is not None and end > start and step is not None and step > 0:
+                expected_steps = max(len(raw_vals), int(math.floor((end - start) / step + 1e-9)) + 1)
+                missing = expected_steps - len(raw_vals)
+            else:
+                missing = 0
             if missing > 0:
                 raw_vals.extend([0.0] * missing)
+
         stats = summarize_samples(raw_vals)
         if stats is None:
             continue
         p50, p90, p99, avg = stats
+        is_bytes = entry["is_bytes"]
         rows.append((
             lbl_str,
             format_num(p50, is_bytes=is_bytes),
@@ -213,6 +296,8 @@ def compute_histogram_deltas_by_group(
     start_by_name: dict[str, list[dict]],
     metric_name: str,
     group_key_fn: Callable[[dict[str, str]], str],
+    *,
+    reset_warnings: list[str] | None = None,
 ) -> tuple[
     dict[str, list[tuple[float, float]]],
     dict[str, float],
@@ -221,13 +306,18 @@ def compute_histogram_deltas_by_group(
     float,
     float,
 ]:
-    """Compute reset-aware per-group and combined histogram deltas from end/start snapshots.
+    """Compute reset-aware per-group and combined histogram deltas from 2-snapshot instant queries.
 
     Detects counter resets per raw Prometheus series (`raw_series_identity`, preserving replica
     and instance labels): if `_count`, `_sum`, or any bucket decreased (`end < start - 1e-9`)
     for a series (e.g., due to a Kueue controller restart on a reused chamber), that series is
     treated as having reset to 0 so its post-restart observations (`end`) are preserved intact
     instead of clamping buckets to 0 or mixing pre-restart and post-restart sums.
+
+    Caveat (2-snapshot instant queries): when a reset occurs mid-run, pre-restart observations
+    recorded after `start_epoch` are lost (only `end` is retained) and the affected series is
+    appended to `reset_warnings` if provided; if post-restart counts surpass `start` (`end >= start`),
+    a reset cannot be detected from two snapshots alone.
     """
     end_buckets = end_by_name.get(f"{metric_name}_bucket", [])
     if not end_buckets:
@@ -292,6 +382,11 @@ def compute_histogram_deltas_by_group(
                     is_reset = True
                     break
 
+        if is_reset and reset_warnings is not None:
+            desc = f"{metric_name} ({gkey})"
+            if desc not in reset_warnings:
+                reset_warnings.append(desc)
+
         if end_b_map:
             base_b_map = {} if is_reset else start_b_map
             delta_le_map = {
@@ -346,6 +441,8 @@ def report_histogram(
     end_by_name: dict[str, list[dict]],
     start_by_name: dict[str, list[dict]],
     spec: MetricSpec,
+    *,
+    reset_warnings: list[str] | None = None,
 ) -> list[tuple[str, str, str, str, str, str, str]]:
     """Computes P50, P90, MAX, AVG, COUNT, and bucket breakdown for a Histogram metric."""
     group_buckets, agg_sum_by_gkey, agg_cnt_by_gkey, _all_b, _all_s, _all_c = compute_histogram_deltas_by_group(
@@ -353,6 +450,7 @@ def report_histogram(
         start_by_name,
         spec.name,
         lambda m: format_labels(m, extra_exclude={"le"}),
+        reset_warnings=reset_warnings,
     )
     if not group_buckets:
         return []
@@ -803,13 +901,20 @@ def report_aggregated_wait_time_by_priority(
     end_by_name: dict[str, list[dict]],
     start_by_name: dict[str, list[dict]],
     metric_name: str = "kueue_admission_wait_time_seconds",
+    *,
+    reset_warnings: list[str] | None = None,
 ) -> list[list[str]]:
     """Computes P50, P90, P99, and AVG wait time aggregated across all ClusterQueues per workload priority."""
     if not end_by_name.get(f"{metric_name}_bucket") and metric_name == "kueue_admission_wait_time_seconds":
         # Fallback to quota_reserved_wait_time_seconds if admission_wait_time_seconds was not populated
         alt = "kueue_quota_reserved_wait_time_seconds"
         if end_by_name.get(f"{alt}_bucket"):
-            return report_aggregated_wait_time_by_priority(end_by_name, start_by_name, metric_name=alt)
+            return report_aggregated_wait_time_by_priority(
+                end_by_name,
+                start_by_name,
+                metric_name=alt,
+                reset_warnings=reset_warnings,
+            )
         return []
 
     prio_buckets, prio_sums, prio_cnts, all_buckets, all_sum, all_cnt = compute_histogram_deltas_by_group(
@@ -817,6 +922,7 @@ def report_aggregated_wait_time_by_priority(
         start_by_name,
         metric_name,
         lambda m: m.get("priority_class", "").strip() or "<none>",
+        reset_warnings=reset_warnings,
     )
     if not prio_buckets:
         return []
@@ -873,7 +979,6 @@ def report_aggregated_evictions_and_reclaims(
 
     total_evictions = 0.0
     evictions_by_reason_cause: dict[tuple[str, str, str], float] = {}
-    reclaims_from_evicted = 0.0
 
     for s in evicted_series:
         inc = counter_series_total_increase(s, start)
@@ -886,8 +991,6 @@ def report_aggregated_evictions_and_reclaims(
         prio = m.get("priority_class", "").strip() or "<none>"
         key = (reason, cause, prio)
         evictions_by_reason_cause[key] = evictions_by_reason_cause.get(key, 0.0) + inc
-        if reason in _RECLAIM_REASONS or cause in _RECLAIM_REASONS:
-            reclaims_from_evicted += inc
 
     total_unique_evictions = 0.0
     for s in evicted_once_series:
@@ -922,7 +1025,6 @@ def report_aggregated_evictions_and_reclaims(
         else:
             other_preemptions[reason] = other_preemptions.get(reason, 0.0) + inc
 
-    total_reclaims = max(reclaims_from_preempted, reclaims_from_evicted)
     evicted_in_cohort_reclam = sum(
         cnt
         for (r, c, _p), cnt in evictions_by_reason_cause.items()
@@ -941,6 +1043,7 @@ def report_aggregated_evictions_and_reclaims(
         preemptions_by_reason.get("InCohortReclaimWhileBorrowing", 0.0),
         evicted_reclaim_while_borrowing,
     )
+    total_reclaims = detail_in_cohort_reclam + detail_reclaim_while_borrowing
 
     preemption_detail_parts = [
         f"InClusterQueue={int(round(in_cq_preemptions))}",

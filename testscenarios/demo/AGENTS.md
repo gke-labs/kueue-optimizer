@@ -32,7 +32,7 @@ Always use a fresh isolated `--namespace` and `--port` per run (never reuse a ch
 - **`Section 5.1` (Quota Utilization)**:
   - `ai-lab-cq` sustains high `cpu` and `memory` quota utilization (`AVG ~55%–85%` under `StrictFIFO`, higher under `BestEffortFIFO` backfilling) and drops back to `0` once all `20` `JobSet`s finish.
 - **`Section 5.2` (Wait Time by Priority)**:
-  - `WORKLOADS = 20` admitted and measured across the single priority tier.
+  - `ADMISSIONS = 20` admitted and measured across the single priority tier.
 - **`Section 5.3` (Evictions & Reclaims)**:
   - `Total Evictions = 0` (`withinClusterQueue: Never`, no cohort reclamation).
 - **`Section 5.4` (Effective Uninterrupted Cluster Saturation)**:

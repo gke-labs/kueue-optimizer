@@ -57,6 +57,7 @@ from metrics import (  # noqa: F401
     compute_effective_step,
     compute_histogram_deltas_by_group,
     counter_series_total_increase,
+    extract_observed_gauge_timestamps,
     extract_workload_podset_slices,
     extract_workload_resource_size_and_cfg_duration as _extract_workload_resource_size_and_cfg_duration,
     format_labels,
@@ -152,6 +153,11 @@ def main() -> int:
         range_start = max(0.0, args.start_epoch - window_sec)
         baseline_time = max(0.0, args.start_epoch - 1.0)
         effective_step = compute_effective_step(range_start, query_end, args.step)
+        counter_window_sec = max(window_sec, effective_step)
+        if counter_window_sec > window_sec:
+            range_start = max(0.0, args.start_epoch - counter_window_sec)
+            effective_step = compute_effective_step(range_start, query_end, args.step)
+            counter_window_sec = max(window_sec, effective_step)
         if effective_step > args.step:
             print(
                 f"  Note: Auto-scaled query step from {args.step:g}s to {effective_step:g}s "
@@ -200,9 +206,11 @@ def main() -> int:
         flush=True,
     )
 
+    observed_gauge_ts = extract_observed_gauge_timestamps(range_by_name, args.start_epoch, end=args.end_epoch)
     gauge_rows: list[list[str]] = []
     counter_rows: list[list[str]] = []
     histogram_rows: list[list[str]] = []
+    histogram_reset_warnings: list[str] = []
     unrecorded_metrics: list[tuple[str, str, str]] = []
 
     for spec in KUEUE_METRICS_CATALOG:
@@ -212,6 +220,8 @@ def main() -> int:
                 args.start_epoch,
                 end=args.end_epoch,
                 step=effective_step,
+                metric_name=spec.name,
+                observed_timestamps=observed_gauge_ts,
             )
             if not res:
                 unrecorded_metrics.append((spec.section, spec.name, spec.metric_type.value))
@@ -224,7 +234,7 @@ def main() -> int:
                 args.start_epoch,
                 query_end,
                 step=effective_step,
-                window_sec=window_sec,
+                window_sec=counter_window_sec,
             )
             if not res:
                 unrecorded_metrics.append((spec.section, spec.name, spec.metric_type.value))
@@ -232,7 +242,12 @@ def main() -> int:
                 counter_rows.append([spec.section, spec.name, lbl_str, p50, p90, p99, avg, total_inc])
 
         elif spec.metric_type == MetricType.HISTOGRAM:
-            res = report_histogram(end_hist_by_name, start_hist_by_name, spec)
+            res = report_histogram(
+                end_hist_by_name,
+                start_hist_by_name,
+                spec,
+                reset_warnings=histogram_reset_warnings,
+            )
             if not res:
                 unrecorded_metrics.append((spec.section, spec.name, spec.metric_type.value))
             for lbl_str, p50, p90, hmax, avg, cnt, buckets in res:
@@ -250,13 +265,23 @@ def main() -> int:
     else:
         print("  (No gauge samples recorded)")
 
+    counter_win_lbl = f"{counter_window_sec:g}s"
     print("")
-    print("=== 2. Kueue Counter Metrics (P50, P90, P99, AVG of 30s-window increase) ===")
+    print(f"=== 2. Kueue Counter Metrics (P50, P90, P99, AVG of {counter_win_lbl}-window increase) ===")
     print("    Ref: https://kueue.sigs.k8s.io/docs/reference/metrics/")
     print("")
     if counter_rows:
         print_table(
-            ["SECTION", "METRIC (COUNTER)", "LABELS", "P50(30s)", "P90(30s)", "P99(30s)", "AVG(30s)", "TOTAL_INC"],
+            [
+                "SECTION",
+                "METRIC (COUNTER)",
+                "LABELS",
+                f"P50({counter_win_lbl})",
+                f"P90({counter_win_lbl})",
+                f"P99({counter_win_lbl})",
+                f"AVG({counter_win_lbl})",
+                "TOTAL_INC",
+            ],
             counter_rows,
         )
     else:
@@ -265,6 +290,14 @@ def main() -> int:
     print("")
     print("=== 3. Kueue Histogram Metrics (P50, P90, MAX, AVG, COUNT, Bucket Distribution) ===")
     print("    Ref: https://kueue.sigs.k8s.io/docs/reference/metrics/")
+    if histogram_reset_warnings:
+        preview = ", ".join(histogram_reset_warnings[:3])
+        more = ", ..." if len(histogram_reset_warnings) > 3 else ""
+        print(
+            f"    WARNING: Counter reset detected between baseline and end snapshots for "
+            f"{len(histogram_reset_warnings)} histogram series ({preview}{more}); "
+            "pre-restart observations after start_epoch are omitted (2-snapshot instant query)."
+        )
     print("")
     if histogram_rows:
         print_table(
@@ -283,7 +316,12 @@ def main() -> int:
         )
 
     quota_util_rows = report_aggregated_quota_utilization(range_by_name, args.start_epoch, end=args.end_epoch)
-    wait_time_prio_rows = report_aggregated_wait_time_by_priority(end_hist_by_name, start_hist_by_name)
+    wait_time_reset_warnings: list[str] = []
+    wait_time_prio_rows = report_aggregated_wait_time_by_priority(
+        end_hist_by_name,
+        start_hist_by_name,
+        reset_warnings=wait_time_reset_warnings,
+    )
     evict_summary_rows, evict_breakdown_rows = report_aggregated_evictions_and_reclaims(
         range_by_name,
         args.start_epoch,
@@ -318,6 +356,14 @@ def main() -> int:
     print("")
     print("=== 5.2 Wait Time Across All ClusterQueues per Workload Priority (P50, P90, P99, AVG) ===")
     print("    Note: ADMISSIONS counts every admission observation (including re-admissions after preemption/eviction), not unique workloads.")
+    if wait_time_reset_warnings:
+        preview = ", ".join(wait_time_reset_warnings[:3])
+        more = ", ..." if len(wait_time_reset_warnings) > 3 else ""
+        print(
+            f"    WARNING: Counter reset detected between baseline and end snapshots for "
+            f"{len(wait_time_reset_warnings)} priority series ({preview}{more}); "
+            "pre-restart observations after start_epoch are omitted (2-snapshot instant query)."
+        )
     print("")
     if wait_time_prio_rows:
         print_table(
