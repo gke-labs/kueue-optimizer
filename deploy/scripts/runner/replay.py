@@ -317,6 +317,32 @@ def _patch_node_ready_condition(
     )
 
 
+def _patch_node_or_skip_missing(
+    mgr: ChamberManager,
+    ie: ScheduledInfraEvent,
+    patch_doc: dict[str, Any],
+    wall_elapsed: float,
+) -> bool:
+    """PATCH a Node for an Update event. Return True when the Node no longer exists and the event is skipped."""
+    st_code, _ = _checked_api_request(
+        mgr,
+        "PATCH",
+        f"/api/v1/nodes/{ie.name}",
+        body=json.dumps(patch_doc).encode("utf-8"),
+        headers={"Content-Type": "application/merge-patch+json"},
+        ignore_not_found=True,
+        context=f"Patch Node '{ie.name}'",
+    )
+    if st_code != 404:
+        return False
+    print(
+        f"  ~ [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s] "
+        f"Skipping Update for Node '{ie.name}': the node does not exist in the chamber",
+        flush=True,
+    )
+    return True
+
+
 def _patch_node_status_resources(
     mgr: ChamberManager,
     node_name: str,
@@ -641,14 +667,8 @@ def _execute_scheduled_infra_event(
                 "taints": taints_list,
             },
         }
-        _checked_api_request(
-            mgr,
-            "PATCH",
-            f"/api/v1/nodes/{ie.name}",
-            body=json.dumps(patch_doc).encode("utf-8"),
-            headers={"Content-Type": "application/merge-patch+json"},
-            context=f"Patch Node '{ie.name}'",
-        )
+        if _patch_node_or_skip_missing(mgr, ie, patch_doc, wall_elapsed):
+            return False, ""
         if ie.is_not_ready:
             _patch_node_ready_condition(
                 mgr,
@@ -689,14 +709,8 @@ def _execute_scheduled_infra_event(
                 "taints": taints_list,
             },
         }
-        _checked_api_request(
-            mgr,
-            "PATCH",
-            f"/api/v1/nodes/{ie.name}",
-            body=json.dumps(patch_doc).encode("utf-8"),
-            headers={"Content-Type": "application/merge-patch+json"},
-            context=f"Patch Node '{ie.name}'",
-        )
+        if _patch_node_or_skip_missing(mgr, ie, patch_doc, wall_elapsed):
+            return False, ""
         _patch_node_ready_condition(
             mgr,
             ie.name,
@@ -1317,6 +1331,10 @@ def run_scenario_replay(
     ever_finished_sched_wl_keys: set[tuple[str, str]] = set()
     ever_finished_init_wl_keys: set[tuple[str, str]] = set()
     cancelled_sched_wl_keys: set[tuple[str, str]] = set()
+    # Workloads counted as finished only because they disappeared, and how many polls in a row each
+    # seen-but-unfinished Workload has been absent.
+    vanished_assumed_finished: set[tuple[str, str]] = set()
+    absent_poll_counts: dict[tuple[str, str], int] = {}
     submitted_batch_records: dict[tuple[str, str, str, int], tuple[str, str, str, str, float]] = {}
     cancelled_workflow_count = 0
     cancelled_unsubmitted_keys: set[tuple[str, str, str, int]] = set()
@@ -1812,23 +1830,43 @@ def run_scenario_replay(
     next_status_mono = t0_mono
     next_poll_mono = t0_mono
 
-    def _record_sched_wl_progress(snap: ClusterStatusSnapshot) -> None:
+    def _record_sched_wl_progress(snap: ClusterStatusSnapshot, *, count_absence: bool = False) -> None:
+        # `count_absence` is set only by _poll_cluster(), so each cluster poll counts once even though
+        # this function runs several times per poll.
         present_sched = _non_serving_finished_keys(snap.present_workload_keys - initial_wl_keys)
         finished_sched = _non_serving_finished_keys(snap.finished_workload_keys - initial_wl_keys)
         ever_seen_sched_wl_keys.update(present_sched)
         ever_finished_sched_wl_keys.update(finished_sched)
-        if snap.workloads_query_ok:
+        vanished_assumed_finished.difference_update(finished_sched)
+        # A Workload that was assumed finished because it vanished, but is present and unfinished
+        # again (Kueue deleted and re-created it under the same name), is running, not finished.
+        reappeared = (vanished_assumed_finished & present_sched) - finished_sched
+        if reappeared:
+            ever_finished_sched_wl_keys.difference_update(reappeared)
+            vanished_assumed_finished.difference_update(reappeared)
+        if count_absence and snap.workloads_query_ok:
             # If a previously observed scheduled Workload disappears before any poll catches
             # Finished=True (for example due to ttlSecondsAfterFinished or external deletion),
-            # treat it as terminal unless it was explicitly cancelled by replay.
-            vanished_seen = (
+            # treat it as terminal unless it was explicitly cancelled by replay. Require two
+            # consecutive polls without it, so a delete-and-re-create between polls is not
+            # mistaken for completion.
+            absent_now = (
                 ever_seen_sched_wl_keys
                 - snap.present_workload_keys
                 - ever_finished_sched_wl_keys
                 - cancelled_sched_wl_keys
             )
+            for wk_gone in list(absent_poll_counts):
+                if wk_gone not in absent_now:
+                    del absent_poll_counts[wk_gone]
+            for wk_gone in absent_now:
+                absent_poll_counts[wk_gone] = absent_poll_counts.get(wk_gone, 0) + 1
+            vanished_seen = {wk_gone for wk_gone, cnt in absent_poll_counts.items() if cnt >= 2}
             if vanished_seen:
                 ever_finished_sched_wl_keys.update(vanished_seen)
+                vanished_assumed_finished.update(vanished_seen)
+                for wk_gone in vanished_seen:
+                    del absent_poll_counts[wk_gone]
 
     def _reconcile_vanished_unseen_workflows(snap: ClusterStatusSnapshot, now_mono: float) -> None:
         """Detect submitted batch workflows whose parent and Workload both vanished before first poll."""
@@ -2315,7 +2353,7 @@ def run_scenario_replay(
             workload_namespaces=bundle.workload_namespaces,
             include_kueue_workloads=True,
         )
-        _record_sched_wl_progress(snap)
+        _record_sched_wl_progress(snap, count_absence=True)
         ever_finished_init_wl_keys.update(snap.finished_workload_keys & initial_wl_keys)
         _check_and_resubmit_evicted_initial_workloads(snap, wall_elapsed)
         return snap
@@ -2385,7 +2423,11 @@ def run_scenario_replay(
                                 _record_node_capacity_snapshot(time.time())
                         elif isinstance(ie.manifest, dict) and (
                             ie.event_type == "New"
-                            or (ie.event_type == "Update" and getattr(ie, "has_explicit_capacity", False))
+                            or (
+                                ie.event_type == "Update"
+                                and getattr(ie, "has_explicit_capacity", False)
+                                and ie.name in live_node_alloc
+                            )
                         ):
                             # An Update changes the timeline only when its raw payload carried capacity,
                             # which is also the only case where replay patches it onto the node.

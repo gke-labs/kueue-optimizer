@@ -264,6 +264,29 @@ class NodeUpdateAndFailFastTests(unittest.TestCase):
             self.assertTrue(upd_without and not any(ie.has_explicit_capacity for ie in upd_without))
             self.assertTrue(all((ie.manifest.get("status") or {}).get("allocatable") for ie in upd_without))
 
+    def test_node_update_for_missing_node_is_skipped_with_warning(self) -> None:
+        """An Update for a Node that no longer exists is skipped, not fatal, and patches no status."""
+        b61 = _load_bundle("st61-tas-single-node-failure-hotswap-same-rack")
+        ie_upd = next(ie for ie in b61.scheduled_infra_events if ie.object_kind == "Node" and ie.event_type == "Update")
+        for label, ie in (
+            ("unhealthy", ie_upd),
+            ("healthy", dataclasses.replace(ie_upd, is_not_ready=False, has_no_execute_taint=False, ready_status="True")),
+        ):
+            with self.subTest(case=label):
+                mgr = _FakeMgr(
+                    responder=lambda m, p, _b: (404, b'{"kind":"Status","code":404}')
+                    if m == "PATCH" and p == f"/api/v1/nodes/{ie_upd.name}"
+                    else None
+                )
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    deferred, _ = _execute_scheduled_infra_event(mgr, b61, ie, 1.0)
+                self.assertFalse(deferred)
+                self.assertIn("does not exist in the chamber", out.getvalue())
+                self.assertEqual(
+                    [p for m, p, _b, _s in mgr.requests if m == "PATCH"], [f"/api/v1/nodes/{ie_upd.name}"]
+                )
+
     def test_node_patch_and_delete_fail_fast_on_non_2xx(self) -> None:
         b61 = _load_bundle("st61-tas-single-node-failure-hotswap-same-rack")
         ie_upd = next(ie for ie in b61.scheduled_infra_events if ie.object_kind == "Node" and ie.event_type == "Update")
@@ -459,6 +482,51 @@ class VanishedWorkloadAndInitialResubmitTests(unittest.TestCase):
         self.assertEqual(res.submitted_count, 2)
         self.assertLess(time.monotonic() - t_start, 3.0)
         self.assertEqual(idx["i"], 3)
+
+    def test_workload_absent_for_one_poll_then_back_is_not_counted_finished(self) -> None:
+        """A Workload deleted and re-created under the same name between polls must keep the replay open."""
+        base = _load_bundle()
+        tmpl = base.scheduled_workflows[0]
+        ns = tmpl.namespace
+        bundle = dataclasses.replace(
+            base,
+            scheduled_workflows=_synth_items(tmpl, 1),
+            scheduled_infra_events=[],
+            scheduled_workflow_updates=[],
+            scheduled_workflow_deletions=[],
+            initial_workloads=[],
+            initial_deployments=[],
+            initial_pods=[],
+        )
+        k0 = (ns, "jobset-wf-000-aaaaa")
+        running = ClusterStatusSnapshot(workloads_query_ok=True, present_workload_keys={k0}, workloads_admitted=1)
+        gone = ClusterStatusSnapshot(workloads_query_ok=True)
+        done = ClusterStatusSnapshot(
+            workloads_query_ok=True, present_workload_keys={k0}, finished_workload_keys={k0}, workloads_finished=1
+        )
+        snaps = [running, gone, running, running, done]
+        idx = {"i": 0}
+
+        def _next_snap(*_a, **_kw):
+            s = snaps[min(idx["i"], len(snaps) - 1)]
+            idx["i"] += 1
+            return s
+
+        with (
+            mock.patch.object(replay, "query_cluster_status", side_effect=_next_snap),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            res = run_scenario_replay(
+                mgr=_FakeMgr(),
+                bundle=bundle,
+                speedup=1.0,
+                max_run_seconds=8.0,
+                status_interval_sec=0.05,
+                wait_for_completion=True,
+            )
+        self.assertEqual(res.stop_reason, "completed")
+        # The replay must not stop at the poll where the Workload was briefly absent.
+        self.assertEqual(idx["i"], 5)
 
     def test_cancelled_workflow_vanishing_is_not_double_counted(self) -> None:
         base = _load_bundle()
