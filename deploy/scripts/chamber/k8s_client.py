@@ -902,6 +902,10 @@ class ChamberK8sClientMixin:
             if st_p == 200 and raw_p:
                 snapshot["pods"] = (json.loads(raw_p.decode("utf-8")) or {}).get("items") or []
 
+            node_timeline = getattr(self, "_node_capacity_timeline", None) or []
+            if len(node_timeline) > 1:
+                snapshot["nodeCapacityTimeline"] = [dict(entry) for entry in node_timeline]
+
             return snapshot
         except Exception:
             return None

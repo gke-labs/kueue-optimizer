@@ -105,7 +105,7 @@ Follow this 5-step protocol for every investigation, bug fix, scheduler tuning e
 2. **Conservation & Sanity Invariants**:
    - `Workloads Status`: `admitted + pending + finished == total_submitted_top_level_workloads`.
    - `KWOK Pods Status`: `failed == 0` (unless testing explicit pod-failure scenarios).
-   - `Sec 5.4`: `Qualifying Workloads + Excluded + Unadmitted == total_top_level_kueue_workloads`.
+   - `Sec 5.4`: `Qualifying Workloads + Excluded + Admitted (pending pods) + Unadmitted == total_top_level_kueue_workloads`.
 
 ### Step 2: Enforce Strict Chamber Isolation per Run / Arm (Mandatory)
 - **Never** run two scenarios or A/B arms back-to-back in the same chamber via `--skip-chamber-deploy`.

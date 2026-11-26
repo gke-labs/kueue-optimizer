@@ -27,7 +27,12 @@ import urllib.parse
 
 from chamber.constants import validate_dns_label
 from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot, query_cluster_status
-from chamber.parsers import format_duration_hms, multiply_k8s_quantity_exact, parse_rfc3339_epoch
+from chamber.parsers import (
+    format_duration_hms,
+    multiply_k8s_quantity_exact,
+    parse_k8s_quantity,
+    parse_rfc3339_epoch,
+)
 from chamber.scenario import build_topology_assignment
 from runner.loader import (
     InitialDeploymentBootstrap,
@@ -1122,6 +1127,41 @@ def run_scenario_replay(
             _bootstrap_initial_deployments(mgr, bundle.initial_deployments)
 
     mgr._retired_serving_workloads = {}
+    mgr._node_capacity_timeline = []
+
+    def _extract_node_alloc(node_doc: dict[str, Any] | None) -> dict[str, float]:
+        if not isinstance(node_doc, dict):
+            return {}
+        st_blk = node_doc.get("status") or {}
+        alloc_blk = st_blk.get("allocatable") or st_blk.get("capacity") or {}
+        if not isinstance(alloc_blk, dict):
+            return {}
+        out: dict[str, float] = {}
+        for rk, rv in alloc_blk.items():
+            if rk == "ephemeral-storage":
+                continue
+            val = parse_k8s_quantity(rv, rk)
+            if val > 0.0:
+                out[str(rk)] = val
+        return out
+
+    live_node_alloc: dict[str, dict[str, float]] = {}
+    for n_doc in bundle.nodes:
+        if not isinstance(n_doc, dict):
+            continue
+        n_name = str((n_doc.get("metadata") or {}).get("name") or "")
+        n_alloc = _extract_node_alloc(n_doc)
+        if n_name and n_alloc:
+            live_node_alloc[n_name] = n_alloc
+
+    def _record_node_capacity_snapshot(ep: float) -> None:
+        totals: dict[str, float] = {}
+        for alloc_map in live_node_alloc.values():
+            for rk, rv in alloc_map.items():
+                if rv > 0.0:
+                    totals[rk] = totals.get(rk, 0.0) + rv
+        mgr._node_capacity_timeline.append({"epoch": float(ep), "capacity": totals})
+
     event_heap: list[ScheduledWorkflowItem] = list(bundle.scheduled_workflows)
     heapq.heapify(event_heap)
     update_heap: list[ScheduledWorkflowUpdate] = list(bundle.scheduled_workflow_updates)
@@ -1624,6 +1664,7 @@ def run_scenario_replay(
     old_sigterm = signal.signal(signal.SIGTERM, _sig_handler)
 
     start_epoch = time.time()
+    _record_node_capacity_snapshot(start_epoch)
     t0_mono = time.monotonic()
     fast_poll_floor = 1.5 if (total_planned + len(initial_wl_keys)) > 200 else 0.5
     poll_interval_sec = min(status_interval_sec, fast_poll_floor)
@@ -2112,6 +2153,15 @@ def run_scenario_replay(
                             infra_heap,
                             dc_replace(ie, target_wall_offset_sec=now_el + max(1.0, poll_interval_sec)),
                         )
+                    elif ie.object_kind == "Node" and ie.name:
+                        if ie.event_type == "Deleted":
+                            if live_node_alloc.pop(ie.name, None) is not None:
+                                _record_node_capacity_snapshot(time.time())
+                        elif ie.event_type == "New" and isinstance(ie.manifest, dict):
+                            new_alloc = _extract_node_alloc(ie.manifest)
+                            if new_alloc and new_alloc != live_node_alloc.get(ie.name):
+                                live_node_alloc[ie.name] = new_alloc
+                                _record_node_capacity_snapshot(time.time())
                 continue
 
             # Drain due deletes, creates, and updates in chronological order so a stale update cannot
