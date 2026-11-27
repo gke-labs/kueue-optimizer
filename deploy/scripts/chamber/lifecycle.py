@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import atexit
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
@@ -33,6 +34,7 @@ from typing import Any
 import urllib.request
 
 from chamber.constants import (
+    CHAMBER_CORE_HEALTH_COMPONENTS,
     CHAMBER_DEPLOYMENTS,
     CHAMBER_NAMESPACE_LABEL_KEY,
     CHAMBER_NAMESPACE_LABEL_VALUE,
@@ -71,6 +73,26 @@ from chamber.parsers import (
 from chamber.pki import ensure_pki_dir, inject_ca_bundle_into_manifests
 from chamber.registry import ChamberRegistryMixin
 from chamber.yaml_utils import docs_to_pretty_yaml
+
+
+@dataclass(frozen=True)
+class ComponentHealthStatus:
+    """Health and container-restart summary for one chamber control-plane deployment."""
+
+    deployment: str
+    ready_pods: int
+    total_pods: int
+    restart_count: int
+    pod_uids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ChamberHealthSnapshot:
+    """Point-in-time health snapshot of core chamber control-plane deployments."""
+
+    components: dict[str, ComponentHealthStatus] = field(default_factory=dict)
+    query_ok: bool = True
+    error: str = ""
 
 
 class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
@@ -780,6 +802,93 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
                 except Exception:
                     pass
 
+    def check_chamber_health_snapshot(
+        self,
+        *,
+        components: dict[str, str] | None = None,
+    ) -> ChamberHealthSnapshot:
+        """Query host-cluster Pods in this chamber namespace and summarize readiness and restarts."""
+        target_components = dict(CHAMBER_CORE_HEALTH_COMPONENTS if components is None else components)
+        try:
+            proc = self.host_kubectl(
+                ["-n", self.chamber_namespace, "get", "pods", "-o", "json"],
+                check=False,
+                timeout=15.0,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return ChamberHealthSnapshot(query_ok=False, error=str(exc)[:300])
+        if proc.returncode != 0:
+            err_msg = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:300]
+            return ChamberHealthSnapshot(query_ok=False, error=err_msg)
+        try:
+            payload = json.loads(proc.stdout or "{}")
+            pod_items = payload.get("items") or []
+        except (json.JSONDecodeError, AttributeError) as exc:
+            return ChamberHealthSnapshot(query_ok=False, error=f"invalid pods JSON: {exc}")
+
+        counts: dict[str, dict[str, Any]] = {
+            dep_name: {"ready": 0, "total": 0, "restarts": 0, "uids": []}
+            for dep_name in target_components.values()
+        }
+        dep_names = tuple(target_components.values())
+        for pod in pod_items:
+            if not isinstance(pod, dict):
+                continue
+            meta = pod.get("metadata") or {}
+            if meta.get("deletionTimestamp"):
+                continue
+            st_obj = pod.get("status") or {}
+            phase = str(st_obj.get("phase") or "")
+            # Ignore terminal Failed/Succeeded Pods (for example, old kubelet-Evicted Pods left behind
+            # from earlier runs when reusing a chamber via --skip-chamber-deploy).
+            if phase in ("Failed", "Succeeded"):
+                continue
+            labels = meta.get("labels") or {}
+            comp_label = str(labels.get("app.kubernetes.io/component") or "")
+            pod_name = str(meta.get("name") or "")
+            dep_name = target_components.get(comp_label)
+            if dep_name is None:
+                for cand_dep in dep_names:
+                    if pod_name.startswith(f"{cand_dep}-"):
+                        dep_name = cand_dep
+                        break
+            if dep_name is None:
+                continue
+
+            entry = counts[dep_name]
+            entry["total"] += 1
+            pod_uid = str(meta.get("uid") or pod_name)
+            if pod_uid:
+                entry["uids"].append(pod_uid)
+
+            conds = st_obj.get("conditions") or []
+            is_ready = phase == "Running" and any(
+                isinstance(c, dict) and c.get("type") == "Ready" and c.get("status") == "True"
+                for c in conds
+            )
+            if is_ready:
+                entry["ready"] += 1
+
+            for cs_key in ("containerStatuses", "initContainerStatuses"):
+                for cs in st_obj.get(cs_key) or []:
+                    if isinstance(cs, dict):
+                        try:
+                            entry["restarts"] += max(0, int(cs.get("restartCount") or 0))
+                        except (TypeError, ValueError):
+                            pass
+
+        comp_statuses = {
+            dep_name: ComponentHealthStatus(
+                deployment=dep_name,
+                ready_pods=int(info["ready"]),
+                total_pods=int(info["total"]),
+                restart_count=int(info["restarts"]),
+                pod_uids=tuple(sorted(info["uids"])),
+            )
+            for dep_name, info in counts.items()
+        }
+        return ChamberHealthSnapshot(components=comp_statuses, query_ok=True)
+
     def cleanup_chamber(self) -> None:
         print(f"==> Cleaning up chamber in host cluster namespace '{self.chamber_namespace}'...", flush=True)
         self.close()
@@ -836,6 +945,53 @@ class ChamberManager(ChamberK8sClientMixin, ChamberRegistryMixin):
             self.kubeconfig_path.unlink()
             print(f"    Removed {self.kubeconfig_path}", flush=True)
         print(f"==> Chamber '{self.chamber_namespace}' cleanup complete.", flush=True)
+
+
+def verify_chamber_control_plane_health(
+    mgr: ChamberManager,
+    baseline: ChamberHealthSnapshot | None = None,
+    *,
+    components: dict[str, str] | None = None,
+    retries: int = 1,
+    retry_delay_sec: float = 0.5,
+    stop_check: Callable[[], bool] | None = None,
+) -> tuple[bool, list[str], ChamberHealthSnapshot]:
+    """Verify chamber control-plane deployments are Ready with no restarts or pod replacements since `baseline`."""
+    attempts = 1 + max(0, int(retries))
+    snap = ChamberHealthSnapshot(query_ok=False, error="not queried")
+    for attempt in range(attempts):
+        snap = (
+            mgr.check_chamber_health_snapshot(components=components)
+            if components is not None
+            else mgr.check_chamber_health_snapshot()
+        )
+        if snap.query_ok:
+            break
+        if attempt + 1 < attempts:
+            if stop_check is not None and stop_check():
+                break
+            if retry_delay_sec > 0:
+                time.sleep(retry_delay_sec)
+            if stop_check is not None and stop_check():
+                break
+    if not snap.query_ok:
+        return False, [f"failed to query chamber control-plane pods: {snap.error or 'unknown error'}"], snap
+
+    issues: list[str] = []
+    for dep_name in sorted(snap.components.keys()):
+        cur = snap.components[dep_name]
+        if cur.total_pods <= 0 or cur.ready_pods <= 0 or cur.ready_pods < cur.total_pods:
+            issues.append(f"{dep_name} unready ({cur.ready_pods}/{cur.total_pods} pods ready)")
+        if baseline is not None and baseline.query_ok and dep_name in baseline.components:
+            base_st = baseline.components[dep_name]
+            if cur.restart_count > base_st.restart_count:
+                issues.append(
+                    f"{dep_name} restarted during replay "
+                    f"(restartCount {base_st.restart_count} -> {cur.restart_count})"
+                )
+            if base_st.pod_uids and cur.pod_uids and set(cur.pod_uids) != set(base_st.pod_uids):
+                issues.append(f"{dep_name} pod replaced during replay")
+    return len(issues) == 0, issues, snap
 
 
 @dataclass

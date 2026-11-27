@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace as dc_replace
 from datetime import datetime, timezone
 import heapq
 import json
+import math
 import re
 import signal
 import time
@@ -28,9 +30,16 @@ from typing import Any
 import urllib.parse
 
 from chamber.constants import validate_dns_label
-from chamber.lifecycle import ChamberManager, ClusterStatusSnapshot, query_cluster_status
+from chamber.lifecycle import (
+    ChamberHealthSnapshot,
+    ChamberManager,
+    ClusterStatusSnapshot,
+    query_cluster_status,
+    verify_chamber_control_plane_health,
+)
 from chamber.parsers import (
     format_duration_hms,
+    format_pod_execution_seconds,
     multiply_k8s_quantity_exact,
     parse_k8s_quantity,
     parse_rfc3339_epoch,
@@ -59,18 +68,27 @@ class ReplayResult:
     total_pods: int
     stop_reason: str = "completed"
     signal_num: int | None = None
+    bootstrap_lag_sec: float = 0.0
+    health_issues: tuple[str, ...] = ()
+    compensated_t0_pods: int = 0
 
     @property
     def interrupted(self) -> bool:
         return self.stop_reason == "interrupted"
 
     @property
+    def control_plane_unhealthy(self) -> bool:
+        return self.stop_reason == "control_plane_unhealthy"
+
+    @property
     def exit_code(self) -> int:
-        if not self.interrupted:
-            return 0
-        if self.signal_num is not None and self.signal_num > 0:
-            return 128 + self.signal_num
-        return 130
+        if self.interrupted:
+            if self.signal_num is not None and self.signal_num > 0:
+                return 128 + self.signal_num
+            return 130
+        if self.control_plane_unhealthy:
+            return 1
+        return 0
 
     def __iter__(self) -> Iterator[Any]:
         yield self.start_epoch
@@ -1237,6 +1255,121 @@ def _bootstrap_initial_deployments(
         mgr.apply_manifests_parallel(paused_to_restore, max_workers=16)
 
 
+FINITE_T0_HOLD_EXEC_SECONDS = "86400"
+
+
+def _compensate_finite_t0_pods_for_bootstrap_lag(
+    mgr: ChamberManager,
+    finite_pods: list[InitialPodSpec],
+    bootstrap_lag_sec: float,
+    *,
+    held: bool = False,
+) -> int:
+    """Release held finite t0 pods (or reset active non-held finite t0 pods) to exact remaining duration at t0."""
+    if not finite_pods:
+        return 0
+    if not held and bootstrap_lag_sec < 0.05:
+        return 0
+
+    expired_risk = sum(1 for p in finite_pods if p.remaining_duration_sec <= bootstrap_lag_sec)
+
+    def _patch_one(pod_spec: InitialPodSpec) -> str:
+        pod_name = str((pod_spec.manifest.get("metadata") or {}).get("name") or pod_spec.name)
+        if not pod_name:
+            return "skipped"
+        pod_path = f"/api/v1/namespaces/{pod_spec.namespace}/pods/{pod_name}"
+        if not held:
+            st_get, raw_get = mgr.api_request("GET", pod_path)
+            if st_get == 404:
+                return "expired"
+            if not (200 <= st_get < 300):
+                return "failed"
+            try:
+                pod_obj = json.loads(raw_get.decode("utf-8")) if raw_get else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return "failed"
+            phase = str(((pod_obj.get("status") or {}).get("phase")) or "") if isinstance(pod_obj, dict) else ""
+            if phase in ("Succeeded", "Failed"):
+                return "expired"
+            if phase != "Running":
+                return "skipped"
+
+        # KWOK v0.8.0 resets its `pod-complete` timer from clock.Now() whenever an annotation patch
+        # bumps ResourceVersion, and metrics/saturation.py reads `pod-execution-time-seconds` as cfg_dur.
+        # Always patch the exact remaining_duration_sec (never remaining + bootstrap_lag_sec).
+        exec_str = format_pod_execution_seconds(
+            max(0.05, float(pod_spec.remaining_duration_sec)),
+            min_seconds=0.05,
+        )
+        patch_doc = {
+            "metadata": {
+                "annotations": {
+                    "kueue-optimizer.gke.io/pod-execution-time-seconds": exec_str,
+                    "kueue-optimizer.gke.io/bootstrap-lag-compensation-sec": f"{bootstrap_lag_sec:.3f}",
+                }
+            }
+        }
+        st_code, raw_resp = mgr.api_request(
+            "PATCH",
+            pod_path,
+            body=json.dumps(patch_doc).encode("utf-8"),
+            headers={"Content-Type": "application/merge-patch+json"},
+        )
+        if st_code == 404:
+            return "expired"
+        if 200 <= st_code < 300:
+            if raw_resp:
+                try:
+                    patched_obj = json.loads(raw_resp.decode("utf-8"))
+                    if isinstance(patched_obj, dict):
+                        patched_phase = str(((patched_obj.get("status") or {}).get("phase")) or "")
+                        if patched_phase in ("Succeeded", "Failed"):
+                            return "expired"
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+            return "patched"
+        return "failed"
+
+    with ThreadPoolExecutor(max_workers=min(16, max(1, len(finite_pods)))) as pool:
+        outcomes = list(pool.map(_patch_one, finite_pods))
+
+    patched = sum(1 for r in outcomes if r == "patched")
+    expired = sum(1 for r in outcomes if r == "expired")
+    failed = sum(1 for r in outcomes if r == "failed")
+
+    if expired > 0:
+        print(
+            f"WARN: {expired}/{len(finite_pods)} finite t0 pod(s) already finished before replay started "
+            f"(bootstrap setup lag {bootstrap_lag_sec:.2f}s).",
+            flush=True,
+        )
+    elif not held and expired_risk > 0:
+        print(
+            f"WARN: Bootstrap setup lag ({bootstrap_lag_sec:.2f}s) met or exceeded remaining duration of "
+            f"{expired_risk}/{len(finite_pods)} finite t0 pod(s) before replay started.",
+            flush=True,
+        )
+    if failed > 0:
+        print(
+            f"WARN: Failed to update {failed}/{len(finite_pods)} finite t0 pod(s) before replay started.",
+            flush=True,
+        )
+    if patched > 0:
+        if held:
+            print(
+                f"==> Released {patched}/{len(finite_pods)} held finite t0 pod(s) to exact remaining duration "
+                f"(after {bootstrap_lag_sec:.2f}s bootstrap setup lag).",
+                flush=True,
+            )
+        else:
+            print(
+                f"==> Compensated {patched}/{len(finite_pods)} finite t0 pod(s) for "
+                f"{bootstrap_lag_sec:.2f}s bootstrap setup lag before replay start.",
+                flush=True,
+            )
+    return patched
+
+
 def apply_scenario_queues_and_wait(
     mgr: ChamberManager,
     prereq_and_queue_docs: list[dict[str, Any]],
@@ -1245,8 +1378,15 @@ def apply_scenario_queues_and_wait(
     initial_workloads: list[InitialWorkloadPodGroup] | None = None,
     initial_deployments: list[InitialDeploymentBootstrap] | None = None,
     initial_pods: list[InitialPodSpec] | None = None,
-) -> None:
-    """Apply prerequisites, optionally bootstrap t0 PodGroup/Deployment Workloads & Pods, then activate ClusterQueues/LocalQueues."""
+    hold_finite_t0_pods: bool = False,
+) -> float | None:
+    """Apply prerequisites, optionally bootstrap t0 PodGroup/Deployment Workloads & Pods, then activate ClusterQueues/LocalQueues.
+
+    When `hold_finite_t0_pods` is True, finite t0 bootstrap Pods are applied as shallow copies with a temporary
+    `"86400"` `pod-execution-time-seconds` hold (without mutating `pod_spec.manifest` or setting `long-running-pod`)
+    so they cannot expire during queue/Deployment/scraper bootstrap before `run_scenario_replay` releases them.
+    Returns the monotonic timestamp when finite t0 bootstrap pods reached Running (or None if there are no finite t0 pods).
+    """
     cq_names = {d["metadata"]["name"] for d in prereq_and_queue_docs if d.get("kind") == "ClusterQueue"}
     lq_keys = {
         (d["metadata"].get("namespace", "default"), d["metadata"]["name"])
@@ -1284,6 +1424,7 @@ def apply_scenario_queues_and_wait(
         if len(initial_workloads) > 8:
             print(f"    ... and {len(initial_workloads) - 8} more initial Kueue workloads.", flush=True)
 
+    t0_pods_started_mono: float | None = None
     all_bootstrap_pods: list[InitialPodSpec] = [
         p for w in (initial_workloads or []) for p in w.pods
     ] + list(initial_pods or [])
@@ -1304,10 +1445,24 @@ def apply_scenario_queues_and_wait(
             if len(initial_pods) > 8:
                 print(f"    ... and {len(initial_pods) - 8} more initial infra pods.", flush=True)
 
-        mgr.apply_manifests_parallel([p.manifest for p in all_bootstrap_pods], max_workers=16)
+        bootstrap_pod_docs: list[dict[str, Any]] = []
+        for p in all_bootstrap_pods:
+            if hold_finite_t0_pods and not p.is_infinite:
+                held_doc = dict(p.manifest)
+                held_meta = dict(held_doc.get("metadata") or {})
+                held_anns = dict(held_meta.get("annotations") or {})
+                held_anns["kueue-optimizer.gke.io/pod-execution-time-seconds"] = FINITE_T0_HOLD_EXEC_SECONDS
+                held_meta["annotations"] = held_anns
+                held_doc["metadata"] = held_meta
+                bootstrap_pod_docs.append(held_doc)
+            else:
+                bootstrap_pod_docs.append(p.manifest)
+        mgr.apply_manifests_parallel(bootstrap_pod_docs, max_workers=16)
         mgr.wait_for_pods_running(
             [(p.namespace, str((p.manifest.get("metadata") or {}).get("name") or p.name)) for p in all_bootstrap_pods]
         )
+        if any(not p.is_infinite for p in all_bootstrap_pods):
+            t0_pods_started_mono = time.monotonic()
 
     if initial_deployments:
         _bootstrap_initial_deployments(mgr, initial_deployments)
@@ -1315,9 +1470,10 @@ def apply_scenario_queues_and_wait(
     mgr.apply_manifests_parallel(cq_lq_docs, max_workers=16)
 
     if not cq_names and not lq_keys:
-        return
+        return t0_pods_started_mono
 
-    deadline = time.monotonic() + timeout_sec
+    wait_start = time.monotonic()
+    deadline = wait_start + timeout_sec
     while time.monotonic() < deadline:
         st_cq, raw_cq = mgr.api_request("GET", "/apis/kueue.x-k8s.io/v1beta2/clusterqueues")
         st_lq, raw_lq = mgr.api_request("GET", "/apis/kueue.x-k8s.io/v1beta2/localqueues")
@@ -1339,8 +1495,9 @@ def apply_scenario_queues_and_wait(
                 )
             }
             if cq_names.issubset(active_cqs) and lq_keys.issubset(active_lqs):
-                return
-        time.sleep(0.5)
+                return t0_pods_started_mono
+        waited = time.monotonic() - wait_start
+        time.sleep(0.1 if waited < 2.0 else (0.25 if waited < 5.0 else 0.5))
     raise RuntimeError("Timed out waiting for ClusterQueues and LocalQueues to become Active")
 
 
@@ -1379,6 +1536,11 @@ def run_scenario_replay(
     max_run_seconds: float | None,
     status_interval_sec: float,
     wait_for_completion: bool,
+    *,
+    t0_pods_started_mono: float | None = None,
+    hold_finite_t0_pods: bool = False,
+    check_control_plane_health: bool = False,
+    health_check_interval_sec: float = 15.0,
 ) -> ReplayResult:
     """Run timed workflow arrivals and watch workloads until completion."""
     if bundle.initial_jump_raw_sec > 0:
@@ -1484,9 +1646,11 @@ def run_scenario_replay(
         if idep.desired_replicas > 0
     }
     deferred_infra_logged_seqs: set[int] = set()
-    # Wall offset before which no workflow may be created. Set after creating one creation-time tier
-    # while later tiers wait, so each tier gets a creationTimestamp in a later whole second.
+    # Wall offset before which no workflow may be created. Set after creating one simultaneous-target
+    # creation-time tier while later tiers wait, so each tier gets a creationTimestamp in a later whole second.
     fifo_gate_wall_sec = 0.0
+    last_fifo_tier_unix_sec: int | None = None
+    fifo_deferred_seqs: set[int] = set()
 
     known_deploy_names_by_ns: dict[str, set[str]] = {}
     known_standalone_pod_names_by_ns: dict[str, set[str]] = {}
@@ -1930,6 +2094,19 @@ def run_scenario_replay(
     stop_requested = False
     received_signal: int | None = None
     stop_reason = "completed"
+    health_issues: tuple[str, ...] = ()
+    baseline_health: ChamberHealthSnapshot | None = None
+    eff_health_check = bool(check_control_plane_health and hasattr(mgr, "check_chamber_health_snapshot"))
+    eff_health_interval = max(1.0, float(health_check_interval_sec))
+    start_epoch = 0.0
+    t0_mono = 0.0
+    bootstrap_lag_sec = 0.0
+    compensated_t0_pods = 0
+    fast_poll_floor = 1.5 if (total_planned + len(initial_wl_keys)) > 200 else 0.5
+    poll_interval_sec = min(status_interval_sec, fast_poll_floor)
+    next_status_mono = 0.0
+    next_poll_mono = 0.0
+    next_health_mono = 0.0
 
     def _sig_handler(signum: int, _frame: Any) -> None:
         nonlocal stop_requested, received_signal, stop_reason
@@ -1937,17 +2114,6 @@ def run_scenario_replay(
         stop_requested = True
         received_signal = signum
         stop_reason = "interrupted"
-
-    old_sigint = signal.signal(signal.SIGINT, _sig_handler)
-    old_sigterm = signal.signal(signal.SIGTERM, _sig_handler)
-
-    start_epoch = time.time()
-    _record_node_capacity_snapshot(start_epoch)
-    t0_mono = time.monotonic()
-    fast_poll_floor = 1.5 if (total_planned + len(initial_wl_keys)) > 200 else 0.5
-    poll_interval_sec = min(status_interval_sec, fast_poll_floor)
-    next_status_mono = t0_mono
-    next_poll_mono = t0_mono
 
     def _record_sched_wl_progress(snap: ClusterStatusSnapshot, *, count_absence: bool = False) -> None:
         # `count_absence` is set only by _poll_cluster(), so each cluster poll counts once even though
@@ -2461,13 +2627,29 @@ def run_scenario_replay(
                 return ev
         return None
 
+    def _effective_fifo_gate() -> float:
+        if last_fifo_tier_unix_sec is not None and time.time() >= last_fifo_tier_unix_sec + 1.02:
+            return 0.0
+        return fifo_gate_wall_sec
+
+    def _split_creation_tiers(cluster: list[ScheduledWorkflowItem]) -> list[list[ScheduledWorkflowItem]]:
+        ordered = sorted(cluster, key=lambda x: (x.creation_epoch, x.seq))
+        tiers: list[list[ScheduledWorkflowItem]] = []
+        for item in ordered:
+            if not tiers or abs(float(item.creation_epoch) - float(tiers[-1][0].creation_epoch)) > 1e-3:
+                tiers.append([item])
+            else:
+                tiers[-1].append(item)
+        return tiers
+
     def _print_status_line(snap: ClusterStatusSnapshot, now_mono: float, note: str = "") -> None:
         wall_elapsed = now_mono - t0_mono
         sim_elapsed = wall_elapsed * speedup
         next_candidates: list[float] = []
         if event_heap:
+            eff_fifo_gate = _effective_fifo_gate()
             next_candidates.append(
-                max(0.0, max(event_heap[0].target_wall_offset_sec, fifo_gate_wall_sec) - wall_elapsed)
+                max(0.0, max(event_heap[0].target_wall_offset_sec, eff_fifo_gate) - wall_elapsed)
             )
         if update_heap:
             next_candidates.append(max(0.0, update_heap[0].target_wall_offset_sec - wall_elapsed))
@@ -2511,8 +2693,50 @@ def run_scenario_replay(
         _print_status_line(snap, now_mono, note=note)
         return snap
 
+    old_sigint = signal.signal(signal.SIGINT, _sig_handler)
     try:
-        while not stop_requested:
+        old_sigterm = signal.signal(signal.SIGTERM, _sig_handler)
+    except BaseException:
+        signal.signal(signal.SIGINT, old_sigint)
+        raise
+
+    try:
+        if eff_health_check and not stop_requested:
+            ok_start, start_issues, baseline_health = verify_chamber_control_plane_health(
+                mgr,
+                stop_check=lambda: stop_requested,
+            )
+            if not ok_start and not stop_requested:
+                health_issues = tuple(start_issues)
+                stop_reason = "control_plane_unhealthy"
+                print(
+                    f"ERROR: Chamber control plane unhealthy before replay start: {'; '.join(start_issues)}",
+                    flush=True,
+                )
+
+        if not stop_requested and stop_reason != "control_plane_unhealthy":
+            finite_t0_pods = [
+                p for w in bundle.initial_workloads for p in w.pods if not p.is_infinite
+            ] + [p for p in bundle.initial_pods if not p.is_infinite]
+            if t0_pods_started_mono is not None:
+                bootstrap_lag_sec = max(0.0, time.monotonic() - float(t0_pods_started_mono))
+            if finite_t0_pods and (hold_finite_t0_pods or bootstrap_lag_sec >= 0.05):
+                compensated_t0_pods = _compensate_finite_t0_pods_for_bootstrap_lag(
+                    mgr,
+                    finite_t0_pods,
+                    bootstrap_lag_sec,
+                    held=hold_finite_t0_pods,
+                )
+
+        start_epoch = time.time()
+        t0_mono = time.monotonic()
+        if not stop_requested and stop_reason != "control_plane_unhealthy":
+            _record_node_capacity_snapshot(start_epoch)
+        next_status_mono = t0_mono
+        next_poll_mono = t0_mono
+        next_health_mono = t0_mono + eff_health_interval
+
+        while not stop_requested and stop_reason != "control_plane_unhealthy":
             now_mono = time.monotonic()
             wall_elapsed = now_mono - t0_mono
 
@@ -2603,10 +2827,11 @@ def run_scenario_replay(
             due_del = _first_runnable_event(delete_heap, now_el_ev, overdue_creates, strictly_after_create=True)
             due_upd = _first_runnable_event(update_heap, now_el_ev, overdue_creates, strictly_after_create=False)
             next_del_ts = due_del.target_wall_offset_sec if due_del is not None else None
+            fifo_gate_open = now_el_ev >= _effective_fifo_gate()
             next_sub_ts = (
                 event_heap[0].target_wall_offset_sec
                 if (
-                    now_el_ev >= fifo_gate_wall_sec
+                    fifo_gate_open
                     and event_heap
                     and event_heap[0].target_wall_offset_sec <= now_el_ev
                 )
@@ -2652,6 +2877,7 @@ def run_scenario_replay(
                     c_key = (cand_it.namespace, cand_it.object_kind, cand_it.name, cand_it.incarnation_index)
                     if c_key in cancelled_unsubmitted_keys:
                         cancelled_unsubmitted_keys.discard(c_key)
+                        fifo_deferred_seqs.discard(cand_it.seq)
                         popped_cancelled = True
                         continue
                     due_batch.append(cand_it)
@@ -2663,46 +2889,96 @@ def run_scenario_replay(
                 due_batch = []
 
             if due_batch:
-                # Preserve exact creationTime FIFO order across small batches: group by creation_epoch
-                # and space distinct creation_epoch tiers across whole RFC3339 seconds when small (<= 12).
+                # Partition due creates by adjacent target proximity (<= 1ms). Apply 1s RFC3339 FIFO
+                # tier spacing strictly to the leading simultaneous-target cluster (or a previously
+                # deferred tier draining out of fifo_deferred_seqs), so dense post-t0 arrivals neither
+                # cancel an active t0 drain nor stall non-colliding earlier prefixes.
                 due_batch.sort(key=lambda x: (round(x.target_wall_offset_sec, 6), x.creation_epoch, x.seq))
-                distinct_c_epochs: list[float] = []
+                target_clusters: list[list[ScheduledWorkflowItem]] = []
                 for x in due_batch:
-                    c_sec = round(float(x.creation_epoch), 3)
-                    if not distinct_c_epochs or abs(c_sec - distinct_c_epochs[-1]) > 1e-3:
-                        distinct_c_epochs.append(c_sec)
+                    if (
+                        not target_clusters
+                        or abs(x.target_wall_offset_sec - target_clusters[-1][-1].target_wall_offset_sec) > 1e-3
+                    ):
+                        target_clusters.append([x])
+                    else:
+                        target_clusters[-1].append(x)
 
-                can_space_fifo = (
-                    1 < len(distinct_c_epochs) <= 12
-                    and len(due_batch) <= 24
-                    and (max_run_seconds is None or max_run_seconds >= len(distinct_c_epochs) * 2.5)
-                )
-                if can_space_fifo:
-                    groups: list[list[ScheduledWorkflowItem]] = []
-                    for x in due_batch:
-                        if not groups or abs(float(x.creation_epoch) - float(groups[-1][0].creation_epoch)) > 1e-3:
-                            groups.append([x])
-                        else:
-                            groups[-1].append(x)
-                    # Create only the earliest creation_epoch tier now. Later tiers go back onto event_heap
-                    # unchanged and wait behind fifo_gate_wall_sec, which is set from the moment this tier
-                    # was actually created. Infra/delete events, --duration and SIGINT stay responsive, a
-                    # slow status poll cannot put two tiers into the same second, and a workflow that
-                    # becomes due meanwhile is sorted behind the waiting tiers instead of passing them.
-                    first_grp = groups[0]
-                    mgr.apply_manifests_parallel(
-                        [it_g.manifest for it_g in first_grp],
-                        max_workers=min(24, max(1, len(first_grp))),
+                leading_cluster = target_clusters[0]
+                later_clusters = target_clusters[1:]
+                lead_tiers = _split_creation_tiers(leading_cluster)
+                lead_is_colliding = len(lead_tiers) > 1
+                lead_is_draining = any(it_c.seq in fifo_deferred_seqs for it_c in leading_cluster)
+
+                if lead_is_colliding or lead_is_draining:
+                    can_space_leading = (
+                        len(lead_tiers) <= 12
+                        and len(leading_cluster) <= 24
+                        and (max_run_seconds is None or max_run_seconds >= len(lead_tiers) * 2.5)
                     )
-                    for grp in groups[1:]:
-                        for it_g in grp:
-                            heapq.heappush(event_heap, it_g)
-                    fifo_gate_wall_sec = (time.monotonic() - t0_mono) + max(0.05, 1.02 - (time.time() % 1.0))
-                    due_batch = first_grp
-                elif len(distinct_c_epochs) > 1 and len(due_batch) <= 24:
-                    mgr.apply_manifests_parallel([item.manifest for item in due_batch], max_workers=1)
+                    if can_space_leading:
+                        # Create only the earliest creation_epoch tier of the leading cluster now.
+                        # Remaining tiers of the leading cluster wait in fifo_deferred_seqs; later
+                        # clusters return to event_heap untouched behind fifo_gate_wall_sec.
+                        first_grp = lead_tiers[0]
+                        mgr.apply_manifests_parallel(
+                            [it_g.manifest for it_g in first_grp],
+                            max_workers=min(24, max(1, len(first_grp))),
+                        )
+                        for it_g in first_grp:
+                            fifo_deferred_seqs.discard(it_g.seq)
+                        for grp in lead_tiers[1:]:
+                            for it_g in grp:
+                                heapq.heappush(event_heap, it_g)
+                                fifo_deferred_seqs.add(it_g.seq)
+                        for cl in later_clusters:
+                            for it_l in cl:
+                                heapq.heappush(event_heap, it_l)
+                        after_mono = time.monotonic()
+                        after_wall = time.time()
+                        last_fifo_tier_unix_sec = int(math.floor(after_wall))
+                        next_sec_wait = max(0.02, (last_fifo_tier_unix_sec + 1.02) - after_wall)
+                        fifo_gate_wall_sec = (after_mono - t0_mono) + next_sec_wait
+                        due_batch = first_grp
+                    else:
+                        ordered_lead = [it_g for grp in lead_tiers for it_g in grp]
+                        lead_workers = 1 if (lead_is_colliding and len(ordered_lead) <= 24) else 24
+                        mgr.apply_manifests_parallel(
+                            [item.manifest for item in ordered_lead],
+                            max_workers=lead_workers,
+                        )
+                        for item in ordered_lead:
+                            fifo_deferred_seqs.discard(item.seq)
+                        for cl in later_clusters:
+                            for it_l in cl:
+                                heapq.heappush(event_heap, it_l)
+                        due_batch = ordered_lead
                 else:
-                    mgr.apply_manifests_parallel([item.manifest for item in due_batch], max_workers=24)
+                    # Submit the non-colliding leading prefix sequentially with 0s extra delay up to
+                    # any later colliding (or deferred) cluster, pushing the suffix back onto event_heap.
+                    prefix_items: list[ScheduledWorkflowItem] = []
+                    suffix_start = len(target_clusters)
+                    for cl_idx, cl in enumerate(target_clusters):
+                        cl_tiers = _split_creation_tiers(cl)
+                        if len(cl_tiers) > 1 or any(it_c.seq in fifo_deferred_seqs for it_c in cl):
+                            suffix_start = cl_idx
+                            break
+                        prefix_items.extend(cl)
+                    for cl in target_clusters[suffix_start:]:
+                        for it_s in cl:
+                            heapq.heappush(event_heap, it_s)
+                    prefix_tiers = _split_creation_tiers(prefix_items)
+                    if len(prefix_items) == 1 or (len(prefix_tiers) > 1 and len(prefix_items) <= 24):
+                        prefix_workers = 1
+                    else:
+                        prefix_workers = 24
+                    mgr.apply_manifests_parallel(
+                        [item.manifest for item in prefix_items],
+                        max_workers=prefix_workers,
+                    )
+                    for item in prefix_items:
+                        fifo_deferred_seqs.discard(item.seq)
+                    due_batch = prefix_items
 
                 now_off = time.monotonic() - t0_mono
                 for item in due_batch:
@@ -2771,6 +3047,23 @@ def run_scenario_replay(
                 continue
 
             now_mono = time.monotonic()
+            if eff_health_check and not stop_requested and now_mono >= next_health_mono:
+                ok_mid, mid_issues, _ = verify_chamber_control_plane_health(
+                    mgr,
+                    baseline=baseline_health,
+                    stop_check=lambda: stop_requested,
+                )
+                while next_health_mono <= now_mono:
+                    next_health_mono += eff_health_interval
+                if not ok_mid and not stop_requested:
+                    health_issues = tuple(mid_issues)
+                    stop_reason = "control_plane_unhealthy"
+                    print(
+                        f"ERROR: Chamber control plane became unhealthy during replay: {'; '.join(mid_issues)}",
+                        flush=True,
+                    )
+                    break
+
             due_status = now_mono >= next_status_mono
             need_fast_poll = (
                 (not event_heap and not update_heap and not delete_heap)
@@ -2861,8 +3154,11 @@ def run_scenario_replay(
             wake_candidates = [next_status_mono - now_mono]
             if (not event_heap and not update_heap and not delete_heap) or initial_wl_keys or known_deploy_names_by_ns:
                 wake_candidates.append(next_poll_mono - now_mono)
+            if eff_health_check:
+                wake_candidates.append(next_health_mono - now_mono)
             if event_heap:
-                wake_candidates.append(max(event_heap[0].target_wall_offset_sec, fifo_gate_wall_sec) - wall_elapsed)
+                eff_fifo_gate = _effective_fifo_gate()
+                wake_candidates.append(max(event_heap[0].target_wall_offset_sec, eff_fifo_gate) - wall_elapsed)
             # An update or delete held behind its own pending create wakes with that create (above).
             overdue_wake = (
                 _overdue_create_ts_by_key(wall_elapsed) if (update_heap or delete_heap) and event_heap else {}
@@ -2882,11 +3178,31 @@ def run_scenario_replay(
             sleep_sec = max(0.01, min(wake_candidates))
             time.sleep(min(sleep_sec, 1.0))
 
+        if (
+            eff_health_check
+            and baseline_health is not None
+            and not stop_requested
+            and stop_reason != "control_plane_unhealthy"
+        ):
+            ok_end, end_issues, _ = verify_chamber_control_plane_health(
+                mgr,
+                baseline=baseline_health,
+                stop_check=lambda: stop_requested,
+            )
+            if not ok_end and not stop_requested:
+                health_issues = tuple(end_issues)
+                stop_reason = "control_plane_unhealthy"
+                print(
+                    f"ERROR: Chamber control plane unhealthy at replay end: {'; '.join(end_issues)}",
+                    flush=True,
+                )
+
     finally:
-        try:
-            _sync_serving_workloads()
-        except Exception:
-            pass
+        if stop_reason != "control_plane_unhealthy":
+            try:
+                _sync_serving_workloads()
+            except Exception:
+                pass
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
 
@@ -2898,4 +3214,7 @@ def run_scenario_replay(
         total_pods=total_pods_submitted,
         stop_reason="interrupted" if stop_requested else stop_reason,
         signal_num=received_signal if stop_requested else None,
+        bootstrap_lag_sec=bootstrap_lag_sec,
+        health_issues=health_issues,
+        compensated_t0_pods=compensated_t0_pods,
     )

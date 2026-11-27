@@ -54,6 +54,7 @@ import time
 from chamber_common import (
     AdmissionFairSharingConfig,
     ChamberManager,
+    ClusterStatusSnapshot,
     DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES,
     DEFAULT_FALLBACK_EXEC_SEC,
     DEFAULT_INFRA_PODS_NAMESPACE,
@@ -811,12 +812,13 @@ def main(argv: list[str] | None = None) -> int:
             f"and LocalQueues from infra.json...",
             flush=True,
         )
-        apply_scenario_queues_and_wait(
+        t0_pods_started_mono = apply_scenario_queues_and_wait(
             mgr,
             bundle.prereq_and_queue_docs,
             initial_workloads=bundle.initial_workloads,
             initial_deployments=bundle.initial_deployments,
             initial_pods=bundle.initial_pods,
+            hold_finite_t0_pods=True,
         )
 
         scraper_proc: subprocess.Popen[str] | None = None
@@ -871,6 +873,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             replay_started = True
+            t0_started = (
+                float(t0_pods_started_mono)
+                if isinstance(t0_pods_started_mono, (int, float)) and not isinstance(t0_pods_started_mono, bool)
+                else None
+            )
             replay_result = run_scenario_replay(
                 mgr=mgr,
                 bundle=bundle,
@@ -878,6 +885,9 @@ def main(argv: list[str] | None = None) -> int:
                 max_run_seconds=max_run_seconds,
                 status_interval_sec=status_interval_sec,
                 wait_for_completion=args.wait_for_completion,
+                t0_pods_started_mono=t0_started,
+                hold_finite_t0_pods=True,
+                check_control_plane_health=True,
             )
             start_epoch, end_epoch, submitted_count, total_pods = replay_result
         finally:
@@ -896,11 +906,14 @@ def main(argv: list[str] | None = None) -> int:
             if scraper_log_fh is not None:
                 scraper_log_fh.close()
 
-        final_snap = query_cluster_status(
-            mgr,
-            workload_namespaces=bundle.workload_namespaces,
-            include_kueue_workloads=True,
-        )
+        if getattr(replay_result, "control_plane_unhealthy", False):
+            final_snap = ClusterStatusSnapshot()
+        else:
+            final_snap = query_cluster_status(
+                mgr,
+                workload_namespaces=bundle.workload_namespaces,
+                include_kueue_workloads=True,
+            )
         observed_pods = (
             final_snap.pods_running
             + final_snap.pods_pending
@@ -952,12 +965,20 @@ def main(argv: list[str] | None = None) -> int:
             f"failed={final_snap.pods_failed}"
         )
         print(f"  ClusterQueues Status    : {' '.join(final_snap.cq_summary)}")
+        if getattr(replay_result, "bootstrap_lag_sec", 0.0) >= 0.05:
+            comp_cnt = int(getattr(replay_result, "compensated_t0_pods", 0) or 0)
+            comp_note = f" (compensated on {comp_cnt} finite t0 pod(s))" if comp_cnt > 0 else ""
+            print(f"  Bootstrap Setup Lag     : {replay_result.bootstrap_lag_sec:.2f}s{comp_note}")
         if replay_result.stop_reason != "completed":
             sig_note = f" (signal {replay_result.signal_num})" if replay_result.signal_num is not None else ""
             print(f"  Stop Reason             : {replay_result.stop_reason}{sig_note}")
+        if getattr(replay_result, "health_issues", ()):
+            print(f"  Control Plane Health    : {'; '.join(replay_result.health_issues)}")
         print("================================================================================", flush=True)
 
-        if args.metrics_report and not replay_result.interrupted:
+        if args.metrics_report and not replay_result.interrupted and not getattr(
+            replay_result, "control_plane_unhealthy", False
+        ):
             mgr.run_kueue_metrics_report(
                 queueing_strategy=bundle.queueing_strategy,
                 start_epoch=start_epoch,
