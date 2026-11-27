@@ -38,6 +38,7 @@ from typing import Any
 
 from chamber_common import (
     ChamberManager,
+    DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES,
     DEFAULT_FLAVOR_NAME,
     DEFAULT_PAUSE_IMAGE,
     add_common_chamber_args,
@@ -54,8 +55,12 @@ from chamber_common import (
     managed_chamber,
     normalize_queueing_strategy,
     parse_duration_seconds,
+    parse_fair_sharing_strategies,
+    parse_feature_gates_arg,
     query_cluster_status,
+    resolve_admission_fair_sharing_config,
     resolve_fair_sharing_arg,
+    termination_signal_handlers,
     validate_dns_label,
 )
 
@@ -502,6 +507,45 @@ def main(argv: list[str] | None = None) -> int:
     total_memory_gb = args.nodes * args.node_memory_gb
     total_pods = args.nodes * args.node_pods
 
+    try:
+        fair_sharing_strategies = (
+            parse_fair_sharing_strategies(args.fair_sharing_strategies)
+            if args.fair_sharing_strategies is not None
+            else DEFAULT_FAIR_SHARING_PREEMPTION_STRATEGIES
+        )
+        afs_cfg = resolve_admission_fair_sharing_config(
+            enabled=args.admission_fair_sharing,
+            raw_usage_half_life=args.afs_usage_half_life,
+            raw_usage_sampling_interval=args.afs_sampling_interval,
+            resource_weights=args.afs_resource_weights,
+        )
+        kueue_feature_gates = parse_feature_gates_arg(args.kueue_feature_gates)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    has_cli_controller_override = any(
+        x is not None
+        for x in (
+            args.fair_sharing_strategies,
+            args.admission_fair_sharing,
+            args.afs_usage_half_life,
+            args.afs_sampling_interval,
+            args.afs_resource_weights,
+            args.kueue_feature_gates,
+        )
+    )
+    if (
+        args.skip_chamber_deploy
+        and not args.cleanup
+        and not args.cleanup_workloads
+        and has_cli_controller_override
+    ):
+        parser.error(
+            "Controller config CLI flags (--fair-sharing-strategies, --admission-fair-sharing*, "
+            "--kueue-feature-gates) cannot be combined with --skip-chamber-deploy because Kueue's "
+            "controller configuration is only applied when deploying a chamber."
+        )
+
     mgr = ChamberManager(
         chamber_namespace=args.namespace,
         workload_namespace=args.workload_namespace,
@@ -513,6 +557,9 @@ def main(argv: list[str] | None = None) -> int:
         kueue_image=args.kueue_image,
         kueue_build_dir=args.kueue_build_dir,
         enable_fair_sharing=enable_fair_sharing,
+        fair_sharing_strategies=fair_sharing_strategies,
+        admission_fair_sharing=afs_cfg,
+        kueue_feature_gates=kueue_feature_gates,
     )
 
     effective_cq_fs = enable_fair_sharing
@@ -556,24 +603,32 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cleanup:
         if args.dry_run:
+            mgr.close()
             print(f"[dry-run] Would tear down chamber in host namespace '{args.namespace}'.")
             return 0
-        mgr.cleanup_chamber()
+        with termination_signal_handlers():
+            mgr.cleanup_chamber()
         return 0
 
     if args.cleanup_workloads:
         if args.dry_run:
+            mgr.close()
             print(f"[dry-run] Would delete demo workloads and queues in chamber '{args.namespace}'.")
             return 0
-        cleanup_demo_workloads(
-            mgr=mgr,
-            resource_flavor_name=args.resource_flavor,
-            cluster_queue_name=args.cluster_queue,
-            local_queue_name=args.local_queue,
-        )
+        with termination_signal_handlers():
+            try:
+                cleanup_demo_workloads(
+                    mgr=mgr,
+                    resource_flavor_name=args.resource_flavor,
+                    cluster_queue_name=args.cluster_queue,
+                    local_queue_name=args.local_queue,
+                )
+            finally:
+                mgr.close()
         return 0
 
     if args.dry_run:
+        mgr.close()
         print(f"# === KWOK Nodes ({args.nodes} nodes: {args.node_cpu} CPU, {args.node_memory_gb}Gi RAM each) ===")
         print(docs_to_pretty_yaml(node_docs), end="")
         print("---")

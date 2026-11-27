@@ -17,17 +17,107 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any
 
 
 YAML_SPECIAL_STRINGS: frozenset[str] = frozenset(
-    {"true", "false", "yes", "no", "on", "off", "null", "~", ""}
+    {
+        "y",
+        "n",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "true",
+        "false",
+        "null",
+        "~",
+        "",
+        ".inf",
+        "+.inf",
+        "-.inf",
+        ".nan",
+        "---",
+        "...",
+        "=",
+        "<<",
+    }
 )
 YAML_SAFE_UNQUOTED_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+YAML_NUMERIC_RE = re.compile(
+    r"^[+-]?(?:"
+    r"0[xX][0-9a-fA-F_]+"
+    r"|0[oO][0-7_]+"
+    r"|0[bB][01_]+"
+    r"|[0-9][0-9_]*"
+    r"|(?:[0-9][0-9_]*\.[0-9_]*|\.[0-9_]*[0-9][0-9_]*)(?:[eE][+-]?[0-9_]+)?"
+    r"|[0-9][0-9_]*[eE][+-]?[0-9_]+"
+    r"|[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?"
+    r")$"
+)
+YAML_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}(?:$|[Tt\s].*)")
 K8S_TOP_KEY_ORDER: tuple[str, ...] = ("apiVersion", "kind", "metadata", "value", "spec", "status")
 K8S_META_KEY_ORDER: tuple[str, ...] = ("name", "namespace", "uid", "creationTimestamp", "labels", "annotations")
+
+_YAML_ESCAPE_MAP: dict[str, str] = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\0": "\\0",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
+def _yaml_double_quote(s: str) -> str:
+    """Encode a Python str as a YAML 1.1/1.2 double-quoted scalar without UTF-16 surrogate escapes."""
+    out: list[str] = ['"']
+    for ch in s:
+        mapped = _YAML_ESCAPE_MAP.get(ch)
+        if mapped is not None:
+            out.append(mapped)
+            continue
+        cp = ord(ch)
+        if cp < 0x20 or (0x7F <= cp <= 0xFFFF):
+            out.append(f"\\u{cp:04x}")
+        elif cp > 0xFFFF:
+            out.append(f"\\U{cp:08x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _yaml_string(s: str) -> str:
+    """Format a Python string so it round-trips identically through YAML 1.1 and YAML 1.2 parsers."""
+    if s == "":
+        return '""'
+    if s.lower() in YAML_SPECIAL_STRINGS:
+        return _yaml_double_quote(s)
+    if s.startswith(("-", ".")):
+        return _yaml_double_quote(s)
+    if YAML_NUMERIC_RE.match(s) or YAML_TIMESTAMP_RE.match(s):
+        return _yaml_double_quote(s)
+    try:
+        float(s)
+        return _yaml_double_quote(s)
+    except ValueError:
+        pass
+    if YAML_SAFE_UNQUOTED_RE.match(s):
+        return s
+    return _yaml_double_quote(s)
+
+
+def _yaml_key(k: Any) -> str:
+    """Format a mapping key safely for YAML 1.1/1.2 parsers."""
+    if isinstance(k, (int, float)) and not isinstance(k, bool):
+        return _yaml_scalar(k)
+    return _yaml_string(str(k))
 
 
 def _yaml_scalar(val: Any) -> str:
@@ -35,25 +125,22 @@ def _yaml_scalar(val: Any) -> str:
         return "null"
     if isinstance(val, bool):
         return "true" if val else "false"
-    if isinstance(val, (int, float)):
+    if isinstance(val, int):
         return str(val)
+    if isinstance(val, float):
+        if math.isnan(val):
+            return ".nan"
+        if math.isinf(val):
+            return ".inf" if val > 0 else "-.inf"
+        s_num = repr(val)
+        if ("e" in s_num or "E" in s_num) and "." not in s_num:
+            s_num = re.sub(r"([eE])", r".0\1", s_num, count=1)
+        return s_num
     if isinstance(val, dict) and not val:
         return "{}"
-    if isinstance(val, list) and not val:
+    if isinstance(val, (list, tuple)) and not val:
         return "[]"
-    s = str(val)
-    if s == "":
-        return '""'
-    if s.lower() in YAML_SPECIAL_STRINGS:
-        return json.dumps(s)
-    try:
-        float(s)
-        return json.dumps(s)
-    except ValueError:
-        pass
-    if YAML_SAFE_UNQUOTED_RE.match(s) and not s.startswith("-"):
-        return s
-    return json.dumps(s)
+    return _yaml_string(str(val))
 
 
 def _ordered_dict_items(d: dict[str, Any], level: int = 0, parent_key: str = "") -> list[tuple[str, Any]]:
@@ -74,14 +161,14 @@ def to_clean_yaml(obj: Any, indent: int = 0, parent_key: str = "") -> str:
             return f"{pad}{{}}" if indent > 0 else "{}"
         lines: list[str] = []
         for k, v in _ordered_dict_items(obj, level=indent, parent_key=parent_key):
-            key_str = k if YAML_SAFE_UNQUOTED_RE.match(str(k)) else json.dumps(str(k))
+            key_str = _yaml_key(k)
             if isinstance(v, dict):
                 if not v:
                     lines.append(f"{pad}{key_str}: {{}}")
                 else:
                     lines.append(f"{pad}{key_str}:")
                     lines.append(to_clean_yaml(v, indent + 1, parent_key=str(k)))
-            elif isinstance(v, list):
+            elif isinstance(v, (list, tuple)):
                 if not v:
                     lines.append(f"{pad}{key_str}: []")
                 else:
@@ -91,7 +178,7 @@ def to_clean_yaml(obj: Any, indent: int = 0, parent_key: str = "") -> str:
                 lines.append(f"{pad}{key_str}: {_yaml_scalar(v)}")
         return "\n".join(lines)
 
-    if isinstance(obj, list):
+    if isinstance(obj, (list, tuple)):
         if not obj:
             return f"{pad}[]" if indent > 0 else "[]"
         lines = []
@@ -102,14 +189,14 @@ def to_clean_yaml(obj: Any, indent: int = 0, parent_key: str = "") -> str:
                     continue
                 items_kv = _ordered_dict_items(item, level=indent + 1)
                 first_k, first_v = items_kv[0]
-                fk_str = first_k if YAML_SAFE_UNQUOTED_RE.match(str(first_k)) else json.dumps(str(first_k))
+                fk_str = _yaml_key(first_k)
                 if isinstance(first_v, dict):
                     if not first_v:
                         lines.append(f"{pad}- {fk_str}: {{}}")
                     else:
                         lines.append(f"{pad}- {fk_str}:")
                         lines.append(to_clean_yaml(first_v, indent + 2, parent_key=str(first_k)))
-                elif isinstance(first_v, list):
+                elif isinstance(first_v, (list, tuple)):
                     if not first_v:
                         lines.append(f"{pad}- {fk_str}: []")
                     else:
@@ -118,14 +205,14 @@ def to_clean_yaml(obj: Any, indent: int = 0, parent_key: str = "") -> str:
                 else:
                     lines.append(f"{pad}- {fk_str}: {_yaml_scalar(first_v)}")
                 for rk, rv in items_kv[1:]:
-                    rk_str = rk if YAML_SAFE_UNQUOTED_RE.match(str(rk)) else json.dumps(str(rk))
+                    rk_str = _yaml_key(rk)
                     if isinstance(rv, dict):
                         if not rv:
                             lines.append(f"{pad}  {rk_str}: {{}}")
                         else:
                             lines.append(f"{pad}  {rk_str}:")
                             lines.append(to_clean_yaml(rv, indent + 2, parent_key=str(rk)))
-                    elif isinstance(rv, list):
+                    elif isinstance(rv, (list, tuple)):
                         if not rv:
                             lines.append(f"{pad}  {rk_str}: []")
                         else:
@@ -133,7 +220,7 @@ def to_clean_yaml(obj: Any, indent: int = 0, parent_key: str = "") -> str:
                             lines.append(to_clean_yaml(rv, indent + 1, parent_key=str(rk)))
                     else:
                         lines.append(f"{pad}  {rk_str}: {_yaml_scalar(rv)}")
-            elif isinstance(item, list):
+            elif isinstance(item, (list, tuple)):
                 if not item:
                     lines.append(f"{pad}- []")
                 else:

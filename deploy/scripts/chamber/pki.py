@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -34,7 +35,13 @@ from chamber.constants import (
 
 
 def fetch_pki_from_cluster(chamber_namespace: str, target_pki_dir: Path) -> bool:
-    """Attempt to read existing Secret/kwok-pki from chamber_namespace in the host cluster."""
+    """Attempt to read existing Secret/kwok-pki from chamber_namespace in the host cluster.
+
+    Returns True if Secret/kwok-pki was fetched and written, False ONLY if the secret or
+    namespace does not exist in the host cluster (NotFound). Raises RuntimeError on transient
+    network/timeout, authentication, RBAC, or malformed-secret errors so callers never silently
+    generate a conflicting ad-hoc CA for a running chamber.
+    """
     try:
         proc = subprocess.run(
             ["kubectl", "-n", chamber_namespace, "get", "secret", PKI_SECRET_NAME, "-o", "json"],
@@ -43,11 +50,14 @@ def fetch_pki_from_cluster(chamber_namespace: str, target_pki_dir: Path) -> bool
             check=False,
             timeout=15.0,
         )
-    except Exception:
-        return False
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to read Secret/{PKI_SECRET_NAME} in namespace '{chamber_namespace}': {exc}"
+        ) from exc
 
     if proc.returncode != 0:
-        err_lower = (proc.stderr or "").lower()
+        err_msg = (proc.stderr or "").strip()
+        err_lower = err_msg.lower()
         if "invalid_rapt" in err_lower or "gke-gcloud-auth-plugin" in err_lower:
             if proc.stderr:
                 sys.stderr.write(proc.stderr)
@@ -56,31 +66,105 @@ def fetch_pki_from_cluster(chamber_namespace: str, target_pki_dir: Path) -> bool
                 "Please re-authenticate in your terminal:\n"
                 "  gcloud auth login && gcloud auth application-default login"
             )
-        return False
+        if "notfound" in err_lower:
+            return False
+        raise RuntimeError(
+            f"Failed to read Secret/{PKI_SECRET_NAME} in namespace '{chamber_namespace}' "
+            f"(exit {proc.returncode}): {err_msg or 'unknown kubectl error'}"
+        )
 
     if not proc.stdout:
-        return False
+        raise RuntimeError(
+            f"Empty response when reading Secret/{PKI_SECRET_NAME} in namespace '{chamber_namespace}'."
+        )
 
     try:
         secret_obj = json.loads(proc.stdout)
-        data = secret_obj.get("data") or {}
-        if not all(k in data for k in PKI_REQUIRED_KEYS):
-            return False
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to parse Secret/{PKI_SECRET_NAME} JSON in namespace '{chamber_namespace}': {exc}"
+        ) from exc
 
+    if not isinstance(secret_obj, dict):
+        raise RuntimeError(
+            f"Secret/{PKI_SECRET_NAME} JSON in namespace '{chamber_namespace}' must be an object, "
+            f"got {type(secret_obj).__name__}."
+        )
+
+    data = secret_obj.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Secret/{PKI_SECRET_NAME} in namespace '{chamber_namespace}' has missing or non-object 'data' field."
+        )
+
+    missing_keys = [k for k in PKI_REQUIRED_KEYS if k not in data]
+    if missing_keys:
+        raise RuntimeError(
+            f"Secret/{PKI_SECRET_NAME} in namespace '{chamber_namespace}' is missing required keys: "
+            f"{', '.join(missing_keys)}"
+        )
+
+    decoded_files: dict[str, bytes] = {}
+    for key in PKI_REQUIRED_KEYS:
+        val = data[key]
+        if not isinstance(val, str) or not val.strip():
+            raise RuntimeError(
+                f"Secret/{PKI_SECRET_NAME} in namespace '{chamber_namespace}' has empty or non-string value "
+                f"for required key '{key}'."
+            )
+        try:
+            raw_bytes = base64.b64decode(val, validate=True)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to base64-decode key '{key}' in Secret/{PKI_SECRET_NAME} "
+                f"from namespace '{chamber_namespace}': {exc}"
+            ) from exc
+        if not raw_bytes:
+            raise RuntimeError(
+                f"Secret/{PKI_SECRET_NAME} in namespace '{chamber_namespace}' decoded to empty bytes "
+                f"for required key '{key}'."
+            )
+        decoded_files[key] = raw_bytes
+
+    if "token.csv" in data and data["token.csv"] is not None:
+        token_val = data["token.csv"]
+        if not isinstance(token_val, str):
+            raise RuntimeError(
+                f"Secret/{PKI_SECRET_NAME} in namespace '{chamber_namespace}' has non-string value for key 'token.csv'."
+            )
+        if token_val:
+            try:
+                decoded_files["token.csv"] = base64.b64decode(token_val, validate=True)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to base64-decode key 'token.csv' in Secret/{PKI_SECRET_NAME} "
+                    f"from namespace '{chamber_namespace}': {exc}"
+                ) from exc
+        else:
+            decoded_files["token.csv"] = METRICS_TOKEN_CSV.encode("utf-8")
+    else:
+        decoded_files["token.csv"] = METRICS_TOKEN_CSV.encode("utf-8")
+
+    staged_paths: list[tuple[Path, Path]] = []
+    try:
         target_pki_dir.mkdir(parents=True, exist_ok=True)
-        for key in (*PKI_REQUIRED_KEYS, "token.csv"):
-            if key in data:
-                raw_bytes = base64.b64decode(data[key])
-                file_path = target_pki_dir / key
-                file_path.write_bytes(raw_bytes)
-                file_path.chmod(0o644)
-        token_path = target_pki_dir / "token.csv"
-        if not token_path.exists():
-            token_path.write_text(METRICS_TOKEN_CSV, encoding="utf-8")
-            token_path.chmod(0o644)
+        for key, raw_bytes in decoded_files.items():
+            tmp_path = target_pki_dir / f".{key}.tmp.{os.getpid()}"
+            tmp_path.write_bytes(raw_bytes)
+            tmp_path.chmod(0o644)
+            staged_paths.append((tmp_path, target_pki_dir / key))
+        for tmp_path, dst_path in staged_paths:
+            os.replace(tmp_path, dst_path)
         return True
-    except Exception:
-        return False
+    except Exception as exc:
+        for tmp_path, _ in staged_paths:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"Failed to decode or write Secret/{PKI_SECRET_NAME} from namespace '{chamber_namespace}': {exc}"
+        ) from exc
 
 
 def generate_adhoc_pki(chamber_namespace: str, target_pki_dir: Path) -> None:

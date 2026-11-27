@@ -2978,6 +2978,7 @@ class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
                         patch.object(mgr, "ensure_prometheus_connection"),
                         patch("chamber.lifecycle.subprocess.run") as m_run,
                     ):
+                        m_run.return_value.returncode = 0
                         mgr.run_kueue_metrics_report(
                             queueing_strategy="StrictFIFO",
                             start_epoch=1700000000.0,

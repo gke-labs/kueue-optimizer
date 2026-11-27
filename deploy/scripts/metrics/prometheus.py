@@ -78,16 +78,9 @@ class PrometheusClient:
         if self.prometheus_url and self._is_url_ready(self.prometheus_url):
             return
 
-        # Check common local port-forward ports before spawning a new subprocess
-        for default_port in (19090, 9090):
-            candidate = f"http://127.0.0.1:{default_port}"
-            if candidate != self.prometheus_url and self._is_url_ready(candidate, timeout=0.5):
-                self.prometheus_url = candidate
-                return
-
-        # Automatically start a local port-forward to svc/prometheus so queries
-        # execute directly over HTTP in milliseconds without spawning per-metric
-        # kubectl subprocesses.
+        # Automatically start a local port-forward to svc/prometheus in self.namespace so queries
+        # execute directly over HTTP in milliseconds without spawning per-metric kubectl
+        # subprocesses (never probing shared ports like 19090/9090 that may belong to another chamber).
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
             local_port = s.getsockname()[1]
@@ -112,17 +105,34 @@ class PrometheusClient:
             if self._pf_proc.poll() is not None:
                 break
             if self._is_url_ready(candidate_url, timeout=1.0):
-                self.prometheus_url = candidate_url
-                return
+                if self._pf_proc.poll() is None:
+                    self.prometheus_url = candidate_url
+                    return
+                break
             time.sleep(0.2)
 
+        # Port-forward did not become ready; terminate and clear prometheus_url so _get_json
+        # falls back to the strictly namespaced kubectl proxy for self.namespace.
+        self.close()
+        self.prometheus_url = None
+
     def close(self) -> None:
-        if self._pf_proc and self._pf_proc.poll() is None:
-            try:
-                self._pf_proc.terminate()
-                self._pf_proc.wait(timeout=2)
-            except Exception:
-                pass
+        if self._pf_proc is not None:
+            if self._pf_proc.poll() is None:
+                try:
+                    self._pf_proc.terminate()
+                    self._pf_proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        self._pf_proc.kill()
+                        self._pf_proc.wait(timeout=2)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    self._pf_proc.wait(timeout=1)
+                except Exception:
+                    pass
             self._pf_proc = None
 
     def _get_json(self, path: str, params: dict[str, str]) -> dict:

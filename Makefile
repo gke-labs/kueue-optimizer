@@ -18,6 +18,14 @@ NAMESPACE ?= kueue-optimizer-chamber-01
 LOCAL_APISERVER_PORT ?= 16443
 LOCAL_PROMETHEUS_PORT ?= 9090
 PROMETHEUS_SCRAPE_INTERVAL ?= 10s
+ADHOC_ONLY ?= 0
+BUILD_ARGS ?=
+
+ifeq ($(ADHOC_ONLY),1)
+_RENDER_ADHOC_FLAG := --adhoc-only
+else
+_RENDER_ADHOC_FLAG :=
+endif
 
 .PHONY: help
 help: ## Show available targets
@@ -37,20 +45,20 @@ generate: ## Regenerate manifests and configs from ./kwok, ./kueue, and ./jobset
 	NAMESPACE=$(NAMESPACE) PROMETHEUS_SCRAPE_INTERVAL=$(PROMETHEUS_SCRAPE_INTERVAL) ./deploy/scripts/generate.sh
 
 .PHONY: build
-build: ## Render the full Kustomize manifest to stdout (picks PKI from cluster or generates ad-hoc)
-	./deploy/scripts/chamber_common.py render --namespace $(NAMESPACE) --scrape-interval $(PROMETHEUS_SCRAPE_INTERVAL) --with-sample-queues
+build: ## Render the full Kustomize manifest to stdout (reads cluster PKI/ports; set ADHOC_ONLY=1 for offline render)
+	@./deploy/scripts/chamber_common.py render --namespace $(NAMESPACE) --port $(LOCAL_APISERVER_PORT) --scrape-interval $(PROMETHEUS_SCRAPE_INTERVAL) --with-sample-queues $(_RENDER_ADHOC_FLAG) $(BUILD_ARGS)
 
 .PHONY: build-base
-build-base: ## Render the base Kustomize manifest (without sample queues) to stdout (picks PKI from cluster or generates ad-hoc)
-	./deploy/scripts/chamber_common.py render --namespace $(NAMESPACE) --scrape-interval $(PROMETHEUS_SCRAPE_INTERVAL)
+build-base: ## Render the base Kustomize manifest (without sample queues) to stdout (set ADHOC_ONLY=1 for offline render)
+	@./deploy/scripts/chamber_common.py render --namespace $(NAMESPACE) --port $(LOCAL_APISERVER_PORT) --scrape-interval $(PROMETHEUS_SCRAPE_INTERVAL) $(_RENDER_ADHOC_FLAG) $(BUILD_ARGS)
 
 .PHONY: deploy
 deploy: ## Deploy the kueue-optimizer chamber (with sample queues) into NAMESPACE
-	./deploy/scripts/chamber_common.py apply --namespace $(NAMESPACE) --scrape-interval $(PROMETHEUS_SCRAPE_INTERVAL) --with-sample-queues
+	./deploy/scripts/chamber_common.py apply --namespace $(NAMESPACE) --port $(LOCAL_APISERVER_PORT) --scrape-interval $(PROMETHEUS_SCRAPE_INTERVAL) --with-sample-queues
 
 .PHONY: deploy-base
 deploy-base: ## Deploy only the base kueue-optimizer chamber into NAMESPACE
-	./deploy/scripts/chamber_common.py apply --namespace $(NAMESPACE) --scrape-interval $(PROMETHEUS_SCRAPE_INTERVAL)
+	./deploy/scripts/chamber_common.py apply --namespace $(NAMESPACE) --port $(LOCAL_APISERVER_PORT) --scrape-interval $(PROMETHEUS_SCRAPE_INTERVAL)
 
 .PHONY: wait
 wait: ## Wait for all chamber control-plane components to become Available in NAMESPACE
