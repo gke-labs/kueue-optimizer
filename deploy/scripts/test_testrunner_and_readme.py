@@ -1554,7 +1554,6 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
                     max_run_seconds=10.0,
                     status_interval_sec=0.02,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
 
             self.assertEqual(len(resubmitted_docs), 1)
@@ -1678,7 +1677,6 @@ class StartupPodGroupAndQuotaSyncTests(unittest.TestCase):
                     max_run_seconds=10.0,
                     status_interval_sec=0.02,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
             self.assertEqual(m_qcs.call_count, 2)
         finally:
@@ -3119,7 +3117,6 @@ class FidelityReviewRegressionTests(unittest.TestCase):
                     max_run_seconds=None,
                     status_interval_sec=3.0,
                     wait_for_completion=False,
-                    initial_state_already_bootstrapped=True,
                 )
             self.assertEqual(calls, [(16, 24)])
         finally:
@@ -3497,7 +3494,6 @@ class FidelityReviewRegressionTests(unittest.TestCase):
                         max_run_seconds=5.0,
                         status_interval_sec=0.2,
                         wait_for_completion=True,
-                        initial_state_already_bootstrapped=True,
                     )
 
                 # BOTH incarnation 0 AND incarnation 1 were submitted (incarnation 1 was NOT dropped!),
@@ -4048,7 +4044,6 @@ class FidelityReviewRegressionTests(unittest.TestCase):
                         max_run_seconds=10.0,
                         status_interval_sec=0.1,
                         wait_for_completion=True,
-                        initial_state_already_bootstrapped=True,
                     )
 
                 # Must finish right after incarnation 1 (~0.3-1.0s), NOT hang until max_run_seconds=10.0s!
@@ -4605,7 +4600,6 @@ class FidelityReviewRegressionTests(unittest.TestCase):
                     max_run_seconds=10.0,
                     status_interval_sec=5.0,
                     wait_for_completion=False,
-                    initial_state_already_bootstrapped=True,
                 )
 
             # Tier 0 fires at t=0, infra event fires at t=0.3 BEFORE tier 1 (t>=1.02) and tier 2 (t>=2.04)!
@@ -4650,7 +4644,6 @@ class FidelityReviewRegressionTests(unittest.TestCase):
                     max_run_seconds=30.0,
                     status_interval_sec=1.0,
                     wait_for_completion=False,
-                    initial_state_already_bootstrapped=True,
                 )
 
             self.assertGreaterEqual(poll_calls[0], 2)
@@ -4909,7 +4902,6 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                     max_run_seconds=10.0,
                     status_interval_sec=0.1,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
                 sat_snap = mgr.capture_cluster_saturation_snapshot(eval_epoch=e_ep)
 
@@ -5315,7 +5307,6 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                     max_run_seconds=5.0,
                     status_interval_sec=0.04,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
                 sat_snap = mgr.capture_cluster_saturation_snapshot(eval_epoch=e_ep)
 
@@ -5339,7 +5330,7 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
     def test_bootstrap_initial_deployments_paused_wfpr_two_phase_patch_error_and_order(self) -> None:
         """Verify paused t0 Deployment unpause/restore, two-phase now->backdated PATCH, Ready wait, PATCH error, order, and multi-flavor node matching."""
         from chamber.parsers import parse_rfc3339_epoch
-        from runner.loader import InitialDeploymentBootstrap, InitialPodSpec, InitialWorkloadPodGroup
+        from runner.loader import InitialDeploymentBootstrap, InitialPodSpec
         from runner.replay import (
             _bootstrap_initial_deployments,
             _build_single_pod_deployment_workload_status,
@@ -6227,7 +6218,6 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                     max_run_seconds=0.4,
                     status_interval_sec=0.03,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
                 sat_snap = mgr.capture_cluster_saturation_snapshot(eval_epoch=e_ep)
 
@@ -6428,7 +6418,6 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                     max_run_seconds=8.0,
                     status_interval_sec=0.05,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
 
             # The gated Deployment is created once with its original spec, and updated only afterwards.
@@ -6622,7 +6611,6 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                     max_run_seconds=3.0,
                     status_interval_sec=0.05,
                     wait_for_completion=True,
-                    initial_state_already_bootstrapped=True,
                 )
             elapsed = time.monotonic() - t_start
 

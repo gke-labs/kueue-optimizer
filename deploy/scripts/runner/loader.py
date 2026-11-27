@@ -209,6 +209,9 @@ class ScheduledInfraEvent:
     is_not_ready: bool = field(compare=False, default=False)
     has_no_execute_taint: bool = field(compare=False, default=False)
     manifest: dict[str, Any] = field(compare=False, default_factory=dict)
+    # True only when the raw Node payload itself carried status.allocatable or status.capacity.
+    # `manifest` always has them, because _prepare_node_manifest() fills a synthetic default.
+    has_explicit_capacity: bool = field(compare=False, default=False)
 
 
 @dataclass
@@ -1102,6 +1105,7 @@ def _parse_infra_resources(
         ready_st: str | None = None,
         not_ready: bool = False,
         no_exec: bool = False,
+        explicit_cap: bool = False,
     ) -> None:
         nonlocal infra_seq
         raw_off = max(0.0, ev_epoch_val - t0_epoch)
@@ -1121,6 +1125,7 @@ def _parse_infra_resources(
                 is_not_ready=not_ready,
                 has_no_execute_taint=no_exec,
                 manifest=doc_val or {},
+                has_explicit_capacity=explicit_cap,
             )
         )
         infra_seq += 1
@@ -1157,6 +1162,8 @@ def _parse_infra_resources(
                 ready_st = extract_node_ready_status(pl)
                 not_ready, no_exec = is_node_payload_unhealthy(pl)
                 prep_node = _prepare_node_manifest(pl, n_idx) if ev_type != "Deleted" else {}
+                raw_st = pl.get("status") if isinstance(pl.get("status"), dict) else {}
+                explicit_cap = ev_type != "Deleted" and bool(raw_st.get("allocatable") or raw_st.get("capacity"))
                 _enqueue_post_t0_infra(
                     ev_epoch,
                     ev_ts_str,
@@ -1167,6 +1174,7 @@ def _parse_infra_resources(
                     ready_st=ready_st,
                     not_ready=not_ready,
                     no_exec=no_exec,
+                    explicit_cap=explicit_cap,
                 )
 
         elif kind == "Namespace":
