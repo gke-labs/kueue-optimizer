@@ -16,6 +16,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -69,18 +70,19 @@ const (
 
 // Config holds runtime configuration for the Kubernetes and Kueue load test scraper.
 type Config struct {
-	Kubeconfig         string
-	Interval           time.Duration
-	Duration           time.Duration
-	HashNames          bool
-	PauseImage         string
-	ExtraHashLabels    []string
-	HashSalt           []byte
-	InfraFile          string
-	WorkflowsFile      string
-	ExecutionTimeFile  string
-	KueueNamespace     string
-	KueueConfigMapName string
+	Kubeconfig               string
+	Interval                 time.Duration
+	Duration                 time.Duration
+	HashNames                bool
+	PauseImage               string
+	ExtraHashLabels          []string
+	HashSalt                 []byte
+	InfraFile                string
+	WorkflowsFile            string
+	ExecutionTimeFile        string
+	KueueNamespace           string
+	KueueConfigMapName       string
+	DisableKueueConfigScrape bool
 }
 
 // InfraEvent represents a single event stored in infra.json.
@@ -176,6 +178,7 @@ const (
 	InterruptionReasonEvicted          = "Evicted"
 	InterruptionReasonFailed           = "Failed"
 	InterruptionReasonDeleted          = "Deleted"
+	InterruptionReasonSliceReplaced    = "WorkloadSliceReplaced"
 	InterruptionReasonScrapeEnded      = "ScrapeEnded"
 )
 
@@ -212,10 +215,11 @@ type ExecutionTimePayload struct {
 // single-line JSON object per line (`{"timestamp":...,"eventType":...,"payload":{...}}\n`)
 // so large files can be parsed line-by-line without loading the entire file into memory.
 type JSONEventLog struct {
-	mu    sync.Mutex
-	path  string
-	file  *os.File
-	count int
+	mu       sync.Mutex
+	path     string
+	file     *os.File
+	count    int
+	firstErr error
 }
 
 // NewJSONEventLog creates or truncates the target JSON Lines file.
@@ -239,22 +243,41 @@ func NewJSONEventLog(path string) (*JSONEventLog, error) {
 	}, nil
 }
 
+func (l *JSONEventLog) recordErrLocked(err error) {
+	if err != nil && l.firstErr == nil {
+		l.firstErr = err
+	}
+}
+
+// Err returns the first I/O error encountered while appending, syncing, or closing this log.
+func (l *JSONEventLog) Err() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.firstErr
+}
+
 // Append marshals event as a single-line compact JSON object and appends it as one line to the file.
 func (l *JSONEventLog) Append(event any) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if l.file == nil {
-		return fmt.Errorf("event log %s is closed", l.path)
+		err := fmt.Errorf("event log %s is closed", l.path)
+		l.recordErrLocked(err)
+		return err
 	}
 
 	raw, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("marshal event for %s: %w", l.path, err)
+		err = fmt.Errorf("marshal event for %s: %w", l.path, err)
+		l.recordErrLocked(err)
+		return err
 	}
 	raw = append(raw, '\n')
 	if _, err := l.file.Write(raw); err != nil {
-		return fmt.Errorf("append event to %s: %w", l.path, err)
+		err = fmt.Errorf("append event to %s: %w", l.path, err)
+		l.recordErrLocked(err)
+		return err
 	}
 	l.count++
 	return nil
@@ -267,7 +290,12 @@ func (l *JSONEventLog) Sync() error {
 	if l.file == nil {
 		return nil
 	}
-	return l.file.Sync()
+	if err := l.file.Sync(); err != nil {
+		err = fmt.Errorf("sync %s: %w", l.path, err)
+		l.recordErrLocked(err)
+		return err
+	}
+	return nil
 }
 
 // Count returns the total number of events written so far.
@@ -277,16 +305,29 @@ func (l *JSONEventLog) Count() int {
 	return l.count
 }
 
-// Close flushes and closes the underlying file.
+// Close flushes and closes the underlying file, returning any sync or close error.
 func (l *JSONEventLog) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.file == nil {
 		return nil
 	}
-	_ = l.file.Sync()
-	err := l.file.Close()
+	syncErr := l.file.Sync()
+	closeErr := l.file.Close()
 	l.file = nil
+	var err error
+	if syncErr != nil {
+		err = fmt.Errorf("sync %s: %w", l.path, syncErr)
+	}
+	if closeErr != nil {
+		cErr := fmt.Errorf("close %s: %w", l.path, closeErr)
+		if err != nil {
+			err = errors.Join(err, cErr)
+		} else {
+			err = cErr
+		}
+	}
+	l.recordErrLocked(err)
 	return err
 }
 
@@ -314,15 +355,15 @@ func PrintStartupBanner(w io.Writer, cfg Config) {
 	b.WriteString(fmt.Sprintf("  3. %-22s : Kueue Workload admission, partial execution (preempted), and full execution (completed without preemption)\n", cfg.ExecutionTimeFile))
 	b.WriteString("\n")
 	b.WriteString("Objects Being Scraped:\n")
-	b.WriteString("  - Nodes (v1/Node)                                        : Sanitized scheduling-relevant spec & status (periodic)\n")
+	b.WriteString("  - Nodes (v1/Node)                                        : Sanitized scheduling-relevant spec & status (watch)\n")
 	b.WriteString("  - Namespaces (v1/Namespace)                              : Sanitized object information without status (periodic)\n")
 	b.WriteString("  - RuntimeClasses (node.k8s.io/v1)                        : Sanitized object information without status (periodic)\n")
-	b.WriteString("  - ClusterQueues (kueue.x-k8s.io/v1beta2)                 : Sanitized object information without status (periodic)\n")
-	b.WriteString("  - Cohorts (kueue.x-k8s.io/v1beta2)                       : Sanitized object information without status (periodic)\n")
-	b.WriteString("  - LocalQueues (kueue.x-k8s.io/v1beta2)                   : Sanitized object information without status (periodic)\n")
-	b.WriteString("  - ResourceFlavors (kueue.x-k8s.io/v1beta2)               : Sanitized object information without status (periodic)\n")
-	b.WriteString("  - Topologies (kueue.x-k8s.io/v1beta2)                    : Sanitized object information without status (periodic)\n")
-	b.WriteString("  - WorkloadPriorityClasses (kueue.x-k8s.io/v1beta2)       : Sanitized object information without status (periodic)\n")
+	b.WriteString("  - ClusterQueues (kueue.x-k8s.io/v1beta2)                 : Sanitized object information without status (watch)\n")
+	b.WriteString("  - Cohorts (kueue.x-k8s.io/v1beta2)                       : Sanitized object information without status (watch)\n")
+	b.WriteString("  - LocalQueues (kueue.x-k8s.io/v1beta2)                   : Sanitized object information without status (watch)\n")
+	b.WriteString("  - ResourceFlavors (kueue.x-k8s.io/v1beta2)               : Sanitized object information without status (watch)\n")
+	b.WriteString("  - Topologies (kueue.x-k8s.io/v1beta2)                    : Sanitized object information without status (watch)\n")
+	b.WriteString("  - WorkloadPriorityClasses (kueue.x-k8s.io/v1beta2)       : Sanitized object information without status (watch)\n")
 	b.WriteString("  - Scheduled & Running Pods (v1/Pod)                      : Placement (nodeName), resource request, scheduling time, first notice time, and deletion time via watch\n")
 	b.WriteString("  - Workflow Creations/Updates (via watch)                 : Jobs, JobSets, LeaderWorkerSets, Kueue-managed Deployments, RayJobs, RayClusters, and standalone Kueue-managed Pods (recording creation time and LocalQueue name)\n")
 	b.WriteString("  - Kueue Workloads (kueue.x-k8s.io/v1beta2, watch)        : Admission timestamp, partial execution (on preemption), and full execution (on completion without preemption)\n")

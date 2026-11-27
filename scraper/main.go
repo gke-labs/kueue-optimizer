@@ -142,7 +142,7 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 	fs.StringVar(&workflowsFile, "workflows-file", "workflows.json", "Path (or filename in --output-dir) for workflow creation/update events")
 	fs.StringVar(&executionTimeFile, "execution-time-file", "execution-time.json", "Path (or filename in --output-dir) for workload execution time events")
 	fs.StringVar(&kueueNamespace, "kueue-namespace", DefaultKueueNamespace, "Namespace containing Kueue's controller ConfigMap (empty string disables ConfigMap scraping)")
-	fs.StringVar(&kueueConfigMap, "kueue-configmap", DefaultKueueConfigMapName, "ConfigMap name holding Kueue's controller_manager_config.yaml")
+	fs.StringVar(&kueueConfigMap, "kueue-configmap", DefaultKueueConfigMapName, "ConfigMap name holding Kueue's controller_manager_config.yaml (empty string disables ConfigMap scraping)")
 	fs.Float64Var(&qps, "qps", 200.0, "Kubernetes API client QPS limit")
 	fs.IntVar(&burst, "burst", 400, "Kubernetes API client burst limit")
 
@@ -173,18 +173,21 @@ func parseFlags(progName string, args []string, errOut io.Writer) (Config, float
 		return filepath.Join(dir, file)
 	}
 
+	trimmedKueueNS := strings.TrimSpace(kueueNamespace)
+	trimmedKueueCM := strings.TrimSpace(kueueConfigMap)
 	cfg := Config{
-		Kubeconfig:        kubeconfig,
-		Interval:          interval,
-		Duration:          duration,
-		HashNames:         hashEnabled,
-		PauseImage:        pauseImage,
-		ExtraHashLabels:   []string(extraHashLabels),
-		InfraFile:          resolveOutputPath(outputDir, infraFile),
-		WorkflowsFile:      resolveOutputPath(outputDir, workflowsFile),
-		ExecutionTimeFile:  resolveOutputPath(outputDir, executionTimeFile),
-		KueueNamespace:     strings.TrimSpace(kueueNamespace),
-		KueueConfigMapName: strings.TrimSpace(kueueConfigMap),
+		Kubeconfig:               kubeconfig,
+		Interval:                 interval,
+		Duration:                 duration,
+		HashNames:                hashEnabled,
+		PauseImage:               pauseImage,
+		ExtraHashLabels:          []string(extraHashLabels),
+		InfraFile:                resolveOutputPath(outputDir, infraFile),
+		WorkflowsFile:            resolveOutputPath(outputDir, workflowsFile),
+		ExecutionTimeFile:        resolveOutputPath(outputDir, executionTimeFile),
+		KueueNamespace:           trimmedKueueNS,
+		KueueConfigMapName:       trimmedKueueCM,
+		DisableKueueConfigScrape: trimmedKueueNS == "" || trimmedKueueCM == "",
 	}
 	return cfg, qps, burst, nil
 }
@@ -263,6 +266,10 @@ func main() {
 
 	if err := scraper.Run(ctx); err != nil {
 		log.Fatalf("Scraper terminated with error: %v", err)
+	}
+
+	if err := errors.Join(infraLog.Close(), workflowsLog.Close(), execTimeLog.Close()); err != nil {
+		log.Fatalf("Failed to flush and close output event logs: %v", err)
 	}
 
 	fmt.Printf(

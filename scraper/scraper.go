@@ -19,7 +19,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
+	"math/rand/v2"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,6 +51,12 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+const (
+	defaultTombstoneRetention = 10 * time.Minute
+	tombstonePruneThreshold   = 4096
+	maxWatchBackoff           = 30 * time.Second
+)
+
 var (
 	lwsGVR = schema.GroupVersionResource{
 		Group:    leaderworkersetv1.GroupVersion.Group,
@@ -67,18 +76,35 @@ var (
 )
 
 type cachedObject struct {
-	name      string
-	namespace string
-	digest    string
-	payload   any
+	name          string
+	namespace     string
+	digest        string
+	payload       any
+	lastEventTime time.Time
+	rv            uint64
+}
+
+type infraTombstone struct {
+	deletedAt time.Time
+	rv        uint64
 }
 
 type trackedPodState struct {
+	uid             string
 	firstNoticeTime time.Time
+	lastEventTime   time.Time
+	lastRV          uint64
 	lastPayload     ScrapedPodPayload
 	lastDigest      string
 	emittedNew      bool
 	deleted         bool
+	deletedAt       time.Time
+}
+
+type podDeletionTombstone struct {
+	uid       string
+	deletedAt time.Time
+	rv        uint64
 }
 
 type trackedWorkflowState struct {
@@ -152,33 +178,40 @@ type Scraper struct {
 	workflowsLog *JSONEventLog
 	execTimeLog  *JSONEventLog
 
-	mu                         sync.Mutex
-	infraCache                 map[string]map[string]cachedObject        // kind -> key -> cachedObject
-	podStates                  map[string]*trackedPodState               // namespace/rawName -> trackedPodState
-	workflowStates             map[string]*trackedWorkflowState          // kind/namespace/rawName -> trackedWorkflowState
-	ownerStates                map[string]WorkloadState                  // kind/namespace/rawName -> WorkloadState from Kueue Workload
-	deploymentWlStates         map[string]map[string]WorkloadState       // Deployment/namespace/rawName -> rawWorkloadName -> WorkloadState
-	ownerToWorkload            map[string]string                         // kind/namespace/rawOwnerName -> rawWorkloadName
-	workloadToOwner            map[string]workloadOwnerRef               // namespace/rawWorkloadName -> raw owner
-	workloadIsTAS              map[string]bool                           // namespace/rawWorkloadName -> uses TAS
-	workloadPodSets            map[string][]string                       // namespace/rawWorkloadName -> podSet names
-	jobSetQueues               map[string]string                         // namespace/rawJobSetName -> localQueueName
-	jobToJobSet                map[string]string                         // namespace/rawJobName -> rawJobSetName
-	rayClusterToRayJob         map[string]string                         // namespace/rawRayClusterName -> rawRayJobName
-	deploymentUIDToKey           map[string]string                         // active deployment UID -> namespace/rawDeploymentName
-	activeDeploymentUID          map[string]string                         // Deployment/namespace/rawDeploymentName -> active deployment UID
-	deletedDeploymentUIDs        map[string]string                         // deleted deployment UID -> namespace/rawDeploymentName
-	replicaSetToDeployment       map[string]string                         // namespace/rawReplicaSetName -> rawDeploymentName
-	replicaSetToDeploymentUID    map[string]string                         // namespace/rawReplicaSetName -> owning deployment UID
-	podToReplicaSet              map[string]string                         // namespace/rawPodName -> rawReplicaSetName
-	podToDeployment              map[string]string                         // namespace/rawPodName -> rawDeploymentName
-	podToDeploymentUID           map[string]string                         // namespace/rawPodName -> owning deployment UID
-	nonDeploymentPods            map[string]bool                           // namespace/rawPodName -> confirmed not Deployment-owned
-	workloadStates               map[string]*workloadExecState             // namespace/rawWorkloadName -> workloadExecState
-	preFinishedWorkloads         map[string]string                         // namespace/rawWorkloadName -> UID of Workload already Finished=True at t0
-	manageJobsWithoutQueueName   bool                                      // cached from Kueue Configuration
-	managedJobsNamespaceSelector labels.Selector                           // optional managedJobsNamespaceSelector from Kueue Configuration
-	namespaceLabels              map[string]map[string]string              // namespace name -> labels (including kubernetes.io/metadata.name)
+	mu                           sync.Mutex
+	infraCache                   map[string]map[string]cachedObject   // kind -> key -> cachedObject
+	deletedInfra                 map[string]map[string]infraTombstone // kind -> key -> deletion tombstone for stale-list protection
+	podStates                    map[string]*trackedPodState          // namespace/rawName -> trackedPodState
+	deletedPods                  map[string]podDeletionTombstone      // namespace/rawName -> deletion tombstone for stale-list protection
+	workflowStates               map[string]*trackedWorkflowState     // kind/namespace/rawName -> trackedWorkflowState
+	ownerStates                  map[string]WorkloadState             // kind/namespace/rawName -> WorkloadState from Kueue Workload
+	deploymentWlStates           map[string]map[string]WorkloadState  // Deployment/namespace/rawName -> rawWorkloadName -> WorkloadState
+	lwsWlStates                  map[string]map[string]WorkloadState  // LeaderWorkerSet/namespace/rawName -> rawWorkloadName -> WorkloadState
+	ownerToWorkload              map[string]string                    // kind/namespace/rawOwnerName -> rawWorkloadName
+	workloadToOwner              map[string]workloadOwnerRef          // namespace/rawWorkloadName -> raw owner
+	workloadIsTAS                map[string]bool                      // namespace/rawWorkloadName -> uses TAS
+	workloadPodSets              map[string][]string                  // namespace/rawWorkloadName -> podSet names
+	jobSetQueues                 map[string]string                    // namespace/rawJobSetName -> localQueueName
+	jobToJobSet                  map[string]string                    // namespace/rawJobName -> rawJobSetName
+	rayClusterToRayJob           map[string]string                    // namespace/rawRayClusterName -> rawRayJobName
+	deploymentUIDToKey           map[string]string                    // active deployment UID -> namespace/rawDeploymentName
+	activeDeploymentUID          map[string]string                    // Deployment/namespace/rawDeploymentName -> active deployment UID
+	deletedDeploymentUIDs        map[string]string                    // deleted deployment UID -> namespace/rawDeploymentName
+	replicaSetToDeployment       map[string]string                    // namespace/rawReplicaSetName -> rawDeploymentName
+	replicaSetToDeploymentUID    map[string]string                    // namespace/rawReplicaSetName -> owning deployment UID
+	podToReplicaSet              map[string]string                    // namespace/rawPodName -> rawReplicaSetName
+	podToDeployment              map[string]string                    // namespace/rawPodName -> rawDeploymentName
+	podToDeploymentUID           map[string]string                    // namespace/rawPodName -> owning deployment UID
+	nonDeploymentPods            map[string]bool                      // namespace/rawPodName -> confirmed not Deployment-owned
+	workloadStates               map[string]*workloadExecState        // namespace/rawWorkloadName -> workloadExecState
+	preFinishedWorkloads         map[string]string                    // namespace/rawWorkloadName -> UID of Workload already Finished=True at t0
+	manageJobsWithoutQueueName   bool                                 // cached from Kueue Configuration
+	managedJobsNamespaceSelector labels.Selector                      // optional managedJobsNamespaceSelector from Kueue Configuration
+	namespaceLabels              map[string]map[string]string         // namespace name -> labels (including kubernetes.io/metadata.name)
+	ioErr                        error                                // first fatal output-log I/O error
+	cancelRun                    context.CancelFunc                   // cancels active Run loop on fatal I/O error
+	tombstoneRetention           time.Duration                        // TTL for deletedPods and deletedInfra tombstones
+	lastTombstonePrune           time.Time                            // throttles size-guard pruning during burst deletions
 }
 
 // NewScraper initializes a new Scraper with the given clients and configuration.
@@ -198,38 +231,43 @@ func NewScraper(
 	if cfg.Interval <= 0 {
 		cfg.Interval = 60 * time.Second
 	}
-	if cfg.KueueNamespace == "" {
-		cfg.KueueNamespace = DefaultKueueNamespace
-	}
-	if cfg.KueueConfigMapName == "" {
-		cfg.KueueConfigMapName = DefaultKueueConfigMapName
+	if !cfg.DisableKueueConfigScrape {
+		if cfg.KueueNamespace == "" {
+			cfg.KueueNamespace = DefaultKueueNamespace
+		}
+		if cfg.KueueConfigMapName == "" {
+			cfg.KueueConfigMapName = DefaultKueueConfigMapName
+		}
 	}
 	var hasher SensitiveDataHasher = NoopHasher{}
 	if cfg.HashNames {
 		hasher = NewSensitiveDataHasher(cfg.ExtraHashLabels, cfg.HashSalt)
 	}
 	return &Scraper{
-		cfg:                    cfg,
-		hasher:                 hasher,
-		kubeClient:             kubeClient,
-		kueueClient:            kueueClient,
-		jobsetClient:           jobsetClient,
-		dynamicClient:          dynamicClient,
-		infraLog:               infraLog,
-		workflowsLog:           workflowsLog,
-		execTimeLog:            execTimeLog,
-		infraCache:             make(map[string]map[string]cachedObject),
-		podStates:              make(map[string]*trackedPodState),
-		workflowStates:         make(map[string]*trackedWorkflowState),
-		ownerStates:            make(map[string]WorkloadState),
-		deploymentWlStates:     make(map[string]map[string]WorkloadState),
-		ownerToWorkload:        make(map[string]string),
-		workloadToOwner:        make(map[string]workloadOwnerRef),
-		workloadIsTAS:          make(map[string]bool),
-		workloadPodSets:        make(map[string][]string),
-		jobSetQueues:           make(map[string]string),
-		jobToJobSet:            make(map[string]string),
-		rayClusterToRayJob:     make(map[string]string),
+		cfg:                       cfg,
+		hasher:                    hasher,
+		kubeClient:                kubeClient,
+		kueueClient:               kueueClient,
+		jobsetClient:              jobsetClient,
+		dynamicClient:             dynamicClient,
+		infraLog:                  infraLog,
+		workflowsLog:              workflowsLog,
+		execTimeLog:               execTimeLog,
+		infraCache:                make(map[string]map[string]cachedObject),
+		deletedInfra:              make(map[string]map[string]infraTombstone),
+		podStates:                 make(map[string]*trackedPodState),
+		deletedPods:               make(map[string]podDeletionTombstone),
+		workflowStates:            make(map[string]*trackedWorkflowState),
+		ownerStates:               make(map[string]WorkloadState),
+		deploymentWlStates:        make(map[string]map[string]WorkloadState),
+		lwsWlStates:               make(map[string]map[string]WorkloadState),
+		ownerToWorkload:           make(map[string]string),
+		workloadToOwner:           make(map[string]workloadOwnerRef),
+		workloadIsTAS:             make(map[string]bool),
+		workloadPodSets:           make(map[string][]string),
+		jobSetQueues:              make(map[string]string),
+		jobToJobSet:               make(map[string]string),
+		rayClusterToRayJob:        make(map[string]string),
 		deploymentUIDToKey:        make(map[string]string),
 		activeDeploymentUID:       make(map[string]string),
 		deletedDeploymentUIDs:     make(map[string]string),
@@ -242,14 +280,27 @@ func NewScraper(
 		workloadStates:            make(map[string]*workloadExecState),
 		preFinishedWorkloads:      make(map[string]string),
 		namespaceLabels:           make(map[string]map[string]string),
+		tombstoneRetention:        defaultTombstoneRetention,
 	}
 }
 
 // Run performs a deterministic synchronous initial List() barrier across Kueue Workloads,
 // parent/child workflows, and Pods so t0 ownership/queue/TAS linkage maps are populated,
 // executes an initial scrape immediately, starts real-time watch loops resuming from the
-// captured ResourceVersions, and then scrapes periodically every cfg.Interval until ctx is canceled.
+// captured ResourceVersions, and then periodically refreshes non-watched resources every
+// cfg.Interval until ctx is canceled or a fatal output-log I/O error occurs.
 func (s *Scraper) Run(ctx context.Context) error {
+	runCtx, cancelRun := context.WithCancel(ctx)
+	s.mu.Lock()
+	s.cancelRun = cancelRun
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.cancelRun = nil
+		s.mu.Unlock()
+		cancelRun()
+	}()
+
 	// Capture a single unified t0 timestamp across the entire synchronous startup List()
 	// barrier and initial ScrapeOnce so all t0 infrastructure, pod, workflow, and
 	// execution-time events share identical t0 alignment even on large (>1,000-workload) clusters.
@@ -258,49 +309,53 @@ func (s *Scraper) Run(ctx context.Context) error {
 	// 0. Scrape Kueue controller Configuration up front so manageJobsWithoutQueueName is warm
 	// before t0 workflow discovery runs, and pre-index Deployment -> ReplicaSet -> Pod ownership
 	// so per-Pod Kueue Workloads owned by Deployments resolve ownerKind="Deployment" at step 1.
-	s.scrapeKueueConfiguration(ctx, startupTime)
-	s.preindexInitialDeploymentOwnership(ctx)
+	s.scrapeKueueConfiguration(runCtx, startupTime)
+	s.preindexInitialDeploymentOwnership(runCtx)
 
 	// 1. Synchronously index existing Kueue Workloads first so ownerStates, ownerToWorkload,
 	// workloadToOwner, workloadIsTAS, and Admitted records exist before workflow and pod events.
-	workloadsRV := s.syncInitialWorkloads(ctx, startupTime)
+	workloadsRV := s.syncInitialWorkloads(runCtx, startupTime)
 
 	// 2. Synchronously index top-level parent workflows (JobSets, RayJobs) so child Jobs/RayClusters
 	// and Pods inherit LocalQueue and parent owner mappings deterministically.
-	jobSetsRV := s.syncInitialJobSets(ctx, startupTime)
+	jobSetsRV := s.syncInitialJobSets(runCtx, startupTime)
 	var rayJobsRV, lwsRV, rayClustersRV string
 	if s.dynamicClient != nil {
-		rayJobsRV = s.syncInitialDynamicResource(ctx, rayJobGVR, "RayJob", func(et watch.EventType, u *unstructured.Unstructured) {
+		rayJobsRV = s.syncInitialDynamicResource(runCtx, rayJobGVR, "RayJob", func(et watch.EventType, u *unstructured.Unstructured) {
 			s.handleRayJobUnstructuredAt(et, u, startupTime, true)
 		})
 	}
 
 	// 3. Synchronously index single-tier and child workflows (Jobs, Deployments, ReplicaSets, LWS, RayClusters).
-	jobsRV := s.syncInitialJobs(ctx, startupTime)
-	deploymentsRV := s.syncInitialDeployments(ctx, startupTime)
-	replicaSetsRV := s.syncInitialReplicaSets(ctx)
+	jobsRV := s.syncInitialJobs(runCtx, startupTime)
+	deploymentsRV := s.syncInitialDeployments(runCtx, startupTime)
+	replicaSetsRV := s.syncInitialReplicaSets(runCtx)
 	if s.dynamicClient != nil {
-		lwsRV = s.syncInitialDynamicResource(ctx, lwsGVR, "LeaderWorkerSet", func(et watch.EventType, u *unstructured.Unstructured) {
+		lwsRV = s.syncInitialDynamicResource(runCtx, lwsGVR, "LeaderWorkerSet", func(et watch.EventType, u *unstructured.Unstructured) {
 			s.handleLeaderWorkerSetUnstructuredAt(et, u, startupTime, true)
 		})
-		rayClustersRV = s.syncInitialDynamicResource(ctx, rayClusterGVR, "RayCluster", func(et watch.EventType, u *unstructured.Unstructured) {
+		rayClustersRV = s.syncInitialDynamicResource(runCtx, rayClusterGVR, "RayCluster", func(et watch.EventType, u *unstructured.Unstructured) {
 			s.handleRayClusterUnstructuredAt(et, u, startupTime, true)
 		})
 	}
 
 	// 4. Synchronously index existing Pods after all Workload and workflow ownership maps are warm.
-	podsRV, initialPods := s.syncInitialPods(ctx, startupTime)
+	podsRV, initialPods := s.syncInitialPods(runCtx, startupTime)
 
-	// 5. Run initial periodic infrastructure & scheduled-pod scrape immediately at startupTime,
+	// 5. Run initial infrastructure & scheduled-pod scrape immediately at startupTime,
 	// reusing initialPods to avoid a redundant cluster-wide Pod List() at startup.
-	rVs := s.scrapeOnceAt(ctx, startupTime, initialPods)
+	rVs := s.scrapeOnceAt(runCtx, startupTime, initialPods, parseResourceVersion(podsRV))
+	if err := s.ioError(); err != nil {
+		_ = s.syncLogs()
+		return s.ioError()
+	}
 
 	var wg sync.WaitGroup
 	startWatcher := func(fn func(context.Context)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			fn(ctx)
+			fn(runCtx)
 		}()
 	}
 
@@ -345,27 +400,126 @@ func (s *Scraper) Run(ctx context.Context) error {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			wg.Wait()
 			s.flushInFlightWorkloadsAsPartial(time.Now().UTC())
-			s.syncLogs()
-			return nil
+			_ = s.syncLogs()
+			return s.ioError()
 		case <-ticker.C:
-			s.ScrapeOnce(ctx)
+			// Only periodically re-list non-watched resources; watched kinds rely on their
+			// real-time watches + 410 relist so periodic List() cannot race newer watch state.
+			s.scrapePeriodicOnly(runCtx, time.Now().UTC())
 		}
 	}
 }
 
-func (s *Scraper) syncLogs() {
-	if s.infraLog != nil {
-		_ = s.infraLog.Sync()
+func (s *Scraper) recordIOError(err error) {
+	if err == nil {
+		return
 	}
-	if s.workflowsLog != nil {
-		_ = s.workflowsLog.Sync()
+	s.mu.Lock()
+	if s.ioErr == nil {
+		s.ioErr = err
 	}
-	if s.execTimeLog != nil {
-		_ = s.execTimeLog.Sync()
+	cancel := s.cancelRun
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
+}
+
+func (s *Scraper) ioError() error {
+	s.mu.Lock()
+	recorded := s.ioErr
+	s.mu.Unlock()
+	var errs []error
+	if recorded != nil {
+		errs = append(errs, recorded)
+	}
+	for _, l := range []*JSONEventLog{s.infraLog, s.workflowsLog, s.execTimeLog} {
+		if l != nil {
+			if err := l.Err(); err != nil && !errors.Is(recorded, err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Scraper) appendToLog(logWriter *JSONEventLog, ev any, label, filePath string) {
+	if logWriter == nil {
+		return
+	}
+	if err := logWriter.Append(ev); err != nil {
+		log.Printf("ERROR writing %s event to %s: %v", label, filePath, err)
+		s.recordIOError(err)
+	}
+}
+
+func (s *Scraper) syncLogs() error {
+	var errs []error
+	for _, l := range []*JSONEventLog{s.infraLog, s.workflowsLog, s.execTimeLog} {
+		if l != nil {
+			if err := l.Sync(); err != nil {
+				log.Printf("ERROR syncing %s: %v", l.path, err)
+				s.recordIOError(err)
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Scraper) pruneExpiredTombstonesLocked(now time.Time) {
+	ttl := s.tombstoneRetention
+	if ttl <= 0 {
+		ttl = defaultTombstoneRetention
+	}
+	cutoff := now.Add(-ttl)
+	for k, tomb := range s.deletedPods {
+		if !tomb.deletedAt.IsZero() && tomb.deletedAt.Before(cutoff) {
+			delete(s.deletedPods, k)
+		}
+	}
+	for kind, delMap := range s.deletedInfra {
+		for k, tomb := range delMap {
+			if !tomb.deletedAt.IsZero() && tomb.deletedAt.Before(cutoff) {
+				delete(delMap, k)
+			}
+		}
+		if len(delMap) == 0 {
+			delete(s.deletedInfra, kind)
+		}
+	}
+	s.lastTombstonePrune = now
+}
+
+func (s *Scraper) maybePruneTombstonesLocked(now time.Time, mapLen int) {
+	if mapLen <= tombstonePruneThreshold {
+		return
+	}
+	ttl := s.tombstoneRetention
+	if ttl <= 0 {
+		ttl = defaultTombstoneRetention
+	}
+	minInterval := min(ttl/4, time.Minute)
+	if !s.lastTombstonePrune.IsZero() && now.Sub(s.lastTombstonePrune) < minInterval {
+		return
+	}
+	s.pruneExpiredTombstonesLocked(now)
+}
+
+// scrapePeriodicOnly refreshes resources that do not have real-time watch loops,
+// prunes expired deletion tombstones, and syncs output logs.
+func (s *Scraper) scrapePeriodicOnly(ctx context.Context, now time.Time) {
+	s.scrapeNamespaces(ctx, now)
+	s.scrapeRuntimeClasses(ctx, now)
+	s.scrapePriorityClasses(ctx, now)
+	s.scrapeKueueConfiguration(ctx, now)
+	s.mu.Lock()
+	s.pruneExpiredTombstonesLocked(now)
+	s.mu.Unlock()
+	_ = s.syncLogs()
 }
 
 type infraScrapeRVs struct {
@@ -382,10 +536,10 @@ type infraScrapeRVs struct {
 // Kueue Configuration, ClusterQueues, Cohorts, LocalQueues, ResourceFlavors, Topologies,
 // WorkloadPriorityClasses, and Scheduled/Running Pods.
 func (s *Scraper) ScrapeOnce(ctx context.Context) {
-	_ = s.scrapeOnceAt(ctx, time.Now().UTC(), nil)
+	_ = s.scrapeOnceAt(ctx, time.Now().UTC(), nil, 0)
 }
 
-func (s *Scraper) scrapeOnceAt(ctx context.Context, now time.Time, prelistedPods []corev1.Pod) infraScrapeRVs {
+func (s *Scraper) scrapeOnceAt(ctx context.Context, now time.Time, prelistedPods []corev1.Pod, prelistedPodsRV uint64) infraScrapeRVs {
 	var out infraScrapeRVs
 	out.nodesRV = s.scrapeNodes(ctx, now)
 	s.scrapeNamespaces(ctx, now)
@@ -400,8 +554,8 @@ func (s *Scraper) scrapeOnceAt(ctx context.Context, now time.Time, prelistedPods
 		out.topologiesRV = s.scrapeTopologies(ctx, now)
 		out.wpcsRV = s.scrapeWorkloadPriorityClasses(ctx, now)
 	}
-	s.scrapeScheduledAndRunningPodsWithList(ctx, now, prelistedPods)
-	s.syncLogs()
+	s.scrapeScheduledAndRunningPodsWithSnapshot(ctx, now, now, prelistedPodsRV, prelistedPods)
+	_ = s.syncLogs()
 	return out
 }
 
@@ -435,12 +589,68 @@ func canonicalDigest(payload any) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func parseResourceVersion(rv string) uint64 {
+	if rv == "" {
+		return 0
+	}
+	v, err := strconv.ParseUint(rv, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func extractPayloadResourceVersion(payload any) uint64 {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return 0
+	}
+	meta, ok := m["metadata"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	rv, _ := meta["resourceVersion"].(string)
+	return parseResourceVersion(rv)
+}
+
+func isSnapshotStale(listStartedAt time.Time, listRV uint64, eventTime time.Time, eventRV uint64) bool {
+	if listRV > 0 && eventRV > 0 {
+		if listRV < eventRV {
+			return true
+		}
+		if listRV > eventRV {
+			return false
+		}
+	}
+	if !eventTime.IsZero() && listStartedAt.Before(eventTime) {
+		return true
+	}
+	return false
+}
+
+func snapshotStartTime(now time.Time) time.Time {
+	start := now
+	if before := time.Now().UTC(); before.Before(start) {
+		start = before
+	}
+	return start
+}
+
 func (s *Scraper) reconcileInfraKind(kind string, now time.Time, current map[string]cachedObject) {
+	s.reconcileInfraKindAt(kind, now, now, 0, current)
+}
+
+func (s *Scraper) reconcileInfraKindAt(kind string, now, listStartedAt time.Time, listRV uint64, current map[string]cachedObject) {
 	s.mu.Lock()
 	prevMap, ok := s.infraCache[kind]
 	if !ok {
 		prevMap = make(map[string]cachedObject)
 		s.infraCache[kind] = prevMap
+	}
+	delMap, ok := s.deletedInfra[kind]
+	if !ok {
+		delMap = make(map[string]infraTombstone)
+		s.deletedInfra[kind] = delMap
 	}
 
 	var events []InfraEvent
@@ -454,21 +664,48 @@ func (s *Scraper) reconcileInfraKind(kind string, now time.Time, current map[str
 
 	for _, k := range keys {
 		cur := current[k]
+		if cur.lastEventTime.IsZero() {
+			cur.lastEventTime = now
+		}
+		if cur.rv == 0 {
+			cur.rv = listRV
+		}
+		snapRV := listRV
+		if snapRV == 0 {
+			snapRV = cur.rv
+		}
 		prev, existed := prevMap[k]
 		if !existed {
+			if tomb, wasDeleted := delMap[k]; wasDeleted && isSnapshotStale(listStartedAt, snapRV, tomb.deletedAt, tomb.rv) {
+				continue
+			}
+			delete(delMap, k)
 			events = append(events, InfraEvent{
 				Timestamp: now,
 				EventType: EventNew,
 				Payload:   cur.payload,
 			})
 			prevMap[k] = cur
-		} else if prev.digest != cur.digest {
-			events = append(events, InfraEvent{
-				Timestamp: now,
-				EventType: EventUpdate,
-				Payload:   cur.payload,
-			})
-			prevMap[k] = cur
+		} else {
+			if isSnapshotStale(listStartedAt, snapRV, prev.lastEventTime, prev.rv) {
+				continue
+			}
+			if prev.digest != cur.digest {
+				events = append(events, InfraEvent{
+					Timestamp: now,
+					EventType: EventUpdate,
+					Payload:   cur.payload,
+				})
+				prevMap[k] = cur
+			} else {
+				if cur.lastEventTime.After(prev.lastEventTime) {
+					prev.lastEventTime = cur.lastEventTime
+				}
+				if cur.rv > prev.rv {
+					prev.rv = cur.rv
+				}
+				prevMap[k] = prev
+			}
 		}
 	}
 
@@ -481,19 +718,22 @@ func (s *Scraper) reconcileInfraKind(kind string, now time.Time, current map[str
 	sort.Strings(deletedKeys)
 	for _, k := range deletedKeys {
 		prev := prevMap[k]
+		if isSnapshotStale(listStartedAt, listRV, prev.lastEventTime, prev.rv) {
+			continue
+		}
 		events = append(events, InfraEvent{
 			Timestamp: now,
 			EventType: EventDeleted,
 			Payload:   prev.payload,
 		})
 		delete(prevMap, k)
+		delMap[k] = infraTombstone{deletedAt: now, rv: listRV}
 	}
+	s.maybePruneTombstonesLocked(now, len(delMap))
 	s.mu.Unlock()
 
 	for _, ev := range events {
-		if err := s.infraLog.Append(ev); err != nil {
-			log.Printf("ERROR writing %s event to %s: %v", kind, s.cfg.InfraFile, err)
-		}
+		s.appendToLog(s.infraLog, ev, kind, s.cfg.InfraFile)
 	}
 }
 
@@ -501,26 +741,27 @@ func (s *Scraper) scrapeNodes(ctx context.Context, now time.Time) string {
 	if s.kubeClient == nil {
 		return ""
 	}
+	listStartedAt := snapshotStartTime(now)
 	list, err := s.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("WARN failed to list Nodes: %v", err)
 		return ""
 	}
+	listRV := parseResourceVersion(list.ResourceVersion)
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		node := &list.Items[i]
 		payload := SanitizeNode(node, s.hasher)
 		current[node.Name] = cachedObject{
-			name:    node.Name,
-			digest:  canonicalDigest(payload),
-			payload: payload,
+			name:          node.Name,
+			digest:        canonicalDigest(payload),
+			payload:       payload,
+			lastEventTime: now,
+			rv:            parseResourceVersion(node.ResourceVersion),
 		}
 	}
-	s.reconcileInfraKind("Node", now, current)
-	if list.ResourceVersion != "" {
-		return list.ResourceVersion
-	}
-	return "0"
+	s.reconcileInfraKindAt("Node", now, listStartedAt, listRV, current)
+	return listRVOrZero(list.ResourceVersion)
 }
 
 func (s *Scraper) handleNodeWatchEvent(eventType watch.EventType, node *corev1.Node) {
@@ -531,6 +772,7 @@ func (s *Scraper) handleNodeWatchEventAt(eventType watch.EventType, node *corev1
 	if node == nil || node.Name == "" {
 		return
 	}
+	rv := parseResourceVersion(node.ResourceVersion)
 	var ev *InfraEvent
 	s.mu.Lock()
 	nodeCache, ok := s.infraCache["Node"]
@@ -538,16 +780,24 @@ func (s *Scraper) handleNodeWatchEventAt(eventType watch.EventType, node *corev1
 		nodeCache = make(map[string]cachedObject)
 		s.infraCache["Node"] = nodeCache
 	}
+	delMap, ok := s.deletedInfra["Node"]
+	if !ok {
+		delMap = make(map[string]infraTombstone)
+		s.deletedInfra["Node"] = delMap
+	}
 	switch eventType {
 	case watch.Added, watch.Modified:
+		delete(delMap, node.Name)
 		payload := SanitizeNode(node, s.hasher)
 		digest := canonicalDigest(payload)
 		prev, existed := nodeCache[node.Name]
 		if !existed {
 			nodeCache[node.Name] = cachedObject{
-				name:    node.Name,
-				digest:  digest,
-				payload: payload,
+				name:          node.Name,
+				digest:        digest,
+				payload:       payload,
+				lastEventTime: now,
+				rv:            rv,
 			}
 			ev = &InfraEvent{
 				Timestamp: now,
@@ -556,17 +806,26 @@ func (s *Scraper) handleNodeWatchEventAt(eventType watch.EventType, node *corev1
 			}
 		} else if prev.digest != digest {
 			nodeCache[node.Name] = cachedObject{
-				name:    node.Name,
-				digest:  digest,
-				payload: payload,
+				name:          node.Name,
+				digest:        digest,
+				payload:       payload,
+				lastEventTime: now,
+				rv:            rv,
 			}
 			ev = &InfraEvent{
 				Timestamp: now,
 				EventType: EventUpdate,
 				Payload:   payload,
 			}
+		} else {
+			prev.lastEventTime = now
+			if rv > prev.rv {
+				prev.rv = rv
+			}
+			nodeCache[node.Name] = prev
 		}
 	case watch.Deleted:
+		delMap[node.Name] = infraTombstone{deletedAt: now, rv: rv}
 		if prev, existed := nodeCache[node.Name]; existed {
 			delete(nodeCache, node.Name)
 			ev = &InfraEvent{
@@ -582,13 +841,12 @@ func (s *Scraper) handleNodeWatchEventAt(eventType watch.EventType, node *corev1
 				Payload:   payload,
 			}
 		}
+		s.maybePruneTombstonesLocked(now, len(delMap))
 	}
 	s.mu.Unlock()
 
-	if ev != nil && s.infraLog != nil {
-		if err := s.infraLog.Append(*ev); err != nil {
-			log.Printf("ERROR writing Node watch event to %s: %v", s.cfg.InfraFile, err)
-		}
+	if ev != nil {
+		s.appendToLog(s.infraLog, *ev, "Node watch", s.cfg.InfraFile)
 	}
 }
 
@@ -829,7 +1087,7 @@ func extractKueueDeploymentOverrides(deploy *appsv1.Deployment) (cmName string, 
 }
 
 func (s *Scraper) scrapeKueueConfiguration(ctx context.Context, now time.Time) {
-	if s.kubeClient == nil || s.cfg.KueueNamespace == "" || s.cfg.KueueConfigMapName == "" {
+	if s.kubeClient == nil || s.cfg.DisableKueueConfigScrape || s.cfg.KueueNamespace == "" || s.cfg.KueueConfigMapName == "" {
 		return
 	}
 	var cliFeatureGates map[string]bool
@@ -942,6 +1200,7 @@ func (s *Scraper) handleInfraObjectWatchEventAt(
 	if cacheKey == "" || payload == nil {
 		return
 	}
+	rv := extractPayloadResourceVersion(payload)
 	var ev *InfraEvent
 	s.mu.Lock()
 	kindCache, ok := s.infraCache[kind]
@@ -949,16 +1208,24 @@ func (s *Scraper) handleInfraObjectWatchEventAt(
 		kindCache = make(map[string]cachedObject)
 		s.infraCache[kind] = kindCache
 	}
+	delMap, ok := s.deletedInfra[kind]
+	if !ok {
+		delMap = make(map[string]infraTombstone)
+		s.deletedInfra[kind] = delMap
+	}
 	switch eventType {
 	case watch.Added, watch.Modified:
+		delete(delMap, cacheKey)
 		digest := canonicalDigest(payload)
 		prev, existed := kindCache[cacheKey]
 		if !existed {
 			kindCache[cacheKey] = cachedObject{
-				name:      name,
-				namespace: namespace,
-				digest:    digest,
-				payload:   payload,
+				name:          name,
+				namespace:     namespace,
+				digest:        digest,
+				payload:       payload,
+				lastEventTime: now,
+				rv:            rv,
 			}
 			ev = &InfraEvent{
 				Timestamp: now,
@@ -967,18 +1234,27 @@ func (s *Scraper) handleInfraObjectWatchEventAt(
 			}
 		} else if prev.digest != digest {
 			kindCache[cacheKey] = cachedObject{
-				name:      name,
-				namespace: namespace,
-				digest:    digest,
-				payload:   payload,
+				name:          name,
+				namespace:     namespace,
+				digest:        digest,
+				payload:       payload,
+				lastEventTime: now,
+				rv:            rv,
 			}
 			ev = &InfraEvent{
 				Timestamp: now,
 				EventType: EventUpdate,
 				Payload:   payload,
 			}
+		} else {
+			prev.lastEventTime = now
+			if rv > prev.rv {
+				prev.rv = rv
+			}
+			kindCache[cacheKey] = prev
 		}
 	case watch.Deleted:
+		delMap[cacheKey] = infraTombstone{deletedAt: now, rv: rv}
 		if prev, existed := kindCache[cacheKey]; existed {
 			delete(kindCache, cacheKey)
 			ev = &InfraEvent{
@@ -993,13 +1269,12 @@ func (s *Scraper) handleInfraObjectWatchEventAt(
 				Payload:   payload,
 			}
 		}
+		s.maybePruneTombstonesLocked(now, len(delMap))
 	}
 	s.mu.Unlock()
 
-	if ev != nil && s.infraLog != nil {
-		if err := s.infraLog.Append(*ev); err != nil {
-			log.Printf("ERROR writing %s watch event to %s: %v", kind, s.cfg.InfraFile, err)
-		}
+	if ev != nil {
+		s.appendToLog(s.infraLog, *ev, kind+" watch", s.cfg.InfraFile)
 	}
 }
 
@@ -1011,6 +1286,7 @@ func listRVOrZero(rv string) string {
 }
 
 func (s *Scraper) scrapeClusterQueues(ctx context.Context, now time.Time) string {
+	listStartedAt := snapshotStartTime(now)
 	list, err := s.kueueClient.KueueV1beta2().ClusterQueues().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -1018,21 +1294,25 @@ func (s *Scraper) scrapeClusterQueues(ctx context.Context, now time.Time) string
 		}
 		return ""
 	}
+	listRV := parseResourceVersion(list.ResourceVersion)
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		cq := &list.Items[i]
 		payload := SanitizeClusterQueue(cq, s.hasher)
 		current[cq.Name] = cachedObject{
-			name:    cq.Name,
-			digest:  canonicalDigest(payload),
-			payload: payload,
+			name:          cq.Name,
+			digest:        canonicalDigest(payload),
+			payload:       payload,
+			lastEventTime: now,
+			rv:            parseResourceVersion(cq.ResourceVersion),
 		}
 	}
-	s.reconcileInfraKind("ClusterQueue", now, current)
+	s.reconcileInfraKindAt("ClusterQueue", now, listStartedAt, listRV, current)
 	return listRVOrZero(list.ResourceVersion)
 }
 
 func (s *Scraper) scrapeCohorts(ctx context.Context, now time.Time) string {
+	listStartedAt := snapshotStartTime(now)
 	list, err := s.kueueClient.KueueV1beta2().Cohorts().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -1040,21 +1320,25 @@ func (s *Scraper) scrapeCohorts(ctx context.Context, now time.Time) string {
 		}
 		return ""
 	}
+	listRV := parseResourceVersion(list.ResourceVersion)
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		cohort := &list.Items[i]
 		payload := SanitizeCohort(cohort, s.hasher)
 		current[cohort.Name] = cachedObject{
-			name:    cohort.Name,
-			digest:  canonicalDigest(payload),
-			payload: payload,
+			name:          cohort.Name,
+			digest:        canonicalDigest(payload),
+			payload:       payload,
+			lastEventTime: now,
+			rv:            parseResourceVersion(cohort.ResourceVersion),
 		}
 	}
-	s.reconcileInfraKind("Cohort", now, current)
+	s.reconcileInfraKindAt("Cohort", now, listStartedAt, listRV, current)
 	return listRVOrZero(list.ResourceVersion)
 }
 
 func (s *Scraper) scrapeLocalQueues(ctx context.Context, now time.Time) string {
+	listStartedAt := snapshotStartTime(now)
 	list, err := s.kueueClient.KueueV1beta2().LocalQueues("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -1062,23 +1346,27 @@ func (s *Scraper) scrapeLocalQueues(ctx context.Context, now time.Time) string {
 		}
 		return ""
 	}
+	listRV := parseResourceVersion(list.ResourceVersion)
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		lq := &list.Items[i]
 		payload := SanitizeLocalQueue(lq, s.hasher)
 		key := lq.Namespace + "/" + lq.Name
 		current[key] = cachedObject{
-			name:      lq.Name,
-			namespace: lq.Namespace,
-			digest:    canonicalDigest(payload),
-			payload:   payload,
+			name:          lq.Name,
+			namespace:     lq.Namespace,
+			digest:        canonicalDigest(payload),
+			payload:       payload,
+			lastEventTime: now,
+			rv:            parseResourceVersion(lq.ResourceVersion),
 		}
 	}
-	s.reconcileInfraKind("LocalQueue", now, current)
+	s.reconcileInfraKindAt("LocalQueue", now, listStartedAt, listRV, current)
 	return listRVOrZero(list.ResourceVersion)
 }
 
 func (s *Scraper) scrapeResourceFlavors(ctx context.Context, now time.Time) string {
+	listStartedAt := snapshotStartTime(now)
 	list, err := s.kueueClient.KueueV1beta2().ResourceFlavors().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -1086,21 +1374,25 @@ func (s *Scraper) scrapeResourceFlavors(ctx context.Context, now time.Time) stri
 		}
 		return ""
 	}
+	listRV := parseResourceVersion(list.ResourceVersion)
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		rf := &list.Items[i]
 		payload := SanitizeResourceFlavor(rf, s.hasher)
 		current[rf.Name] = cachedObject{
-			name:    rf.Name,
-			digest:  canonicalDigest(payload),
-			payload: payload,
+			name:          rf.Name,
+			digest:        canonicalDigest(payload),
+			payload:       payload,
+			lastEventTime: now,
+			rv:            parseResourceVersion(rf.ResourceVersion),
 		}
 	}
-	s.reconcileInfraKind("ResourceFlavor", now, current)
+	s.reconcileInfraKindAt("ResourceFlavor", now, listStartedAt, listRV, current)
 	return listRVOrZero(list.ResourceVersion)
 }
 
 func (s *Scraper) scrapeTopologies(ctx context.Context, now time.Time) string {
+	listStartedAt := snapshotStartTime(now)
 	list, err := s.kueueClient.KueueV1beta2().Topologies().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -1108,21 +1400,25 @@ func (s *Scraper) scrapeTopologies(ctx context.Context, now time.Time) string {
 		}
 		return ""
 	}
+	listRV := parseResourceVersion(list.ResourceVersion)
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		topo := &list.Items[i]
 		payload := SanitizeTopology(topo, s.hasher)
 		current[topo.Name] = cachedObject{
-			name:    topo.Name,
-			digest:  canonicalDigest(payload),
-			payload: payload,
+			name:          topo.Name,
+			digest:        canonicalDigest(payload),
+			payload:       payload,
+			lastEventTime: now,
+			rv:            parseResourceVersion(topo.ResourceVersion),
 		}
 	}
-	s.reconcileInfraKind("Topology", now, current)
+	s.reconcileInfraKindAt("Topology", now, listStartedAt, listRV, current)
 	return listRVOrZero(list.ResourceVersion)
 }
 
 func (s *Scraper) scrapeWorkloadPriorityClasses(ctx context.Context, now time.Time) string {
+	listStartedAt := snapshotStartTime(now)
 	list, err := s.kueueClient.KueueV1beta2().WorkloadPriorityClasses().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -1130,17 +1426,20 @@ func (s *Scraper) scrapeWorkloadPriorityClasses(ctx context.Context, now time.Ti
 		}
 		return ""
 	}
+	listRV := parseResourceVersion(list.ResourceVersion)
 	current := make(map[string]cachedObject, len(list.Items))
 	for i := range list.Items {
 		wpc := &list.Items[i]
 		payload := SanitizeWorkloadPriorityClass(wpc, s.hasher)
 		current[wpc.Name] = cachedObject{
-			name:    wpc.Name,
-			digest:  canonicalDigest(payload),
-			payload: payload,
+			name:          wpc.Name,
+			digest:        canonicalDigest(payload),
+			payload:       payload,
+			lastEventTime: now,
+			rv:            parseResourceVersion(wpc.ResourceVersion),
 		}
 	}
-	s.reconcileInfraKind("WorkloadPriorityClass", now, current)
+	s.reconcileInfraKindAt("WorkloadPriorityClass", now, listStartedAt, listRV, current)
 	return listRVOrZero(list.ResourceVersion)
 }
 
@@ -1290,23 +1589,27 @@ func (s *Scraper) scrapeScheduledAndRunningPods(ctx context.Context, now time.Ti
 }
 
 func (s *Scraper) scrapeScheduledAndRunningPodsWithList(ctx context.Context, now time.Time, prelistedPods []corev1.Pod) {
+	s.scrapeScheduledAndRunningPodsWithSnapshot(ctx, now, now, 0, prelistedPods)
+}
+
+func (s *Scraper) scrapeScheduledAndRunningPodsWithSnapshot(ctx context.Context, now, listStartedAt time.Time, listRV uint64, prelistedPods []corev1.Pod) {
 	if s.kubeClient == nil && prelistedPods == nil {
 		return
 	}
-	listStartedAt := now
+	if listStartedAt.IsZero() {
+		listStartedAt = now
+	}
 	var items []corev1.Pod
 	if prelistedPods != nil {
 		items = prelistedPods
 	} else {
-		beforeList := time.Now().UTC()
-		if beforeList.Before(listStartedAt) {
-			listStartedAt = beforeList
-		}
+		listStartedAt = snapshotStartTime(now)
 		list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 		if err != nil {
 			log.Printf("WARN failed to list Pods: %v", err)
 			return
 		}
+		listRV = parseResourceVersion(list.ResourceVersion)
 		items = list.Items
 	}
 
@@ -1326,6 +1629,46 @@ func (s *Scraper) scrapeScheduledAndRunningPodsWithList(ctx context.Context, now
 		pod := &items[i]
 		key := pod.Namespace + "/" + pod.Name
 		if IsScheduledAndRunningPod(pod) {
+			podUID := string(pod.UID)
+			effectiveListRV := listRV
+			if effectiveListRV == 0 {
+				effectiveListRV = parseResourceVersion(pod.ResourceVersion)
+			}
+			if tomb, wasDeleted := s.deletedPods[key]; wasDeleted {
+				if tomb.uid != "" && podUID == tomb.uid {
+					continue
+				}
+				if isSnapshotStale(listStartedAt, effectiveListRV, tomb.deletedAt, tomb.rv) {
+					continue
+				}
+				delete(s.deletedPods, key)
+			}
+			if st, ok := s.podStates[key]; ok {
+				if st.deleted {
+					if st.uid != "" && podUID == st.uid {
+						continue
+					}
+					if isSnapshotStale(listStartedAt, effectiveListRV, st.deletedAt, st.lastRV) {
+						continue
+					}
+					delete(s.podStates, key)
+				} else if isSnapshotStale(listStartedAt, effectiveListRV, st.lastEventTime, st.lastRV) {
+					presentActive[key] = true
+					continue
+				} else if st.emittedNew && st.uid != "" && podUID != "" && podUID != st.uid {
+					// Same-name Pod was replaced by a different UID during a watch gap:
+					// emit Deleted for the old incarnation before recording New for the new one.
+					delPayload := st.lastPayload
+					t := metav1.NewTime(now.UTC())
+					delPayload.DeletionTime = &t
+					events = append(events, InfraEvent{
+						Timestamp: now,
+						EventType: EventDeleted,
+						Payload:   delPayload,
+					})
+					delete(s.podStates, key)
+				}
+			}
 			presentActive[key] = true
 			ev := s.observeScheduledRunningPodLocked(pod, now)
 			if ev != nil {
@@ -1345,13 +1688,27 @@ func (s *Scraper) scrapeScheduledAndRunningPodsWithList(ctx context.Context, now
 	for _, k := range podKeys {
 		st := s.podStates[k]
 		if st.deleted {
+			// Evict previously terminated pods once they are no longer present in etcd (e.g., their
+			// watch.Deleted was missed during a 410 gap) while keeping a TTL-bounded tombstone.
+			if !presentActive[k] {
+				if _, isTerm := terminalPods[k]; !isTerm && !isSnapshotStale(listStartedAt, listRV, st.deletedAt, st.lastRV) {
+					if _, hasTomb := s.deletedPods[k]; !hasTomb {
+						s.deletedPods[k] = podDeletionTombstone{
+							uid:       st.uid,
+							deletedAt: now,
+							rv:        max(st.lastRV, listRV),
+						}
+					}
+					delete(s.podStates, k)
+				}
+			}
 			continue
 		}
 		// Guard against the stale periodic List() race: if a pod was bound by kube-scheduler and
 		// observed via the real-time Pod watch *after* Pods().List() started, its absence from
 		// presentActive is solely due to the older List() snapshot—do NOT mark it deleted!
 		if !presentActive[k] {
-			if _, isTerm := terminalPods[k]; !isTerm && st.firstNoticeTime.After(listStartedAt) {
+			if _, isTerm := terminalPods[k]; !isTerm && (isSnapshotStale(listStartedAt, listRV, st.firstNoticeTime, st.lastRV) || isSnapshotStale(listStartedAt, listRV, st.lastEventTime, st.lastRV)) {
 				continue
 			}
 		}
@@ -1378,13 +1735,32 @@ func (s *Scraper) scrapeScheduledAndRunningPodsWithList(ctx context.Context, now
 					delPayload.SchedulingTime = st.lastPayload.SchedulingTime
 				}
 				mergePreservedPodLinkage(&delPayload, st.lastPayload)
+				if termPod.UID != "" {
+					st.uid = string(termPod.UID)
+				}
+				st.deleted = true
+				st.deletedAt = now
+				st.lastEventTime = now
+				if termRV := parseResourceVersion(termPod.ResourceVersion); termRV > st.lastRV {
+					st.lastRV = termRV
+				}
+				if listRV > st.lastRV {
+					st.lastRV = listRV
+				}
+				st.lastPayload = ScrapedPodPayload{}
 			} else {
 				delPayload = st.lastPayload
 				t := metav1.NewTime(endTime.UTC())
 				delPayload.DeletionTime = &t
+				// Pod is completely absent from etcd; remove active state so a recreated same-name
+				// Pod starts cleanly, while recording a tombstone to block older stale snapshots.
+				s.deletedPods[k] = podDeletionTombstone{
+					uid:       st.uid,
+					deletedAt: now,
+					rv:        max(st.lastRV, listRV),
+				}
+				delete(s.podStates, k)
 			}
-			st.deleted = true
-			st.lastPayload = ScrapedPodPayload{}
 			events = append(events, InfraEvent{
 				Timestamp: now,
 				EventType: EventDeleted,
@@ -1392,12 +1768,11 @@ func (s *Scraper) scrapeScheduledAndRunningPodsWithList(ctx context.Context, now
 			})
 		}
 	}
+	s.maybePruneTombstonesLocked(now, len(s.deletedPods))
 	s.mu.Unlock()
 
 	for _, ev := range events {
-		if err := s.infraLog.Append(ev); err != nil {
-			log.Printf("ERROR writing Pod event to %s: %v", s.cfg.InfraFile, err)
-		}
+		s.appendToLog(s.infraLog, ev, "Pod", s.cfg.InfraFile)
 	}
 }
 
@@ -1581,11 +1956,12 @@ func (s *Scraper) resolvePodWorkloadLinkageLocked(pod *corev1.Pod) PodWorkloadLi
 		wfKey := ownerKind + "/" + ns + "/" + rawOwnerName
 		_, hasOwnerWl := s.ownerStates[wfKey]
 		_, hasDepWl := s.deploymentWlStates[wfKey]
+		_, hasLwsWl := s.lwsWlStates[wfKey]
 		var hasQueue bool
 		if wfSt, ok := s.workflowStates[wfKey]; ok && wfSt.localQueueName != "" {
 			hasQueue = true
 		}
-		if !hasOwnerWl && !hasDepWl && !hasQueue && !IsKueueManagedPod(pod) {
+		if !hasOwnerWl && !hasDepWl && !hasLwsWl && !hasQueue && !IsKueueManagedPod(pod) {
 			ownerKind = ""
 			rawOwnerName = ""
 			podSetName = ""
@@ -1632,15 +2008,35 @@ func mergePreservedPodLinkage(dst *ScrapedPodPayload, prev ScrapedPodPayload) {
 
 func (s *Scraper) observeScheduledRunningPodLocked(pod *corev1.Pod, now time.Time) *InfraEvent {
 	key := pod.Namespace + "/" + pod.Name
+	podUID := string(pod.UID)
+	podRV := parseResourceVersion(pod.ResourceVersion)
 	st, ok := s.podStates[key]
 	if !ok {
 		st = &trackedPodState{
+			uid:             podUID,
 			firstNoticeTime: now,
 		}
 		s.podStates[key] = st
 	}
 	if st.deleted {
-		return nil
+		// Same UID is a stale duplicate of an already-terminated incarnation; any different UID
+		// (or a fresh active incarnation when UID is empty) clears the tombstone so a recreated
+		// same-name Pod is tracked normally.
+		if st.uid != "" && podUID == st.uid {
+			return nil
+		}
+		st = &trackedPodState{
+			uid:             podUID,
+			firstNoticeTime: now,
+		}
+		s.podStates[key] = st
+	}
+	if podUID != "" {
+		st.uid = podUID
+	}
+	st.lastEventTime = now
+	if podRV > st.lastRV {
+		st.lastRV = podRV
 	}
 
 	linkage := s.resolvePodWorkloadLinkageLocked(pod)
@@ -1713,6 +2109,8 @@ func (s *Scraper) handlePodWatchEventAt(eventType watch.EventType, pod *corev1.P
 
 	// 2. Track scheduled/running Pod lifecycle and completion/deletion time for infra.json.
 	key := pod.Namespace + "/" + pod.Name
+	podUID := string(pod.UID)
+	podRV := parseResourceVersion(pod.ResourceVersion)
 	var infraEvents []InfraEvent
 
 	if eventType != watch.Deleted && IsScheduledAndRunningPod(pod) {
@@ -1726,28 +2124,71 @@ func (s *Scraper) handlePodWatchEventAt(eventType watch.EventType, pod *corev1.P
 	switch eventType {
 	case watch.Added, watch.Modified:
 		if IsScheduledAndRunningPod(pod) {
-			if isInitialSync {
-				st, ok := s.podStates[key]
-				if !ok {
-					st = &trackedPodState{
-						firstNoticeTime: now,
-					}
-					s.podStates[key] = st
+			skipDeletedUID := false
+			if tomb, wasDeleted := s.deletedPods[key]; wasDeleted {
+				if tomb.uid != "" && podUID == tomb.uid {
+					skipDeletedUID = true
+				} else {
+					delete(s.deletedPods, key)
 				}
-				if !st.deleted {
-					prev := st.lastPayload
-					linkage := s.resolvePodWorkloadLinkageLocked(pod)
-					st.lastPayload = BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, nil, linkage, s.hasher)
-					if prev.SchedulingTime != nil {
-						st.lastPayload.SchedulingTime = prev.SchedulingTime
+			}
+			if !skipDeletedUID {
+				if isInitialSync {
+					st, ok := s.podStates[key]
+					if ok && !st.deleted && st.emittedNew && st.uid != "" && podUID != "" && podUID != st.uid {
+						delPayload := st.lastPayload
+						t := metav1.NewTime(now.UTC())
+						delPayload.DeletionTime = &t
+						infraEvents = append(infraEvents, InfraEvent{
+							Timestamp: now,
+							EventType: EventDeleted,
+							Payload:   delPayload,
+						})
+						st = &trackedPodState{
+							uid:             podUID,
+							firstNoticeTime: now,
+						}
+						s.podStates[key] = st
+					} else if !ok || (st.deleted && (st.uid == "" || podUID != st.uid)) {
+						st = &trackedPodState{
+							uid:             podUID,
+							firstNoticeTime: now,
+						}
+						s.podStates[key] = st
 					}
-					mergePreservedPodLinkage(&st.lastPayload, prev)
-				}
-			} else {
-				// Real-time post-t0 pod watch: emit EventNew (and EventUpdate on placement/request change)
-				// immediately at exact observation timestamp `now` instead of waiting for the next periodic tick.
-				if ev := s.observeScheduledRunningPodLocked(pod, now); ev != nil {
-					infraEvents = append(infraEvents, *ev)
+					if !st.deleted {
+						if podUID != "" {
+							st.uid = podUID
+						}
+						st.lastEventTime = now
+						if podRV > st.lastRV {
+							st.lastRV = podRV
+						}
+						prev := st.lastPayload
+						linkage := s.resolvePodWorkloadLinkageLocked(pod)
+						st.lastPayload = BuildScrapedPodPayloadWithLinkage(pod, st.firstNoticeTime, nil, linkage, s.hasher)
+						if prev.SchedulingTime != nil {
+							st.lastPayload.SchedulingTime = prev.SchedulingTime
+						}
+						mergePreservedPodLinkage(&st.lastPayload, prev)
+					}
+				} else {
+					if st, ok := s.podStates[key]; ok && !st.deleted && st.emittedNew && st.uid != "" && podUID != "" && podUID != st.uid {
+						delPayload := st.lastPayload
+						t := metav1.NewTime(now.UTC())
+						delPayload.DeletionTime = &t
+						infraEvents = append(infraEvents, InfraEvent{
+							Timestamp: now,
+							EventType: EventDeleted,
+							Payload:   delPayload,
+						})
+						delete(s.podStates, key)
+					}
+					// Real-time post-t0 pod watch: emit EventNew (and EventUpdate on placement/request change)
+					// immediately at exact observation timestamp `now` instead of waiting for the next periodic tick.
+					if ev := s.observeScheduledRunningPodLocked(pod, now); ev != nil {
+						infraEvents = append(infraEvents, *ev)
+					}
 				}
 			}
 		} else if !isInitialSync && (IsTerminalPod(pod) || (pod.DeletionTimestamp != nil && !pod.DeletionTimestamp.IsZero())) {
@@ -1779,7 +2220,15 @@ func (s *Scraper) handlePodWatchEventAt(eventType watch.EventType, pod *corev1.P
 					delPayload.SchedulingTime = st.lastPayload.SchedulingTime
 				}
 				mergePreservedPodLinkage(&delPayload, st.lastPayload)
+				if podUID != "" {
+					st.uid = podUID
+				}
 				st.deleted = true
+				st.deletedAt = now
+				st.lastEventTime = now
+				if podRV > st.lastRV {
+					st.lastRV = podRV
+				}
 				st.lastPayload = ScrapedPodPayload{}
 				infraEvents = append(infraEvents, InfraEvent{
 					Timestamp: now,
@@ -1792,9 +2241,20 @@ func (s *Scraper) handlePodWatchEventAt(eventType watch.EventType, pod *corev1.P
 		st, ok := s.podStates[key]
 		if !ok && pod.Spec.NodeName != "" && !IsTerminalPod(pod) {
 			st = &trackedPodState{
+				uid:             podUID,
 				firstNoticeTime: now,
 			}
 			s.podStates[key] = st
+		}
+		effectiveUID := podUID
+		effectiveRV := podRV
+		if st != nil {
+			if effectiveUID == "" {
+				effectiveUID = st.uid
+			}
+			if st.lastRV > effectiveRV {
+				effectiveRV = st.lastRV
+			}
 		}
 		if st != nil && !st.deleted && (st.emittedNew || pod.Spec.NodeName != "" || st.lastPayload.Placement != "") {
 			delTime := ExtractPodEndTime(pod, now)
@@ -1830,14 +2290,18 @@ func (s *Scraper) handlePodWatchEventAt(eventType watch.EventType, pod *corev1.P
 				Payload:   delPayload,
 			})
 		}
+		s.deletedPods[key] = podDeletionTombstone{
+			uid:       effectiveUID,
+			deletedAt: now,
+			rv:        effectiveRV,
+		}
 		delete(s.podStates, key)
+		s.maybePruneTombstonesLocked(now, len(s.deletedPods))
 	}
 	s.mu.Unlock()
 
 	for _, ev := range infraEvents {
-		if err := s.infraLog.Append(ev); err != nil {
-			log.Printf("ERROR writing Pod watch event to %s: %v", s.cfg.InfraFile, err)
-		}
+		s.appendToLog(s.infraLog, ev, "Pod watch", s.cfg.InfraFile)
 	}
 }
 
@@ -1932,9 +2396,7 @@ func (s *Scraper) recordWorkflowEventWithMeta(
 	s.mu.Unlock()
 
 	if ev != nil {
-		if err := s.workflowsLog.Append(*ev); err != nil {
-			log.Printf("ERROR writing %s workflow event to %s: %v", kind, s.cfg.WorkflowsFile, err)
-		}
+		s.appendToLog(s.workflowsLog, *ev, kind+" workflow", s.cfg.WorkflowsFile)
 	}
 }
 
@@ -2062,15 +2524,16 @@ func (s *Scraper) recordWorkflowEventWithMetaLocked(
 			st.readyReplicas = deployMeta.readyReplicas
 		}
 	case watch.Deleted:
-		if existed {
-			if localQueueName == "" {
-				localQueueName = st.localQueueName
-			}
-			if workloadState == "" {
-				workloadState = st.workloadState
-			}
-			delete(s.workflowStates, key)
+		if !existed {
+			return nil
 		}
+		if localQueueName == "" {
+			localQueueName = st.localQueueName
+		}
+		if workloadState == "" {
+			workloadState = st.workloadState
+		}
+		delete(s.workflowStates, key)
 		if workloadState == "" {
 			workloadState = WorkloadStateNotAdmitted
 		}
@@ -2090,7 +2553,7 @@ func (s *Scraper) recordWorkflowEventWithMetaLocked(
 			wfPayload.ReadyReplicas = &rr
 			wfPayload.Paused = &p
 			wfPayload.TemplateHash = deployMeta.templateHash
-		} else if existed && st.hasReplicas {
+		} else if st.hasReplicas {
 			r := st.replicas
 			rr := st.readyReplicas
 			p := st.paused
@@ -2441,9 +2904,7 @@ func (s *Scraper) handleDeploymentWatchEventAt(eventType watch.EventType, deploy
 	s.mu.Unlock()
 
 	if ev != nil {
-		if err := s.workflowsLog.Append(*ev); err != nil {
-			log.Printf("ERROR writing Deployment workflow event to %s: %v", s.cfg.WorkflowsFile, err)
-		}
+		s.appendToLog(s.workflowsLog, *ev, "Deployment workflow", s.cfg.WorkflowsFile)
 	}
 }
 
@@ -2464,16 +2925,36 @@ func (s *Scraper) handleLeaderWorkerSetWatchEventAt(eventType watch.EventType, l
 	if lws.Spec.LeaderWorkerTemplate.LeaderTemplate != nil {
 		extraMaps = append(extraMaps, lws.Spec.LeaderWorkerTemplate.LeaderTemplate.Labels, lws.Spec.LeaderWorkerTemplate.LeaderTemplate.Annotations)
 	}
+	payload := SanitizeLeaderWorkerSet(lws, s.cfg.PauseImage, s.hasher)
+	displayName := s.hasher.HashNameForKind("LeaderWorkerSet", lws.Name)
+	digest := canonicalDigest(payload)
+
+	oKey := "LeaderWorkerSet/" + lws.Namespace + "/" + lws.Name
 	s.mu.Lock()
 	if !s.isKueueManagedWorkflowLocked("LeaderWorkerSet", lws.Namespace, lws.Name, lq, false, &lws.ObjectMeta, extraMaps...) {
 		s.mu.Unlock()
 		return
 	}
 	wlState := s.determineGroupWorkloadStateLocked("LeaderWorkerSet", lws.Namespace, lws.Name, lws.Status.ReadyReplicas, lws.Status.Replicas)
+	queueManaged := lq != "" || s.isNamespaceManagedWithoutQueueLocked(lws.Namespace)
+	if queueManaged && wlState == WorkloadStateAdmissionInProgress && lws.Status.ReadyReplicas == 0 {
+		if _, hasOwnerWl := s.ownerStates[oKey]; !hasOwnerWl {
+			wlState = WorkloadStateNotAdmitted
+		}
+	}
+	if eventType == watch.Deleted {
+		delete(s.lwsWlStates, oKey)
+		delete(s.ownerStates, oKey)
+		delete(s.ownerToWorkload, oKey)
+	}
+	ev := s.recordWorkflowEventWithMetaLocked(
+		eventType, "LeaderWorkerSet", lws.Name, displayName, lws.Namespace, lws.CreationTimestamp, lq, wlState, payload, digest, nil, now,
+	)
 	s.mu.Unlock()
 
-	payload := SanitizeLeaderWorkerSet(lws, s.cfg.PauseImage, s.hasher)
-	s.recordWorkflowEvent(eventType, "LeaderWorkerSet", lws.Name, lws.Namespace, lws.CreationTimestamp, lq, wlState, payload, now)
+	if ev != nil {
+		s.appendToLog(s.workflowsLog, *ev, "LeaderWorkerSet workflow", s.cfg.WorkflowsFile)
+	}
 }
 
 func (s *Scraper) handleRayJobWatchEvent(eventType watch.EventType, rj *rayv1.RayJob) {
@@ -2791,10 +3272,10 @@ func (s *Scraper) handleWorkloadWatchEvent(eventType watch.EventType, wl *kueuev
 	s.handleWorkloadWatchEventAt(eventType, wl, time.Now().UTC())
 }
 
-func (s *Scraper) recomputeDeploymentOwnerStateLocked(ownerKey string) {
-	wlMap := s.deploymentWlStates[ownerKey]
+func (s *Scraper) recomputeAggregateOwnerStateLocked(store map[string]map[string]WorkloadState, ownerKey string) {
+	wlMap := store[ownerKey]
 	if len(wlMap) == 0 {
-		delete(s.deploymentWlStates, ownerKey)
+		delete(store, ownerKey)
 		delete(s.ownerStates, ownerKey)
 		return
 	}
@@ -2815,6 +3296,10 @@ func (s *Scraper) recomputeDeploymentOwnerStateLocked(ownerKey string) {
 	}
 }
 
+func (s *Scraper) recomputeDeploymentOwnerStateLocked(ownerKey string) {
+	s.recomputeAggregateOwnerStateLocked(s.deploymentWlStates, ownerKey)
+}
+
 // isStaleDeploymentWorkloadLocked reports whether a pod Workload belongs to a deleted or superseded
 // incarnation of the Deployment at ownerKey, using Deployment UIDs (never wall-clock timestamps).
 // Additionally, a Finished=True (OwnerNotFound) Workload that is not already tracked in
@@ -2830,6 +3315,20 @@ func (s *Scraper) isStaleDeploymentWorkloadLocked(ownerKey, depUID string, wl *k
 	}
 	if isOwnerNotFound && wl != nil {
 		if wlMap := s.deploymentWlStates[ownerKey]; wlMap == nil {
+			return true
+		} else if _, exists := wlMap[wl.Name]; !exists {
+			return true
+		}
+	}
+	return false
+}
+
+// isStaleLWSWorkloadLocked reports whether a Finished=True (OwnerNotFound) Workload for a
+// LeaderWorkerSet is not already tracked in lwsWlStates[ownerKey] and must not repopulate
+// ownerStates[ownerKey] or ownerToWorkload[ownerKey] after the LeaderWorkerSet is deleted.
+func (s *Scraper) isStaleLWSWorkloadLocked(ownerKey string, wl *kueuev1beta2.Workload, isOwnerNotFound bool) bool {
+	if isOwnerNotFound && wl != nil {
+		if wlMap := s.lwsWlStates[ownerKey]; wlMap == nil {
 			return true
 		} else if _, exists := wlMap[wl.Name]; !exists {
 			return true
@@ -3104,6 +3603,18 @@ func (s *Scraper) handleDeletedWorkloadKeyLocked(key string, deletionTime *metav
 						break
 					}
 				}
+			} else if ownerRef.kind == "LeaderWorkerSet" {
+				if wlMap, ok := s.lwsWlStates[oKey]; ok {
+					delete(wlMap, rawWlName)
+					s.recomputeAggregateOwnerStateLocked(s.lwsWlStates, oKey)
+				}
+				if ownerMatchedWl {
+					delete(s.ownerToWorkload, oKey)
+					for remWl := range s.lwsWlStates[oKey] {
+						s.ownerToWorkload[oKey] = remWl
+						break
+					}
+				}
 			} else if ownerMatchedWl {
 				delete(s.ownerToWorkload, oKey)
 				delete(s.ownerStates, oKey)
@@ -3137,10 +3648,8 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 		s.mu.Lock()
 		delEv := s.handleDeletedWorkloadKeyLocked(key, wl.DeletionTimestamp, now)
 		s.mu.Unlock()
-		if delEv != nil && s.execTimeLog != nil {
-			if err := s.execTimeLog.Append(*delEv); err != nil {
-				log.Printf("ERROR writing deleted workload PartialExecution event to %s: %v", s.cfg.ExecutionTimeFile, err)
-			}
+		if delEv != nil {
+			s.appendToLog(s.execTimeLog, *delEv, "deleted workload PartialExecution", s.cfg.ExecutionTimeFile)
 		}
 		return
 	}
@@ -3250,15 +3759,22 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	var events []ExecutionTimeEvent
 
 	isOwnerNotFound := isFinished && finishedCond.Reason == kueuev1beta2.WorkloadFinishedReasonOwnerNotFound
+	isSliceReplaced := isFinished && finishedCond.Reason == kueuev1beta2.WorkloadSliceReplaced
 
 	s.mu.Lock()
 	staleDeploymentWl := rawOwnerKind == "Deployment" && s.isStaleDeploymentWorkloadLocked(ownerKey, rawOwnerUID, wl, isOwnerNotFound)
-	if !staleDeploymentWl {
+	staleLWSWl := rawOwnerKind == "LeaderWorkerSet" && s.isStaleLWSWorkloadLocked(ownerKey, wl, isOwnerNotFound)
+	supersededSliceWl := isSliceReplaced && s.ownerToWorkload[ownerKey] != "" && s.ownerToWorkload[ownerKey] != wl.Name
+	if !staleDeploymentWl && !staleLWSWl && !supersededSliceWl {
 		s.ownerToWorkload[ownerKey] = wl.Name
 	}
 	for _, ref := range wl.OwnerReferences {
 		if ref.Kind != "" && ref.Name != "" {
-			s.ownerToWorkload[ref.Kind+"/"+wl.Namespace+"/"+ref.Name] = wl.Name
+			refKey := ref.Kind + "/" + wl.Namespace + "/" + ref.Name
+			if staleDeploymentWl || staleLWSWl || (isSliceReplaced && s.ownerToWorkload[refKey] != "" && s.ownerToWorkload[refKey] != wl.Name) {
+				continue
+			}
+			s.ownerToWorkload[refKey] = wl.Name
 		}
 	}
 	s.workloadToOwner[key] = workloadOwnerRef{kind: rawOwnerKind, name: rawOwnerName, podName: rawPodOwnerName}
@@ -3280,11 +3796,13 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	}
 	// Allow FullExecution when Finished=True transitioned cleanly (Reason == Succeeded, or Workload
 	// completed without pods/owner being suspended) even when Preempted=True remains latched on wl.Status.Conditions.
+	// WorkloadSliceReplaced indicates an elastic-job slice was superseded by a scaled slice, NOT a full completion.
 	finishedCleanly := isFinished && (finishedCond.Reason == kueuev1beta2.WorkloadFinishedReasonSucceeded ||
 		(ownerUnsuspended &&
 			finishedCond.Reason != kueuev1beta2.WorkloadFinishedReasonFailed &&
 			finishedCond.Reason != kueuev1beta2.WorkloadFinishedReasonOwnerNotFound &&
-			finishedCond.Reason != kueuev1beta2.WorkloadFinishedReasonOutOfSync))
+			finishedCond.Reason != kueuev1beta2.WorkloadFinishedReasonOutOfSync &&
+			finishedCond.Reason != kueuev1beta2.WorkloadSliceReplaced))
 
 	var thisWlState WorkloadState
 	switch {
@@ -3300,7 +3818,7 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 		thisWlState = WorkloadStateNotAdmitted
 	}
 	if rawOwnerKind == "Deployment" {
-		if !staleDeploymentWl {
+		if !staleDeploymentWl && !supersededSliceWl {
 			wlMap, exists := s.deploymentWlStates[ownerKey]
 			if !exists {
 				wlMap = make(map[string]WorkloadState)
@@ -3309,7 +3827,17 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 			wlMap[wl.Name] = thisWlState
 			s.recomputeDeploymentOwnerStateLocked(ownerKey)
 		}
-	} else {
+	} else if rawOwnerKind == "LeaderWorkerSet" {
+		if !staleLWSWl && !supersededSliceWl {
+			wlMap, exists := s.lwsWlStates[ownerKey]
+			if !exists {
+				wlMap = make(map[string]WorkloadState)
+				s.lwsWlStates[ownerKey] = wlMap
+			}
+			wlMap[wl.Name] = thisWlState
+			s.recomputeAggregateOwnerStateLocked(s.lwsWlStates, ownerKey)
+		}
+	} else if !supersededSliceWl {
 		s.ownerStates[ownerKey] = thisWlState
 	}
 
@@ -3387,15 +3915,32 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 		evictedFromExecution ||
 		hadRevokedReservation
 
-	if interruptionCategory == "" && isFinished && !finishedCleanly && wasEverAdmitted {
-		if finishedCond.Reason == kueuev1beta2.WorkloadFinishedReasonOwnerNotFound {
-			interruptionCategory = InterruptionReasonDeleted
-		} else {
-			interruptionCategory = InterruptionReasonFailed
+	if isFinished && !finishedCleanly && wasEverAdmitted {
+		overrideWithFinished := interruptionCategory == ""
+		if !overrideWithFinished {
+			existingTime := interruptTime
+			if existingTime.IsZero() {
+				existingTime = now
+			}
+			existingPartialKey := existingTime.Format(time.RFC3339Nano) + "/" + interruptionCategory + "/" + interruptReason
+			if st.recordedPartialKeys[existingPartialKey] {
+				overrideWithFinished = true
+			}
 		}
-		interruptTime = finishedCond.LastTransitionTime.Time.UTC()
-		interruptReason = finishedCond.Reason
-		interruptMsg = finishedCond.Message
+		if overrideWithFinished {
+			isPreempted = false
+			switch finishedCond.Reason {
+			case kueuev1beta2.WorkloadFinishedReasonOwnerNotFound:
+				interruptionCategory = InterruptionReasonDeleted
+			case kueuev1beta2.WorkloadSliceReplaced:
+				interruptionCategory = InterruptionReasonSliceReplaced
+			default:
+				interruptionCategory = InterruptionReasonFailed
+			}
+			interruptTime = finishedCond.LastTransitionTime.Time.UTC()
+			interruptReason = finishedCond.Reason
+			interruptMsg = finishedCond.Message
+		}
 	}
 
 	// 1. Check if Workload is currently Admitted.
@@ -3646,9 +4191,7 @@ func (s *Scraper) handleWorkloadWatchEventAt(eventType watch.EventType, wl *kueu
 	s.mu.Unlock()
 
 	for _, ev := range events {
-		if err := s.execTimeLog.Append(ev); err != nil {
-			log.Printf("ERROR writing Workload execution event to %s: %v", s.cfg.ExecutionTimeFile, err)
-		}
+		s.appendToLog(s.execTimeLog, ev, "Workload execution", s.cfg.ExecutionTimeFile)
 	}
 }
 
@@ -3791,9 +4334,7 @@ func (s *Scraper) flushInFlightWorkloadsAsPartial(shutdownTime time.Time) {
 	s.mu.Unlock()
 
 	for _, ev := range events {
-		if err := s.execTimeLog.Append(ev); err != nil {
-			log.Printf("ERROR writing ScrapeEnded partial execution event to %s: %v", s.cfg.ExecutionTimeFile, err)
-		}
+		s.appendToLog(s.execTimeLog, ev, "ScrapeEnded partial execution", s.cfg.ExecutionTimeFile)
 	}
 }
 
@@ -3981,10 +4522,11 @@ func (s *Scraper) syncInitialPods(ctx context.Context, now time.Time) (string, [
 	for i := range list.Items {
 		s.handlePodWatchEventAt(watch.Added, &list.Items[i], now, true)
 	}
-	if list.ResourceVersion != "" {
-		return list.ResourceVersion, list.Items
+	items := list.Items
+	if items == nil {
+		items = []corev1.Pod{}
 	}
-	return "0", list.Items
+	return listRVOrZero(list.ResourceVersion), items
 }
 
 func (s *Scraper) syncInitialDynamicResource(
@@ -4029,21 +4571,6 @@ func isWatchExpiredError(err error) bool {
 	return apierrors.IsResourceExpired(err) || apierrors.IsGone(err)
 }
 
-func extractWatchRVAndExpired(ev watch.Event) (string, bool) {
-	if ev.Type == watch.Error {
-		if ev.Object != nil {
-			if statusErr := apierrors.FromObject(ev.Object); statusErr != nil && isWatchExpiredError(statusErr) {
-				return "", true
-			}
-		}
-		return "", false
-	}
-	if metaObj, ok := ev.Object.(metav1.Object); ok && metaObj != nil {
-		return metaObj.GetResourceVersion(), false
-	}
-	return "", false
-}
-
 func (s *Scraper) reconcileWorkflowDeletionsOnRelist(kind string, presentRawKeys map[string]bool, now time.Time) {
 	var deletedEvents []WorkflowEvent
 	s.mu.Lock()
@@ -4063,6 +4590,10 @@ func (s *Scraper) reconcileWorkflowDeletionsOnRelist(kind string, presentRawKeys
 				rawDepName = parts[2]
 			}
 			s.clearDeploymentOwnershipLocked(k, st.namespace, rawDepName, "")
+		} else if st.kind == "LeaderWorkerSet" {
+			delete(s.lwsWlStates, k)
+			delete(s.ownerStates, k)
+			delete(s.ownerToWorkload, k)
 		}
 		wlState := st.workloadState
 		if wlState == "" {
@@ -4095,11 +4626,7 @@ func (s *Scraper) reconcileWorkflowDeletionsOnRelist(kind string, presentRawKeys
 	s.mu.Unlock()
 
 	for _, ev := range deletedEvents {
-		if s.workflowsLog != nil {
-			if err := s.workflowsLog.Append(ev); err != nil {
-				log.Printf("ERROR writing reconciled %s deletion event to %s: %v", kind, s.cfg.WorkflowsFile, err)
-			}
-		}
+		s.appendToLog(s.workflowsLog, ev, "reconciled "+kind+" deletion", s.cfg.WorkflowsFile)
 	}
 }
 
@@ -4121,11 +4648,205 @@ func (s *Scraper) reconcileWorkloadDeletionsOnRelist(presentRawKeys map[string]b
 	s.mu.Unlock()
 
 	for _, ev := range partialEvents {
-		if s.execTimeLog != nil {
-			if err := s.execTimeLog.Append(ev); err != nil {
-				log.Printf("ERROR writing reconciled deleted workload PartialExecution event to %s: %v", s.cfg.ExecutionTimeFile, err)
+		s.appendToLog(s.execTimeLog, ev, "reconciled deleted workload PartialExecution", s.cfg.ExecutionTimeFile)
+	}
+}
+
+type watchLoopConfig struct {
+	name            string
+	initialRV       string
+	retryBackoff    time.Duration
+	notFoundBackoff time.Duration
+	logMissingCRD   string // optional GVR string logged once on initial 404 NotFound
+	silentWatchErr  bool   // suppress WARN log on transient watch errors (e.g. optional Kueue infra CRDs)
+	relist          func(ctx context.Context) (string, error)
+	watch           func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)
+	handleEvent     func(ev watch.Event)
+	sleep           func(ctx context.Context, d time.Duration)
+}
+
+type watchConsumeResult struct {
+	nextRV   string
+	expired  bool
+	watchErr error
+	events   int
+	elapsed  time.Duration
+}
+
+func watchBackoffWithJitter(base time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		base = 2 * time.Second
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	shift := min(attempt-1, 4)
+	d := base << shift
+	if d <= 0 || d > maxWatchBackoff {
+		d = maxWatchBackoff
+	}
+	if base > maxWatchBackoff {
+		d = base
+	}
+	jitterFactor := 0.8 + rand.Float64()*0.4
+	jittered := time.Duration(float64(d) * jitterFactor)
+	if jittered <= 0 {
+		return base
+	}
+	return jittered
+}
+
+func consumeWatch(ctx context.Context, w watch.Interface, currentRV string, handleEvent func(watch.Event)) watchConsumeResult {
+	defer w.Stop()
+	started := time.Now()
+	rv := currentRV
+	var events int
+	for {
+		select {
+		case <-ctx.Done():
+			return watchConsumeResult{nextRV: rv, events: events, elapsed: time.Since(started)}
+		case ev, ok := <-w.ResultChan():
+			if !ok {
+				return watchConsumeResult{nextRV: rv, events: events, elapsed: time.Since(started)}
 			}
+			if ev.Type == watch.Error {
+				var statusErr error
+				if ev.Object != nil {
+					statusErr = apierrors.FromObject(ev.Object)
+				}
+				if statusErr != nil && isWatchExpiredError(statusErr) {
+					return watchConsumeResult{expired: true, watchErr: statusErr, events: events, elapsed: time.Since(started)}
+				}
+				if statusErr == nil {
+					statusErr = fmt.Errorf("watch error event: %T", ev.Object)
+				}
+				return watchConsumeResult{nextRV: rv, watchErr: statusErr, events: events, elapsed: time.Since(started)}
+			}
+			if metaObj, ok := ev.Object.(metav1.Object); ok && metaObj != nil {
+				if evRV := metaObj.GetResourceVersion(); evRV != "" {
+					rv = evRV
+				}
+			}
+			events++
+			if ev.Type == watch.Bookmark {
+				continue
+			}
+			handleEvent(ev)
 		}
+	}
+}
+
+func runWatchLoop(ctx context.Context, cfg watchLoopConfig) {
+	retryBackoff := cfg.retryBackoff
+	if retryBackoff <= 0 {
+		retryBackoff = 2 * time.Second
+	}
+	sleepFn := cfg.sleep
+	if sleepFn == nil {
+		sleepFn = sleepContext
+	}
+	loggedMissingCRD := false
+	rv := cfg.initialRV
+	consecutiveFailures := 0
+	consecutiveFast410s := 0
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if rv == "" {
+			nextRV, err := cfg.relist(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if apierrors.IsNotFound(err) {
+					if cfg.logMissingCRD != "" && !loggedMissingCRD {
+						log.Printf("INFO CRD for %s (%s) is not installed on cluster; will retry periodically", cfg.name, cfg.logMissingCRD)
+						loggedMissingCRD = true
+					}
+					backoff := cfg.notFoundBackoff
+					if backoff <= 0 {
+						backoff = retryBackoff
+					}
+					sleepFn(ctx, backoff)
+					continue
+				}
+				log.Printf("WARN failed to list %s: %v", cfg.name, err)
+				consecutiveFailures++
+				sleepFn(ctx, watchBackoffWithJitter(retryBackoff, consecutiveFailures))
+				continue
+			}
+			if nextRV == "" {
+				if ctx.Err() != nil {
+					return
+				}
+				consecutiveFailures++
+				sleepFn(ctx, watchBackoffWithJitter(retryBackoff, consecutiveFailures))
+				continue
+			}
+			loggedMissingCRD = false
+			rv = nextRV
+		}
+
+		watchOpts := watchOptionsFromSentinel(rv)
+		w, err := cfg.watch(ctx, watchOpts)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if isWatchExpiredError(err) {
+				rv = ""
+				consecutiveFast410s++
+				if consecutiveFast410s >= 2 {
+					sleepFn(ctx, watchBackoffWithJitter(retryBackoff, consecutiveFast410s-1))
+				}
+				continue
+			}
+			if !cfg.silentWatchErr {
+				log.Printf("WARN failed to watch %s: %v", cfg.name, err)
+			}
+			consecutiveFast410s = 0
+			consecutiveFailures++
+			sleepFn(ctx, watchBackoffWithJitter(retryBackoff, consecutiveFailures))
+			continue
+		}
+
+		res := consumeWatch(ctx, w, rv, cfg.handleEvent)
+		if ctx.Err() != nil {
+			return
+		}
+		if res.expired {
+			rv = ""
+			if res.events == 0 && res.elapsed < time.Second {
+				consecutiveFast410s++
+				if consecutiveFast410s >= 2 {
+					sleepFn(ctx, watchBackoffWithJitter(retryBackoff, consecutiveFast410s-1))
+				}
+			} else {
+				consecutiveFast410s = 0
+				consecutiveFailures = 0
+			}
+			continue
+		}
+		rv = res.nextRV
+		if res.watchErr != nil {
+			if !cfg.silentWatchErr {
+				log.Printf("WARN watch %s received error: %v", cfg.name, res.watchErr)
+			}
+			consecutiveFast410s = 0
+			consecutiveFailures++
+			sleepFn(ctx, watchBackoffWithJitter(retryBackoff, consecutiveFailures))
+			continue
+		}
+		if res.events == 0 && res.elapsed < time.Second {
+			consecutiveFast410s = 0
+			consecutiveFailures++
+			sleepFn(ctx, watchBackoffWithJitter(retryBackoff, consecutiveFailures))
+			continue
+		}
+		consecutiveFast410s = 0
+		consecutiveFailures = 0
 	}
 }
 
@@ -4133,173 +4854,86 @@ func (s *Scraper) watchNodesLoop(ctx context.Context, initialRV string) {
 	if s.kubeClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
-			rv = s.scrapeNodes(ctx, time.Now().UTC())
-			if rv == "" {
-				if ctx.Err() != nil {
-					return
-				}
-				sleepContext(ctx, 2*time.Second)
-				continue
-			}
-		}
-
-		watchOpts := watchOptionsFromSentinel(rv)
-		w, err := s.kubeClient.CoreV1().Nodes().Watch(ctx, watchOpts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			log.Printf("WARN failed to start Node watch: %v", err)
-			sleepContext(ctx, 2*time.Second)
-			continue
-		}
-		nextRV, expired := s.consumeNodeWatch(ctx, w, rv)
-		if expired {
-			rv = ""
-		} else {
-			rv = nextRV
-		}
-	}
-}
-
-func (s *Scraper) consumeNodeWatch(ctx context.Context, w watch.Interface, currentRV string) (string, bool) {
-	defer w.Stop()
-	rv := currentRV
-	for {
-		select {
-		case <-ctx.Done():
-			return rv, false
-		case ev, ok := <-w.ResultChan():
-			if !ok {
-				return rv, false
-			}
-			evRV, expired := extractWatchRVAndExpired(ev)
-			if expired {
-				return "", true
-			}
-			if evRV != "" {
-				rv = evRV
-			}
-			if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-				continue
-			}
+	runWatchLoop(ctx, watchLoopConfig{
+		name:         "Nodes",
+		initialRV:    initialRV,
+		retryBackoff: 2 * time.Second,
+		relist: func(ctx context.Context) (string, error) {
+			return s.scrapeNodes(ctx, time.Now().UTC()), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kubeClient.CoreV1().Nodes().Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
 			if node, ok := ev.Object.(*corev1.Node); ok {
 				s.handleNodeWatchEvent(ev.Type, node)
 			}
-		}
+		},
+	})
+}
+
+func (s *Scraper) relistPodsAt(ctx context.Context, relistNow time.Time) (string, error) {
+	listStartedAt := relistNow
+	list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return "", err
 	}
+	listRV := parseResourceVersion(list.ResourceVersion)
+	sort.Slice(list.Items, func(i, j int) bool {
+		return compareMetaOrder(&list.Items[i], &list.Items[j])
+	})
+	presentStandalonePods := make(map[string]bool, len(list.Items))
+	for i := range list.Items {
+		pod := &list.Items[i]
+		if IsStandaloneKueuePod(pod) {
+			presentStandalonePods["Pod/"+pod.Namespace+"/"+pod.Name] = true
+		}
+		s.handlePodWatchEventAt(watch.Added, pod, relistNow, true)
+	}
+	s.reconcileWorkflowDeletionsOnRelist("Pod", presentStandalonePods, relistNow)
+	items := list.Items
+	if items == nil {
+		items = []corev1.Pod{}
+	}
+	s.scrapeScheduledAndRunningPodsWithSnapshot(ctx, relistNow, listStartedAt, listRV, items)
+	return listRVOrZero(list.ResourceVersion), nil
 }
 
 func (s *Scraper) watchPodsLoop(ctx context.Context, initialRV string) {
 	if s.kubeClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
-			relistNow := time.Now().UTC()
-			list, err := s.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("WARN failed to list Pods for watch initialization: %v", err)
-				sleepContext(ctx, 2*time.Second)
-				continue
-			}
-			sort.Slice(list.Items, func(i, j int) bool {
-				return compareMetaOrder(&list.Items[i], &list.Items[j])
-			})
-			for i := range list.Items {
-				s.handlePodWatchEventAt(watch.Added, &list.Items[i], relistNow, true)
-			}
-			s.scrapeScheduledAndRunningPodsWithList(ctx, relistNow, list.Items)
-			rv = listRVOrZero(list.ResourceVersion)
-		}
-
-		watchOpts := watchOptionsFromSentinel(rv)
-		w, err := s.kubeClient.CoreV1().Pods("").Watch(ctx, watchOpts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			log.Printf("WARN failed to start Pod watch: %v", err)
-			sleepContext(ctx, 2*time.Second)
-			continue
-		}
-		nextRV, expired := s.consumePodWatch(ctx, w, rv)
-		if expired {
-			rv = ""
-		} else {
-			rv = nextRV
-		}
-	}
-}
-
-func (s *Scraper) consumePodWatch(ctx context.Context, w watch.Interface, currentRV string) (string, bool) {
-	defer w.Stop()
-	rv := currentRV
-	for {
-		select {
-		case <-ctx.Done():
-			return rv, false
-		case ev, ok := <-w.ResultChan():
-			if !ok {
-				return rv, false
-			}
-			evRV, expired := extractWatchRVAndExpired(ev)
-			if expired {
-				return "", true
-			}
-			if evRV != "" {
-				rv = evRV
-			}
-			if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-				continue
-			}
+	runWatchLoop(ctx, watchLoopConfig{
+		name:         "Pods",
+		initialRV:    initialRV,
+		retryBackoff: 2 * time.Second,
+		relist: func(ctx context.Context) (string, error) {
+			return s.relistPodsAt(ctx, time.Now().UTC())
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kubeClient.CoreV1().Pods("").Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
 			if pod, ok := ev.Object.(*corev1.Pod); ok {
 				s.handlePodWatchEvent(ev.Type, pod)
 			}
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchJobsLoop(ctx context.Context, initialRV string) {
 	if s.kubeClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
+	runWatchLoop(ctx, watchLoopConfig{
+		name:         "Jobs",
+		initialRV:    initialRV,
+		retryBackoff: 2 * time.Second,
+		relist: func(ctx context.Context) (string, error) {
 			relistNow := time.Now().UTC()
 			list, err := s.kubeClient.BatchV1().Jobs("").List(ctx, metav1.ListOptions{})
 			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("WARN failed to list Jobs: %v", err)
-				sleepContext(ctx, 2*time.Second)
-				continue
+				return "", err
 			}
 			sort.Slice(list.Items, func(i, j int) bool {
 				return compareMetaOrder(&list.Items[i], &list.Items[j])
@@ -4310,76 +4944,32 @@ func (s *Scraper) watchJobsLoop(ctx context.Context, initialRV string) {
 				s.handleJobWatchEventAt(watch.Added, &list.Items[i], relistNow, true)
 			}
 			s.reconcileWorkflowDeletionsOnRelist("Job", present, relistNow)
-			rv = listRVOrZero(list.ResourceVersion)
-		}
-
-		watchOpts := watchOptionsFromSentinel(rv)
-		w, err := s.kubeClient.BatchV1().Jobs("").Watch(ctx, watchOpts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+			return listRVOrZero(list.ResourceVersion), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kubeClient.BatchV1().Jobs("").Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if job, ok := ev.Object.(*batchv1.Job); ok {
+				s.handleJobWatchEvent(ev.Type, job)
 			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			log.Printf("WARN failed to watch Jobs: %v", err)
-			sleepContext(ctx, 2*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if job, ok := ev.Object.(*batchv1.Job); ok {
-						s.handleJobWatchEvent(ev.Type, job)
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchDeploymentsLoop(ctx context.Context, initialRV string) {
 	if s.kubeClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
+	runWatchLoop(ctx, watchLoopConfig{
+		name:         "Deployments",
+		initialRV:    initialRV,
+		retryBackoff: 2 * time.Second,
+		relist: func(ctx context.Context) (string, error) {
 			relistNow := time.Now().UTC()
 			list, err := s.kubeClient.AppsV1().Deployments("").List(ctx, metav1.ListOptions{})
 			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("WARN failed to list Deployments: %v", err)
-				sleepContext(ctx, 2*time.Second)
-				continue
+				return "", err
 			}
 			sort.Slice(list.Items, func(i, j int) bool {
 				return compareMetaOrder(&list.Items[i], &list.Items[j])
@@ -4390,151 +4980,61 @@ func (s *Scraper) watchDeploymentsLoop(ctx context.Context, initialRV string) {
 				s.handleDeploymentWatchEventAt(watch.Added, &list.Items[i], relistNow)
 			}
 			s.reconcileWorkflowDeletionsOnRelist("Deployment", present, relistNow)
-			rv = listRVOrZero(list.ResourceVersion)
-		}
-
-		watchOpts := watchOptionsFromSentinel(rv)
-		w, err := s.kubeClient.AppsV1().Deployments("").Watch(ctx, watchOpts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+			return listRVOrZero(list.ResourceVersion), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kubeClient.AppsV1().Deployments("").Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if deploy, ok := ev.Object.(*appsv1.Deployment); ok {
+				s.handleDeploymentWatchEvent(ev.Type, deploy)
 			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			log.Printf("WARN failed to watch Deployments: %v", err)
-			sleepContext(ctx, 2*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if deploy, ok := ev.Object.(*appsv1.Deployment); ok {
-						s.handleDeploymentWatchEvent(ev.Type, deploy)
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchReplicaSetsLoop(ctx context.Context, initialRV string) {
 	if s.kubeClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
+	runWatchLoop(ctx, watchLoopConfig{
+		name:         "ReplicaSets",
+		initialRV:    initialRV,
+		retryBackoff: 2 * time.Second,
+		relist: func(ctx context.Context) (string, error) {
 			list, err := s.kubeClient.AppsV1().ReplicaSets("").List(ctx, metav1.ListOptions{})
 			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("WARN failed to list ReplicaSets: %v", err)
-				sleepContext(ctx, 2*time.Second)
-				continue
+				return "", err
 			}
 			for i := range list.Items {
 				s.handleReplicaSetWatchEvent(watch.Added, &list.Items[i])
 			}
-			rv = listRVOrZero(list.ResourceVersion)
-		}
-
-		watchOpts := watchOptionsFromSentinel(rv)
-		w, err := s.kubeClient.AppsV1().ReplicaSets("").Watch(ctx, watchOpts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+			return listRVOrZero(list.ResourceVersion), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kubeClient.AppsV1().ReplicaSets("").Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if rs, ok := ev.Object.(*appsv1.ReplicaSet); ok {
+				s.handleReplicaSetWatchEvent(ev.Type, rs)
 			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			log.Printf("WARN failed to watch ReplicaSets: %v", err)
-			sleepContext(ctx, 2*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if rs, ok := ev.Object.(*appsv1.ReplicaSet); ok {
-						s.handleReplicaSetWatchEvent(ev.Type, rs)
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchJobSetsLoop(ctx context.Context, initialRV string) {
 	if s.jobsetClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
+	runWatchLoop(ctx, watchLoopConfig{
+		name:         "JobSets",
+		initialRV:    initialRV,
+		retryBackoff: 5 * time.Second,
+		relist: func(ctx context.Context) (string, error) {
 			relistNow := time.Now().UTC()
 			list, err := s.jobsetClient.JobsetV1alpha2().JobSets("").List(ctx, metav1.ListOptions{})
 			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				if !apierrors.IsNotFound(err) {
-					log.Printf("WARN failed to list JobSets: %v", err)
-				}
-				sleepContext(ctx, 5*time.Second)
-				continue
+				return "", err
 			}
 			sort.Slice(list.Items, func(i, j int) bool {
 				return compareMetaOrder(&list.Items[i], &list.Items[j])
@@ -4545,78 +5045,32 @@ func (s *Scraper) watchJobSetsLoop(ctx context.Context, initialRV string) {
 				s.handleJobSetWatchEventAt(watch.Added, &list.Items[i], relistNow, true)
 			}
 			s.reconcileWorkflowDeletionsOnRelist("JobSet", present, relistNow)
-			rv = listRVOrZero(list.ResourceVersion)
-		}
-
-		watchOpts := watchOptionsFromSentinel(rv)
-		w, err := s.jobsetClient.JobsetV1alpha2().JobSets("").Watch(ctx, watchOpts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+			return listRVOrZero(list.ResourceVersion), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.jobsetClient.JobsetV1alpha2().JobSets("").Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if js, ok := ev.Object.(*jobsetv1alpha2.JobSet); ok {
+				s.handleJobSetWatchEvent(ev.Type, js)
 			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			log.Printf("WARN failed to watch JobSets: %v", err)
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if js, ok := ev.Object.(*jobsetv1alpha2.JobSet); ok {
-						s.handleJobSetWatchEvent(ev.Type, js)
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchWorkloadsLoop(ctx context.Context, initialRV string) {
 	if s.kueueClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
+	runWatchLoop(ctx, watchLoopConfig{
+		name:         "Kueue Workloads",
+		initialRV:    initialRV,
+		retryBackoff: 5 * time.Second,
+		relist: func(ctx context.Context) (string, error) {
 			relistNow := time.Now().UTC()
 			list, err := s.kueueClient.KueueV1beta2().Workloads("").List(ctx, metav1.ListOptions{})
 			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				if !apierrors.IsNotFound(err) {
-					log.Printf("WARN failed to list Kueue Workloads: %v", err)
-				}
-				sleepContext(ctx, 5*time.Second)
-				continue
+				return "", err
 			}
 			sort.Slice(list.Items, func(i, j int) bool {
 				return compareMetaOrder(&list.Items[i], &list.Items[j])
@@ -4627,445 +5081,155 @@ func (s *Scraper) watchWorkloadsLoop(ctx context.Context, initialRV string) {
 				s.handleWorkloadWatchEventAt(watch.Added, &list.Items[i], relistNow)
 			}
 			s.reconcileWorkloadDeletionsOnRelist(present, relistNow)
-			rv = listRVOrZero(list.ResourceVersion)
-		}
-
-		watchOpts := watchOptionsFromSentinel(rv)
-		w, err := s.kueueClient.KueueV1beta2().Workloads("").Watch(ctx, watchOpts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+			return listRVOrZero(list.ResourceVersion), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kueueClient.KueueV1beta2().Workloads("").Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if wl, ok := ev.Object.(*kueuev1beta2.Workload); ok {
+				s.handleWorkloadWatchEvent(ev.Type, wl)
 			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			log.Printf("WARN failed to watch Kueue Workloads: %v", err)
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if wl, ok := ev.Object.(*kueuev1beta2.Workload); ok {
-						s.handleWorkloadWatchEvent(ev.Type, wl)
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchClusterQueuesLoop(ctx context.Context, initialRV string) {
 	if s.kueueClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
-			rv = s.scrapeClusterQueues(ctx, time.Now().UTC())
-			if rv == "" {
-				if ctx.Err() != nil {
-					return
-				}
-				sleepContext(ctx, 5*time.Second)
-				continue
+	runWatchLoop(ctx, watchLoopConfig{
+		name:           "ClusterQueues",
+		initialRV:      initialRV,
+		retryBackoff:   5 * time.Second,
+		silentWatchErr: true,
+		relist: func(ctx context.Context) (string, error) {
+			return s.scrapeClusterQueues(ctx, time.Now().UTC()), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kueueClient.KueueV1beta2().ClusterQueues().Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if cq, ok := ev.Object.(*kueuev1beta2.ClusterQueue); ok {
+				s.handleInfraObjectWatchEventAt(ev.Type, "ClusterQueue", cq.Name, cq.Name, "", SanitizeClusterQueue(cq, s.hasher), time.Now().UTC())
 			}
-		}
-		w, err := s.kueueClient.KueueV1beta2().ClusterQueues().Watch(ctx, watchOptionsFromSentinel(rv))
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if cq, ok := ev.Object.(*kueuev1beta2.ClusterQueue); ok {
-						s.handleInfraObjectWatchEventAt(ev.Type, "ClusterQueue", cq.Name, cq.Name, "", SanitizeClusterQueue(cq, s.hasher), time.Now().UTC())
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchCohortsLoop(ctx context.Context, initialRV string) {
 	if s.kueueClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
-			rv = s.scrapeCohorts(ctx, time.Now().UTC())
-			if rv == "" {
-				if ctx.Err() != nil {
-					return
-				}
-				sleepContext(ctx, 5*time.Second)
-				continue
+	runWatchLoop(ctx, watchLoopConfig{
+		name:           "Cohorts",
+		initialRV:      initialRV,
+		retryBackoff:   5 * time.Second,
+		silentWatchErr: true,
+		relist: func(ctx context.Context) (string, error) {
+			return s.scrapeCohorts(ctx, time.Now().UTC()), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kueueClient.KueueV1beta2().Cohorts().Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if cohort, ok := ev.Object.(*kueuev1beta2.Cohort); ok {
+				s.handleInfraObjectWatchEventAt(ev.Type, "Cohort", cohort.Name, cohort.Name, "", SanitizeCohort(cohort, s.hasher), time.Now().UTC())
 			}
-		}
-		w, err := s.kueueClient.KueueV1beta2().Cohorts().Watch(ctx, watchOptionsFromSentinel(rv))
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if cohort, ok := ev.Object.(*kueuev1beta2.Cohort); ok {
-						s.handleInfraObjectWatchEventAt(ev.Type, "Cohort", cohort.Name, cohort.Name, "", SanitizeCohort(cohort, s.hasher), time.Now().UTC())
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchLocalQueuesLoop(ctx context.Context, initialRV string) {
 	if s.kueueClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
-			rv = s.scrapeLocalQueues(ctx, time.Now().UTC())
-			if rv == "" {
-				if ctx.Err() != nil {
-					return
-				}
-				sleepContext(ctx, 5*time.Second)
-				continue
+	runWatchLoop(ctx, watchLoopConfig{
+		name:           "LocalQueues",
+		initialRV:      initialRV,
+		retryBackoff:   5 * time.Second,
+		silentWatchErr: true,
+		relist: func(ctx context.Context) (string, error) {
+			return s.scrapeLocalQueues(ctx, time.Now().UTC()), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kueueClient.KueueV1beta2().LocalQueues("").Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if lq, ok := ev.Object.(*kueuev1beta2.LocalQueue); ok {
+				s.handleInfraObjectWatchEventAt(ev.Type, "LocalQueue", lq.Namespace+"/"+lq.Name, lq.Name, lq.Namespace, SanitizeLocalQueue(lq, s.hasher), time.Now().UTC())
 			}
-		}
-		w, err := s.kueueClient.KueueV1beta2().LocalQueues("").Watch(ctx, watchOptionsFromSentinel(rv))
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if lq, ok := ev.Object.(*kueuev1beta2.LocalQueue); ok {
-						s.handleInfraObjectWatchEventAt(ev.Type, "LocalQueue", lq.Namespace+"/"+lq.Name, lq.Name, lq.Namespace, SanitizeLocalQueue(lq, s.hasher), time.Now().UTC())
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchResourceFlavorsLoop(ctx context.Context, initialRV string) {
 	if s.kueueClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
-			rv = s.scrapeResourceFlavors(ctx, time.Now().UTC())
-			if rv == "" {
-				if ctx.Err() != nil {
-					return
-				}
-				sleepContext(ctx, 5*time.Second)
-				continue
+	runWatchLoop(ctx, watchLoopConfig{
+		name:           "ResourceFlavors",
+		initialRV:      initialRV,
+		retryBackoff:   5 * time.Second,
+		silentWatchErr: true,
+		relist: func(ctx context.Context) (string, error) {
+			return s.scrapeResourceFlavors(ctx, time.Now().UTC()), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kueueClient.KueueV1beta2().ResourceFlavors().Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if rf, ok := ev.Object.(*kueuev1beta2.ResourceFlavor); ok {
+				s.handleInfraObjectWatchEventAt(ev.Type, "ResourceFlavor", rf.Name, rf.Name, "", SanitizeResourceFlavor(rf, s.hasher), time.Now().UTC())
 			}
-		}
-		w, err := s.kueueClient.KueueV1beta2().ResourceFlavors().Watch(ctx, watchOptionsFromSentinel(rv))
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if rf, ok := ev.Object.(*kueuev1beta2.ResourceFlavor); ok {
-						s.handleInfraObjectWatchEventAt(ev.Type, "ResourceFlavor", rf.Name, rf.Name, "", SanitizeResourceFlavor(rf, s.hasher), time.Now().UTC())
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchTopologiesLoop(ctx context.Context, initialRV string) {
 	if s.kueueClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
-			rv = s.scrapeTopologies(ctx, time.Now().UTC())
-			if rv == "" {
-				if ctx.Err() != nil {
-					return
-				}
-				sleepContext(ctx, 5*time.Second)
-				continue
+	runWatchLoop(ctx, watchLoopConfig{
+		name:           "Topologies",
+		initialRV:      initialRV,
+		retryBackoff:   5 * time.Second,
+		silentWatchErr: true,
+		relist: func(ctx context.Context) (string, error) {
+			return s.scrapeTopologies(ctx, time.Now().UTC()), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kueueClient.KueueV1beta2().Topologies().Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if topo, ok := ev.Object.(*kueuev1beta2.Topology); ok {
+				s.handleInfraObjectWatchEventAt(ev.Type, "Topology", topo.Name, topo.Name, "", SanitizeTopology(topo, s.hasher), time.Now().UTC())
 			}
-		}
-		w, err := s.kueueClient.KueueV1beta2().Topologies().Watch(ctx, watchOptionsFromSentinel(rv))
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if topo, ok := ev.Object.(*kueuev1beta2.Topology); ok {
-						s.handleInfraObjectWatchEventAt(ev.Type, "Topology", topo.Name, topo.Name, "", SanitizeTopology(topo, s.hasher), time.Now().UTC())
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchWorkloadPriorityClassesLoop(ctx context.Context, initialRV string) {
 	if s.kueueClient == nil {
 		return
 	}
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
-			rv = s.scrapeWorkloadPriorityClasses(ctx, time.Now().UTC())
-			if rv == "" {
-				if ctx.Err() != nil {
-					return
-				}
-				sleepContext(ctx, 5*time.Second)
-				continue
+	runWatchLoop(ctx, watchLoopConfig{
+		name:           "WorkloadPriorityClasses",
+		initialRV:      initialRV,
+		retryBackoff:   5 * time.Second,
+		silentWatchErr: true,
+		relist: func(ctx context.Context) (string, error) {
+			return s.scrapeWorkloadPriorityClasses(ctx, time.Now().UTC()), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.kueueClient.KueueV1beta2().WorkloadPriorityClasses().Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if wpc, ok := ev.Object.(*kueuev1beta2.WorkloadPriorityClass); ok {
+				s.handleInfraObjectWatchEventAt(ev.Type, "WorkloadPriorityClass", wpc.Name, wpc.Name, "", SanitizeWorkloadPriorityClass(wpc, s.hasher), time.Now().UTC())
 			}
-		}
-		w, err := s.kueueClient.KueueV1beta2().WorkloadPriorityClasses().Watch(ctx, watchOptionsFromSentinel(rv))
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if wpc, ok := ev.Object.(*kueuev1beta2.WorkloadPriorityClass); ok {
-						s.handleInfraObjectWatchEventAt(ev.Type, "WorkloadPriorityClass", wpc.Name, wpc.Name, "", SanitizeWorkloadPriorityClass(wpc, s.hasher), time.Now().UTC())
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func (s *Scraper) watchDynamicResourceLoop(
@@ -5078,32 +5242,18 @@ func (s *Scraper) watchDynamicResourceLoop(
 	if s.dynamicClient == nil {
 		return
 	}
-	loggedMissingCRD := false
-	rv := initialRV
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if rv == "" {
+	runWatchLoop(ctx, watchLoopConfig{
+		name:            kindName,
+		initialRV:       initialRV,
+		retryBackoff:    5 * time.Second,
+		notFoundBackoff: 30 * time.Second,
+		logMissingCRD:   gvr.String(),
+		relist: func(ctx context.Context) (string, error) {
 			relistNow := time.Now().UTC()
 			list, err := s.dynamicClient.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
 			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				if apierrors.IsNotFound(err) {
-					if !loggedMissingCRD {
-						log.Printf("INFO CRD for %s (%s) is not installed on cluster; will retry periodically", kindName, gvr.String())
-						loggedMissingCRD = true
-					}
-					sleepContext(ctx, 30*time.Second)
-					continue
-				}
-				log.Printf("WARN failed to list %s: %v", kindName, err)
-				sleepContext(ctx, 5*time.Second)
-				continue
+				return "", err
 			}
-			loggedMissingCRD = false
 			sort.Slice(list.Items, func(i, j int) bool {
 				return compareMetaOrder(&list.Items[i], &list.Items[j])
 			})
@@ -5113,55 +5263,17 @@ func (s *Scraper) watchDynamicResourceLoop(
 				handler(watch.Added, &list.Items[i], true)
 			}
 			s.reconcileWorkflowDeletionsOnRelist(kindName, present, relistNow)
-			rv = listRVOrZero(list.GetResourceVersion())
-		}
-
-		watchOpts := watchOptionsFromSentinel(rv)
-		w, err := s.dynamicClient.Resource(gvr).Namespace(metav1.NamespaceAll).Watch(ctx, watchOpts)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
+			return listRVOrZero(list.GetResourceVersion()), nil
+		},
+		watch: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return s.dynamicClient.Resource(gvr).Namespace(metav1.NamespaceAll).Watch(ctx, opts)
+		},
+		handleEvent: func(ev watch.Event) {
+			if u, ok := ev.Object.(*unstructured.Unstructured); ok {
+				handler(ev.Type, u, false)
 			}
-			if isWatchExpiredError(err) {
-				rv = ""
-				continue
-			}
-			log.Printf("WARN failed to watch %s: %v", kindName, err)
-			sleepContext(ctx, 5*time.Second)
-			continue
-		}
-		expired := false
-		func() {
-			defer w.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ev, ok := <-w.ResultChan():
-					if !ok {
-						return
-					}
-					evRV, isExp := extractWatchRVAndExpired(ev)
-					if isExp {
-						expired = true
-						return
-					}
-					if evRV != "" {
-						rv = evRV
-					}
-					if ev.Type == watch.Bookmark || ev.Type == watch.Error {
-						continue
-					}
-					if u, ok := ev.Object.(*unstructured.Unstructured); ok {
-						handler(ev.Type, u, false)
-					}
-				}
-			}
-		}()
-		if expired {
-			rv = ""
-		}
-	}
+		},
+	})
 }
 
 func sleepContext(ctx context.Context, d time.Duration) {

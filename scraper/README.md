@@ -11,8 +11,8 @@ For the complete output format, event envelope, `workloadState` state machine, a
 ## Features
 
 - **Hybrid Periodic + Watch Recording**:
-  - Periodically snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, `PriorityClass`es (`scheduling.k8s.io/v1`), Kueue controller `Configuration` (`ConfigMap/kueue-manager-config` plus `Deployment/kueue-controller-manager` `--feature-gates` CLI overrides and custom `--config` ConfigMap discovery in `--kueue-namespace`), and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, and `WorkloadPriorityClass`es, emitting events only when canonical object state changes (ignoring volatile `metadata.resourceVersion`, `metadata.generation`, and `status.conditions[].lastHeartbeatTime`).
-  - Watches `Node`s, `Pod`s, Kueue-managed `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, Kueue `ClusterQueue`s/`Cohort`s/`LocalQueue`s/`ResourceFlavor`s/`Topology`/`WorkloadPriorityClass`es, and Kueue `Workload`s in real time (preserving `ResourceVersion`s across watch reconnects) to capture exact mid-run node/queue/quota changes, workload creation, admission, scheduling, interruptions (`PartialExecution` across `Preempted`, `NodeFailure`, `PodsReadyTimeout`, `Evicted`, `Failed`, `Deleted`, and shutdown `ScrapeEnded`), `unhealthyNodes` TAS hot-swaps, completion (`FullExecution`), and deletion timestamps.
+  - Snapshots sanitized `Node`s (scheduling-relevant spec & status), `Namespace`s, `RuntimeClass`es, `PriorityClass`es (`scheduling.k8s.io/v1`), Kueue controller `Configuration` (`ConfigMap/kueue-manager-config` plus `Deployment/kueue-controller-manager` `--feature-gates` CLI overrides and custom `--config` ConfigMap discovery in `--kueue-namespace`), and Kueue `ClusterQueue`s, `Cohort`s, `LocalQueue`s, `ResourceFlavor`s, `Topology` objects, and `WorkloadPriorityClass`es at `t0`, then periodically refreshes non-watched resources (`Namespace`, `RuntimeClass`, `PriorityClass`, `Configuration`) while emitting events only when canonical object state changes (ignoring volatile `metadata.resourceVersion`, `metadata.generation`, and `status.conditions[].lastHeartbeatTime`).
+  - Watches `Node`s, `Pod`s, Kueue-managed `Job`s, `JobSet`s, `LeaderWorkerSet`s, `Deployment`s, `RayJob`s, `RayCluster`s, Kueue `ClusterQueue`s/`Cohort`s/`LocalQueue`s/`ResourceFlavor`s/`Topology`/`WorkloadPriorityClass`es, and Kueue `Workload`s in real time (preserving `ResourceVersion`s across watch reconnects and reconciling deletions on `410 Gone` relists) to capture exact mid-run node/queue/quota changes, workload creation, admission, scheduling, interruptions (`PartialExecution` across `Preempted`, `NodeFailure`, `PodsReadyTimeout`, `Evicted`, `Failed`, `Deleted`, `WorkloadSliceReplaced`, and shutdown `ScrapeEnded`), `unhealthyNodes` TAS hot-swaps, completion (`FullExecution`), and deletion timestamps.
   - Gracefully handles optional CRDs (`JobSet`, `LeaderWorkerSet`, `RayJob`, `RayCluster`, Kueue APIs) if they are not installed on the target cluster, retrying periodically without failing.
 - **Strict Data Sanitization** (see [`SCRAPER-SCHEMA.md`](SCRAPER-SCHEMA.md) for the full field-by-field specification):
   - **Nodes (`infra.json`)**: Retains only scheduling-relevant spec (`taints`, `unschedulable`) and status (`capacity`, `allocatable`, `conditions`, `phase`), stripping node network/system metadata (`nodeInfo`, `daemonEndpoints`, `addresses`), cached images, attached volumes, cloud/cluster-identifying node labels, and disallowed annotations.
@@ -170,6 +170,9 @@ rules:
     verbs: ["get"]
   - apiGroups: ["node.k8s.io"]
     resources: ["runtimeclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets"]
