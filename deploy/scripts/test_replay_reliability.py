@@ -265,27 +265,179 @@ class NodeUpdateAndFailFastTests(unittest.TestCase):
             self.assertTrue(all((ie.manifest.get("status") or {}).get("allocatable") for ie in upd_without))
 
     def test_node_update_for_missing_node_is_skipped_with_warning(self) -> None:
-        """An Update for a Node that no longer exists is skipped, not fatal, and patches no status."""
+        """An Update for a Node that no longer exists is skipped (GET, spec PATCH, or /status PATCH 404) without timeline drift."""
         b61 = _load_bundle("st61-tas-single-node-failure-hotswap-same-rack")
         ie_upd = next(ie for ie in b61.scheduled_infra_events if ie.object_kind == "Node" and ie.event_type == "Update")
-        for label, ie in (
-            ("unhealthy", ie_upd),
-            ("healthy", dataclasses.replace(ie_upd, is_not_ready=False, has_no_execute_taint=False, ready_status="True")),
-        ):
+        ie_healthy = dataclasses.replace(ie_upd, is_not_ready=False, has_no_execute_taint=False, ready_status="True")
+        cases = [
+            ("unhealthy_get_404", ie_upd, "GET", f"/api/v1/nodes/{ie_upd.name}", []),
+            ("healthy_get_404", ie_healthy, "GET", f"/api/v1/nodes/{ie_upd.name}", []),
+            ("unhealthy_spec_patch_404", ie_upd, "PATCH", f"/api/v1/nodes/{ie_upd.name}", [f"/api/v1/nodes/{ie_upd.name}"]),
+            ("healthy_spec_patch_404", ie_healthy, "PATCH", f"/api/v1/nodes/{ie_upd.name}", [f"/api/v1/nodes/{ie_upd.name}"]),
+            (
+                "unhealthy_status_patch_404",
+                ie_upd,
+                "PATCH",
+                f"/api/v1/nodes/{ie_upd.name}/status",
+                [f"/api/v1/nodes/{ie_upd.name}", f"/api/v1/nodes/{ie_upd.name}/status"],
+            ),
+            (
+                "healthy_status_patch_404",
+                ie_healthy,
+                "PATCH",
+                f"/api/v1/nodes/{ie_upd.name}/status",
+                [f"/api/v1/nodes/{ie_upd.name}", f"/api/v1/nodes/{ie_upd.name}/status"],
+            ),
+        ]
+        for label, ie, fail_method, fail_path, expected_patches in cases:
             with self.subTest(case=label):
                 mgr = _FakeMgr(
-                    responder=lambda m, p, _b: (404, b'{"kind":"Status","code":404}')
-                    if m == "PATCH" and p == f"/api/v1/nodes/{ie_upd.name}"
+                    responder=lambda m, p, _b, fm=fail_method, fp=fail_path: (404, b'{"kind":"Status","code":404}')
+                    if m == fm and p == fp
                     else None
                 )
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
-                    deferred, _ = _execute_scheduled_infra_event(mgr, b61, ie, 1.0)
+                    deferred, reason = _execute_scheduled_infra_event(mgr, b61, ie, 1.0)
                 self.assertFalse(deferred)
+                self.assertEqual(reason, "not_found")
                 self.assertIn("does not exist in the chamber", out.getvalue())
                 self.assertEqual(
-                    [p for m, p, _b, _s in mgr.requests if m == "PATCH"], [f"/api/v1/nodes/{ie_upd.name}"]
+                    [p for m, p, _b, _s in mgr.requests if m == "PATCH"],
+                    expected_patches,
                 )
+
+    def test_node_update_merge_patch_nulls_dropped_resources_labels_and_annotations(self) -> None:
+        """RFC 7396 merge-patch emits explicit null values for resources/labels/annotations removed by a Node Update."""
+        b61 = _load_bundle("st61-tas-single-node-failure-hotswap-same-rack")
+        ie0 = next(ie for ie in b61.scheduled_infra_events if ie.object_kind == "Node")
+        node0 = next(n for n in b61.nodes if n["metadata"]["name"] == ie0.name)
+
+        live_node = copy.deepcopy(node0)
+        live_node["metadata"]["labels"]["custom.io/removed-label"] = "present"
+        live_node["metadata"].setdefault("annotations", {})["kueue-optimizer.gke.io/node-accel-resource"] = "google.com/tpu"
+        live_node["metadata"]["annotations"]["kueue-optimizer.gke.io/node-accel-count"] = "4"
+
+        updated = copy.deepcopy(node0)
+        updated["status"]["allocatable"].pop("google.com/tpu", None)
+        updated["status"]["capacity"].pop("google.com/tpu", None)
+        updated["status"]["conditions"] = [{"type": "Ready", "status": "True"}]
+        man = _prepare_node_manifest(updated, 0)
+        ie = dataclasses.replace(
+            ie0,
+            event_type="Update",
+            is_not_ready=False,
+            has_no_execute_taint=False,
+            ready_status="True",
+            manifest=man,
+            has_explicit_capacity=True,
+        )
+        live_bytes = json.dumps(live_node).encode("utf-8")
+        mgr = _FakeMgr(
+            responder=lambda m, p, _b: (200, live_bytes) if m == "GET" and p == f"/api/v1/nodes/{ie.name}" else None
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            deferred, reason = _execute_scheduled_infra_event(mgr, b61, ie, 1.0)
+        self.assertFalse(deferred)
+        self.assertEqual(reason, "")
+
+        node_patches = [b for m, p, b, _ in mgr.requests if m == "PATCH" and p == f"/api/v1/nodes/{ie.name}"]
+        status_patches = [b for m, p, b, _ in mgr.requests if m == "PATCH" and p == f"/api/v1/nodes/{ie.name}/status"]
+        self.assertEqual(len(node_patches), 1)
+        self.assertEqual(len(status_patches), 1)
+
+        self.assertIn("custom.io/removed-label", node_patches[0]["metadata"]["labels"])
+        self.assertIsNone(node_patches[0]["metadata"]["labels"]["custom.io/removed-label"])
+        self.assertIsNone(node_patches[0]["metadata"]["annotations"]["kueue-optimizer.gke.io/node-accel-resource"])
+        self.assertIsNone(node_patches[0]["metadata"]["annotations"]["kueue-optimizer.gke.io/node-accel-count"])
+        self.assertIn("google.com/tpu", status_patches[0]["status"]["allocatable"])
+        self.assertIsNone(status_patches[0]["status"]["allocatable"]["google.com/tpu"])
+        self.assertIn("google.com/tpu", status_patches[0]["status"]["capacity"])
+        self.assertIsNone(status_patches[0]["status"]["capacity"]["google.com/tpu"])
+
+    def test_skipped_404_node_update_records_no_capacity_timeline_transition(self) -> None:
+        """A Node Update skipped due to HTTP 404 must never append phantom capacity to _node_capacity_timeline."""
+        b61 = _load_bundle("st61-tas-single-node-failure-hotswap-same-rack")
+        ie0 = next(ie for ie in b61.scheduled_infra_events if ie.object_kind == "Node" and ie.event_type == "Update")
+        node0 = next(n for n in b61.nodes if n["metadata"]["name"] == ie0.name)
+        resized = copy.deepcopy(node0)
+        resized["status"]["allocatable"]["google.com/tpu"] = "16"
+        resized["status"]["capacity"]["google.com/tpu"] = "16"
+        resized_man = _prepare_node_manifest(resized, 0)
+        ie_upd = dataclasses.replace(
+            ie0,
+            target_wall_offset_sec=0.05,
+            event_type="Update",
+            is_not_ready=False,
+            has_no_execute_taint=False,
+            ready_status="True",
+            manifest=resized_man,
+            has_explicit_capacity=True,
+        )
+        bundle = dataclasses.replace(
+            b61,
+            scheduled_workflows=[],
+            scheduled_infra_events=[ie_upd],
+            scheduled_workflow_updates=[],
+            scheduled_workflow_deletions=[],
+            initial_workloads=[],
+            initial_deployments=[],
+            initial_pods=[],
+        )
+        mgr = _FakeMgr(
+            responder=lambda m, p, _b: (404, b'{"kind":"Status","code":404}')
+            if p == f"/api/v1/nodes/{ie_upd.name}"
+            else None
+        )
+        with (
+            mock.patch.object(
+                replay,
+                "query_cluster_status",
+                return_value=ClusterStatusSnapshot(workloads_query_ok=True),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            run_scenario_replay(
+                mgr=mgr,
+                bundle=bundle,
+                speedup=1.0,
+                max_run_seconds=0.3,
+                status_interval_sec=0.05,
+                wait_for_completion=False,
+            )
+        # Only the initial t0 snapshot should exist; the 404-skipped resize must not append a transition.
+        self.assertEqual(len(mgr._node_capacity_timeline), 1)
+
+    def test_fail_pods_bound_to_node_tolerates_404_and_fails_fast_on_5xx(self) -> None:
+        pod_list = json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": "pod-0", "namespace": "default"},
+                        "spec": {"containers": [{"name": "c", "image": "pause"}]},
+                        "status": {"phase": "Running"},
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+        mgr_404 = _FakeMgr(
+            responder=lambda m, p, _b: (200, pod_list)
+            if m == "GET" and p.startswith("/api/v1/pods?")
+            else ((404, b'{"code":404}') if m == "PATCH" else None)
+        )
+        self.assertEqual(
+            replay._fail_pods_bound_to_node(mgr_404, {"default"}, "node-0", "NodeFailure", "gone"),
+            0,
+        )
+
+        mgr_503 = _FakeMgr(
+            responder=lambda m, p, _b: (200, pod_list)
+            if m == "GET" and p.startswith("/api/v1/pods?")
+            else ((503, b'{"code":503}') if m == "PATCH" else None)
+        )
+        with self.assertRaisesRegex(RuntimeError, "503"):
+            replay._fail_pods_bound_to_node(mgr_503, {"default"}, "node-0", "NodeFailure", "err")
 
     def test_node_patch_and_delete_fail_fast_on_non_2xx(self) -> None:
         b61 = _load_bundle("st61-tas-single-node-failure-hotswap-same-rack")
@@ -735,6 +887,155 @@ class VanishedWorkloadAndInitialResubmitTests(unittest.TestCase):
         self.assertEqual(len(mgr_preempt.applied), 1)
         self.assertEqual(res_p.submitted_count, 1)
 
+    def test_workload_name_matches_owner_avoids_prefix_collisions(self) -> None:
+        """Kueue Workload matching requires the exact 5-hex suffix so sibling prefixes never collide."""
+        long_owner = "a" * 60
+        trunc_jobset = f"jobset-{long_owner}"[:57]
+        cases = [
+            ("exact_5hex", "jobset-train-abcde", "JobSet", "train", True),
+            ("exact_5hex_digits", "job-train-01234", "Job", "train", True),
+            ("sibling_prefix_rejected", "jobset-train-eval-abcde", "JobSet", "train", False),
+            ("extra_suffix_rejected", "jobset-train-abcde-extra", "JobSet", "train", False),
+            ("non_hex_suffix_rejected", "jobset-train-zzzzz", "JobSet", "train", False),
+            ("truncated_long_owner_valid", f"{trunc_jobset}-1a2b3", "JobSet", long_owner, True),
+            ("truncated_long_owner_non_hex", f"{trunc_jobset}-ghijk", "JobSet", long_owner, False),
+        ]
+        for label, wl_name, kind, owner_name, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(replay._workload_name_matches_owner(wl_name, kind, owner_name), expected)
+
+    def test_recreated_incarnation_vanishing_and_scale_burst_probe_rate_limit(self) -> None:
+        """Recreated same-name incarnations are not masked by incarnation 0, and burst probes are capped/cooldown-limited."""
+        base = _load_bundle()
+        tmpl = base.scheduled_workflows[0]
+        ns = tmpl.namespace
+
+        # Subtest 1: incarnation 0 finishes normally, is deleted (before_recreate), incarnation 1 vanishes before poll.
+        inc0 = _synth_items(tmpl, 1)[0]
+        inc1 = dataclasses.replace(inc0, target_wall_offset_sec=0.15, seq=1, incarnation_index=1)
+        del_inc0 = ScheduledWorkflowDeletion(
+            target_wall_offset_sec=0.10,
+            seq=0,
+            raw_offset_sec=0.10,
+            raw_offset_from_t0_sec=0.10,
+            event_timestamp="",
+            object_kind="JobSet",
+            manifest_kind="JobSet",
+            manifest_api_version="jobset.x-k8s.io/v1alpha2",
+            name="wf-000",
+            applied_name="wf-000",
+            namespace=ns,
+            incarnation_index=0,
+            delete_reason="before_recreate",
+            has_later_incarnation=True,
+        )
+        bundle_recreate = dataclasses.replace(
+            base,
+            scheduled_workflows=[inc0, inc1],
+            scheduled_infra_events=[],
+            scheduled_workflow_updates=[],
+            scheduled_workflow_deletions=[del_inc0],
+            initial_workloads=[],
+            initial_deployments=[],
+            initial_pods=[],
+        )
+        k0 = (ns, "jobset-wf-000-aaaaa")
+        parent_path = f"/apis/jobset.x-k8s.io/v1alpha2/namespaces/{ns}/jobsets/wf-000"
+        wls_list_resp = json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {
+                            "name": k0[1],
+                            "namespace": ns,
+                            "ownerReferences": [{"name": "wf-000"}],
+                        },
+                        "status": {"conditions": [{"type": "Finished", "status": "True"}]},
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        recreate_state = {"deleted_inc0": False}
+
+        def _recreate_resp(m, p, _b):
+            if m == "GET" and p.endswith("/workloads"):
+                return (200, wls_list_resp)
+            if m == "DELETE" and p == parent_path:
+                recreate_state["deleted_inc0"] = True
+                return (200, b"{}")
+            if m == "GET" and p == parent_path and recreate_state["deleted_inc0"]:
+                return (404, b'{"code":404}')
+            return None
+
+        def _recreate_snap(*_a, **_kw):
+            if not recreate_state["deleted_inc0"]:
+                return ClusterStatusSnapshot(
+                    workloads_query_ok=True,
+                    present_workload_keys={k0},
+                    finished_workload_keys={k0},
+                    workloads_finished=1,
+                )
+            return ClusterStatusSnapshot(workloads_query_ok=True)
+
+        mgr_rec = _FakeMgr(responder=_recreate_resp)
+        t0 = time.monotonic()
+        with (
+            mock.patch.object(replay, "query_cluster_status", side_effect=_recreate_snap),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            res_rec = run_scenario_replay(
+                mgr=mgr_rec,
+                bundle=bundle_recreate,
+                speedup=1.0,
+                max_run_seconds=6.0,
+                status_interval_sec=0.05,
+                wait_for_completion=True,
+            )
+        self.assertEqual(res_rec.stop_reason, "completed")
+        self.assertLess(time.monotonic() - t0, 4.5)
+
+        # Subtest 2: scale-burst probe cooldown prevents hammering GET on every 0.05s poll.
+        burst_items = _synth_items(tmpl, 40)
+        bundle_burst = dataclasses.replace(
+            base,
+            scheduled_workflows=burst_items,
+            scheduled_infra_events=[],
+            scheduled_workflow_updates=[],
+            scheduled_workflow_deletions=[],
+            initial_workloads=[],
+            initial_deployments=[],
+            initial_pods=[],
+        )
+        parent_gets: dict[str, int] = {}
+
+        def _burst_resp(m, p, _b):
+            if m == "GET" and "/jobsets/wf-" in p:
+                parent_gets[p] = parent_gets.get(p, 0) + 1
+                return (200, b"{}")
+            return None
+
+        mgr_burst = _FakeMgr(responder=_burst_resp)
+        with (
+            mock.patch.object(
+                replay,
+                "query_cluster_status",
+                return_value=ClusterStatusSnapshot(workloads_query_ok=True),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            res_burst = run_scenario_replay(
+                mgr=mgr_burst,
+                bundle=bundle_burst,
+                speedup=1.0,
+                max_run_seconds=2.5,
+                status_interval_sec=0.05,
+                wait_for_completion=True,
+            )
+        self.assertEqual(res_burst.stop_reason, "duration_reached")
+        # Every record should have been probed at most once during the 5s cooldown window.
+        self.assertGreater(len(parent_gets), 0)
+        self.assertTrue(all(cnt == 1 for cnt in parent_gets.values()), f"Repeated probes during cooldown: {parent_gets}")
+
 
 class ParseDurationSecondsTests(unittest.TestCase):
     """Tests for R4 (Go compound duration parsing)."""
@@ -768,6 +1069,9 @@ class ParseDurationSecondsTests(unittest.TestCase):
             ("2D", 172800.0),
             ("30sec", 30.0),
             ("2mins", 120.0),
+            ("+1m30s", 90.0),
+            ("+45s", 45.0),
+            ("+10", 10.0),
             (0, 0.0),
             (42, 42.0),
             (2.5, 2.5),
@@ -797,6 +1101,12 @@ class ParseDurationSecondsTests(unittest.TestCase):
             "1m30",
             "1.2.3s",
             "1e3",
+            "9" * 400,
+            "9" * 400 + "s",
+            "1" + "0" * 308 + "d",
+            "+",
+            "+-5s",
+            "++5s",
         ]
         for raw in invalid_cases:
             with self.subTest(invalid=raw):

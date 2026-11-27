@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace as dc_replace
 from datetime import datetime, timezone
 import heapq
 import json
+import re
 import signal
 import time
 from typing import Any
@@ -111,8 +112,26 @@ def _checked_api_request(
     raise RuntimeError(f"{ctx_prefix}{method} {path} failed with HTTP {st_code}: {resp_txt}")
 
 
+@dataclass
+class _SubmittedBatchRecord:
+    """Tracks a submitted finite batch workflow for vanished-before-first-poll reconciliation."""
+
+    api_version: str
+    kind: str
+    namespace: str
+    applied_name: str
+    submitted_mono: float
+    pre_existing_wl_keys: frozenset[tuple[str, str]] = frozenset()
+    last_probe_mono: float = 0.0
+
+
 def _workload_name_matches_owner(wl_name: str, kind: str, owner_name: str) -> bool:
-    """Return True if Kueue Workload name `wl_name` matches owner `(kind, owner_name)`."""
+    """Return True if Kueue Workload name `wl_name` matches owner `(kind, owner_name)`.
+
+    Requires Kueue's exact 5-character lowercase hex hash suffix (`-[0-9a-f]{5}`) after the
+    owner prefix (including the 57-character truncation branch for long names) so sibling
+    workflows sharing a hyphenated prefix (e.g., `train` vs. `train-eval`) never collide.
+    """
     if not wl_name or not owner_name:
         return False
     if wl_name == owner_name:
@@ -127,10 +146,21 @@ def _workload_name_matches_owner(wl_name: str, kind: str, owner_name: str) -> bo
         "RayCluster": ("raycluster",),
     }.get(kind, (kind.lower(),) if kind else ())
     for pref in kind_prefixes:
-        if wl_name == f"{pref}-{owner_name}" or wl_name.startswith(f"{pref}-{owner_name}-"):
+        base = f"{pref}-{owner_name}"
+        if wl_name == base:
             return True
-        if len(owner_name) > 53 and wl_name.startswith(f"{pref}-{owner_name[:53]}-"):
-            return True
+        if len(base) <= 57:
+            if re.fullmatch(rf"{re.escape(base)}-[0-9a-f]{{5}}", wl_name):
+                return True
+        else:
+            trunc = base[:57]
+            if re.fullmatch(rf"{re.escape(trunc)}-[0-9a-f]{{5}}", wl_name):
+                return True
+            trunc_stripped = trunc.rstrip("-")
+            if trunc_stripped and trunc_stripped != trunc and re.fullmatch(
+                rf"{re.escape(trunc_stripped)}-[0-9a-f]{{5}}", wl_name
+            ):
+                return True
     return False
 
 
@@ -212,8 +242,13 @@ def _fail_pods_bound_to_node(
 ) -> int:
     """Transition active non-terminal Pods bound to `node_name` to phase=Failed so Job/JobSet & Kueue TAS react immediately."""
     q_sel = urllib.parse.quote(f"spec.nodeName={node_name}", safe="=")
-    st, raw = mgr.api_request("GET", f"/api/v1/pods?fieldSelector={q_sel}")
-    if st != 200 or not raw:
+    st, raw = _checked_api_request(
+        mgr,
+        "GET",
+        f"/api/v1/pods?fieldSelector={q_sel}",
+        context=f"List pods bound to Node '{node_name}'",
+    )
+    if not raw:
         return 0
     items = json.loads(raw.decode("utf-8")).get("items") or []
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -269,13 +304,16 @@ def _fail_pods_bound_to_node(
                 "containerStatuses": c_statuses,
             }
         }
-        p_st, _ = mgr.api_request(
+        p_st, _ = _checked_api_request(
+            mgr,
             "PATCH",
             f"/api/v1/namespaces/{ns}/pods/{p_name}/status",
             body=json.dumps(status_patch).encode("utf-8"),
             headers={"Content-Type": "application/merge-patch+json"},
+            ignore_not_found=True,
+            context=f"Fail bound Pod '{ns}/{p_name}' on Node '{node_name}'",
         )
-        if p_st in (200, 201):
+        if 200 <= p_st < 300:
             failed_count += 1
     return failed_count
 
@@ -287,8 +325,13 @@ def _patch_node_ready_condition(
     reason: str,
     message: str,
     extra_status: dict[str, Any] | None = None,
-) -> None:
-    """Patch Node /status Ready condition while preserving allocatable/capacity."""
+    *,
+    ignore_not_found: bool = False,
+) -> bool:
+    """Patch Node /status Ready condition while preserving allocatable/capacity.
+
+    Returns False only when `ignore_not_found=True` and the Node returned HTTP 404.
+    """
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     status_body: dict[str, Any] = {
         "conditions": [
@@ -307,14 +350,49 @@ def _patch_node_ready_condition(
         for k in ("allocatable", "capacity", "nodeInfo"):
             if extra_status.get(k):
                 status_body[k] = extra_status[k]
-    _checked_api_request(
+    st_code, _ = _checked_api_request(
         mgr,
         "PATCH",
         f"/api/v1/nodes/{node_name}/status",
         body=json.dumps({"status": status_body}).encode("utf-8"),
         headers={"Content-Type": "application/merge-patch+json"},
+        ignore_not_found=ignore_not_found,
         context=f"Patch Node '{node_name}' status",
     )
+    return st_code != 404
+
+
+def _log_missing_node_update_skip(ie: ScheduledInfraEvent, wall_elapsed: float) -> None:
+    print(
+        f"  ~ [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s] "
+        f"Skipping Update for Node '{ie.name}': the node does not exist in the chamber",
+        flush=True,
+    )
+
+
+def _fetch_live_node_or_skip_missing(
+    mgr: ChamberManager,
+    ie: ScheduledInfraEvent,
+    wall_elapsed: float,
+) -> tuple[dict[str, Any] | None, bool]:
+    """GET the live Node before an Update so RFC 7396 merge-patches can null out removed keys."""
+    st_code, raw_resp = _checked_api_request(
+        mgr,
+        "GET",
+        f"/api/v1/nodes/{ie.name}",
+        ignore_not_found=True,
+        context=f"Get Node '{ie.name}'",
+    )
+    if st_code == 404:
+        _log_missing_node_update_skip(ie, wall_elapsed)
+        return None, True
+    if not raw_resp:
+        return {}, False
+    try:
+        parsed = json.loads(raw_resp.decode("utf-8"))
+        return (parsed if isinstance(parsed, dict) else {}), False
+    except Exception:
+        return {}, False
 
 
 def _patch_node_or_skip_missing(
@@ -335,11 +413,7 @@ def _patch_node_or_skip_missing(
     )
     if st_code != 404:
         return False
-    print(
-        f"  ~ [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s] "
-        f"Skipping Update for Node '{ie.name}': the node does not exist in the chamber",
-        flush=True,
-    )
+    _log_missing_node_update_skip(ie, wall_elapsed)
     return True
 
 
@@ -347,25 +421,32 @@ def _patch_node_status_resources(
     mgr: ChamberManager,
     node_name: str,
     extra_status: dict[str, Any] | None,
-) -> None:
-    """Patch Node /status allocatable/capacity/nodeInfo fields without modifying Ready conditions."""
+    *,
+    ignore_not_found: bool = False,
+) -> bool:
+    """Patch Node /status allocatable/capacity/nodeInfo fields without modifying Ready conditions.
+
+    Returns False only when `ignore_not_found=True` and the Node returned HTTP 404.
+    """
     if not extra_status:
-        return
+        return True
     status_body = {
         k: extra_status[k]
         for k in ("allocatable", "capacity", "nodeInfo")
         if extra_status.get(k)
     }
     if not status_body:
-        return
-    _checked_api_request(
+        return True
+    st_code, _ = _checked_api_request(
         mgr,
         "PATCH",
         f"/api/v1/nodes/{node_name}/status",
         body=json.dumps({"status": status_body}).encode("utf-8"),
         headers={"Content-Type": "application/merge-patch+json"},
+        ignore_not_found=ignore_not_found,
         context=f"Patch Node '{node_name}' status resources",
     )
+    return st_code != 404
 
 
 PROTECTED_PREREQ_INFRA_KINDS = frozenset(
@@ -624,6 +705,14 @@ def _execute_scheduled_infra_event(
         return False, ""
 
     # ie.event_type == "Update"
+    live_node, node_missing = _fetch_live_node_or_skip_missing(mgr, ie, wall_elapsed)
+    if node_missing:
+        return False, "not_found"
+    live_meta = (live_node.get("metadata") or {}) if isinstance(live_node, dict) else {}
+    live_labels = live_meta.get("labels") if isinstance(live_meta.get("labels"), dict) else {}
+    live_anns = live_meta.get("annotations") if isinstance(live_meta.get("annotations"), dict) else {}
+    live_status = (live_node.get("status") or {}) if isinstance(live_node, dict) else {}
+
     meta_in = (ie.manifest.get("metadata") or {}) if isinstance(ie.manifest, dict) else {}
     labels_in = meta_in.get("labels") if isinstance(meta_in.get("labels"), dict) else None
     anns_in = meta_in.get("annotations") if isinstance(meta_in.get("annotations"), dict) else None
@@ -632,27 +721,47 @@ def _execute_scheduled_infra_event(
     # Apply capacity only when the raw Update payload carried it. Otherwise `ie.manifest` holds the
     # synthetic default from _prepare_node_manifest(), which must never overwrite a live node.
     has_explicit_cap = bool(getattr(ie, "has_explicit_capacity", False))
-    extra_status = (
-        st_in
-        if has_explicit_cap
-        and isinstance(st_in, dict)
-        and any(st_in.get(k) for k in ("allocatable", "capacity", "nodeInfo"))
-        else None
-    )
+    extra_status: dict[str, Any] | None = None
+    if has_explicit_cap and isinstance(st_in, dict) and any(
+        st_in.get(k) for k in ("allocatable", "capacity", "nodeInfo")
+    ):
+        extra_status = {}
+        for field in ("allocatable", "capacity"):
+            in_map = st_in.get(field)
+            if isinstance(in_map, dict) and in_map:
+                merged_res: dict[str, Any] = dict(in_map)
+                live_map = live_status.get(field) if isinstance(live_status.get(field), dict) else {}
+                # RFC 7396 merge-patch leaves omitted keys untouched; emit explicit nulls for dropped resources.
+                for rk in live_map:
+                    if rk not in merged_res:
+                        merged_res[rk] = None
+                extra_status[field] = merged_res
+        if st_in.get("nodeInfo"):
+            extra_status["nodeInfo"] = st_in["nodeInfo"]
     taints_list = [dict(t) for t in (spec_in.get("taints") or []) if isinstance(t, dict)]
     patch_meta: dict[str, Any] = {}
-    if labels_in:
-        patch_meta["labels"] = dict(labels_in)
+    if labels_in is not None:
+        merged_labels: dict[str, Any] = dict(labels_in)
+        for lk in live_labels:
+            if lk not in merged_labels:
+                merged_labels[lk] = None
+        if merged_labels:
+            patch_meta["labels"] = merged_labels
     patch_anns: dict[str, Any] = dict(anns_in) if anns_in else {}
+    _node_res_anns = (
+        "kueue-optimizer.gke.io/node-cpu",
+        "kueue-optimizer.gke.io/node-memory",
+        "kueue-optimizer.gke.io/node-pods",
+        "kueue-optimizer.gke.io/node-accel-resource",
+        "kueue-optimizer.gke.io/node-accel-count",
+    )
     if not has_explicit_cap:
-        for res_ann in (
-            "kueue-optimizer.gke.io/node-cpu",
-            "kueue-optimizer.gke.io/node-memory",
-            "kueue-optimizer.gke.io/node-pods",
-            "kueue-optimizer.gke.io/node-accel-resource",
-            "kueue-optimizer.gke.io/node-accel-count",
-        ):
+        for res_ann in _node_res_anns:
             patch_anns.pop(res_ann, None)
+    else:
+        for res_ann in _node_res_anns:
+            if res_ann in live_anns and res_ann not in patch_anns:
+                patch_anns[res_ann] = None
     if ie.is_not_ready or ie.has_no_execute_taint:
         if ie.is_not_ready and not any(
             t.get("key") == "node.kubernetes.io/not-ready" for t in taints_list
@@ -668,18 +777,25 @@ def _execute_scheduled_infra_event(
             },
         }
         if _patch_node_or_skip_missing(mgr, ie, patch_doc, wall_elapsed):
-            return False, ""
+            return False, "not_found"
         if ie.is_not_ready:
-            _patch_node_ready_condition(
+            if not _patch_node_ready_condition(
                 mgr,
                 ie.name,
                 ready_status=ie.ready_status or "False",
                 reason="KubeletNotReady",
                 message="Simulated node failure during scenario replay",
                 extra_status=extra_status,
-            )
+                ignore_not_found=True,
+            ):
+                _log_missing_node_update_skip(ie, wall_elapsed)
+                return False, "not_found"
         elif extra_status:
-            _patch_node_status_resources(mgr, ie.name, extra_status)
+            if not _patch_node_status_resources(
+                mgr, ie.name, extra_status, ignore_not_found=True
+            ):
+                _log_missing_node_update_skip(ie, wall_elapsed)
+                return False, "not_found"
         no_exec_filter = (
             [t for t in taints_list if str(t.get("effect") or "") == "NoExecute"]
             if (not ie.is_not_ready and ie.has_no_execute_taint)
@@ -710,15 +826,18 @@ def _execute_scheduled_infra_event(
             },
         }
         if _patch_node_or_skip_missing(mgr, ie, patch_doc, wall_elapsed):
-            return False, ""
-        _patch_node_ready_condition(
+            return False, "not_found"
+        if not _patch_node_ready_condition(
             mgr,
             ie.name,
             ready_status="True",
             reason="KubeletReady",
             message="kubelet is posting ready status",
             extra_status=extra_status,
-        )
+            ignore_not_found=True,
+        ):
+            _log_missing_node_update_skip(ie, wall_elapsed)
+            return False, "not_found"
         print(
             f"  * [t={wall_elapsed:.2f}s wall / +{ie.raw_offset_sec:.2f}s (t0+{ie.raw_offset_from_t0_sec:.2f}s)] "
             f"Node '{ie.name}' updated/recovered (Ready=True, unschedulable={bool(spec_in.get('unschedulable', False))})",
@@ -1335,7 +1454,7 @@ def run_scenario_replay(
     # seen-but-unfinished Workload has been absent.
     vanished_assumed_finished: set[tuple[str, str]] = set()
     absent_poll_counts: dict[tuple[str, str], int] = {}
-    submitted_batch_records: dict[tuple[str, str, str, int], tuple[str, str, str, str, float]] = {}
+    submitted_batch_records: dict[tuple[str, str, str, int], _SubmittedBatchRecord] = {}
     cancelled_workflow_count = 0
     cancelled_unsubmitted_keys: set[tuple[str, str, str, int]] = set()
     recreated_names: set[tuple[str, str]] = {
@@ -1868,27 +1987,53 @@ def run_scenario_replay(
                 for wk_gone in vanished_seen:
                     del absent_poll_counts[wk_gone]
 
+    def _snapshot_matching_wl_keys(r_ns: str, m_kind: str, r_name: str) -> frozenset[tuple[str, str]]:
+        known_now = ever_seen_sched_wl_keys | ever_finished_sched_wl_keys | cancelled_sched_wl_keys
+        return frozenset(
+            (w_ns, w_n)
+            for (w_ns, w_n) in known_now
+            if w_ns == r_ns and _workload_name_matches_owner(w_n, m_kind, r_name)
+        )
+
     def _reconcile_vanished_unseen_workflows(snap: ClusterStatusSnapshot, now_mono: float) -> None:
         """Detect submitted batch workflows whose parent and Workload both vanished before first poll."""
         if not snap.workloads_query_ok or not submitted_batch_records:
             return
-        if len(ever_seen_sched_wl_keys | ever_finished_sched_wl_keys) + finite_batch_cancelled >= finite_batch_submitted:
+        accounted_non_cancelled = len(
+            (ever_seen_sched_wl_keys | ever_finished_sched_wl_keys) - cancelled_sched_wl_keys
+        )
+        if accounted_non_cancelled + finite_batch_cancelled >= finite_batch_submitted:
             return
         grace_sec = max(2.0, poll_interval_sec * 2.0)
+        probe_cooldown_sec = max(5.0, poll_interval_sec * 4.0)
+        max_probes_per_poll = 16
         known_wls = ever_seen_sched_wl_keys | ever_finished_sched_wl_keys | cancelled_sched_wl_keys
-        for rec_key, (api_ver, m_kind, r_ns, r_name, sub_mono) in list(submitted_batch_records.items()):
+        known_by_ns: dict[str, list[str]] = {}
+        for w_ns, w_n in known_wls:
+            known_by_ns.setdefault(w_ns, []).append(w_n)
+
+        probe_candidates: list[tuple[float, tuple[str, str, str, int], _SubmittedBatchRecord]] = []
+        for rec_key, rec in list(submitted_batch_records.items()):
             if any(
-                w_ns == r_ns and _workload_name_matches_owner(w_n, m_kind, r_name)
-                for (w_ns, w_n) in known_wls
+                (rec.namespace, w_n) not in rec.pre_existing_wl_keys
+                and _workload_name_matches_owner(w_n, rec.kind, rec.applied_name)
+                for w_n in known_by_ns.get(rec.namespace, ())
             ):
                 submitted_batch_records.pop(rec_key, None)
                 continue
-            if now_mono - sub_mono < grace_sec:
+            if now_mono - rec.submitted_mono < grace_sec:
                 continue
-            parent_path = _delete_rest_path(api_ver, m_kind, r_ns, r_name)
+            if rec.last_probe_mono > 0.0 and (now_mono - rec.last_probe_mono) < probe_cooldown_sec:
+                continue
+            probe_candidates.append((rec.last_probe_mono, rec_key, rec))
+
+        probe_candidates.sort(key=lambda item: item[0])
+        for _last_p, rec_key, rec in probe_candidates[:max_probes_per_poll]:
+            rec.last_probe_mono = now_mono
+            parent_path = _delete_rest_path(rec.api_version, rec.kind, rec.namespace, rec.applied_name)
             st_parent, _ = mgr.api_request("GET", parent_path)
             if st_parent == 404:
-                vanished_key = (r_ns, f"__vanished__/{m_kind}/{r_name}#{rec_key[3]}")
+                vanished_key = (rec.namespace, f"__vanished__/{rec.kind}/{rec.applied_name}#{rec_key[3]}")
                 ever_finished_sched_wl_keys.add(vanished_key)
                 submitted_batch_records.pop(rec_key, None)
 
@@ -1934,11 +2079,14 @@ def run_scenario_replay(
                 resub_api = str(it.manifest.get("apiVersion") or "")
                 resub_kind = str(it.manifest.get("kind") or it.object_kind)
                 submitted_batch_records[(it.namespace, it.object_kind, it.name, it.incarnation_index)] = (
-                    resub_api,
-                    resub_kind,
-                    it.namespace,
-                    resub_applied,
-                    time.monotonic(),
+                    _SubmittedBatchRecord(
+                        api_version=resub_api,
+                        kind=resub_kind,
+                        namespace=it.namespace,
+                        applied_name=resub_applied,
+                        submitted_mono=time.monotonic(),
+                        pre_existing_wl_keys=_snapshot_matching_wl_keys(it.namespace, resub_kind, resub_applied),
+                    )
                 )
             total_pods_submitted += it.pod_count
             print(
@@ -2418,7 +2566,11 @@ def run_scenario_replay(
                             dc_replace(ie, target_wall_offset_sec=now_el + max(1.0, poll_interval_sec)),
                         )
                     elif ie.object_kind == "Node" and ie.name:
-                        if ie.event_type == "Deleted":
+                        if defer_reason == "not_found":
+                            # The node no longer exists in the chamber; drop stale tracking
+                            # without recording an un-applied capacity transition.
+                            live_node_alloc.pop(ie.name, None)
+                        elif ie.event_type == "Deleted":
                             if live_node_alloc.pop(ie.name, None) is not None:
                                 _record_node_capacity_snapshot(time.time())
                         elif isinstance(ie.manifest, dict) and (
@@ -2580,14 +2732,16 @@ def run_scenario_replay(
                             item.local_queue_name,
                             it_applied,
                         )
+                        it_kind = str(item.manifest.get("kind") or item.object_kind)
                         submitted_batch_records[
                             (item.namespace, item.object_kind, item.name, item.incarnation_index)
-                        ] = (
-                            str(item.manifest.get("apiVersion") or ""),
-                            str(item.manifest.get("kind") or item.object_kind),
-                            item.namespace,
-                            it_applied,
-                            t0_mono + now_off,
+                        ] = _SubmittedBatchRecord(
+                            api_version=str(item.manifest.get("apiVersion") or ""),
+                            kind=it_kind,
+                            namespace=item.namespace,
+                            applied_name=it_applied,
+                            submitted_mono=t0_mono + now_off,
+                            pre_existing_wl_keys=_snapshot_matching_wl_keys(item.namespace, it_kind, it_applied),
                         )
                     submitted_count += 1
                     total_pods_submitted += item.pod_count

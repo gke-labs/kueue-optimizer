@@ -76,12 +76,12 @@ _DURATION_UNIT_SECONDS: dict[str, float] = {
     "days": 86400.0,
 }
 
-_DURATION_BARE_RE = re.compile(r"^(?:\d+(?:\.\d*)?|\.\d+)$")
+_DURATION_BARE_RE = re.compile(r"^\+?(?:\d+(?:\.\d*)?|\.\d+)$")
 _DURATION_TOKEN_RE = re.compile(
     r"(\d+(?:\.\d*)?|\.\d+)\s*(secs|sec|mins|min|hrs|hr|days|day|ms|ns|us|µs|μs|s|m|h|d)"
 )
 _DURATION_COMPOUND_RE = re.compile(
-    r"^(?:(?:\d+(?:\.\d*)?|\.\d+)\s*(?:secs|sec|mins|min|hrs|hr|days|day|ms|ns|us|µs|μs|s|m|h|d)\s*)+$"
+    r"^\+?(?:(?:\d+(?:\.\d*)?|\.\d+)\s*(?:secs|sec|mins|min|hrs|hr|days|day|ms|ns|us|µs|μs|s|m|h|d)\s*)+$"
 )
 
 
@@ -104,7 +104,12 @@ def parse_duration_seconds(raw: str | float | int | None) -> float | None:
     if not s:
         return None
     if _DURATION_BARE_RE.fullmatch(s):
-        return float(s)
+        val = float(s)
+        if not math.isfinite(val):
+            raise ValueError(
+                f"Invalid duration '{raw}'. Expected finite non-negative seconds (e.g. 120) or duration string."
+            )
+        return val
     if not _DURATION_COMPOUND_RE.fullmatch(s):
         raise ValueError(
             f"Invalid duration '{raw}'. Expected seconds (e.g. 120) or unit-suffixed duration (e.g. 30s, 1m30s, 1h)."
@@ -112,6 +117,10 @@ def parse_duration_seconds(raw: str | float | int | None) -> float | None:
     total = 0.0
     for num_str, unit in _DURATION_TOKEN_RE.findall(s):
         total += float(num_str) * _DURATION_UNIT_SECONDS[unit]
+    if not math.isfinite(total):
+        raise ValueError(
+            f"Invalid duration '{raw}'. Expected finite non-negative seconds (e.g. 120) or duration string."
+        )
     return total
 
 

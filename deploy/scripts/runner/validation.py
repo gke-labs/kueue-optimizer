@@ -253,10 +253,16 @@ def _prepare_node_manifest(node_obj: dict[str, Any], node_idx: int) -> dict[str,
         annotations.pop("kueue-optimizer.gke.io/node-failed", None)
     if "cpu" in alloc:
         annotations["kueue-optimizer.gke.io/node-cpu"] = str(alloc["cpu"])
+    else:
+        annotations.pop("kueue-optimizer.gke.io/node-cpu", None)
     if "memory" in alloc:
         annotations["kueue-optimizer.gke.io/node-memory"] = str(alloc["memory"])
+    else:
+        annotations.pop("kueue-optimizer.gke.io/node-memory", None)
     if "pods" in alloc:
         annotations["kueue-optimizer.gke.io/node-pods"] = str(alloc["pods"])
+    else:
+        annotations.pop("kueue-optimizer.gke.io/node-pods", None)
     accel_candidates: list[tuple[int, str, Any]] = []
     for r_key, r_val in alloc.items():
         if r_key in ("cpu", "memory", "pods", "ephemeral-storage") or str(r_key).startswith("hugepages-"):
@@ -271,6 +277,9 @@ def _prepare_node_manifest(node_obj: dict[str, Any], node_idx: int) -> dict[str,
         _, chosen_key, chosen_val = accel_candidates[0]
         annotations["kueue-optimizer.gke.io/node-accel-resource"] = chosen_key
         annotations["kueue-optimizer.gke.io/node-accel-count"] = str(chosen_val)
+    else:
+        annotations.pop("kueue-optimizer.gke.io/node-accel-resource", None)
+        annotations.pop("kueue-optimizer.gke.io/node-accel-count", None)
     meta["annotations"] = annotations
 
     spec = dict(node.get("spec") or {})
