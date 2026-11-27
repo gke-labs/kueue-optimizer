@@ -8,7 +8,7 @@
 | :--- | :--- |
 | **Scenario Directory** | `testscenarios/self-tests/st69-wfpr-recovery-timeout-after-node-failure` |
 | **Raw Event Counts** | `infra.json`: **11** events · `workflows.json`: **3** events · `execution-time.json`: **8** events |
-| **Cluster Capacity** | **4 nodes** · `64 cores` · `256 GiB` · `16` `google.com/tpu` (1 distinct node group) |
+| **Cluster Capacity** | **4 nodes** · `64 cores` · `256 GiB` · `16` `google.com/tpu` (1 distinct node group; +2 post-$t_0$ `Node` event(s): 2 `Update`) |
 | **Topology Configuration** | **0** `Topology` CRD(s) (none) |
 | **Initial In-Flight Pods at $t_0$** | **0** pods across **0** / 4 nodes (initial `google.com/tpu` utilization: **0.00%**) |
 | **Kueue Objects** | **1** `ResourceFlavor`(s) · **0** `Cohort`(s) · **1** `ClusterQueue`(s) · **1** `LocalQueue`(s) · **1** `WorkloadPriorityClass`(es) |

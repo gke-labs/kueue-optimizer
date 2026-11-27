@@ -617,45 +617,39 @@ def extract_pod_spec_resources(
     return per_pod
 
 
-def extract_workflow_pods_and_requests(
+def extract_workflow_podset_shapes(
     obj: dict[str, Any],
     kind: str | None = None,
-) -> tuple[int, dict[str, float], dict[str, float]]:
-    """Return (total_pods, total_requests_across_all_pods, representative_per_pod_requests)
-    across JobSet, Job, Deployment, StatefulSet, LeaderWorkerSet, RayJob, RayCluster, Workload, and Pod."""
+) -> list[tuple[str, int, dict[str, float]]]:
+    """Return per-PodSet `(podset_name, pod_count, per_pod_requests)` entries with `pod_count > 0`
+    across JobSet, Job, Deployment, StatefulSet, ReplicaSet, LeaderWorkerSet, RayJob, RayCluster,
+    Workload, and Pod."""
     resolved_kind = str(kind or obj.get("kind") or "JobSet")
     spec = obj.get("spec") or {}
-    total_pods = 0
-    total_reqs: dict[str, float] = defaultdict(float)
-    sample_pod_reqs: dict[str, float] = {}
+    shapes: list[tuple[str, int, dict[str, float]]] = []
 
-    def _accumulate_pod_group(p_spec: dict[str, Any] | None, count: int) -> None:
-        nonlocal total_pods, sample_pod_reqs
+    def _add_shape(ps_name: str, p_spec: dict[str, Any] | None, count: int) -> None:
         if count <= 0:
             return
-        p_reqs = extract_pod_spec_resources(p_spec)
-        if p_reqs and not sample_pod_reqs:
-            sample_pod_reqs = dict(p_reqs)
-        total_pods += count
-        for rk, rv in p_reqs.items():
-            total_reqs[rk] += rv * count
+        shapes.append((ps_name, count, extract_pod_spec_resources(p_spec)))
 
     if resolved_kind == "JobSet":
         for rj in spec.get("replicatedJobs") or []:
             if not isinstance(rj, dict):
                 continue
+            rj_name = str(rj.get("name") or "main")
             replicas = max(1, int(rj.get("replicas") or 1))
             j_spec = ((rj.get("template") or {}).get("spec")) or {}
             parallelism = max(1, int(j_spec.get("parallelism") or j_spec.get("completions") or 1))
             pod_spec = ((j_spec.get("template") or {}).get("spec")) or {}
-            _accumulate_pod_group(pod_spec, replicas * parallelism)
+            _add_shape(rj_name, pod_spec, replicas * parallelism)
     elif resolved_kind == "Job":
         parallelism = max(1, int(spec.get("parallelism") or spec.get("completions") or 1))
-        _accumulate_pod_group(((spec.get("template") or {}).get("spec")) or {}, parallelism)
+        _add_shape("main", ((spec.get("template") or {}).get("spec")) or {}, parallelism)
     elif resolved_kind in ("Deployment", "StatefulSet", "ReplicaSet"):
         raw_rep = spec.get("replicas")
         replicas = max(0, int(raw_rep)) if raw_rep is not None else 1
-        _accumulate_pod_group(((spec.get("template") or {}).get("spec")) or {}, replicas)
+        _add_shape("main", ((spec.get("template") or {}).get("spec")) or {}, replicas)
     elif resolved_kind == "LeaderWorkerSet":
         replicas = max(1, int(spec.get("replicas") or 1))
         lwt = spec.get("leaderWorkerTemplate") or {}
@@ -663,45 +657,71 @@ def extract_workflow_pods_and_requests(
         worker_tpl_spec = ((lwt.get("workerTemplate") or {}).get("spec")) or {}
         leader_tpl = lwt.get("leaderTemplate")
         if isinstance(leader_tpl, dict) and leader_tpl:
-            _accumulate_pod_group(leader_tpl.get("spec") or {}, replicas)
-            _accumulate_pod_group(worker_tpl_spec, replicas * max(0, size - 1))
+            _add_shape("leader", leader_tpl.get("spec") or {}, replicas)
+            _add_shape("worker", worker_tpl_spec, replicas * max(0, size - 1))
         else:
-            _accumulate_pod_group(worker_tpl_spec, replicas * size)
+            _add_shape("main", worker_tpl_spec, replicas * size)
     elif resolved_kind == "RayJob":
         sub_tpl = spec.get("submitterPodTemplate")
         if isinstance(sub_tpl, dict) and sub_tpl:
-            _accumulate_pod_group(sub_tpl.get("spec") or {}, 1)
+            _add_shape("submitter", sub_tpl.get("spec") or {}, 1)
         rcs = spec.get("rayClusterSpec") or {}
         if isinstance(rcs, dict):
             head = rcs.get("headGroupSpec")
             if isinstance(head, dict):
-                _accumulate_pod_group(((head.get("template") or {}).get("spec")) or {}, 1)
-            for wg in rcs.get("workerGroupSpecs") or []:
+                _add_shape("head", ((head.get("template") or {}).get("spec")) or {}, 1)
+            for idx_wg, wg in enumerate(rcs.get("workerGroupSpecs") or []):
                 if isinstance(wg, dict):
-                    _accumulate_pod_group(
+                    wg_name = str(wg.get("groupName") or f"worker-{idx_wg}")
+                    _add_shape(
+                        wg_name,
                         ((wg.get("template") or {}).get("spec")) or {},
                         max(1, int(wg.get("replicas") or 1)),
                     )
     elif resolved_kind == "RayCluster":
         head = spec.get("headGroupSpec")
         if isinstance(head, dict):
-            _accumulate_pod_group(((head.get("template") or {}).get("spec")) or {}, 1)
-        for wg in spec.get("workerGroupSpecs") or []:
+            _add_shape("head", ((head.get("template") or {}).get("spec")) or {}, 1)
+        for idx_wg, wg in enumerate(spec.get("workerGroupSpecs") or []):
             if isinstance(wg, dict):
-                _accumulate_pod_group(
+                wg_name = str(wg.get("groupName") or f"worker-{idx_wg}")
+                _add_shape(
+                    wg_name,
                     ((wg.get("template") or {}).get("spec")) or {},
                     max(1, int(wg.get("replicas") or 1)),
                 )
     elif resolved_kind == "Workload":
-        for ps in spec.get("podSets") or []:
+        for idx_ps, ps in enumerate(spec.get("podSets") or []):
             if isinstance(ps, dict):
+                ps_name = str(ps.get("name") or f"ps-{idx_ps}")
                 ps_count = max(1, int(ps.get("count") if ps.get("count") is not None else 1))
-                _accumulate_pod_group(((ps.get("template") or {}).get("spec")) or {}, ps_count)
+                _add_shape(ps_name, ((ps.get("template") or {}).get("spec")) or {}, ps_count)
     elif resolved_kind == "Pod":
-        _accumulate_pod_group(spec, 1)
+        _add_shape("main", spec, 1)
     else:
         replicas = max(1, int(spec.get("replicas") or 1))
-        _accumulate_pod_group(((spec.get("template") or {}).get("spec")) or {}, replicas)
+        _add_shape("main", ((spec.get("template") or {}).get("spec")) or {}, replicas)
+
+    return shapes
+
+
+def extract_workflow_pods_and_requests(
+    obj: dict[str, Any],
+    kind: str | None = None,
+) -> tuple[int, dict[str, float], dict[str, float]]:
+    """Return (total_pods, total_requests_across_all_pods, representative_per_pod_requests)
+    across JobSet, Job, Deployment, StatefulSet, LeaderWorkerSet, RayJob, RayCluster, Workload, and Pod."""
+    shapes = extract_workflow_podset_shapes(obj, kind)
+    total_pods = 0
+    total_reqs: dict[str, float] = defaultdict(float)
+    sample_pod_reqs: dict[str, float] = {}
+
+    for _ps_name, count, p_reqs in shapes:
+        if p_reqs and not sample_pod_reqs:
+            sample_pod_reqs = dict(p_reqs)
+        total_pods += count
+        for rk, rv in p_reqs.items():
+            total_reqs[rk] += rv * count
 
     total_pods = max(1, total_pods)
     total_reqs["pods"] = float(total_pods)

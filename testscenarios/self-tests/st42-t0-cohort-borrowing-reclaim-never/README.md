@@ -111,7 +111,7 @@ Additionally, `workflows.json` records **`8`** pre-existing `Admitted` `JobSet` 
 
 ### 4.2 Initial Pod Remaining Lifetimes & Request Profiles
 
-- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **8** pods — `min=19s`, `P50=19s`, `AVG=19s`, `P90=19s`, `P99=19s`, `max=19s`
+- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **8** pods — `min=30s`, `P50=30s`, `AVG=30s`, `P90=30s`, `P99=30s`, `max=30s`
 - **Pods per Occupied Node (`8` active nodes)**: `min=1`, `P50=1`, `AVG=1.00`, `P90=1`, `max=1`
 
 | Rank | Initial Pod Resource Request Profile | Pod Count | Share of Initial Pods |

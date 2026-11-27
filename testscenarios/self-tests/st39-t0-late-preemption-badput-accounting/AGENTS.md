@@ -15,7 +15,7 @@
 - **Title**: Adversarial Late Preemption of `t0` `PodGroup`s (`Sec 5.1 ≈ 97%` vs `Sec 5.4 ≈ 36%`, `Excluded: 8`)
 - **Primary Verification Target**: Verifies aborted `t0` `PodGroup` compute (`0s–24s`) is excluded from `Sec 5.4` goodput and pending resubmitted workflows classify under `Excluded (preempted/reclaimed/failed): 8`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st39` (`--namespace kueue-optimizer-chamber-st39`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16439` | Prometheus `19086` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16439` | Prometheus `19086` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st15-preemption-badput-collapse-stress`](../st15-preemption-badput-collapse-stress/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST39 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st39' (API port 16439, Prom port 19086):

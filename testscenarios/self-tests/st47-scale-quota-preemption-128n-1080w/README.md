@@ -98,7 +98,7 @@ No `kueue.x-k8s.io/Topology` CRD is defined in `infra.json` (Topology-Aware Sche
 ## 4. Initial Running Pods & Initial Cluster Utilization at $t_0$
 
 At scenario start ($t_0 = 2026-06-01T00:00:00Z$), **`192`** running `Pod` objects are pre-placed across **`128`** of the **`128`** cluster nodes (`100.0%` of nodes occupied; `0` nodes completely free).
-Additionally, `workflows.json` records **`192`** pre-existing `Admitted` `JobSet` warmup workflow object(s) at $t_0$.
+Additionally, `workflows.json` records **`192`** pre-existing `Admitted` `Job` warmup workflow object(s) at $t_0$.
 
 ### 4.1 Initial Cluster Utilization Breakdown
 
@@ -111,7 +111,7 @@ Additionally, `workflows.json` records **`192`** pre-existing `Admitted` `JobSet
 
 ### 4.2 Initial Pod Remaining Lifetimes & Request Profiles
 
-- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **192** pods — `min=17s`, `P50=17s`, `AVG=22s`, `P90=31s`, `P99=31s`, `max=31s`
+- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **192** pods — `min=20s`, `P50=20s`, `AVG=25s`, `P90=34s`, `P99=34s`, `max=34s`
 - **Pods per Occupied Node (`128` active nodes)**: `min=1`, `P50=1`, `AVG=1.50`, `P90=2`, `max=2`
 
 | Rank | Initial Pod Resource Request Profile | Pod Count | Share of Initial Pods |

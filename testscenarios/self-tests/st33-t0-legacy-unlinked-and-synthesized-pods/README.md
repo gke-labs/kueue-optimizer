@@ -10,7 +10,7 @@
 | **Raw Event Counts** | `infra.json`: **20** events · `workflows.json`: **8** events · `execution-time.json`: **16** events |
 | **Cluster Capacity** | **8 nodes** · `128 cores` · `512 GiB` · `32` `google.com/tpu` (1 distinct node group) |
 | **Topology Configuration** | **0** `Topology` CRD(s) (none) |
-| **Initial In-Flight Pods at $t_0$** | **4** pods across **4** / 8 nodes (initial `google.com/tpu` utilization: **50.00%**) |
+| **Initial In-Flight Pods at $t_0$** | **6** pods across **4** / 8 nodes (initial `google.com/tpu` utilization: **75.00%**; includes 2 synthesized from pre-admitted $t_0$ workloads) |
 | **Kueue Objects** | **1** `ResourceFlavor`(s) · **0** `Cohort`(s) · **1** `ClusterQueue`(s) · **1** `LocalQueue`(s) · **0** `WorkloadPriorityClass`(es) |
 | **Test Arrival Window ($T_{\text{test}}$)** | **0s** (`2026-06-01T00:00:00Z` $\rightarrow$ `2026-06-01T00:00:00Z`) |
 | **Unadmitted Workloads** | **2** `NotAdmitted` arrivals (2 total pods; gang size min=1, p50=1, p90=1, max=1) + **6** pre-admitted at $t_0$ |
@@ -97,26 +97,26 @@ No `kueue.x-k8s.io/Topology` CRD is defined in `infra.json` (Topology-Aware Sche
 
 ## 4. Initial Running Pods & Initial Cluster Utilization at $t_0$
 
-At scenario start ($t_0 = 2026-06-01T00:00:00Z$), **`4`** running `Pod` objects are pre-placed across **`4`** of the **`8`** cluster nodes (`50.0%` of nodes occupied; `4` nodes completely free).
+At scenario start ($t_0 = 2026-06-01T00:00:00Z$), **`6`** running `Pod` objects are pre-placed across **`4`** of the **`8`** cluster nodes (`50.0%` of nodes occupied; `4` nodes completely free).
 Additionally, `workflows.json` records **`6`** pre-existing `Admitted` `JobSet` warmup workflow object(s) at $t_0$.
 
 ### 4.1 Initial Cluster Utilization Breakdown
 
 | Resource | Initial Pods Requested | Cluster Allocatable | Free Allocatable at $t_0$ | Initial Utilization (% Allocatable) | Initial Utilization (% Capacity) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| `cpu` | **16 cores** | 128 cores | 112 cores | **12.50%** | 12.50% |
-| `memory` | **64 GiB** | 512 GiB | 448 GiB | **12.50%** | 12.50% |
-| `pods` | **4** | 880 | 876 | **0.45%** | 0.45% |
-| `google.com/tpu` | **16** | 32 | 16 | **50.00%** | 50.00% |
+| `cpu` | **24 cores** | 128 cores | 104 cores | **18.75%** | 18.75% |
+| `memory` | **96 GiB** | 512 GiB | 416 GiB | **18.75%** | 18.75% |
+| `pods` | **6** | 880 | 874 | **0.68%** | 0.68% |
+| `google.com/tpu` | **24** | 32 | 8 | **75.00%** | 75.00% |
 
 ### 4.2 Initial Pod Remaining Lifetimes & Request Profiles
 
-- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **4** pods — `min=28s`, `P50=28s`, `AVG=28s`, `P90=28s`, `P99=28s`, `max=28s`
+- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **6** pods — `min=28s`, `P50=28s`, `AVG=28s`, `P90=28s`, `P99=28s`, `max=28s`
 - **Pods per Occupied Node (`4` active nodes)**: `min=1`, `P50=1`, `AVG=1.00`, `P90=1`, `max=1`
 
 | Rank | Initial Pod Resource Request Profile | Pod Count | Share of Initial Pods |
 | :---: | :--- | ---: | ---: |
-| `1` | `cpu: 4`, `google.com/tpu: 4`, `memory: 16Gi` | **4** | 100.0% |
+| `1` | `cpu: 4`, `google.com/tpu: 4`, `memory: 16Gi` | **6** | 100.0% |
 
 ---
 

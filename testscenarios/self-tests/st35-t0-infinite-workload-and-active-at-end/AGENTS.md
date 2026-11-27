@@ -15,7 +15,7 @@
 - **Title**: Long-Running / Infinite `t0` Kueue Workloads (`is_infinite=True`) With `ACTIVE AT END` & `FULL-DUR SAT` Guard
 - **Primary Verification Target**: Verifies `t0` `PodGroup`s with no `deletionTime` (`864000s` placeholder) report exact `~50%` `ACTIVE AT END` without inflating `FULL-DUR SAT`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st35` (`--namespace kueue-optimizer-chamber-st35`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16435` | Prometheus `19082` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16435` | Prometheus `19082` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st05-mixed-completed-and-active-at-end`](../st05-mixed-completed-and-active-at-end/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST35 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st35' (API port 16435, Prom port 19082):

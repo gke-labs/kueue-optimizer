@@ -15,7 +15,7 @@
 - **Title**: Unpaused `Deployment` Immediate `1 -> 4` TPU Upgrade at `t=+11s` (Control Twin of st87)
 - **Primary Verification Target**: Direct A/B control twin of `st87` omitting `Paused`/`Resumed`: the `t=+11s` `1 -> 4` TPU/pod `Upgrade` rolls out `13s` earlier (`t=11s` vs. `t=24s`), lifting time-weighted TPU utilization and `Section 5.4` saturation by `~16–20pp`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st88` (`--namespace kueue-optimizer-chamber-st88`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16488` | Prometheus `19135` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16488` | Prometheus `19135` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st87-deployment-pause-defers-rollout-and-resume`](../st87-deployment-pause-defers-rollout-and-resume/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST88 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st88' (API port 16488, Prom port 19135):

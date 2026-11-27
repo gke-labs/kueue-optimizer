@@ -15,7 +15,7 @@
 - **Title**: `t0` `Deployment` Deletion, Same-Name Incarnation-`1` Re-Creation & Canary Creation/Deletion
 - **Primary Verification Target**: Verifies full `Deployment` deletion & creation lifecycle: `t0` `ephemeral-srv` (`4/4` = `8` TPUs) is deleted at `t=+8s` (freeing `100%` of its ReplicaSet/Pods/Workloads), re-created with the same name at `t=+12s` (`replicas: 6` = `12` TPUs) alongside new `canary-srv` (`replicas: 2` = `4` TPUs -> `16/16` TPUs), and `canary-srv` is deleted at `t=+26s` without touching `ephemeral-srv`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st90` (`--namespace kueue-optimizer-chamber-st90`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16490` | Prometheus `19137` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16490` | Prometheus `19137` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st89-deployment-t0-partial-status-and-preemption`](../st89-deployment-t0-partial-status-and-preemption/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST90 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st90' (API port 16490, Prom port 19137):

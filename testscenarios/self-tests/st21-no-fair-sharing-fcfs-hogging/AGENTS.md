@@ -12,10 +12,10 @@
 
 - **Scenario ID / Directory**: `st21-no-fair-sharing-fcfs-hogging`
 - **Category**: 5. Fair Sharing & Priority Thresholds
-- **Title**: Zero-Nominal Shared Pool Without Fair Sharing (First-Mover Monopolization)
-- **Primary Verification Target**: Baseline control for `st22`: shared `32`-TPU Cohort pool (`0` CQ nominal quotas, `reclaimWithinCohort: Never`)
+- **Title**: Zero-Nominal Shared Pool Without Fair Sharing (First-Mover Monopolization, `--no-fair-sharing`)
+- **Primary Verification Target**: Baseline control for `st22`: global Fair Sharing disabled (`Configuration` omitting `fairSharing` + `--no-fair-sharing`) on a shared `32`-TPU Cohort pool (`0` CQ nominal quotas, `reclaimWithinCohort: Never`)
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st21` (`--namespace kueue-optimizer-chamber-st21`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16421` | Prometheus `19068` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16421` | Prometheus `19068` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st22-equal-fair-sharing-50-50-split`](../st22-equal-fair-sharing-50-50-split/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,11 +27,11 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST21 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st21' (API port 16421, Prom port 19068):
-python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging --namespace kueue-optimizer-chamber-st21 --port 16421 > /tmp/st21.log 2>&1 &
+python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging --no-fair-sharing --namespace kueue-optimizer-chamber-st21 --port 16421 > /tmp/st21.log 2>&1 &
 PID_ST21=$!
 
 # Simultaneously launch paired ST22 in its own separate kueue-optimizer chamber 'kueue-optimizer-chamber-st22' (API port 16422, Prom port 19069):
@@ -48,7 +48,7 @@ Run from the repository root:
 
 ```bash
 # 1. Run ST21 in its own isolated kueue-optimizer chamber 'kueue-optimizer-chamber-st21' (auto-deployed & auto-cleaned):
-python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging --namespace kueue-optimizer-chamber-st21 --port 16421 | tee /tmp/st21.log
+python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging --no-fair-sharing --namespace kueue-optimizer-chamber-st21 --port 16421 | tee /tmp/st21.log
 
 # 2. Run paired ST22 in its own separate fresh kueue-optimizer chamber 'kueue-optimizer-chamber-st22':
 python3 deploy/scripts/testrunner.py testscenarios/self-tests/st22-equal-fair-sharing-50-50-split --namespace kueue-optimizer-chamber-st22 --port 16422 | tee /tmp/st22.log
@@ -63,9 +63,9 @@ python3 deploy/scripts/testrunner.py testscenarios/self-tests/st21-no-fair-shari
 
 Never evaluate this scenario in isolation when validating scheduler behavior or `kueue_metrics_report.py` changes. Always execute it in its dedicated `kueue-optimizer` chamber (`kueue-optimizer-chamber-st21`) alongside its paired counterpart(s) in their dedicated chamber(s) below and verify every cross-scenario delta:
 
-### Pair: `st21-no-fair-sharing-fcfs-hogging` (`kueue-optimizer-chamber-st21`) ↔ [`st22-equal-fair-sharing-50-50-split`](../st22-equal-fair-sharing-50-50-split/AGENTS.md) (`kueue-optimizer-chamber-st22`) — No Fair Sharing (`st21`) vs. Equal `1:1` Fair Sharing (`st22`) Pair
+### Pair: `st21-no-fair-sharing-fcfs-hogging` (`kueue-optimizer-chamber-st21`) ↔ [`st22-equal-fair-sharing-50-50-split`](../st22-equal-fair-sharing-50-50-split/AGENTS.md) (`kueue-optimizer-chamber-st22`) — No Fair Sharing (`st21`, `--no-fair-sharing`) vs. Equal `1:1` Fair Sharing (`st22`) Pair
 
-- **Controlled Variable Changed**: Unweighted shared Cohort pool (`st21`) vs. `fairSharing: {weight: '1'}` on both CQs (`st22`).
+- **Controlled Variable Changed**: Global Fair Sharing disabled via declarative `Configuration` + `--no-fair-sharing` (`reclaimWithinCohort: Never` in `st21`) vs. global Fair Sharing enabled with `fairSharing: {weight: '1'}` and `reclaimWithinCohort: Any` on both CQs (`st22`).
 - **Isolated Peer Command**: `python3 deploy/scripts/testrunner.py testscenarios/self-tests/st22-equal-fair-sharing-50-50-split --namespace kueue-optimizer-chamber-st22 --port 16422`
 - **Cross-Examination Assertion**: In `st21`, first-mover `cq-hog` monopolizes `32/32` TPUs while `cq-victim` waits `~24s`; in `st22`, both teams split the `32`-TPU pool `50/50` (`16` vs. `16` TPUs) across every wave.
 - **Expected Target Shift**:
@@ -78,8 +78,8 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 
 ## 4. Scenario Mechanics & Expected Live Metrics
 
-- **Setup**: 8-node (`32`-TPU) cluster. All `32` TPUs live on `Cohort: cohort-nofs`; both `cq-hog` and `cq-victim` have `nominalQuota: 0` and `reclaimWithinCohort: Never`. `cq-hog` submits 8 jobs (`32` TPUs, `28s`) at `t=0s`; `cq-victim` submits 4 jobs (`16` TPUs, `18s`) at `t=4s`.
-- **Expected Runtime Behavior**: `cq-hog` grabs 100% of the shared `32`-TPU cohort pool at `t=0s`. When `cq-victim` arrives at `t=4s`, `reclaimWithinCohort: Never` prevents cohort preemption, so `cq-victim` waits (`0` TPUs) for `24s` until `cq-hog` finishes at `t=28s`.
+- **Setup**: 8-node (`32`-TPU) cluster with global Fair Sharing disabled (`kind: Configuration` omitting `fairSharing` + `--no-fair-sharing`). All `32` TPUs live on `Cohort: cohort-nofs`; both `cq-hog` and `cq-victim` have `nominalQuota: 0` and `reclaimWithinCohort: Never`. `cq-hog` submits 8 jobs (`32` TPUs, `28s`) at `t=0s`; `cq-victim` submits 4 jobs (`16` TPUs, `18s`) at `t=4s`.
+- **Expected Runtime Behavior**: `testrunner.py` deploys `kueue-controller-manager` with Fair Sharing disabled. `cq-hog` grabs 100% of the shared `32`-TPU cohort pool at `t=0s`. When `cq-victim` arrives at `t=4s`, both disabled Fair Sharing and `reclaimWithinCohort: Never` prevent cohort preemption, so `cq-victim` waits (`0` TPUs) for `24s` until `cq-hog` finishes at `t=28s`.
 
 ### Target Metric Scorecard
 
@@ -98,7 +98,7 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 
 ### Hard Failure Invariants (What Definitely MUST NOT Happen)
 
-- ❌ `cq-victim` preempting `cq-hog` when both have `0` nominal quota and `reclaimWithinCohort: Never`.
+- ❌ `cq-victim` preempting `cq-hog` when global Fair Sharing is disabled and both CQs have `0` nominal quota and `reclaimWithinCohort: Never`.
 
 ---
 

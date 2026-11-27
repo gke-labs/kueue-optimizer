@@ -220,7 +220,7 @@ python3 deploy/scripts/testrunner.py --scenario testscenarios/demo --speedup 0.2
 
 | Priority Class | Priority Value | Workloads | Share | Total Pods | Gang Size (`min / P50 / P90 / max`) | Duration (`P50 / AVG / P90 / P99`) | Offered Core-Hours | `cpu` Saturation | `memory` Saturation |
 | :--- | ---: | ---: | ---: | ---: | :---: | :---: | ---: | ---: | ---: |
-| `<default>` | `0` | 20 | 100.0% | 154 | `5 / 8 / 10 / 10` | `11s / 13s / 20s / 21s` | 1.3 | 39499.76% | 31657.30% |
+| `<default>` | `0` | 20 | 100.0% | 154 | `5 / 8 / 10 / 10` | `11s / 13s / 20s / 21s` | 1.3 | **39499.76%** | 31657.30% |
 | **ALL (Total)** | — | **20** | 100.0% | 154 | `5 / 8 / 10 / 10` | `11s / 13s / 20s / 21s` | 1.3 | **39499.76%** | **31657.30%** |
 
 ### 7.2 Workload Dissection per `LocalQueue` (and Target `ClusterQueue`)

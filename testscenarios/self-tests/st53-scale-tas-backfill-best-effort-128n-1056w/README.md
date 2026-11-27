@@ -148,7 +148,7 @@ Cluster Total: 128 nodes
 ## 4. Initial Running Pods & Initial Cluster Utilization at $t_0$
 
 At scenario start ($t_0 = 2026-06-01T00:00:00Z$), **`32`** running `Pod` objects are pre-placed across **`32`** of the **`128`** cluster nodes (`25.0%` of nodes occupied; `96` nodes completely free).
-Additionally, `workflows.json` records **`32`** pre-existing `Admitted` `JobSet` warmup workflow object(s) at $t_0$.
+Additionally, `workflows.json` records **`32`** pre-existing `Admitted` `Job` warmup workflow object(s) at $t_0$.
 
 ### 4.1 Initial Cluster Utilization Breakdown
 
@@ -161,7 +161,7 @@ Additionally, `workflows.json` records **`32`** pre-existing `Admitted` `JobSet`
 
 ### 4.2 Initial Pod Remaining Lifetimes & Request Profiles
 
-- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **32** pods — `min=15s`, `P50=15s`, `AVG=15s`, `P90=15s`, `P99=15s`, `max=15s`
+- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **32** pods — `min=16s`, `P50=16s`, `AVG=16s`, `P90=16s`, `P99=16s`, `max=16s`
 - **Pods per Occupied Node (`32` active nodes)**: `min=1`, `P50=1`, `AVG=1.00`, `P90=1`, `max=1`
 
 | Rank | Initial Pod Resource Request Profile | Pod Count | Share of Initial Pods |

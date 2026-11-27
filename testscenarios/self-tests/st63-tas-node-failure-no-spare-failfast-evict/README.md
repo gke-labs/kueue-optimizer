@@ -8,7 +8,7 @@
 | :--- | :--- |
 | **Scenario Directory** | `testscenarios/self-tests/st63-tas-node-failure-no-spare-failfast-evict` |
 | **Raw Event Counts** | `infra.json`: **16** events · `workflows.json`: **2** events · `execution-time.json`: **6** events |
-| **Cluster Capacity** | **8 nodes** · `128 cores` · `512 GiB` · `32` `google.com/tpu` (1 distinct node group) |
+| **Cluster Capacity** | **8 nodes** · `128 cores` · `512 GiB` · `32` `google.com/tpu` (1 distinct node group; +2 post-$t_0$ `Node` event(s): 2 `Update`) |
 | **Topology Configuration** | **1** `Topology` CRD(s) (`st-slice-topology`) |
 | **Initial In-Flight Pods at $t_0$** | **0** pods across **0** / 8 nodes (initial `google.com/tpu` utilization: **0.00%**) |
 | **Kueue Objects** | **1** `ResourceFlavor`(s) · **0** `Cohort`(s) · **1** `ClusterQueue`(s) · **1** `LocalQueue`(s) · **1** `WorkloadPriorityClass`(es) |

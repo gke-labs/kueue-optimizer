@@ -15,7 +15,7 @@
 - **Title**: Multi-ClusterQueue Strict Quota Isolation Without a Cohort
 - **Primary Verification Target**: Per-CQ breakdown in `Section 5.1` when `cq-alpha` is 200% overloaded and `cq-beta` is 0% idle with no shared Cohort
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st16` (`--namespace kueue-optimizer-chamber-st16`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16416` | Prometheus `19063` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16416` | Prometheus `19063` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st17-cohort-borrowing-idle-peer-no-reclaim`](../st17-cohort-borrowing-idle-peer-no-reclaim/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST16 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st16' (API port 16416, Prom port 19063):

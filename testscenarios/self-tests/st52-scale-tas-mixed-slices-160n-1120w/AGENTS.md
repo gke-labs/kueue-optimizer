@@ -15,7 +15,7 @@
 - **Title**: 160-Node, 1,120-Workload Mixed `4`-Node Rack, `2`-Node Pair & `1`-Node TAS Slices
 - **Primary Verification Target**: Co-schedules `40` `4`-pod `t0` rack `JobSet`s (`160` pods), `80` `2`-pod pair `JobSet`s (`160` pods), and `1,000` `1`-pod TAS `Job`s across `40` racks (`160` nodes)
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st52` (`--namespace kueue-optimizer-chamber-st52`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16452` | Prometheus `19099` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16452` | Prometheus `19099` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st51-scale-tas-rack-packing-128n-1088w`](../st51-scale-tas-rack-packing-128n-1088w/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST52 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st52' (API port 16452, Prom port 19099):

@@ -15,7 +15,7 @@
 - **Title**: TAS Node Failure With Zero Spare Nodes — `FailFast` `NodeFailures` Eviction & Recovery (Twin of st61)
 - **Primary Verification Target**: Direct A/B twin of `st61` using `4`-pod full-rack `Job`s (`0` spare nodes in `p224-0`): `TASFailedNodeReplacementFailFast` immediately evicts with `NodeFailures`, then re-admits once `st-node-00` recovers at `t=13s`
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st63` (`--namespace kueue-optimizer-chamber-st63`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16463` | Prometheus `19110` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16463` | Prometheus `19110` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st61-tas-single-node-failure-hotswap-same-rack`](../st61-tas-single-node-failure-hotswap-same-rack/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST63 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st63' (API port 16463, Prom port 19110):

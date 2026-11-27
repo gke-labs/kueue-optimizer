@@ -15,7 +15,7 @@
 - **Title**: Seniority Protection of `t0` `PodGroup`s Under `withinClusterQueue: LowerOrNewerEqualPriority`
 - **Primary Verification Target**: Verifies `t0` `PodGroup`s carry older `creationTimestamp` than `t > 0` arrivals so equal-priority newcomers never preempt `t0` incumbents
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st38` (`--namespace kueue-optimizer-chamber-st38`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16438` | Prometheus `19085` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16438` | Prometheus `19085` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st13-preempt-within-cq-lower-or-newer-equal`](../st13-preempt-within-cq-lower-or-newer-equal/AGENTS.md), [`st37-t0-preempt-within-cq-lower-priority-resubmit`](../st37-t0-preempt-within-cq-lower-priority-resubmit/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST38 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st38' (API port 16438, Prom port 19085):

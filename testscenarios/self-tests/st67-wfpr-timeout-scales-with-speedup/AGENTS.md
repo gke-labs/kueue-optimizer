@@ -15,7 +15,7 @@
 - **Title**: `waitForPodsReady` Timeout Scaled by `--speedup 5` (`40s` Raw -> `8s` Wall — Exact Twin of st66)
 - **Primary Verification Target**: Direct `5x` time-compressed twin of `st66`: `--speedup 5 --wait-for-pods-ready-timeout 40s` automatically compresses `waitForPodsReady.timeout` (`40s -> 8s`), `backoffBaseSeconds` (`10s -> 2s`), and `pod-startup-delay-seconds` (`300s -> 60s`) to match `st66` wall-for-wall
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st67` (`--namespace kueue-optimizer-chamber-st67`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16467` | Prometheus `19114` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16467` | Prometheus `19114` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st66-wfpr-timeout-evicts-stuck-pods-native`](../st66-wfpr-timeout-evicts-stuck-pods-native/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST67 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st67' (API port 16467, Prom port 19114):

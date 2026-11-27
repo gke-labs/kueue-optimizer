@@ -10,7 +10,7 @@
 | **Raw Event Counts** | `infra.json`: **293** events · `workflows.json`: **1,104** events · `execution-time.json`: **2,208** events |
 | **Cluster Capacity** | **144 nodes** · `4,608 cores` · `18,432 GiB (18.0 TiB)` · `1,152` `google.com/tpu` (1 distinct node group) |
 | **Topology Configuration** | **1** `Topology` CRD(s) (`st-slice-topology`) |
-| **Initial In-Flight Pods at $t_0$** | **72** pods across **72** / 144 nodes (initial `google.com/tpu` utilization: **25.00%**) |
+| **Initial In-Flight Pods at $t_0$** | **96** pods across **72** / 144 nodes (initial `google.com/tpu` utilization: **33.33%**; includes 24 synthesized from pre-admitted $t_0$ workloads) |
 | **Kueue Objects** | **1** `ResourceFlavor`(s) · **0** `Cohort`(s) · **1** `ClusterQueue`(s) · **1** `LocalQueue`(s) · **0** `WorkloadPriorityClass`(es) |
 | **Test Arrival Window ($T_{\text{test}}$)** | **12.0s** (`2026-06-01T00:00:01Z` $\rightarrow$ `2026-06-01T00:00:13Z`) |
 | **Unadmitted Workloads** | **1,056** `NotAdmitted` arrivals (1,056 total pods; gang size min=1, p50=1, p90=1, max=1) + **48** pre-admitted at $t_0$ |
@@ -147,26 +147,26 @@ Cluster Total: 144 nodes
 
 ## 4. Initial Running Pods & Initial Cluster Utilization at $t_0$
 
-At scenario start ($t_0 = 2026-06-01T00:00:00Z$), **`72`** running `Pod` objects are pre-placed across **`72`** of the **`144`** cluster nodes (`50.0%` of nodes occupied; `72` nodes completely free).
-Additionally, `workflows.json` records **`48`** pre-existing `Admitted` `JobSet` warmup workflow object(s) at $t_0$.
+At scenario start ($t_0 = 2026-06-01T00:00:00Z$), **`96`** running `Pod` objects are pre-placed across **`72`** of the **`144`** cluster nodes (`50.0%` of nodes occupied; `72` nodes completely free).
+Additionally, `workflows.json` records **`48`** pre-existing `Admitted` `Job` warmup workflow object(s) at $t_0$.
 
 ### 4.1 Initial Cluster Utilization Breakdown
 
 | Resource | Initial Pods Requested | Cluster Allocatable | Free Allocatable at $t_0$ | Initial Utilization (% Allocatable) | Initial Utilization (% Capacity) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| `cpu` | **288 cores** | 4,608 cores | 4,320 cores | **6.25%** | 6.25% |
-| `memory` | **1,152 GiB** | 18,432 GiB (18.0 TiB) | 17,280 GiB (16.9 TiB) | **6.25%** | 6.25% |
-| `pods` | **72** | 15,840 | 15,768 | **0.45%** | 0.45% |
-| `google.com/tpu` | **288** | 1,152 | 864 | **25.00%** | 25.00% |
+| `cpu` | **384 cores** | 4,608 cores | 4,224 cores | **8.33%** | 8.33% |
+| `memory` | **1,536 GiB** | 18,432 GiB (18.0 TiB) | 16,896 GiB (16.5 TiB) | **8.33%** | 8.33% |
+| `pods` | **96** | 15,840 | 15,744 | **0.61%** | 0.61% |
+| `google.com/tpu` | **384** | 1,152 | 768 | **33.33%** | 33.33% |
 
 ### 4.2 Initial Pod Remaining Lifetimes & Request Profiles
 
-- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **72** pods — `min=11s`, `P50=11s`, `AVG=11s`, `P90=11s`, `P99=11s`, `max=11s`
+- **Pods with Finite Remaining Lifetime (`deletionTime - t0`)**: **96** pods — `min=12s`, `P50=12s`, `AVG=12s`, `P90=12s`, `P99=12s`, `max=12s`
 - **Pods per Occupied Node (`72` active nodes)**: `min=1`, `P50=1`, `AVG=1.00`, `P90=1`, `max=1`
 
 | Rank | Initial Pod Resource Request Profile | Pod Count | Share of Initial Pods |
 | :---: | :--- | ---: | ---: |
-| `1` | `cpu: 4`, `google.com/tpu: 4`, `memory: 16Gi` | **72** | 100.0% |
+| `1` | `cpu: 4`, `google.com/tpu: 4`, `memory: 16Gi` | **96** | 100.0% |
 
 ---
 

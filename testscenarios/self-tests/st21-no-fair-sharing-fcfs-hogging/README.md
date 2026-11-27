@@ -7,11 +7,12 @@
 | Dimension | Summary |
 | :--- | :--- |
 | **Scenario Directory** | `testscenarios/self-tests/st21-no-fair-sharing-fcfs-hogging` |
-| **Raw Event Counts** | `infra.json`: **15** events · `workflows.json`: **12** events · `execution-time.json`: **24** events |
+| **Raw Event Counts** | `infra.json`: **16** events · `workflows.json`: **12** events · `execution-time.json`: **24** events |
 | **Cluster Capacity** | **8 nodes** · `128 cores` · `512 GiB` · `32` `google.com/tpu` (1 distinct node group) |
 | **Topology Configuration** | **0** `Topology` CRD(s) (none) |
 | **Initial In-Flight Pods at $t_0$** | **0** pods across **0** / 8 nodes (initial `google.com/tpu` utilization: **0.00%**) |
 | **Kueue Objects** | **1** `ResourceFlavor`(s) · **1** `Cohort`(s) · **2** `ClusterQueue`(s) · **2** `LocalQueue`(s) · **0** `WorkloadPriorityClass`(es) |
+| **Kueue Controller `Configuration`** | `fairSharing`: **disabled globally** (`Classical Preemption`) · `admissionFairSharing`: disabled |
 | **Test Arrival Window ($T_{\text{test}}$)** | **4.0s** (`2026-06-01T00:00:00Z` $\rightarrow$ `2026-06-01T00:00:04Z`) |
 | **Unadmitted Workloads** | **12** `NotAdmitted` arrivals (12 total pods; gang size min=1, p50=1, p90=1, max=1) + **0** pre-admitted at $t_0$ |
 | **Execution Duration Quantiles** | `min=18s`, `P50=28s`, `AVG=25s`, `P90=28s`, `P99=28s`, `max=28s` |
@@ -103,6 +104,15 @@ No `kueue.x-k8s.io/Topology` CRD is defined in `infra.json` (Topology-Aware Sche
 ---
 
 ## 5. Kueue Setup: ResourceFlavors, Cohorts, ClusterQueues, Namespaces & LocalQueues
+
+### 5.0 Kueue Controller `Configuration` (`infra.json`)
+
+When replaying this scenario, `testrunner.py` applies the following declarative Kueue `Configuration` statement into `ConfigMap/kueue-manager-config` when deploying the `kueue-optimizer` chamber:
+
+```yaml
+apiVersion: config.kueue.x-k8s.io/v1beta2
+kind: Configuration
+```
 
 ### 5.1 ResourceFlavors (`ResourceFlavor`) & Topology Binding
 

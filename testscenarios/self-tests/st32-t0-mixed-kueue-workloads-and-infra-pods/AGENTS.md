@@ -15,7 +15,7 @@
 - **Title**: Hybrid `t0` Partitioning: 4 Pre-Admitted Kueue `PodGroup`s + 2 Non-Kueue `infra-pods` + 2 New Arrivals
 - **Primary Verification Target**: Simultaneous separation of Class 1 `t0` Kueue `PodGroup`s (`16` TPUs in `cq-hybrid`) and Class 2 `infra-pods` (`8` TPUs excluded from Kueue) alongside `8` TPUs of `t=0s` arrivals
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st32` (`--namespace kueue-optimizer-chamber-st32`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16432` | Prometheus `19079` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16432` | Prometheus `19079` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st26-t0-initial-running-pods-baseline`](../st26-t0-initial-running-pods-baseline/AGENTS.md), [`st33-t0-legacy-unlinked-and-synthesized-pods`](../st33-t0-legacy-unlinked-and-synthesized-pods/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST32 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st32' (API port 16432, Prom port 19079):

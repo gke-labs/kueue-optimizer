@@ -15,7 +15,7 @@
 - **Title**: Heterogeneous Multi-PodSet `t0` `PodGroup` (`1` CPU Coordinator + `4` TPU Workers per Workload)
 - **Primary Verification Target**: Homogeneous-per-PodSet grouping (`resourceUsage % count == 0` Kueue `WorkloadWebhook` invariant) and multi-role `t0` quota/saturation math
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st34` (`--namespace kueue-optimizer-chamber-st34`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16434` | Prometheus `19081` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16434` | Prometheus `19081` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st29-multi-role-heterogeneous-jobset`](../st29-multi-role-heterogeneous-jobset/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST34 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st34' (API port 16434, Prom port 19081):

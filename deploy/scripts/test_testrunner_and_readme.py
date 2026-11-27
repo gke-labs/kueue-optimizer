@@ -6763,5 +6763,1257 @@ class DeploymentScrapingAndReplayTests(unittest.TestCase):
                     self.assertNotIn(tok, raw, f"Sensitive token {tok!r} leaked into {slug}/{fname}")
 
 
+class ReadmeGeneratorAndSelfTestIntegrityTests(unittest.TestCase):
+    """Regression tests for README analysis (G1, G3, G4) and self-test suite generation/checks (G2, G5, G6, G7)."""
+
+    def test_g1_bottleneck_selection_picks_highest_demand_to_capacity_ratio(self) -> None:
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+        st27_dir = suite_dir / "st27-cpu-memory-secondary-bottleneck"
+        a27 = generate_scenario_readme.analyze_scenario(st27_dir)
+        self.assertEqual(a27.primary_sat_resource, "cpu")
+        self.assertAlmostEqual(a27.ideal_full_capacity_sec(a27.unadmitted_wfs, "cpu") or 0.0, 35.0)
+        md27 = generate_scenario_readme.generate_readme_for_scenario(st27_dir)
+        self.assertIn("*(bottleneck: `cpu`,", md27)
+        self.assertIn("| **`cpu`** *(bottleneck)* |", md27)
+        self.assertNotIn("*(bottleneck: `google.com/tpu`", md27)
+
+        # Synthetic multi-accelerator & memory-bound scenarios verify ratio selection, tie-breaks, and no dup memory.
+        with tempfile.TemporaryDirectory() as tmp:
+            t0 = "2026-06-01T00:00:00Z"
+
+            # 1. Second alphabetical accelerator has higher demand/capacity ratio than first.
+            multi_acc = Path(tmp) / "multi_accel"
+            multi_acc.mkdir()
+            infra_multi = [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "n0"},
+                        "status": {
+                            "capacity": {
+                                "cpu": "64",
+                                "memory": "256Gi",
+                                "pods": "110",
+                                "amd.com/gpu": "8",
+                                "nvidia.com/gpu": "4",
+                            },
+                            "allocatable": {
+                                "cpu": "64",
+                                "memory": "256Gi",
+                                "pods": "110",
+                                "amd.com/gpu": "8",
+                                "nvidia.com/gpu": "4",
+                            },
+                        },
+                    },
+                }
+            ]
+            wf_multi = [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "j-nv",
+                        "namespace": "default",
+                        "object": {
+                            "apiVersion": "batch/v1",
+                            "kind": "Job",
+                            "metadata": {
+                                "name": "j-nv",
+                                "namespace": "default",
+                                "annotations": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "20"},
+                            },
+                            "spec": {
+                                "parallelism": 1,
+                                "template": {
+                                    "spec": {
+                                        "containers": [
+                                            {
+                                                "name": "c",
+                                                "resources": {
+                                                    "requests": {
+                                                        "cpu": "4",
+                                                        "memory": "16Gi",
+                                                        "amd.com/gpu": "1",
+                                                        "nvidia.com/gpu": "4",
+                                                    }
+                                                },
+                                            }
+                                        ]
+                                    }
+                                },
+                            },
+                        },
+                    },
+                }
+            ]
+            (multi_acc / "infra.json").write_text("\n".join(json.dumps(e) for e in infra_multi) + "\n", encoding="utf-8")
+            (multi_acc / "workflows.json").write_text(
+                "\n".join(json.dumps(e) for e in wf_multi) + "\n", encoding="utf-8"
+            )
+            (multi_acc / "execution-time.json").write_text("", encoding="utf-8")
+            a_multi = generate_scenario_readme.analyze_scenario(multi_acc)
+            self.assertEqual(a_multi.primary_accel_resource, "nvidia.com/gpu")
+            self.assertEqual(a_multi.primary_sat_resource, "nvidia.com/gpu")
+
+            # 2. Memory-bound scenario picks memory and never prints `memory` twice in overview.
+            mem_dir = Path(tmp) / "mem_bound"
+            mem_dir.mkdir()
+            wf_mem = [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "Job",
+                        "name": "j-mem",
+                        "namespace": "default",
+                        "object": {
+                            "apiVersion": "batch/v1",
+                            "kind": "Job",
+                            "metadata": {
+                                "name": "j-mem",
+                                "namespace": "default",
+                                "annotations": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "40"},
+                            },
+                            "spec": {
+                                "parallelism": 1,
+                                "template": {
+                                    "spec": {
+                                        "containers": [
+                                            {
+                                                "name": "c",
+                                                "resources": {"requests": {"cpu": "4", "memory": "256Gi"}},
+                                            }
+                                        ]
+                                    }
+                                },
+                            },
+                        },
+                    },
+                }
+            ]
+            (mem_dir / "infra.json").write_text("\n".join(json.dumps(e) for e in infra_multi) + "\n", encoding="utf-8")
+            (mem_dir / "workflows.json").write_text("\n".join(json.dumps(e) for e in wf_mem) + "\n", encoding="utf-8")
+            (mem_dir / "execution-time.json").write_text("", encoding="utf-8")
+            a_mem = generate_scenario_readme.analyze_scenario(mem_dir)
+            self.assertEqual(a_mem.primary_sat_resource, "memory")
+            md_mem = generate_scenario_readme.generate_readme_for_scenario(mem_dir)
+            sat_6h_line = next(ln for ln in md_mem.splitlines() if "Saturation (Reference `6h`" in ln)
+            self.assertEqual(sat_6h_line.count("`memory`:"), 1)
+
+    def test_g2_self_test_check_detects_mutated_scenario_readme(self) -> None:
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+        if str(suite_dir) not in sys.path:
+            sys.path.insert(0, str(suite_dir))
+        import generate_self_test_suite as gen_suite
+
+        st01_slug = "st01-50pct-single-cq-quota-cap"
+        st01_src = suite_dir / st01_slug
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_suite = Path(tmp)
+            fake_st01 = fake_suite / st01_slug
+            fake_st01.mkdir(parents=True, exist_ok=True)
+            subset_expected: dict[Path, str] = {}
+            for fname in ("infra.json", "workflows.json", "execution-time.json", "AGENTS.md"):
+                content = (st01_src / fname).read_text(encoding="utf-8")
+                (fake_st01 / fname).write_text(content, encoding="utf-8")
+                subset_expected[gen_suite.SUITE_DIR / st01_slug / fname] = content
+
+            # Fresh copy with exact README rendered for fake_st01 passes.
+            (fake_st01 / "README.md").write_text(
+                generate_scenario_readme.generate_readme_for_scenario(fake_st01), encoding="utf-8"
+            )
+            with mock.patch.object(gen_suite, "build_expected_suite_files", return_value=subset_expected):
+                self.assertEqual(gen_suite.check_suite_sync(fake_suite), [])
+
+                # Mutating README content MUST fail with DRIFTED SCENARIO README.
+                (fake_st01 / "README.md").write_text("# Stale / garbage README\n", encoding="utf-8")
+                drifted = gen_suite.check_suite_sync(fake_suite)
+                self.assertTrue(
+                    any("DRIFTED SCENARIO README:" in item and st01_slug in item for item in drifted),
+                    msg=f"Expected DRIFTED SCENARIO README for {st01_slug}, got: {drifted}",
+                )
+
+    def test_g3_and_g4_t0_nodes_workflow_incarnations_and_t0_pod_counts_match_loader(self) -> None:
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+
+        # G3: st62 excludes post-t0 Node New scale-up from initial cluster capacity (8 nodes / 32 TPUs, not 9 / 36).
+        st62_dir = suite_dir / "st62-tas-node-deleted-hotswap-and-scaleup"
+        b62 = testrunner.load_scenario_bundle(scenario_dir=st62_dir, skip_initial_offset=False)
+        a62 = generate_scenario_readme.analyze_scenario(st62_dir)
+        self.assertEqual(len(b62.nodes), 8)
+        self.assertEqual(a62.total_node_count, 8)
+        self.assertAlmostEqual(a62.cluster_cap["google.com/tpu"], 32.0)
+        self.assertEqual(len(a62.post_t0_node_events), 2)
+        md62 = generate_scenario_readme.generate_readme_for_scenario(st62_dir)
+        self.assertIn("**8 nodes**", md62)
+        self.assertIn("`32` `google.com/tpu`", md62)
+        self.assertNotIn("**9 nodes**", md62)
+
+        # G4a: st90 preserves re-created same-named Deployment incarnation (2 NotAdmitted arrivals / 8 pods, 4 t0 pods).
+        st90_dir = suite_dir / "st90-deployment-t0-delete-and-recreate-lifecycle"
+        b90 = testrunner.load_scenario_bundle(scenario_dir=st90_dir, skip_initial_offset=False)
+        a90 = generate_scenario_readme.analyze_scenario(st90_dir)
+        self.assertEqual(len(a90.admitted_at_start_wfs), 1)
+        self.assertEqual(len(a90.unadmitted_wfs), len(b90.scheduled_workflows))
+        self.assertEqual(len(a90.unadmitted_wfs), 2)
+        self.assertEqual(sum(w.total_pods for w in a90.unadmitted_wfs), sum(w.pod_count for w in b90.scheduled_workflows))
+        self.assertEqual(sum(w.total_pods for w in a90.unadmitted_wfs), 8)
+        self.assertEqual(a90.total_initial_pods, b90.initial_workload_pods_count + len(b90.initial_pods))
+        self.assertEqual(a90.total_initial_pods, 4)
+
+        # G4b: st33 and st54 align t0 pod accounting with loader's Tier-4 synthesis (6 and 96 t0 pods).
+        st33_dir = suite_dir / "st33-t0-legacy-unlinked-and-synthesized-pods"
+        b33 = testrunner.load_scenario_bundle(scenario_dir=st33_dir, skip_initial_offset=False)
+        a33 = generate_scenario_readme.analyze_scenario(st33_dir)
+        self.assertEqual(a33.total_initial_pods, len(b33.initial_pods) + b33.initial_workload_pods_count)
+        self.assertEqual(a33.total_initial_pods, 6)
+        self.assertEqual(a33.synthesized_initial_pods, 2)
+
+        st54_dir = suite_dir / "st54-scale-tas-preferred-and-partial-t0-144n-1104w"
+        b54 = testrunner.load_scenario_bundle(scenario_dir=st54_dir, skip_initial_offset=False)
+        a54 = generate_scenario_readme.analyze_scenario(st54_dir)
+        self.assertEqual(a54.total_initial_pods, len(b54.initial_pods) + b54.initial_workload_pods_count)
+        self.assertEqual(a54.total_initial_pods, 96)
+        self.assertEqual(a54.synthesized_initial_pods, 24)
+
+    def test_g5_g6_g7_self_test_agents_count_st21_no_fair_sharing_and_asymmetric_limits(self) -> None:
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+        sc_dirs = sorted(p for p in suite_dir.iterdir() if p.is_dir() and p.name.startswith("st"))
+        self.assertEqual(len(sc_dirs), 95)
+
+        # G5: No hardcoded "all 45 scenarios" or "st01–st45" in generated per-scenario AGENTS.md files.
+        for sc_dir in sc_dirs:
+            agents_txt = (sc_dir / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertNotIn("all 45 scenarios", agents_txt, sc_dir.name)
+            self.assertNotIn("`st01`–`st45`", agents_txt, sc_dir.name)
+            self.assertNotIn("16445/19092", agents_txt, sc_dir.name)
+            self.assertIn("all 95 scenarios `st01`–`st95`", agents_txt, sc_dir.name)
+
+        # G6: st21 explicitly disables global Fair Sharing via Configuration + --no-fair-sharing.
+        st21_dir = suite_dir / "st21-no-fair-sharing-fcfs-hogging"
+        b21 = testrunner.load_scenario_bundle(scenario_dir=st21_dir)
+        self.assertIsNotNone(b21.kueue_configuration)
+        assert b21.kueue_configuration is not None
+        self.assertFalse(b21.kueue_configuration.fair_sharing_enabled)
+        self.assertIn("--no-fair-sharing", (st21_dir / "AGENTS.md").read_text(encoding="utf-8"))
+
+        # G7: Asymmetric borrowingLimit != lendingLimit across st20 (8 vs 12) and st43 (12 vs 8).
+        def _tpu_limits(sc_path: Path) -> tuple[str | None, str | None]:
+            borrow_lim: str | None = None
+            lend_lim: str | None = None
+            for raw in (sc_path / "infra.json").read_text(encoding="utf-8").splitlines():
+                pl = json.loads(raw)["payload"]
+                if pl.get("kind") != "ClusterQueue":
+                    continue
+                for rg in pl["spec"].get("resourceGroups") or []:
+                    for flv in rg.get("flavors") or []:
+                        for res in flv.get("resources") or []:
+                            if res.get("name") == "google.com/tpu":
+                                if res.get("borrowingLimit") is not None:
+                                    borrow_lim = str(res["borrowingLimit"])
+                                if res.get("lendingLimit") is not None:
+                                    lend_lim = str(res["lendingLimit"])
+            return borrow_lim, lend_lim
+
+        b20, l20 = _tpu_limits(suite_dir / "st20-borrowing-and-lending-limits-enforced")
+        b43, l43 = _tpu_limits(suite_dir / "st43-t0-borrowing-limit-enforced-with-initial-load")
+        self.assertEqual((b20, l20), ("8", "12"))
+        self.assertEqual((b43, l43), ("12", "8"))
+        self.assertNotEqual(b20, l20)
+        self.assertNotEqual(b43, l43)
+
+    @staticmethod
+    def _write_jsonl(path: Path, events: list[dict]) -> None:
+        path.write_text("\n".join(json.dumps(e) for e in events) + ("\n" if events else ""), encoding="utf-8")
+
+    @staticmethod
+    def _base_tpu_infra(t0: str, *, node_count: int = 2, ns: str = "team-a") -> list[dict]:
+        events: list[dict] = []
+        for idx in range(node_count):
+            events.append(
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {
+                            "name": f"n-{idx}",
+                            "labels": {
+                                "kubernetes.io/hostname": f"n-{idx}",
+                                "cloud.google.com/gke-tpu-accelerator": "tpu-v7x-st",
+                                "type": "kwok",
+                            },
+                        },
+                        "status": {
+                            "capacity": {"cpu": "16", "memory": "64Gi", "pods": "110", "google.com/tpu": "4"},
+                            "allocatable": {"cpu": "16", "memory": "64Gi", "pods": "110", "google.com/tpu": "4"},
+                        },
+                    },
+                }
+            )
+        events.extend(
+            [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}},
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ResourceFlavor",
+                        "metadata": {"name": "rf-tpu"},
+                        "spec": {"nodeLabels": {"cloud.google.com/gke-tpu-accelerator": "tpu-v7x-st"}},
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "ClusterQueue",
+                        "metadata": {"name": "cq-main"},
+                        "spec": {
+                            "namespaceSelector": {},
+                            "resourceGroups": [
+                                {
+                                    "coveredResources": ["cpu", "memory", "google.com/tpu"],
+                                    "flavors": [
+                                        {
+                                            "name": "rf-tpu",
+                                            "resources": [
+                                                {"name": "cpu", "nominalQuota": str(16 * node_count)},
+                                                {"name": "memory", "nominalQuota": f"{64 * node_count}Gi"},
+                                                {"name": "google.com/tpu", "nominalQuota": str(4 * node_count)},
+                                            ],
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    },
+                },
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "payload": {
+                        "apiVersion": "kueue.x-k8s.io/v1beta2",
+                        "kind": "LocalQueue",
+                        "metadata": {"name": "lq-main", "namespace": ns},
+                        "spec": {"clusterQueue": "cq-main"},
+                    },
+                },
+            ]
+        )
+        return events
+
+    def test_blocking1_workloadname_only_no_double_count_and_no_enriched_infrapod_stealing(self) -> None:
+        """Pass 1 matches workloadName-only pods via exec_info; enriched traces never steal infra-pods."""
+        t0 = "2026-06-01T00:00:00Z"
+        t_end = "2026-06-01T00:00:30Z"
+        with tempfile.TemporaryDirectory() as tmp:
+            # Case A: workloadName-only pods (no ownerName) must match via exec_info.workload_name (2 pods / 8 TPUs, not 4 / 16).
+            sc_a = Path(tmp) / "wl_only"
+            sc_a.mkdir()
+            infra_a = self._base_tpu_infra(t0, node_count=2)
+            for idx in range(2):
+                infra_a.append(
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "payload": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "name": f"h-0000000000000000000000000000001{idx}",
+                            "namespace": "team-a",
+                            "placement": f"n-{idx}",
+                            "schedulingTime": t0,
+                            "resourceRequest": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "4"},
+                            "workloadName": "jobset-t0-wl-only-abc",
+                        },
+                    }
+                )
+            wf_a = [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "JobSet",
+                        "name": "t0-wl-only",
+                        "namespace": "team-a",
+                        "creationTime": t0,
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "jobset.x-k8s.io/v1alpha2",
+                            "kind": "JobSet",
+                            "metadata": {
+                                "name": "t0-wl-only",
+                                "namespace": "team-a",
+                                "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                            },
+                            "spec": {
+                                "replicatedJobs": [
+                                    {
+                                        "name": "w",
+                                        "replicas": 1,
+                                        "template": {
+                                            "spec": {
+                                                "parallelism": 2,
+                                                "completions": 2,
+                                                "template": {
+                                                    "spec": {
+                                                        "containers": [
+                                                            {
+                                                                "name": "c",
+                                                                "resources": {
+                                                                    "requests": {
+                                                                        "cpu": "4",
+                                                                        "memory": "16Gi",
+                                                                        "google.com/tpu": "4",
+                                                                    }
+                                                                },
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                }
+            ]
+            exec_a = [
+                {
+                    "timestamp": t0,
+                    "eventType": "Admitted",
+                    "payload": {
+                        "workloadName": "jobset-t0-wl-only-abc",
+                        "namespace": "team-a",
+                        "ownerKind": "JobSet",
+                        "ownerName": "t0-wl-only",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "admittedTime": t0,
+                    },
+                },
+                {
+                    "timestamp": t_end,
+                    "eventType": "FullExecution",
+                    "payload": {
+                        "workloadName": "jobset-t0-wl-only-abc",
+                        "namespace": "team-a",
+                        "ownerKind": "JobSet",
+                        "ownerName": "t0-wl-only",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "admittedTime": t0,
+                        "endTime": t_end,
+                        "executionDurationSeconds": 30.0,
+                    },
+                },
+            ]
+            self._write_jsonl(sc_a / "infra.json", infra_a)
+            self._write_jsonl(sc_a / "workflows.json", wf_a)
+            self._write_jsonl(sc_a / "execution-time.json", exec_a)
+            a_a = generate_scenario_readme.analyze_scenario(sc_a)
+            b_a = testrunner.load_scenario_bundle(sc_a, skip_initial_offset=False)
+            self.assertEqual(a_a.total_initial_pods, 2)
+            self.assertEqual(a_a.synthesized_initial_pods, 0)
+            self.assertAlmostEqual(a_a.init_pod_requests_sum["google.com/tpu"], 8.0)
+            self.assertEqual(a_a.total_initial_pods, len(b_a.initial_pods) + b_a.initial_workload_pods_count)
+
+            # Case B: Enriched trace with 1 scraped Kueue pod (missing 1 of 2) + 1 unlinked infra-pod sharing prefix/profile.
+            # Enriched linkage must gate off prefix & profile fallbacks so infra-pod is NOT stolen (total = 3 pods).
+            sc_b = Path(tmp) / "enriched_infrapod"
+            sc_b.mkdir()
+            infra_b = self._base_tpu_infra(t0, node_count=3)
+            infra_b.extend(
+                [
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "payload": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "name": "t0-wl-only-w-0-abc",
+                            "namespace": "team-a",
+                            "placement": "n-0",
+                            "schedulingTime": t0,
+                            "resourceRequest": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "4"},
+                            "ownerKind": "JobSet",
+                            "ownerName": "t0-wl-only",
+                        },
+                    },
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "payload": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "name": "t0-wl-only-daemon-sidecar",
+                            "namespace": "team-a",
+                            "placement": "n-1",
+                            "schedulingTime": t0,
+                            "resourceRequest": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "4"},
+                        },
+                    },
+                ]
+            )
+            self._write_jsonl(sc_b / "infra.json", infra_b)
+            self._write_jsonl(sc_b / "workflows.json", wf_a)
+            self._write_jsonl(sc_b / "execution-time.json", exec_a)
+            a_b = generate_scenario_readme.analyze_scenario(sc_b)
+            b_b = testrunner.load_scenario_bundle(sc_b, skip_initial_offset=False)
+            self.assertEqual(a_b.synthesized_initial_pods, 1)
+            self.assertEqual(a_b.total_initial_pods, 3)
+            self.assertEqual(len(b_b.initial_pods), 1)
+            self.assertEqual(b_b.initial_workload_pods_count, 2)
+            self.assertEqual(a_b.total_initial_pods, len(b_b.initial_pods) + b_b.initial_workload_pods_count)
+
+    def test_blocking2_sparse_in_window_node_update_preserves_capacity_and_labels(self) -> None:
+        """An in-window sparse Node Update omitting capacity/allocatable/labels must not wipe Node capacity."""
+        t0 = "2026-06-01T00:00:00Z"
+        t_upd = "2026-06-01T00:00:00.500Z"
+        with tempfile.TemporaryDirectory() as tmp:
+            sc = Path(tmp) / "sparse_node_upd"
+            sc.mkdir()
+            infra = self._base_tpu_infra(t0, node_count=2)
+            infra.append(
+                {
+                    "timestamp": t_upd,
+                    "eventType": "Update",
+                    "payload": {
+                        "apiVersion": "v1",
+                        "kind": "Node",
+                        "metadata": {"name": "n-0", "labels": {}},
+                        "spec": {"taints": [{"key": "maintenance", "effect": "NoSchedule"}]},
+                        "status": {
+                            "conditions": [{"type": "Ready", "status": "True"}],
+                        },
+                    },
+                }
+            )
+            self._write_jsonl(sc / "infra.json", infra)
+            self._write_jsonl(sc / "workflows.json", [])
+            self._write_jsonl(sc / "execution-time.json", [])
+            a = generate_scenario_readme.analyze_scenario(sc)
+            self.assertEqual(a.total_node_count, 2)
+            self.assertAlmostEqual(a.cluster_cap["cpu"], 32.0)
+            self.assertAlmostEqual(a.cluster_cap["memory"], 128.0)
+            self.assertAlmostEqual(a.cluster_cap["google.com/tpu"], 8.0)
+            self.assertAlmostEqual(a.cluster_alloc["google.com/tpu"], 8.0)
+            n0_labels = (a.nodes_by_name["n-0"].get("metadata") or {}).get("labels") or {}
+            self.assertEqual(n0_labels.get("cloud.google.com/gke-tpu-accelerator"), "tpu-v7x-st")
+            self.assertEqual((a.nodes_by_name["n-0"].get("spec") or {}).get("taints"), [{"key": "maintenance", "effect": "NoSchedule"}])
+
+    def test_blocking3_tier4_multipodset_deployment_caps_pre_t0_lifetimes_and_deleted_t0(self) -> None:
+        """Tier-4 synthesis matches loader.py for multi-PodSet JobSets, Deployment caps, unmanaged t0, and pre-t0 end epochs."""
+        t_pre = "2026-05-31T23:59:40Z"  # t0 - 20s
+        t0 = "2026-06-01T00:00:00Z"
+        t_end30 = "2026-06-01T00:00:30Z"  # t0 + 30s
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Multi-PodSet t0 JobSet (1 CPU-only leader scraped + 2 missing 4-TPU workers) + pre-t0 admitted lifetime (30s, not 50s).
+            sc_mp = Path(tmp) / "multipodset"
+            sc_mp.mkdir()
+            infra_mp = self._base_tpu_infra(t0, node_count=3)
+            infra_mp.extend(
+                [
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "payload": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "name": "mp-js-leader-0-0",
+                            "namespace": "team-a",
+                            "placement": "n-0",
+                            "schedulingTime": t_pre,
+                            "resourceRequest": {"cpu": "2", "memory": "4Gi"},
+                            "ownerKind": "JobSet",
+                            "ownerName": "mp-js",
+                            "podSetName": "leader",
+                        },
+                    },
+                    {
+                        "timestamp": t_end30,
+                        "eventType": "Deleted",
+                        "payload": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "name": "mp-js-leader-0-0",
+                            "namespace": "team-a",
+                            "deletionTime": t_end30,
+                        },
+                    },
+                ]
+            )
+            wf_mp = [
+                {
+                    "timestamp": t0,
+                    "eventType": "New",
+                    "workloadState": "Admitted",
+                    "payload": {
+                        "objectKind": "JobSet",
+                        "name": "mp-js",
+                        "namespace": "team-a",
+                        "creationTime": t_pre,
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "jobset.x-k8s.io/v1alpha2",
+                            "kind": "JobSet",
+                            "metadata": {
+                                "name": "mp-js",
+                                "namespace": "team-a",
+                                "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                            },
+                            "spec": {
+                                "replicatedJobs": [
+                                    {
+                                        "name": "leader",
+                                        "replicas": 1,
+                                        "template": {
+                                            "spec": {
+                                                "parallelism": 1,
+                                                "completions": 1,
+                                                "template": {
+                                                    "spec": {
+                                                        "containers": [
+                                                            {
+                                                                "name": "l",
+                                                                "resources": {"requests": {"cpu": "2", "memory": "4Gi"}},
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    },
+                                    {
+                                        "name": "worker",
+                                        "replicas": 1,
+                                        "template": {
+                                            "spec": {
+                                                "parallelism": 2,
+                                                "completions": 2,
+                                                "template": {
+                                                    "spec": {
+                                                        "containers": [
+                                                            {
+                                                                "name": "w",
+                                                                "resources": {
+                                                                    "requests": {
+                                                                        "cpu": "4",
+                                                                        "memory": "16Gi",
+                                                                        "google.com/tpu": "4",
+                                                                    }
+                                                                },
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    },
+                                ]
+                            },
+                        },
+                    },
+                }
+            ]
+            exec_mp = [
+                {
+                    "timestamp": t_pre,
+                    "eventType": "Admitted",
+                    "payload": {
+                        "workloadName": "jobset-mp-js-001",
+                        "namespace": "team-a",
+                        "ownerKind": "JobSet",
+                        "ownerName": "mp-js",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "admittedTime": t_pre,
+                    },
+                },
+                {
+                    "timestamp": t_end30,
+                    "eventType": "FullExecution",
+                    "payload": {
+                        "workloadName": "jobset-mp-js-001",
+                        "namespace": "team-a",
+                        "ownerKind": "JobSet",
+                        "ownerName": "mp-js",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "admittedTime": t_pre,
+                        "endTime": t_end30,
+                        "executionDurationSeconds": 50.0,
+                    },
+                },
+            ]
+            self._write_jsonl(sc_mp / "infra.json", infra_mp)
+            self._write_jsonl(sc_mp / "workflows.json", wf_mp)
+            self._write_jsonl(sc_mp / "execution-time.json", exec_mp)
+            a_mp = generate_scenario_readme.analyze_scenario(sc_mp)
+            b_mp = testrunner.load_scenario_bundle(sc_mp, skip_initial_offset=False)
+            self.assertEqual(a_mp.total_initial_pods, 3)
+            self.assertEqual(a_mp.synthesized_initial_pods, 2)
+            self.assertAlmostEqual(a_mp.init_pod_requests_sum["google.com/tpu"], 8.0)
+            self.assertAlmostEqual(a_mp.init_pod_requests_sum["cpu"], 10.0)
+            self.assertAlmostEqual(a_mp.init_pod_requests_sum["memory"], 36.0)
+            self.assertEqual(sorted(round(x, 1) for x in a_mp.init_pod_lifetimes), [30.0, 30.0, 30.0])
+            self.assertEqual(a_mp.total_initial_pods, len(b_mp.initial_pods) + b_mp.initial_workload_pods_count)
+
+            # 2. Pre-t0 PartialExecution (no full_end_epoch): remaining lifetime uses min(admitted_epochs) + resolved_dur - t0.
+            sc_pe = Path(tmp) / "pre_t0_partial"
+            sc_pe.mkdir()
+            exec_pe = [
+                {
+                    "timestamp": t_pre,
+                    "eventType": "Admitted",
+                    "payload": {
+                        "workloadName": "jobset-mp-js-001",
+                        "namespace": "team-a",
+                        "ownerKind": "JobSet",
+                        "ownerName": "mp-js",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "admittedTime": t_pre,
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:10Z",
+                    "eventType": "PartialExecution",
+                    "payload": {
+                        "workloadName": "jobset-mp-js-001",
+                        "namespace": "team-a",
+                        "ownerKind": "JobSet",
+                        "ownerName": "mp-js",
+                        "localQueueName": "lq-main",
+                        "clusterQueueName": "cq-main",
+                        "admittedTime": t_pre,
+                        "endTime": "2026-06-01T00:00:10Z",
+                        "executionDurationSeconds": 30.0,
+                        "interruptionReason": "ScrapeEnded",
+                    },
+                },
+            ]
+            self._write_jsonl(sc_pe / "infra.json", self._base_tpu_infra(t0, node_count=3))
+            self._write_jsonl(sc_pe / "workflows.json", wf_mp)
+            self._write_jsonl(sc_pe / "execution-time.json", exec_pe)
+            a_pe = generate_scenario_readme.analyze_scenario(sc_pe)
+            # 30.0 * 1.5 = 45.0s total from (t0 - 20s) => ends at t0 + 25.0s!
+            self.assertEqual(sorted(round(x, 1) for x in a_pe.init_pod_lifetimes), [25.0, 25.0, 25.0])
+
+            # 3. Deployment replica caps (surge clamp, desired=0, readyReplicas=None with partial matched pods,
+            #    unmanaged t0 Deployment, and t0-deleted Deployment).
+            sc_dep = Path(tmp) / "dep_caps"
+            sc_dep.mkdir()
+
+            def _dep_ev(
+                name: str,
+                *,
+                ns: str = "team-a",
+                replicas: int = 3,
+                ready_replicas: int | None = None,
+                lq: str = "lq-main",
+                ev_type: str = "New",
+                ts: str = t0,
+            ) -> dict:
+                labels = {"app": name}
+                if lq:
+                    labels["kueue.x-k8s.io/queue-name"] = lq
+                pl: dict = {
+                    "objectKind": "Deployment",
+                    "name": name,
+                    "namespace": ns,
+                    "creationTime": t0,
+                    "localQueueName": lq,
+                    "replicas": replicas,
+                    "object": {
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {"name": name, "namespace": ns, "labels": labels},
+                        "spec": {
+                            "replicas": replicas,
+                            "selector": {"matchLabels": {"app": name}},
+                            "template": {
+                                "metadata": {"labels": {"app": name}},
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "s",
+                                            "resources": {
+                                                "requests": {"cpu": "2", "memory": "4Gi", "google.com/tpu": "1"}
+                                            },
+                                        }
+                                    ]
+                                },
+                            },
+                        },
+                    },
+                }
+                if ready_replicas is not None:
+                    pl["readyReplicas"] = ready_replicas
+                return {"timestamp": ts, "eventType": ev_type, "workloadState": "Admitted", "payload": pl}
+
+            infra_dep = self._base_tpu_infra(t0, node_count=4)
+            # 2 scraped pods for dep-partial-none (spec.replicas=4, readyReplicas=None => must NOT synthesize 2 more!)
+            for idx in range(2):
+                infra_dep.append(
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "payload": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "name": f"dep-partial-none-rs-{idx}",
+                            "namespace": "team-a",
+                            "placement": f"n-{idx}",
+                            "schedulingTime": t0,
+                            "resourceRequest": {"cpu": "2", "memory": "4Gi", "google.com/tpu": "1"},
+                            "ownerKind": "Deployment",
+                            "ownerName": "dep-partial-none",
+                        },
+                    }
+                )
+            wf_dep = [
+                # Surge: desired=3, ready=4, 0 scraped => synthesizes 3 (NOT 4).
+                _dep_ev("dep-surge", replicas=3, ready_replicas=4),
+                # Zero replicas: desired=0, 0 scraped => synthesizes 0 (NOT 1).
+                _dep_ev("dep-zero", replicas=0, ready_replicas=0),
+                # Omitted readyReplicas with 2 matched pods out of desired=4 => synthesizes 0 (total 2, NOT 4).
+                _dep_ev("dep-partial-none", replicas=4, ready_replicas=None),
+                # Unmanaged system-namespace Deployment lacking queue => synthesizes 0.
+                _dep_ev("coredns", ns="kube-system", replicas=2, ready_replicas=2, lq=""),
+                # Deleted at t0 => dropped & synthesizes 0.
+                _dep_ev("dep-del-t0", replicas=2, ready_replicas=2),
+                _dep_ev("dep-del-t0", replicas=2, ready_replicas=2, ev_type="Deleted", ts=t0),
+            ]
+            self._write_jsonl(sc_dep / "infra.json", infra_dep)
+            self._write_jsonl(sc_dep / "workflows.json", wf_dep)
+            self._write_jsonl(sc_dep / "execution-time.json", [])
+            a_dep = generate_scenario_readme.analyze_scenario(sc_dep)
+            b_dep = testrunner.load_scenario_bundle(sc_dep, skip_initial_offset=False)
+            # Total expected: 3 (dep-surge) + 0 (dep-zero) + 2 (dep-partial-none) + 0 (coredns) + 0 (dep-del-t0) = 5 pods!
+            self.assertEqual(a_dep.synthesized_initial_pods, 3)
+            self.assertEqual(a_dep.total_initial_pods, 5)
+            self.assertEqual(a_dep.total_initial_pods, len(b_dep.initial_pods) + b_dep.initial_workload_pods_count)
+            self.assertNotIn("dep-del-t0", [w.name for w in a_dep.admitted_at_start_wfs])
+
+    def test_blocking4_recreated_podgroup_without_delete_and_incarnation_keying(self) -> None:
+        """Recreated PodGroups (with newer creationTime, no Deleted event, and new or same pod names) stay separate."""
+        t0 = "2026-06-01T00:00:00Z"
+        t20 = "2026-06-01T00:00:20Z"
+        with tempfile.TemporaryDirectory() as tmp:
+            sc = Path(tmp) / "pg_recreate"
+            sc.mkdir()
+            self._write_jsonl(sc / "infra.json", self._base_tpu_infra(t0, node_count=2))
+
+            def _pg_pod(pod_name: str, pg_name: str, ts: str) -> dict:
+                return {
+                    "timestamp": ts,
+                    "eventType": "New",
+                    "workloadState": "NotAdmitted",
+                    "payload": {
+                        "objectKind": "Pod",
+                        "name": pod_name,
+                        "namespace": "team-a",
+                        "creationTime": ts,
+                        "localQueueName": "lq-main",
+                        "object": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                "name": pod_name,
+                                "namespace": "team-a",
+                                "creationTimestamp": ts,
+                                "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                                "annotations": {
+                                    "kueue.x-k8s.io/pod-group-name": pg_name,
+                                    "kueue.x-k8s.io/pod-group-total-count": "2",
+                                },
+                            },
+                            "spec": {
+                                "containers": [
+                                    {
+                                        "name": "c",
+                                        "resources": {
+                                            "requests": {"cpu": "4", "memory": "16Gi", "google.com/tpu": "2"}
+                                        },
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                }
+
+            wf_events = [
+                # Incarnation 0 of pg-same (no Deleted event before incarnation 1!)
+                _pg_pod("pg-same-0", "pg-same", t0),
+                _pg_pod("pg-same-1", "pg-same", t0),
+                # Incarnation 1 of pg-same with same pod names and newer creationTime (+20s)
+                _pg_pod("pg-same-0", "pg-same", t20),
+                _pg_pod("pg-same-1", "pg-same", t20),
+                # Incarnation 0 of pg-newpods, then Deleted, then incarnation 1 with brand-new pod names
+                _pg_pod("pg-new-a0", "pg-newpods", t0),
+                _pg_pod("pg-new-a1", "pg-newpods", t0),
+                {
+                    "timestamp": "2026-06-01T00:00:10Z",
+                    "eventType": "Deleted",
+                    "workloadState": "NotAdmitted",
+                    "payload": {"objectKind": "Pod", "name": "pg-new-a0", "namespace": "team-a", "object": {}},
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:10Z",
+                    "eventType": "Deleted",
+                    "workloadState": "NotAdmitted",
+                    "payload": {"objectKind": "Pod", "name": "pg-new-a1", "namespace": "team-a", "object": {}},
+                },
+                _pg_pod("pg-new-b0", "pg-newpods", t20),
+                _pg_pod("pg-new-b1", "pg-newpods", t20),
+            ]
+            exec_events = [
+                {
+                    "timestamp": "2026-06-01T00:00:10Z",
+                    "eventType": "FullExecution",
+                    "payload": {
+                        "workloadName": "pg-same-inc0",
+                        "namespace": "team-a",
+                        "ownerKind": "PodGroup",
+                        "ownerName": "pg-same",
+                        "creationTime": t0,
+                        "executionDurationSeconds": 10.0,
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:01:05Z",
+                    "eventType": "FullExecution",
+                    "payload": {
+                        "workloadName": "pg-same-inc1",
+                        "namespace": "team-a",
+                        "ownerKind": "PodGroup",
+                        "ownerName": "pg-same",
+                        "creationTime": t20,
+                        "executionDurationSeconds": 45.0,
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:00:12Z",
+                    "eventType": "FullExecution",
+                    "payload": {
+                        "workloadName": "pg-newpods-inc0",
+                        "namespace": "team-a",
+                        "ownerKind": "PodGroup",
+                        "ownerName": "pg-newpods",
+                        "executionDurationSeconds": 12.0,
+                    },
+                },
+                {
+                    "timestamp": "2026-06-01T00:01:10Z",
+                    "eventType": "FullExecution",
+                    "payload": {
+                        "workloadName": "pg-newpods-inc1",
+                        "namespace": "team-a",
+                        "ownerKind": "PodGroup",
+                        "ownerName": "pg-newpods",
+                        "executionDurationSeconds": 50.0,
+                    },
+                },
+            ]
+            self._write_jsonl(sc / "workflows.json", wf_events)
+            self._write_jsonl(sc / "execution-time.json", exec_events)
+            a = generate_scenario_readme.analyze_scenario(sc)
+            pg_same = [w for w in a.unadmitted_wfs if w.name == "pg-same"]
+            pg_new = [w for w in a.unadmitted_wfs if w.name == "pg-newpods"]
+            self.assertEqual(len(pg_same), 2)
+            self.assertEqual([(w.incarnation_index, w.total_pods, w.duration_sec) for w in pg_same], [(0, 2, 10.0), (1, 2, 45.0)])
+            self.assertEqual(len(pg_new), 2)
+            self.assertEqual([(w.incarnation_index, w.total_pods, w.duration_sec) for w in pg_new], [(0, 2, 12.0), (1, 2, 50.0)])
+
+    def test_should_fix_g2_extra_dirs_files_g1_edges_sections_7_fast_admitted_and_kind_labels(self) -> None:
+        """Cover G2 extra dir/file/missing README/drifted infra, G1 edges, Sections 7.1/7.2, post_t0_fast_admitted, Section 4 kind, and format_speedup_val."""
+        from scenario_readme.analysis import format_speedup_val
+
+        # 1. format_speedup_val never prints "0.000" for tiny positive values.
+        self.assertEqual(format_speedup_val(125.44), "125.4")
+        self.assertEqual(format_speedup_val(12.345), "12.35")
+        self.assertEqual(format_speedup_val(0.404), "0.404")
+        tiny_s = format_speedup_val(0.0001)
+        self.assertNotEqual(tiny_s, "0.000")
+        self.assertAlmostEqual(float(tiny_s), 0.0001)
+        self.assertGreater(float(format_speedup_val(1e-6)), 0.0)
+
+        # 2. G2 check_suite_sync flags EXTRA SCENARIO DIR, EXTRA SCENARIO FILE, MISSING SCENARIO README, and DRIFTED infra.json.
+        suite_dir = REPO_ROOT / "testscenarios" / "self-tests"
+        if str(suite_dir) not in sys.path:
+            sys.path.insert(0, str(suite_dir))
+        import generate_self_test_suite as gen_suite
+
+        st01_slug = "st01-50pct-single-cq-quota-cap"
+        st01_src = suite_dir / st01_slug
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_suite = Path(tmp)
+            fake_st01 = fake_suite / st01_slug
+            fake_st01.mkdir(parents=True, exist_ok=True)
+            subset_expected: dict[Path, str] = {}
+            for fname in ("infra.json", "workflows.json", "execution-time.json", "AGENTS.md"):
+                content = (st01_src / fname).read_text(encoding="utf-8")
+                (fake_st01 / fname).write_text(content, encoding="utf-8")
+                subset_expected[gen_suite.SUITE_DIR / st01_slug / fname] = content
+            (fake_st01 / "README.md").write_text(
+                generate_scenario_readme.generate_readme_for_scenario(fake_st01), encoding="utf-8"
+            )
+            with mock.patch.object(gen_suite, "build_expected_suite_files", return_value=subset_expected):
+                self.assertEqual(gen_suite.check_suite_sync(fake_suite), [])
+
+                # Extra stale scenario directory + extra unexpected file inside scenario dir.
+                extra_dir = fake_suite / "st99-stale-scenario"
+                extra_dir.mkdir()
+                extra_file = fake_st01 / "stray.tmp"
+                extra_file.write_text("oops\n", encoding="utf-8")
+                drifted = gen_suite.check_suite_sync(fake_suite)
+                self.assertTrue(any("EXTRA SCENARIO DIR:" in item and "st99-stale-scenario" in item for item in drifted), drifted)
+                self.assertTrue(any("EXTRA SCENARIO FILE:" in item and "stray.tmp" in item for item in drifted), drifted)
+
+                # Missing README and drifted infra.json.
+                extra_dir.rmdir()
+                extra_file.unlink()
+                (fake_st01 / "README.md").unlink()
+                (fake_st01 / "infra.json").write_text("{}\n", encoding="utf-8")
+                drifted2 = gen_suite.check_suite_sync(fake_suite)
+                self.assertTrue(any("MISSING SCENARIO README:" in item for item in drifted2), drifted2)
+                self.assertTrue(any("DRIFTED:" in item and "infra.json" in item for item in drifted2), drifted2)
+
+        # 3. G1 tie-breaking (accel > cpu > memory), zero-capacity accel fallback, use_init=True fallback,
+        #    Sections 7.1 & 7.2 primary_sat_resource, and post_t0_fast_admitted promotion.
+        t0 = "2026-06-01T00:00:00Z"
+        t10 = "2026-06-01T00:00:10Z"
+        with tempfile.TemporaryDirectory() as tmp:
+            # 3a. Exact ratio tie between TPU (4/4 = 1.0), CPU (16/16 = 1.0), memory (64/64 = 1.0) => picks accelerator!
+            sc_tie = Path(tmp) / "tie"
+            sc_tie.mkdir()
+            self._write_jsonl(sc_tie / "infra.json", self._base_tpu_infra(t0, node_count=1))
+            self._write_jsonl(
+                sc_tie / "workflows.json",
+                [
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "workloadState": "NotAdmitted",
+                        "payload": {
+                            "objectKind": "Job",
+                            "name": "j-tie",
+                            "namespace": "team-a",
+                            "localQueueName": "lq-main",
+                            "object": {
+                                "apiVersion": "batch/v1",
+                                "kind": "Job",
+                                "metadata": {
+                                    "name": "j-tie",
+                                    "namespace": "team-a",
+                                    "annotations": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "10"},
+                                },
+                                "spec": {
+                                    "parallelism": 1,
+                                    "template": {
+                                        "spec": {
+                                            "containers": [
+                                                {
+                                                    "name": "c",
+                                                    "resources": {
+                                                        "requests": {
+                                                            "cpu": "16",
+                                                            "memory": "64Gi",
+                                                            "google.com/tpu": "4",
+                                                        }
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    },
+                                },
+                            },
+                        },
+                    }
+                ],
+            )
+            self._write_jsonl(sc_tie / "execution-time.json", [])
+            self.assertEqual(generate_scenario_readme.analyze_scenario(sc_tie).primary_sat_resource, "google.com/tpu")
+
+            # 3b. Zero-capacity accelerator with 0 unadmitted workloads and only t0 init pods (use_init=True -> memory).
+            sc_init = Path(tmp) / "init_only_zero_accel"
+            sc_init.mkdir()
+            self._write_jsonl(
+                sc_init / "infra.json",
+                [
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "payload": {
+                            "apiVersion": "v1",
+                            "kind": "Node",
+                            "metadata": {"name": "n-0"},
+                            "status": {
+                                "capacity": {"cpu": "16", "memory": "64Gi", "pods": "110", "nvidia.com/gpu": "0"},
+                                "allocatable": {"cpu": "16", "memory": "64Gi", "pods": "110", "nvidia.com/gpu": "0"},
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "payload": {
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "name": "init-mem-0",
+                            "namespace": "team-a",
+                            "placement": "n-0",
+                            "schedulingTime": t0,
+                            "resourceRequest": {"cpu": "2", "memory": "32Gi", "nvidia.com/gpu": "1"},
+                        },
+                    },
+                ],
+            )
+            self._write_jsonl(sc_init / "workflows.json", [])
+            self._write_jsonl(sc_init / "execution-time.json", [])
+            a_init = generate_scenario_readme.analyze_scenario(sc_init)
+            self.assertEqual(a_init.primary_sat_resource, "memory")
+
+            # 3c. CPU-bound scenario with accelerators + non-zero T_test + post_t0_fast_admitted arrival.
+            sc_cpu = Path(tmp) / "cpu_bound_with_accel_and_fast_adm"
+            sc_cpu.mkdir()
+            self._write_jsonl(sc_cpu / "infra.json", self._base_tpu_infra(t0, node_count=2))
+            self._write_jsonl(
+                sc_cpu / "workflows.json",
+                [
+                    {
+                        "timestamp": t0,
+                        "eventType": "New",
+                        "workloadState": "NotAdmitted",
+                        "payload": {
+                            "objectKind": "Job",
+                            "name": "j-0",
+                            "namespace": "team-a",
+                            "creationTime": t0,
+                            "localQueueName": "lq-main",
+                            "object": {
+                                "apiVersion": "batch/v1",
+                                "kind": "Job",
+                                "metadata": {
+                                    "name": "j-0",
+                                    "namespace": "team-a",
+                                    "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                                    "annotations": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "20"},
+                                },
+                                "spec": {
+                                    "parallelism": 1,
+                                    "template": {
+                                        "spec": {
+                                            "containers": [
+                                                {
+                                                    "name": "c",
+                                                    "resources": {
+                                                        "requests": {
+                                                            "cpu": "16",
+                                                            "memory": "16Gi",
+                                                            "google.com/tpu": "1",
+                                                        }
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    # Post-t0 fast-admitted Job at t0 + 10s (workloadState == "Admitted") => promoted to unadmitted_wfs!
+                    {
+                        "timestamp": t10,
+                        "eventType": "New",
+                        "workloadState": "Admitted",
+                        "payload": {
+                            "objectKind": "Job",
+                            "name": "j-fast-1",
+                            "namespace": "team-a",
+                            "creationTime": t10,
+                            "localQueueName": "lq-main",
+                            "object": {
+                                "apiVersion": "batch/v1",
+                                "kind": "Job",
+                                "metadata": {
+                                    "name": "j-fast-1",
+                                    "namespace": "team-a",
+                                    "labels": {"kueue.x-k8s.io/queue-name": "lq-main"},
+                                    "annotations": {"kueue-optimizer.gke.io/pod-execution-time-seconds": "20"},
+                                },
+                                "spec": {
+                                    "parallelism": 1,
+                                    "template": {
+                                        "spec": {
+                                            "containers": [
+                                                {
+                                                    "name": "c",
+                                                    "resources": {
+                                                        "requests": {
+                                                            "cpu": "16",
+                                                            "memory": "16Gi",
+                                                            "google.com/tpu": "1",
+                                                        }
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    },
+                                },
+                            },
+                        },
+                    },
+                ],
+            )
+            self._write_jsonl(sc_cpu / "execution-time.json", [])
+            a_cpu = generate_scenario_readme.analyze_scenario(sc_cpu)
+            b_cpu = testrunner.load_scenario_bundle(sc_cpu, skip_initial_offset=False)
+            self.assertEqual(len(a_cpu.admitted_at_start_wfs), 0)
+            self.assertEqual(len(a_cpu.unadmitted_wfs), 2)
+            self.assertEqual(len(b_cpu.scheduled_workflows), 2)
+            self.assertEqual(a_cpu.primary_sat_resource, "cpu")
+            md_cpu = generate_scenario_readme.generate_readme_for_scenario(sc_cpu)
+            # Section 7.1: Offered Core-Hours; CPU saturation (200.00%) bolded, TPU saturation (50.00%) NOT bolded on priority row.
+            self.assertIn("| Offered Core-Hours | `google.com/tpu` Saturation | `cpu` Saturation | `memory` Saturation |", md_cpu)
+            self.assertIn("| 50.00% | **200.00%** | 50.00% |", md_cpu)
+            # Section 7.2: Uses primary_sat_resource (`cpu`) for Offered / Cluster / Target CQ Nominal saturation.
+            self.assertIn("| Offered Core-Hours | Cluster `cpu` Saturation | Target CQ Nominal `cpu` Saturation |", md_cpu)
+            self.assertIn("| **200.00%** | **200.00%** | `<default>`:2 |", md_cpu)
+
+        # 4. Section 4 kind labels reflect actual workload kinds (Deployment in st89/st90, mixed kinds in st50).
+        md89 = generate_scenario_readme.generate_readme_for_scenario(
+            suite_dir / "st89-deployment-t0-partial-status-and-preemption"
+        )
+        md90 = generate_scenario_readme.generate_readme_for_scenario(
+            suite_dir / "st90-deployment-t0-delete-and-recreate-lifecycle"
+        )
+        md50 = generate_scenario_readme.generate_readme_for_scenario(
+            suite_dir / "st50-scale-quota-mixed-apis-infra-128n-1064w"
+        )
+        self.assertIn("pre-existing `Admitted` `Deployment` warmup workflow object(s) at $t_0$.", md89)
+        self.assertIn("pre-existing `Admitted` `Deployment` warmup workflow object(s) at $t_0$.", md90)
+        self.assertIn("(16 `Deployment`, 16 `Job`, 16 `JobSet`, 16 `PodGroup`)", md50)
+
+
 if __name__ == "__main__":
     unittest.main()

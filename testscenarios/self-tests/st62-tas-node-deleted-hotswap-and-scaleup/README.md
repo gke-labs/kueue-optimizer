@@ -8,42 +8,42 @@
 | :--- | :--- |
 | **Scenario Directory** | `testscenarios/self-tests/st62-tas-node-deleted-hotswap-and-scaleup` |
 | **Raw Event Counts** | `infra.json`: **16** events · `workflows.json`: **4** events · `execution-time.json`: **8** events |
-| **Cluster Capacity** | **9 nodes** · `144 cores` · `576 GiB` · `36` `google.com/tpu` (1 distinct node group) |
+| **Cluster Capacity** | **8 nodes** · `128 cores` · `512 GiB` · `32` `google.com/tpu` (1 distinct node group; +2 post-$t_0$ `Node` event(s): 1 `Deleted`, 1 `New`) |
 | **Topology Configuration** | **1** `Topology` CRD(s) (`st-slice-topology`) |
-| **Initial In-Flight Pods at $t_0$** | **0** pods across **0** / 9 nodes (initial `google.com/tpu` utilization: **0.00%**) |
+| **Initial In-Flight Pods at $t_0$** | **0** pods across **0** / 8 nodes (initial `google.com/tpu` utilization: **0.00%**) |
 | **Kueue Objects** | **1** `ResourceFlavor`(s) · **0** `Cohort`(s) · **1** `ClusterQueue`(s) · **1** `LocalQueue`(s) · **1** `WorkloadPriorityClass`(es) |
 | **Test Arrival Window ($T_{\text{test}}$)** | **9.0s** (`2026-06-01T00:00:00Z` $\rightarrow$ `2026-06-01T00:00:09Z`) |
 | **Unadmitted Workloads** | **4** `NotAdmitted` arrivals (14 total pods; gang size min=3, p50=3, p90=4, max=4) + **0** pre-admitted at $t_0$ |
 | **Execution Duration Quantiles** | `min=10s`, `P50=12s`, `AVG=12s`, `P90=14s`, `P99=14s`, `max=14s` |
-| **1. Saturation (Arrival Window $T_{\text{test}}$)** | `google.com/tpu`: **202.47%** · `cpu`: **101.23%** · `memory`: **101.23%** *(over $T_{\text{test}} = 9.0s$)* |
-| **2. Saturation (Reference `6h` / `21,600s` Window)** | `google.com/tpu`: **0.08%** · `cpu`: **0.04%** · `memory`: **0.04%** *(over $T_{6\text{h}} = 21{,}600\text{s}$)* |
-| **3. Recommended `100%` Saturation Settings (`5m` & `10m`)** | **5m (`300s`)**: `--speedup 0.061 --duration 5m` · **10m (`600s`)**: `--speedup 0.030 --duration 10m` *(bottleneck: `google.com/tpu`, $T_{100\%} = 18.2s$)* |
+| **1. Saturation (Arrival Window $T_{\text{test}}$)** | `google.com/tpu`: **227.78%** · `cpu`: **113.89%** · `memory`: **113.89%** *(over $T_{\text{test}} = 9.0s$)* |
+| **2. Saturation (Reference `6h` / `21,600s` Window)** | `google.com/tpu`: **0.09%** · `cpu`: **0.05%** · `memory`: **0.05%** *(over $T_{6\text{h}} = 21{,}600\text{s}$)* |
+| **3. Recommended `100%` Saturation Settings (`5m` & `10m`)** | **5m (`300s`)**: `--speedup 0.068 --duration 5m` · **10m (`600s`)**: `--speedup 0.034 --duration 10m` *(bottleneck: `google.com/tpu`, $T_{100\%} = 20.5s$)* |
 
 ---
 
 ## 2. Cluster Nodes & Distinct Node Groups
 
-The cluster contains **9** `v1/Node` objects partitioned into **1** distinct hardware/label configuration group(s).
+The cluster contains **8** `v1/Node` objects partitioned into **1** distinct hardware/label configuration group(s).
 
 ### 2.1 Aggregate Physical Cluster Capacity & Allocatable Resources
 
 | Resource | Total Capacity | Total Allocatable | Per-Node Average (Capacity) |
 | :--- | ---: | ---: | ---: |
-| `nodes` | **9** | **9** | `1` |
-| `cpu` | **144 cores** | **144 cores** | 16 cores |
-| `memory` | **576 GiB** | **576 GiB** | 64 GiB |
-| `pods` | **990** | **990** | 110 |
-| `google.com/tpu` | **36** | **36** | 4 |
+| `nodes` | **8** | **8** | `1` |
+| `cpu` | **128 cores** | **128 cores** | 16 cores |
+| `memory` | **512 GiB** | **512 GiB** | 64 GiB |
+| `pods` | **880** | **880** | 110 |
+| `google.com/tpu` | **32** | **32** | 4 |
 
 ### 2.2 Summary of Distinct Node Groups
 
 | Group | Node Count | Share | Sample Node Name | `cpu` / Node | `memory` / Node | `pods` / Node | `google.com/tpu` / Node | Key Identifying Labels |
 | :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: | :--- |
-| **Group 1: accel=`tpu-v7x-st`** | **9** | 100.0% | `st-node-00` | `16` | `64Gi` | `110` | 4 | `cloud.google.com/gke-tpu-accelerator=tpu-v7x-st`, `kubernetes.io/role=agent`, `kueue-optimizer.gke.io/node-role=agent`, `type=kwok` |
+| **Group 1: accel=`tpu-v7x-st`** | **8** | 100.0% | `st-node-00` | `16` | `64Gi` | `110` | 4 | `cloud.google.com/gke-tpu-accelerator=tpu-v7x-st`, `kubernetes.io/role=agent`, `kueue-optimizer.gke.io/node-role=agent`, `type=kwok` |
 
 ### 2.3 Sample Node Manifest (YAML) from Each Distinct Group
 
-#### Group 1: accel=`tpu-v7x-st` — Sample Node `st-node-00` (9 nodes in group)
+#### Group 1: accel=`tpu-v7x-st` — Sample Node `st-node-00` (8 nodes in group)
 
 ```yaml
 apiVersion: v1
@@ -122,25 +122,25 @@ spec:
 
 | Level | Topology Label (`nodeLabel`) | Distinct Domains | Nodes w/ Label | Min Nodes/Domain | Median (P50) | Mean Nodes/Domain | Max Nodes/Domain | Domain Balance | Sample Domain Counts |
 | :---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |
-| `L1` | `cloud.google.com/gce-topology-block` | **1** | `9 / 9` | `9` | `9` | `9.0` | `9` | Uniform | `st-block-00` (9) |
-| `L2` | `cloud.google.com/gke-tpu-partition-4x4x4-id` | **1** | `9 / 9` | `9` | `9` | `9.0` | `9` | Uniform | `b00-c00` (9) |
-| `L3` | `cloud.google.com/gke-tpu-partition-2x4x4-id` | **1** | `9 / 9` | `9` | `9` | `9.0` | `9` | Uniform | `b00-c00-p244-0` (9) |
-| `L4` | `cloud.google.com/gke-tpu-partition-2x2x4-id` | **2** | `9 / 9` | `4` | `4` | `4.5` | `5` | Asymmetric (`4..5`) | 1 domain × 5 nodes, 1 domain × 4 nodes |
-| `L5` | `cloud.google.com/gke-tpu-partition-2x2x2-id` | **5** | `9 / 9` | `1` | `2` | `1.8` | `2` | Asymmetric (`1..2`) | 4 domains × 2 nodes, 1 domain × 1 nodes |
-| `L6` | `cloud.google.com/gke-tpu-partition-2x2x1-id` | **9** | `9 / 9` | `1` | `1` | `1.0` | `1` | Uniform | `b00-c00-p221-00` (1), `b00-c00-p221-01` (1), `b00-c00-p221-02` (1), … (9x `1` nodes) |
-| `L7` | `kubernetes.io/hostname` | **9** | `9 / 9` | `1` | `1` | `1.0` | `1` | Uniform | `st-node-00` (1), `st-node-01` (1), `st-node-02` (1), … (9x `1` nodes) |
+| `L1` | `cloud.google.com/gce-topology-block` | **1** | `8 / 8` | `8` | `8` | `8.0` | `8` | Uniform | `st-block-00` (8) |
+| `L2` | `cloud.google.com/gke-tpu-partition-4x4x4-id` | **1** | `8 / 8` | `8` | `8` | `8.0` | `8` | Uniform | `b00-c00` (8) |
+| `L3` | `cloud.google.com/gke-tpu-partition-2x4x4-id` | **1** | `8 / 8` | `8` | `8` | `8.0` | `8` | Uniform | `b00-c00-p244-0` (8) |
+| `L4` | `cloud.google.com/gke-tpu-partition-2x2x4-id` | **2** | `8 / 8` | `4` | `4` | `4.0` | `4` | Uniform | `b00-c00-p224-0` (4), `b00-c00-p224-1` (4) |
+| `L5` | `cloud.google.com/gke-tpu-partition-2x2x2-id` | **4** | `8 / 8` | `2` | `2` | `2.0` | `2` | Uniform | `b00-c00-p222-0` (2), `b00-c00-p222-1` (2), `b00-c00-p222-2` (2), … (4x `2` nodes) |
+| `L6` | `cloud.google.com/gke-tpu-partition-2x2x1-id` | **8** | `8 / 8` | `1` | `1` | `1.0` | `1` | Uniform | `b00-c00-p221-00` (1), `b00-c00-p221-01` (1), `b00-c00-p221-02` (1), … (8x `1` nodes) |
+| `L7` | `kubernetes.io/hostname` | **8** | `8 / 8` | `1` | `1` | `1.0` | `1` | Uniform | `st-node-00` (1), `st-node-01` (1), `st-node-02` (1), … (8x `1` nodes) |
 
 #### Hierarchical Tree Branching Summary (`st-slice-topology`)
 
 ```text
-Cluster Total: 9 nodes
-  └── L1 [cloud.google.com/gce-topology-block]: 1 total domains (1 domain(s) of 9 node(s))
-    └── L2 [cloud.google.com/gke-tpu-partition-4x4x4-id]: 1 total domains (1 domain(s) of 9 node(s))
-      └── L3 [cloud.google.com/gke-tpu-partition-2x4x4-id]: 1 total domains (1 domain(s) of 9 node(s))
-        └── L4 [cloud.google.com/gke-tpu-partition-2x2x4-id]: 2 total domains (1 domain(s) of 5 node(s), 1 domain(s) of 4 node(s))
-          └── L5 [cloud.google.com/gke-tpu-partition-2x2x2-id]: 5 total domains (4 domain(s) of 2 node(s), 1 domain(s) of 1 node(s))
-            └── L6 [cloud.google.com/gke-tpu-partition-2x2x1-id]: 9 total domains (9 domain(s) of 1 node(s))
-              └── L7 [kubernetes.io/hostname]: 9 total domains (9 domain(s) of 1 node(s))
+Cluster Total: 8 nodes
+  └── L1 [cloud.google.com/gce-topology-block]: 1 total domains (1 domain(s) of 8 node(s))
+    └── L2 [cloud.google.com/gke-tpu-partition-4x4x4-id]: 1 total domains (1 domain(s) of 8 node(s))
+      └── L3 [cloud.google.com/gke-tpu-partition-2x4x4-id]: 1 total domains (1 domain(s) of 8 node(s))
+        └── L4 [cloud.google.com/gke-tpu-partition-2x2x4-id]: 2 total domains (2 domain(s) of 4 node(s))
+          └── L5 [cloud.google.com/gke-tpu-partition-2x2x2-id]: 4 total domains (4 domain(s) of 2 node(s))
+            └── L6 [cloud.google.com/gke-tpu-partition-2x2x1-id]: 8 total domains (8 domain(s) of 1 node(s))
+              └── L7 [kubernetes.io/hostname]: 8 total domains (8 domain(s) of 1 node(s))
 ```
 
 ---
@@ -173,7 +173,7 @@ Cluster Total: 9 nodes
 | ClusterQueue | Cohort | Queueing Strategy | FS Weight | Flavors | Nominal `cpu` | Nominal `memory` | Nominal `google.com/tpu` | Borrowing / Lending Limits | Preemption Policy (`withinCQ` / `reclaim` / `borrow`) |
 | :--- | :--- | :--- | :---: | :--- | ---: | ---: | ---: | :--- | :--- |
 | `cq-tas-del` | `*(standalone)*` | `BestEffortFIFO` | `1` | `st-tpu-flavor` | **128 cores** | **512 GiB** | **32** | unbounded (default) | `Never` / `Never` / `Never` |
-| **Total Nominal Quota (CQs + Cohort)** | — | — | — | — | **128 cores** (88.9% of cluster) | **512 GiB** (88.9% of cluster) | **32** (88.9% of cluster) | — | — |
+| **Total Nominal Quota (CQs + Cohort)** | — | — | — | — | **128 cores** (100.0% of cluster) | **512 GiB** (100.0% of cluster) | **32** (100.0% of cluster) | — | — |
 
 ### 5.4 Namespaces & LocalQueues (`Namespace` & `LocalQueue`)
 
@@ -227,37 +227,37 @@ $$\text{Sat}_{\text{window}}(r) = \frac{W(r)}{T_{\text{window}} \times C_{\text{
 
 | Resource ($r$) | Physical Cluster Capacity $C_{\text{cluster}}(r)$ | Total Offered Work ($1.0\text{x}$) | Ideal `100%`-Util Service Time $T_{100\%}(r)$ | (1) Saturation over Arrival Window ($T_{\text{test}} = 9.0s$) | (2) Saturation over Default `6h` ($21{,}600\text{s}$) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **`google.com/tpu`** *(bottleneck)* | 36 | `0.18` `google.com/tpu`-h | `18.2s` | **202.47%** | **0.08%** |
-| `cpu` | 144 cores | `0.36` core-h | `9.1s` | 101.23% | 0.04% |
-| `memory` | 576 GiB | `1.46` GiB-h | `9.1s` | 101.23% | 0.04% |
+| **`google.com/tpu`** *(bottleneck)* | 32 | `0.18` `google.com/tpu`-h | `20.5s` | **227.78%** | **0.09%** |
+| `cpu` | 128 cores | `0.36` core-h | `10.2s` | 113.89% | 0.05% |
+| `memory` | 512 GiB | `1.46` GiB-h | `10.2s` | 113.89% | 0.05% |
 
 #### Part 3 — Recommended `testrunner.py` Settings for `100%` Saturation in `5m` (`300s`) & `10m` (`600s`)
 
 | Target Wall-Clock Window ($T_{\text{target}}$) | Bottleneck Resource ($r^*$) | Recommended `--speedup` ($N_{100\%}$) | Recommended `--duration` | Compressed Arrival Span ($T_{\text{test}} / N_{100\%}$) | Execution & Drain Behavior |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`5m` (`300s`)** | `google.com/tpu` | **`--speedup 0.061`** | **`--duration 5m`** | `148.2s` | All arrivals submit within `148.2s` (≤ `300s`); `--duration 5m` captures `100%` of arrivals and `100.0%` full-cluster work in `5m`. |
-| **`10m` (`600s`)** | `google.com/tpu` | **`--speedup 0.030`** | **`--duration 10m`** | `296.3s` | All arrivals submit within `296.3s` (≤ `600s`); `--duration 10m` captures `100%` of arrivals and `100.0%` full-cluster work in `10m`. |
+| **`5m` (`300s`)** | `google.com/tpu` | **`--speedup 0.068`** | **`--duration 5m`** | `131.7s` | All arrivals submit within `131.7s` (≤ `300s`); `--duration 5m` captures `100%` of arrivals and `100.0%` full-cluster work in `5m`. |
+| **`10m` (`600s`)** | `google.com/tpu` | **`--speedup 0.034`** | **`--duration 10m`** | `263.4s` | All arrivals submit within `263.4s` (≤ `600s`); `--duration 10m` captures `100%` of arrivals and `100.0%` full-cluster work in `10m`. |
 
 ```bash
 # Run at 100% offered google.com/tpu saturation in a 5-minute (300s) wall-clock window:
-python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st62-tas-node-deleted-hotswap-and-scaleup --speedup 0.061 --duration 5m
+python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st62-tas-node-deleted-hotswap-and-scaleup --speedup 0.068 --duration 5m
 
 # Run at 100% offered google.com/tpu saturation in a 10-minute (600s) wall-clock window:
-python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st62-tas-node-deleted-hotswap-and-scaleup --speedup 0.030 --duration 10m
+python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st62-tas-node-deleted-hotswap-and-scaleup --speedup 0.034 --duration 10m
 ```
 
 ### 7.1 Workload Breakdown & Cluster Saturation by Priority Class
 
 | Priority Class | Priority Value | Workloads | Share | Total Pods | Gang Size (`min / P50 / P90 / max`) | Duration (`P50 / AVG / P90 / P99`) | Offered `google.com/tpu`-Hours | `google.com/tpu` Saturation | `cpu` Saturation | `memory` Saturation |
 | :--- | ---: | ---: | ---: | ---: | :---: | :---: | ---: | ---: | ---: | ---: |
-| `p-standard` | `100` | 4 | 100.0% | 14 | `3 / 3 / 4 / 4` | `12s / 12s / 14s / 14s` | 0.2 | **202.47%** | 101.23% | 101.23% |
-| **ALL (Total)** | — | **4** | 100.0% | 14 | `3 / 3 / 4 / 4` | `12s / 12s / 14s / 14s` | 0.2 | **202.47%** | **101.23%** | **101.23%** |
+| `p-standard` | `100` | 4 | 100.0% | 14 | `3 / 3 / 4 / 4` | `12s / 12s / 14s / 14s` | 0.2 | **227.78%** | 113.89% | 113.89% |
+| **ALL (Total)** | — | **4** | 100.0% | 14 | `3 / 3 / 4 / 4` | `12s / 12s / 14s / 14s` | 0.2 | **227.78%** | **113.89%** | **113.89%** |
 
 ### 7.2 Workload Dissection per `LocalQueue` (and Target `ClusterQueue`)
 
 | LocalQueue (`ns/name`) | Target `ClusterQueue` | Workloads | Share | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Offered `google.com/tpu`-h | Cluster `google.com/tpu` Saturation | Target CQ Nominal Quota Saturation | Priority Breakdown (Count) |
 | :--- | :--- | ---: | ---: | ---: | :---: | ---: | ---: | ---: | :--- |
-| `st-workloads/lq-tas-del` | `cq-tas-del` | **4** | 100.0% | 14 | `12s / 12s / 14s / 14s` | 0.2 | **202.47%** | **227.78%** | `p-standard`:4 |
+| `st-workloads/lq-tas-del` | `cq-tas-del` | **4** | 100.0% | 14 | `12s / 12s / 14s / 14s` | 0.2 | **227.78%** | **227.78%** | `p-standard`:4 |
 
 #### Detailed Per-`LocalQueue` × Priority Dissection
 
@@ -266,7 +266,7 @@ python3 deploy/scripts/testrunner.py --scenario testscenarios/self-tests/st62-ta
 
 | Priority Class | Priority Value | Workloads | Share of LQ | Total Pods | Duration (`P50 / AVG / P90 / P99`) | Cluster `google.com/tpu` Saturation | Cluster `cpu` Saturation |
 | :--- | ---: | ---: | ---: | ---: | :---: | ---: | ---: |
-| `p-standard` | `100` | **4** | 100.0% | 14 | `12s / 12s / 14s / 14s` | 202.47% | 101.23% |
+| `p-standard` | `100` | **4** | 100.0% | 14 | `12s / 12s / 14s / 14s` | 227.78% | 113.89% |
 
 </details>
 

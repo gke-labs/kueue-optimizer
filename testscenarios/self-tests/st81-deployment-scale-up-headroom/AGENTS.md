@@ -15,7 +15,7 @@
 - **Title**: `Deployment` Scale-Up (`2 -> 6` Replicas) With Full `ClusterQueue` Headroom
 - **Primary Verification Target**: Verifies post-`t0` `Deployment` `ScaleUp` (`updateTypes: ['ScaleUp']`, `replicas: 2 -> 6` at `t=+10s`) creates `4` additional per-pod Kueue `Workload`s that admit immediately onto `16`-TPU `ClusterQueue` (`0` pending, long-running pods never prematurely terminated by KWOK `Stage/pod-complete`)
 - **Dedicated `kueue-optimizer` Chamber Namespace**: `kueue-optimizer-chamber-st81` (`--namespace kueue-optimizer-chamber-st81`)
-- **Dedicated Local Port Allocation**: KWOK API `--port 16481` | Prometheus `19128` (collision-free across all 45 scenarios `st01`–`st45`)
+- **Dedicated Local Port Allocation**: KWOK API `--port 16481` | Prometheus `19128` (collision-free across all 95 scenarios `st01`–`st95`)
 - **Mandatory Paired Counterpart(s)**: [`st82-deployment-scale-up-quota-cap`](../st82-deployment-scale-up-quota-cap/AGENTS.md)
 - **Suite Master Protocol**: See [`../AGENTS.md`](../AGENTS.md) and [`../README.md`](../README.md); auto-generated static stats in [`README.md`](README.md).
 
@@ -27,7 +27,7 @@
 
 ### Option A: Parallel Side-by-Side Execution in Separate `kueue-optimizer` Chambers
 
-Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st45`) and non-overlapping port pair (`16401/19048` .. `16445/19092`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
+Because every scenario in `testscenarios/self-tests/` has its own unique `kueue-optimizer` chamber namespace (`kueue-optimizer-chamber-st01` .. `kueue-optimizer-chamber-st95`) and non-overlapping port pair (`16401/19048` .. `16495/19142`), you can fire this scenario and its paired counterpart(s) **concurrently in separate chambers** with zero cross-contamination:
 
 ```bash
 # Launch ST81 in dedicated kueue-optimizer chamber 'kueue-optimizer-chamber-st81' (API port 16481, Prom port 19128):
