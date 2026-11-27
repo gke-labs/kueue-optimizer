@@ -93,7 +93,7 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 ### Detailed Metric Checkpoints
 
 - `Section 5.1`: `AVG ~95%–100%` (`16/16` TPUs across 2 waves).
-- `Section 5.2`: `p-std` `WORKLOADS=8`, Wave 1 `~0s–1s`, Wave 2 `~10s–11s`, `AVG ~5.0s–6.5s`.
+- `Section 5.2`: `p-std` `ADMISSIONS=8`, Wave 1 `~0s–1s`, Wave 2 `~10s–11s`, `AVG ~5.0s–6.5s`.
 - `Section 5.3`: **`0`** evictions.
 - `Section 5.4`: `Qualifying Workloads: 8 (completed=8)`, `EFFECTIVE SAT ~90%–100%` (matching `st92`).
 

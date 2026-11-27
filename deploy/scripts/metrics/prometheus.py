@@ -28,6 +28,33 @@ import urllib.parse
 import urllib.request
 
 
+DEFAULT_MAX_QUERY_RANGE_POINTS = 10_000
+
+
+def compute_effective_step(
+    range_start: float,
+    query_end: float,
+    requested_step: float = 1.0,
+    *,
+    max_points: int = DEFAULT_MAX_QUERY_RANGE_POINTS,
+) -> float:
+    """Return a query_range step >= requested_step keeping point count <= max_points.
+
+    Prometheus returns ``floor((end - start) / step) + 1`` points (inclusive endpoints) and
+    rejects ``/api/v1/query_range`` requests exceeding 11,000 points per series with HTTP 400.
+    Keeping the effective step within 10,000 points leaves headroom while keeping ``step=1.0s``
+    unchanged for runs up to ~2.7 hours.
+    """
+    base_step = requested_step if requested_step > 0 else 1.0
+    span = max(0.0, query_end - range_start)
+    if max_points <= 0 or span <= 0.0:
+        return base_step
+    max_intervals = max(1, max_points - 1)
+    if int(math.floor(span / base_step + 1e-9)) + 1 <= max_points:
+        return base_step
+    return max(base_step, float(math.ceil(span / float(max_intervals))))
+
+
 class PrometheusClient:
     """Queries Prometheus via local HTTP port-forward (auto-started if needed) or kubectl proxy."""
 

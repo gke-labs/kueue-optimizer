@@ -35,14 +35,19 @@ Run with:
 
 from __future__ import annotations
 
+import contextlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
+import json
 import math
 import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -2259,6 +2264,720 @@ class TestSection54SaturationFixesM1ToM4(unittest.TestCase):
             self.assertIsNotNone(snap_static)
             assert snap_static is not None
             self.assertNotIn("nodeCapacityTimeline", snap_static)
+        finally:
+            mgr.close()
+
+
+class TestPrometheusAggregationFixesM5ToM10(unittest.TestCase):
+    """Table-driven unit tests covering Prometheus aggregation and query fixes M5-M10."""
+
+    @staticmethod
+    def _build_wait_histogram_snapshot(
+        labels_list: list[tuple[dict[str, str], list[float]]],
+        ts: float,
+        metric_name: str = "kueue_admission_wait_time_seconds",
+    ) -> dict[str, list[dict]]:
+        les = [1.0, 2.5, 5.0, 10.0, 20.0, 40.0, math.inf]
+        out: dict[str, list[dict]] = {
+            f"{metric_name}_bucket": [],
+            f"{metric_name}_sum": [],
+            f"{metric_name}_count": [],
+        }
+        for labels, obs in labels_list:
+            for le in les:
+                cnt = sum(1 for v in obs if v <= le)
+                le_str = "+Inf" if math.isinf(le) else f"{le:g}"
+                out[f"{metric_name}_bucket"].append({"metric": {**labels, "le": le_str}, "value": [ts, str(cnt)]})
+            out[f"{metric_name}_sum"].append({"metric": dict(labels), "value": [ts, str(sum(obs))]})
+            out[f"{metric_name}_count"].append({"metric": dict(labels), "value": [ts, str(len(obs))]})
+        return out
+
+    def test_M5_histogram_counter_reset_full_and_partial_shared_by_section_3_and_5_2(self) -> None:
+        """M5: Section 3 and Section 5.2 share reset-aware histogram deltas across full, partial, and HA resets."""
+        spec = kmr.MetricSpec(
+            section="ClusterQueue Status",
+            name="kueue_admission_wait_time_seconds",
+            metric_type=kmr.MetricType.HISTOGRAM,
+            labels=("cluster_queue", "priority_class"),
+            description="Wait time",
+        )
+        lab_leader = {
+            "cluster_queue": "cq",
+            "priority_class": "high",
+            "instance": "kueue-0:8443",
+            "replica_role": "leader",
+        }
+        lab_follower = {
+            "cluster_queue": "cq",
+            "priority_class": "high",
+            "instance": "kueue-1:8443",
+            "replica_role": "follower",
+        }
+        cases = [
+            (
+                "full_reset_end_below_start",
+                [(lab_leader, [3.0] * 100)],
+                [(lab_leader, [30.0] * 40)],
+                ("30.00s", "38.00s", "40.00s", "30.00s", "40", "<=40s:40"),
+                ["high", "30.00s", "38.00s", "39.80s", "30.00s", "40"],
+                True,
+            ),
+            (
+                "partial_reset_only_low_bucket_decreases",
+                [(lab_leader, [3.0] * 100)],
+                [(lab_leader, [3.0] * 60 + [30.0] * 60)],
+                ("5.00s", "36.00s", "40.00s", "16.50s", "120", "<=5s:60, <=40s:60"),
+                ["high", "5.00s", "36.00s", "39.60s", "16.50s", "120"],
+                True,
+            ),
+            (
+                "ha_leader_restarts_while_follower_is_monotonic",
+                [(lab_leader, [3.0] * 100), (lab_follower, [3.0] * 20)],
+                [(lab_leader, [30.0] * 10), (lab_follower, [3.0] * 30)],
+                ("5.00s", "36.00s", "40.00s", "16.50s", "20", "<=5s:10, <=40s:10"),
+                ["high", "5.00s", "36.00s", "39.60s", "16.50s", "20"],
+                True,
+            ),
+            (
+                "monotonic_no_reset_emits_no_warning",
+                [(lab_leader, [3.0] * 10)],
+                [(lab_leader, [3.0] * 10 + [30.0] * 10)],
+                ("30.00s", "38.00s", "40.00s", "30.00s", "10", "<=40s:10"),
+                ["high", "30.00s", "38.00s", "39.80s", "30.00s", "10"],
+                False,
+            ),
+        ]
+        for case_name, start_series, end_series, expected_s3, expected_s52, expect_warn in cases:
+            with self.subTest(case=case_name):
+                start_by = self._build_wait_histogram_snapshot(start_series, ts=999.0)
+                end_by = self._build_wait_histogram_snapshot(end_series, ts=2000.0)
+                s3_warns: list[str] = []
+                s3_rows = kmr.report_histogram(end_by, start_by, spec, reset_warnings=s3_warns)
+                self.assertEqual(len(s3_rows), 1)
+                self.assertEqual(s3_rows[0][1:], expected_s3)
+                self.assertEqual(bool(s3_warns), expect_warn)
+
+                s52_warns: list[str] = []
+                s52_rows = kmr.report_aggregated_wait_time_by_priority(
+                    end_by, start_by, reset_warnings=s52_warns
+                )
+                self.assertEqual(s52_rows, [expected_s52])
+                self.assertEqual(bool(s52_warns), expect_warn)
+
+    def test_M6_section_5_3_exact_reclaim_classification_and_configurable_preemption(self) -> None:
+        """M6: Exact reclaim matching avoids substring false positives and accounts for ConfigurablePreemption."""
+        cases = [
+            (
+                "configurable_preemption_included_in_preemption_details",
+                {
+                    "kueue_evicted_workloads_total": [
+                        {
+                            "metric": {"cluster_queue": "cq-a", "reason": "Preempted", "priority_class": "low"},
+                            "values": [[1000.0, "0"], [1050.0, "9"]],
+                        }
+                    ],
+                    "kueue_evicted_workloads_once_total": [
+                        {
+                            "metric": {"cluster_queue": "cq-a", "reason": "Preempted", "priority_class": "low"},
+                            "values": [[1000.0, "0"], [1050.0, "9"]],
+                        }
+                    ],
+                    "kueue_preempted_workloads_total": [
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-b", "reason": "InCohortReclamation"},
+                            "values": [[1000.0, "0"], [1050.0, "3"]],
+                        },
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-a", "reason": "InClusterQueue"},
+                            "values": [[1000.0, "0"], [1050.0, "2"]],
+                        },
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-b", "reason": "ConfigurablePreemption"},
+                            "values": [[1000.0, "0"], [1050.0, "4"]],
+                        },
+                    ],
+                },
+                ("9", "3", "InCohortReclamation=3, InCohortReclaimWhileBorrowing=0", "9",
+                 "InClusterQueue=2, Reclaims=3, FairSharing=0, ConfigurablePreemption=4"),
+            ),
+            (
+                "configurable_preemption_rule_named_reclaim_not_counted_as_cohort_reclaim",
+                {
+                    "kueue_evicted_workloads_total": [
+                        {
+                            "metric": {
+                                "cluster_queue": "cq-a",
+                                "reason": "Preempted",
+                                "underlying_cause": "reclaim-idle-gpus",
+                                "priority_class": "low",
+                            },
+                            "values": [[1000.0, "0"], [1050.0, "4"]],
+                        }
+                    ],
+                    "kueue_preempted_workloads_total": [
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-b", "reason": "ConfigurablePreemption"},
+                            "values": [[1000.0, "0"], [1050.0, "4"]],
+                        }
+                    ],
+                },
+                ("4", "0", "InCohortReclamation=0, InCohortReclaimWhileBorrowing=0", "4",
+                 "InClusterQueue=0, Reclaims=0, FairSharing=0, ConfigurablePreemption=4"),
+            ),
+            (
+                "reclaim_while_borrowing_fair_sharing_and_custom_reason_sum_cleanly",
+                {
+                    "kueue_evicted_workloads_total": [],
+                    "kueue_preempted_workloads_total": [
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-b", "reason": "InCohortReclaimWhileBorrowing"},
+                            "values": [[1000.0, "0"], [1050.0, "2"]],
+                        },
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-c", "reason": "InCohortFairSharing"},
+                            "values": [[1000.0, "0"], [1050.0, "3"]],
+                        },
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-d", "reason": "CustomRuleReason"},
+                            "values": [[1000.0, "0"], [1050.0, "1"]],
+                        },
+                    ],
+                },
+                ("0", "2", "InCohortReclamation=0, InCohortReclaimWhileBorrowing=2", "6",
+                 "InClusterQueue=0, Reclaims=2, FairSharing=3, CustomRuleReason=1"),
+            ),
+            (
+                "split_reclaim_reasons_across_preempted_and_evicted_match_detail_sum",
+                {
+                    "kueue_evicted_workloads_total": [
+                        {
+                            "metric": {
+                                "cluster_queue": "cq-a",
+                                "reason": "Preempted",
+                                "underlying_cause": "InCohortReclaimWhileBorrowing",
+                                "priority_class": "low",
+                            },
+                            "values": [[1000.0, "0"], [1050.0, "2"]],
+                        }
+                    ],
+                    "kueue_preempted_workloads_total": [
+                        {
+                            "metric": {"preempting_cluster_queue": "cq-b", "reason": "InCohortReclamation"},
+                            "values": [[1000.0, "0"], [1050.0, "3"]],
+                        }
+                    ],
+                },
+                ("2", "5", "InCohortReclamation=3, InCohortReclaimWhileBorrowing=2", "3",
+                 "InClusterQueue=0, Reclaims=3, FairSharing=0"),
+            ),
+        ]
+        for case_name, rng, expected in cases:
+            with self.subTest(case=case_name):
+                summary, _breakdown = kmr.report_aggregated_evictions_and_reclaims(rng, start=1000.0)
+                by_cat = _rows_by_key(summary, 0)
+                exp_evict, exp_reclaim, exp_reclaim_det, exp_preempt, exp_preempt_det = expected
+                self.assertEqual(by_cat["Total Evictions"][2], exp_evict)
+                self.assertEqual(by_cat["Total Reclaims"][2], exp_reclaim)
+                self.assertEqual(by_cat["Total Reclaims"][3], exp_reclaim_det)
+                self.assertEqual(by_cat["Total Preemptions"][2], exp_preempt)
+                self.assertEqual(by_cat["Total Preemptions"][3], exp_preempt_det)
+
+    def test_M7_section_5_1_cohort_owned_quota_and_mixed_standalone_cq_denominator(self) -> None:
+        """M7: ClusterQueue Quotas (All) includes cohort-owned quota without double-counting or exceeding 100%."""
+        ts_list = [1000.0 + 10 * i for i in range(6)]
+        cases = [
+            (
+                "cohort_owns_extra_nominal_quota",
+                {
+                    "kueue_cluster_queue_nominal_quota": [
+                        {"metric": {"cluster_queue": "cq-a", "cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "4"] for t in ts_list]},
+                        {"metric": {"cluster_queue": "cq-b", "cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "4"] for t in ts_list]},
+                    ],
+                    "kueue_cluster_queue_resource_usage": [
+                        {"metric": {"cluster_queue": "cq-a", "cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "8"] for t in ts_list]},
+                        {"metric": {"cluster_queue": "cq-b", "cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "4"] for t in ts_list]},
+                    ],
+                    "kueue_cohort_subtree_quota": [
+                        {"metric": {"cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "16"] for t in ts_list]},
+                    ],
+                    "kueue_cohort_subtree_resource_reservations": [
+                        {"metric": {"cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "12"] for t in ts_list]},
+                    ],
+                    "kueue_cohort_info": [
+                        {"metric": {"cohort": "root", "parent_cohort": ""}, "values": [[t, "1"] for t in ts_list]},
+                    ],
+                },
+                "75.00%",
+                "12.00 / 16.00",
+                {"ClusterQueue: cq-a": ("200.00%", "8.00 / 4.00"), "Cohort Quotas (All)": ("75.00%", "12.00 / 16.00")},
+            ),
+            (
+                "mixed_cohort_plus_standalone_cluster_queue",
+                {
+                    "kueue_cluster_queue_nominal_quota": [
+                        {"metric": {"cluster_queue": "cq-a", "cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "4"] for t in ts_list]},
+                        {"metric": {"cluster_queue": "cq-b", "cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "4"] for t in ts_list]},
+                        {"metric": {"cluster_queue": "cq-solo", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "4"] for t in ts_list]},
+                    ],
+                    "kueue_cluster_queue_resource_usage": [
+                        {"metric": {"cluster_queue": "cq-a", "cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "8"] for t in ts_list]},
+                        {"metric": {"cluster_queue": "cq-b", "cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "4"] for t in ts_list]},
+                        {"metric": {"cluster_queue": "cq-solo", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "2"] for t in ts_list]},
+                    ],
+                    "kueue_cohort_subtree_quota": [
+                        {"metric": {"cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "16"] for t in ts_list]},
+                    ],
+                    "kueue_cohort_subtree_resource_reservations": [
+                        {"metric": {"cohort": "root", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "12"] for t in ts_list]},
+                    ],
+                    "kueue_cohort_info": [
+                        {"metric": {"cohort": "root", "parent_cohort": ""}, "values": [[t, "1"] for t in ts_list]},
+                    ],
+                },
+                "70.00%",
+                "14.00 / 20.00",
+                {"ClusterQueue: cq-solo": ("50.00%", "2.00 / 4.00"), "Cohort Quotas (All)": ("75.00%", "12.00 / 16.00")},
+            ),
+            (
+                "zero_nominal_cqs_borrowing_from_cohort_emit_all_row",
+                {
+                    "kueue_cluster_queue_nominal_quota": [
+                        {"metric": {"cluster_queue": "cq-a", "cohort": "shared", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "0"] for t in ts_list]},
+                        {"metric": {"cluster_queue": "cq-b", "cohort": "shared", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "0"] for t in ts_list]},
+                    ],
+                    "kueue_cluster_queue_resource_usage": [
+                        {"metric": {"cluster_queue": "cq-a", "cohort": "shared", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "16"] for t in ts_list]},
+                        {"metric": {"cluster_queue": "cq-b", "cohort": "shared", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "16"] for t in ts_list]},
+                    ],
+                    "kueue_cohort_subtree_quota": [
+                        {"metric": {"cohort": "shared", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "32"] for t in ts_list]},
+                    ],
+                    "kueue_cohort_subtree_resource_reservations": [
+                        {"metric": {"cohort": "shared", "flavor": "f", "resource": "google.com/tpu"}, "values": [[t, "32"] for t in ts_list]},
+                    ],
+                },
+                "100.00%",
+                "32.00 / 32.00",
+                {"Cohort Quotas (All)": ("100.00%", "32.00 / 32.00")},
+            ),
+        ]
+        for case_name, rng, exp_all_avg, exp_all_used_quota, extra_checks in cases:
+            with self.subTest(case=case_name):
+                rows = kmr.report_aggregated_quota_utilization(rng, start=1000.0, end=1050.0)
+                by_scope = _rows_by_key(rows, 0)
+                self.assertEqual(by_scope["ClusterQueue Quotas (All)"][5], exp_all_avg)
+                self.assertEqual(by_scope["ClusterQueue Quotas (All)"][6], exp_all_used_quota)
+                for scope, (exp_avg, exp_uq) in extra_checks.items():
+                    self.assertEqual(by_scope[scope][5], exp_avg)
+                    self.assertEqual(by_scope[scope][6], exp_uq)
+
+    def test_M9_report_gauge_zero_fills_deleted_at_zero_series_with_step(self) -> None:
+        """M9: Gauge averaging anchors to observed scrapes, merges restarts, handles missing __name__, and uses inclusive grid."""
+        cases = [
+            (
+                "deleted_at_zero_cohort_reservations_inclusive_61_steps_fallback",
+                [
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                        },
+                        "values": [[1000.0 + i, "8"] for i in range(10)],
+                    }
+                ],
+                1000.0,
+                1060.0,
+                1.0,
+                "",
+                None,
+                ("0.00", "8.00", "8.00", "1.31"),
+            ),
+            (
+                "anchored_to_observed_scrapes_avoids_pre_first_scrape_startup_bias",
+                [
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                        },
+                        "values": [[1007.0 + i, "8"] for i in range(24)],
+                    }
+                ],
+                1000.0,
+                1030.0,
+                1.0,
+                "kueue_cohort_subtree_resource_reservations",
+                {1007.0 + i for i in range(24)},
+                ("8.00", "8.00", "8.00", "8.00"),
+            ),
+            (
+                "anchored_to_observed_scrapes_zero_fills_only_post_deletion_scrapes",
+                [
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                        },
+                        "values": [[1007.0 + i, "8"] for i in range(12)],
+                    }
+                ],
+                1000.0,
+                1030.0,
+                1.0,
+                "kueue_cohort_subtree_resource_reservations",
+                {1007.0 + i for i in range(24)},
+                ("4.00", "8.00", "8.00", "4.00"),
+            ),
+            (
+                "phase_shifted_full_series_anchored_adds_no_spurious_zeros",
+                [
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                        },
+                        "values": [[1002.0 + 4.0 * i, "8"] for i in range(15)],
+                    }
+                ],
+                1000.0,
+                1060.0,
+                4.0,
+                "kueue_cohort_subtree_resource_reservations",
+                {1002.0 + 4.0 * i for i in range(15)},
+                ("8.00", "8.00", "8.00", "8.00"),
+            ),
+            (
+                "controller_pod_restart_merges_two_instances_into_single_continuous_row",
+                [
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                            "instance": "kueue-0:8443",
+                        },
+                        "values": [[1007.0 + i, "8"] for i in range(12)],
+                    },
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                            "instance": "kueue-1:8443",
+                        },
+                        "values": [[1019.0 + i, "8"] for i in range(12)],
+                    },
+                ],
+                1000.0,
+                1030.0,
+                1.0,
+                "kueue_cohort_subtree_resource_reservations",
+                {1007.0 + i for i in range(24)},
+                ("8.00", "8.00", "8.00", "8.00"),
+            ),
+            (
+                "static_status_gauge_without_dunder_name_uses_metric_name_arg",
+                [
+                    {
+                        "metric": {
+                            "cluster_queue": "cq-a",
+                            "status": "active",
+                        },
+                        "values": [[1010.0 + i, "1"] for i in range(50)],
+                    }
+                ],
+                1000.0,
+                1060.0,
+                1.0,
+                "kueue_cluster_queue_status",
+                {1000.0 + i for i in range(61)},
+                ("1.00", "1.00", "1.00", "1.00"),
+            ),
+            (
+                "legacy_call_without_step_keeps_observed_sample_average",
+                [
+                    {
+                        "metric": {
+                            "__name__": "kueue_cohort_subtree_resource_reservations",
+                            "cohort": "root",
+                            "flavor": "f",
+                            "resource": "google.com/tpu",
+                        },
+                        "values": [[1000.0 + i, "8"] for i in range(10)],
+                    }
+                ],
+                1000.0,
+                1060.0,
+                None,
+                "",
+                None,
+                ("8.00", "8.00", "8.00", "8.00"),
+            ),
+        ]
+        for case_name, series, start, end, step, mname, obs_ts, expected_stats in cases:
+            with self.subTest(case=case_name):
+                rows = kmr.report_gauge(
+                    series,
+                    start,
+                    end=end,
+                    step=step,
+                    metric_name=mname,
+                    observed_timestamps=obs_ts,
+                )
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0][1:], expected_stats)
+
+        # Verify extract_observed_gauge_timestamps anchors on always-emitted Kueue gauges in [start, end]
+        anchor_ts = kmr.extract_observed_gauge_timestamps(
+            {
+                "kueue_build_info": [{"metric": {}, "values": [[995.0, "1"], [1007.0, "1"], [1017.0, "1"], [1035.0, "1"]]}],
+                "kueue_cohort_subtree_resource_reservations": [{"metric": {}, "values": [[1007.0, "8"]]}],
+            },
+            start=1000.0,
+            end=1030.0,
+        )
+        self.assertEqual(anchor_ts, {1007.0, 1017.0})
+
+    def test_M8_and_M10_cli_admissions_header_and_long_run_step_auto_scaling(self) -> None:
+        """M8 & M10: inclusive compute_effective_step, CLI >3h auto-scaling, dynamic counter header, reset warning, and lifecycle."""
+        step_cases = [
+            ("short_60s", 970.0, 1070.0, 1.0, 10_000, 1.0),
+            ("exact_10000_points_boundary", 0.0, 9999.0, 1.0, 10_000, 1.0),
+            ("just_over_10000_points_boundary", 0.0, 10000.0, 1.0, 10_000, 2.0),
+            ("exact_11000_cap_needs_step_2_at_11000s", 0.0, 11000.0, 1.0, 11_000, 2.0),
+            ("just_over_3h", 970.0, 12410.0, 1.0, 10_000, 2.0),
+            ("six_hours", 970.0, 22610.0, 1.0, 10_000, 3.0),
+            ("twenty_four_hours", 970.0, 87410.0, 1.0, 10_000, 9.0),
+            ("preserves_coarser_requested_step", 970.0, 22610.0, 5.0, 10_000, 5.0),
+            ("bumps_sub_second_step_when_exceeding_cap", 970.0, 8210.0, 0.5, 10_000, 1.0),
+        ]
+        for case_name, r_start, q_end, req_step, max_pts, exp_step in step_cases:
+            with self.subTest(step_case=case_name):
+                got = kmr.compute_effective_step(r_start, q_end, req_step, max_points=max_pts)
+                self.assertEqual(got, exp_step)
+                pts = int(math.floor((q_end - r_start) / got + 1e-9)) + 1
+                self.assertLessEqual(pts, max_pts)
+
+        observed_steps: list[float] = []
+        simulate_hist_reset = {"enabled": False}
+
+        class _StubPromHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                if parsed.path == "/-/ready":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                    return
+                if parsed.path == "/api/v1/query_range":
+                    q_start = float(qs["start"][0])
+                    q_end = float(qs["end"][0])
+                    q_step = float(qs["step"][0])
+                    observed_steps.append(q_step)
+                    if int(math.floor((q_end - q_start) / q_step + 1e-9)) + 1 > 11000:
+                        body = json.dumps({
+                            "status": "error",
+                            "errorType": "bad_data",
+                            "error": "exceeded maximum resolution of 11,000 points per timeseries",
+                        }).encode()
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    matrix_res = [
+                        {
+                            "metric": {
+                                "__name__": "kueue_admitted_workloads_total",
+                                "cluster_queue": "cq-a",
+                                "priority_class": "high",
+                            },
+                            "values": [[q_start, "0"], [q_end, "3"]],
+                        }
+                    ]
+                    body = json.dumps({"status": "success", "data": {"resultType": "matrix", "result": matrix_res}}).encode()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if parsed.path == "/api/v1/query":
+                    eval_ts = float(qs["time"][0])
+                    res = []
+                    if eval_ts > 1700000000.0:
+                        res = [
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_bucket",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                    "le": "10",
+                                },
+                                "value": [eval_ts, "3"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_bucket",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                    "le": "+Inf",
+                                },
+                                "value": [eval_ts, "3"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_sum",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                },
+                                "value": [eval_ts, "12.0"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_count",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                },
+                                "value": [eval_ts, "3"],
+                            },
+                        ]
+                    elif simulate_hist_reset["enabled"]:
+                        res = [
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_bucket",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                    "le": "10",
+                                },
+                                "value": [eval_ts, "10"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_bucket",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                    "le": "+Inf",
+                                },
+                                "value": [eval_ts, "10"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_sum",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                },
+                                "value": [eval_ts, "50.0"],
+                            },
+                            {
+                                "metric": {
+                                    "__name__": "kueue_admission_wait_time_seconds_count",
+                                    "cluster_queue": "cq-a",
+                                    "priority_class": "high",
+                                },
+                                "value": [eval_ts, "10"],
+                            },
+                        ]
+                    body = json.dumps({"status": "success", "data": {"resultType": "vector", "result": res}}).encode()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+        srv = HTTPServer(("127.0.0.1", 0), _StubPromHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_port}"
+            snap = {"nodes": [{"metadata": {"name": "n0"}, "status": {"allocatable": {"cpu": "4"}}}], "workloads": [], "pods": []}
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                json.dump(snap, tf)
+                snap_path = tf.name
+            try:
+                for dur, exp_step, exp_win_lbl, do_reset in (
+                    (3 * 3600, 2.0, "30s", False),
+                    (6 * 3600, 3.0, "30s", True),
+                    (4 * 86400, 35.0, "35s", False),
+                ):
+                    with self.subTest(cli_duration=dur, hist_reset=do_reset):
+                        observed_steps.clear()
+                        simulate_hist_reset["enabled"] = do_reset
+                        start = 1700000000.0
+                        argv = [
+                            "kueue_metrics_report.py",
+                            "--namespace", "kueue-optimizer-chamber-test",
+                            "--prometheus-url", url,
+                            "--start-epoch", str(start),
+                            "--end-epoch", str(start + dur),
+                            "--query-end-epoch", str(start + dur + 10),
+                            "--jobset-count", "1",
+                            "--total-pods", "1",
+                            "--cluster-snapshot-json", snap_path,
+                        ]
+                        buf = io.StringIO()
+                        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(buf):
+                            rc = kmr.main()
+                        out = buf.getvalue()
+                        self.assertEqual(rc, 0)
+                        self.assertEqual(observed_steps, [exp_step])
+                        self.assertIn(f"Note: Auto-scaled query step from 1s to {exp_step:g}s", out)
+                        self.assertIn("=== 1. Kueue Gauge Metrics", out)
+                        self.assertIn(f"AVG of {exp_win_lbl}-window increase", out)
+                        self.assertIn(f"P50({exp_win_lbl})", out)
+                        self.assertIn("=== 5.4 Effective Uninterrupted Cluster Saturation", out)
+                        sec3_block = out.split("=== 3. Kueue Histogram Metrics")[1].split("=== 4.")[0]
+                        sec52_block = out.split("=== 5.2 Wait Time Across All ClusterQueues")[1].split("=== 5.3")[0]
+                        self.assertIn("ADMISSIONS", sec52_block)
+                        self.assertNotIn("WORKLOADS", sec52_block)
+                        self.assertIn("re-admissions after preemption/eviction", sec52_block)
+                        if do_reset:
+                            self.assertIn("WARNING: Counter reset detected", sec3_block)
+                            self.assertIn("WARNING: Counter reset detected", sec52_block)
+                        else:
+                            self.assertNotIn("WARNING: Counter reset detected", sec3_block)
+                            self.assertNotIn("WARNING: Counter reset detected", sec52_block)
+            finally:
+                os.unlink(snap_path)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # Verify ChamberManager.run_kueue_metrics_report omits --step so kueue_metrics_report.py
+        # performs auto-scaling in a single place and prints the auto-scale notice.
+        from chamber.lifecycle import ChamberManager
+
+        mgr = ChamberManager("kueue-optimizer-chamber-step-test")
+        try:
+            for dur in (60.0, 6 * 3600.0):
+                with self.subTest(lifecycle_duration=dur):
+                    with (
+                        patch.object(mgr, "capture_cluster_saturation_snapshot", return_value=None),
+                        patch.object(mgr, "ensure_prometheus_connection"),
+                        patch("chamber.lifecycle.subprocess.run") as m_run,
+                    ):
+                        mgr.run_kueue_metrics_report(
+                            queueing_strategy="StrictFIFO",
+                            start_epoch=1700000000.0,
+                            end_epoch=1700000000.0 + dur,
+                            jobset_count=1,
+                            total_pods=1,
+                            wait_for_scrape=False,
+                        )
+                    m_run.assert_called_once()
+                    cmd = m_run.call_args.args[0]
+                    self.assertNotIn("--step", cmd)
         finally:
             mgr.close()
 

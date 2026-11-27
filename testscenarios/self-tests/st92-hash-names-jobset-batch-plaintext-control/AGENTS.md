@@ -93,7 +93,7 @@ Never evaluate this scenario in isolation when validating scheduler behavior or 
 ### Detailed Metric Checkpoints
 
 - `Section 5.1`: `AVG ~95%–100%` (matches `st91`).
-- `Section 5.2`: `p-std` `WORKLOADS=8`, `AVG ~5.0s–6.5s` (matches `st91`).
+- `Section 5.2`: `p-std` `ADMISSIONS=8`, `AVG ~5.0s–6.5s` (matches `st91`).
 - `Section 5.3`: **`0`** evictions (matches `st91`).
 - `Section 5.4`: `Qualifying Workloads: 8 (completed=8)`, `EFFECTIVE SAT ~90%–100%` (matches `st91`).
 
